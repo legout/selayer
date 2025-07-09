@@ -1,0 +1,211 @@
+erDiagram
+    orders {
+        string type "parquet"
+        string path "data/orders.parquet"
+    }
+    order_items {
+        string type "parquet"
+        string path "data/order_items.parquet"
+    }
+    customers {
+        string type "parquet"
+        string path "data/customers.parquet"
+    }
+    products {
+        string type "parquet"
+        string path "data/products.parquet"
+    }
+    campaigns {
+        string type "parquet"
+        string path "data/campaigns.parquet"
+    }
+    marketing_touches {
+        string type "parquet"
+        string path "data/marketing_touches.parquet"
+    }
+    website_visits {
+        string type "parquet"
+        string path "data/website_visits.parquet"
+    }
+    order_amount {
+        string description "Total amount of each order in USD"
+        string dataType "decimal"
+        string source "orders"
+        bool isAdditive "True"
+    }
+    orders ||--o{ order_amount : contains
+    order_total_amount {
+        string description "Total amount including shipping and discounts"
+        string dataType "decimal"
+        string source "orders"
+        bool isAdditive "True"
+    }
+    orders ||--o{ order_total_amount : contains
+    discount_amount {
+        string description "Discount amount applied to each order"
+        string dataType "decimal"
+        string source "orders"
+        bool isAdditive "True"
+    }
+    orders ||--o{ discount_amount : contains
+    shipping_cost {
+        string description "Shipping cost for each order"
+        string dataType "decimal"
+        string source "orders"
+        bool isAdditive "True"
+    }
+    orders ||--o{ shipping_cost : contains
+    item_quantity {
+        string description "Quantity of each product in an order"
+        string dataType "integer"
+        string source "order_items"
+        bool isAdditive "True"
+    }
+    order_items ||--o{ item_quantity : contains
+    item_price {
+        string description "Price of each product in an order"
+        string dataType "decimal"
+        string source "order_items"
+        bool isAdditive "False"
+    }
+    order_items ||--o{ item_price : contains
+    item_total {
+        string description "Total price for each line item"
+        string dataType "decimal"
+        string source "order_items"
+        bool isAdditive "True"
+    }
+    order_items ||--o{ item_total : contains
+    product_base_price {
+        string description "Base price of each product"
+        string dataType "decimal"
+        string source "products"
+        bool isAdditive "False"
+    }
+    products ||--o{ product_base_price : contains
+    product_cost {
+        string description "Cost of each product"
+        string dataType "decimal"
+        string source "products"
+        bool isAdditive "False"
+    }
+    products ||--o{ product_cost : contains
+    total_revenue {
+        string description "Sum of all order amounts"
+        string fact "order_amount"
+        string aggregation "sum"
+    }
+    order_amount ||--o{ total_revenue : aggregates
+    total_discount {
+        string description "Sum of all discounts"
+        string fact "discount_amount"
+        string aggregation "sum"
+    }
+    discount_amount ||--o{ total_discount : aggregates
+    total_shipping {
+        string description "Sum of all shipping costs"
+        string fact "shipping_cost"
+        string aggregation "sum"
+    }
+    shipping_cost ||--o{ total_shipping : aggregates
+    order_count {
+        string description "Count of orders"
+        string fact "order_amount"
+        string aggregation "count_distinct"
+    }
+    order_amount ||--o{ order_count : aggregates
+    completed_order_count {
+        string description "Count of completed orders"
+        string fact "order_amount"
+        string aggregation "count_distinct"
+    }
+    order_amount ||--o{ completed_order_count : aggregates
+    units_sold {
+        string description "Total quantity of items sold"
+        string fact "item_quantity"
+        string aggregation "sum"
+    }
+    item_quantity ||--o{ units_sold : aggregates
+    product_cost_sum {
+        string description "Sum of product costs"
+        string fact "product_cost"
+        string aggregation "sum"
+    }
+    product_cost ||--o{ product_cost_sum : aggregates
+    customer_id {
+        string description "Unique customer identifier"
+        string dataType "string"
+        string source "customers"
+    }
+    customers ||--o{ customer_id : contains
+    customer_segment {
+        string description "Customer segment"
+        string dataType "string"
+        string source "customers"
+    }
+    customers ||--o{ customer_segment : contains
+    customer_country {
+        string description "Customer country"
+        string dataType "string"
+        string source "customers"
+    }
+    customers ||--o{ customer_country : contains
+    product_id {
+        string description "Unique product identifier"
+        string dataType "string"
+        string source "products"
+    }
+    products ||--o{ product_id : contains
+    product_category {
+        string description "Product category"
+        string dataType "string"
+        string source "products"
+    }
+    products ||--o{ product_category : contains
+    product_subcategory {
+        string description "Product subcategory"
+        string dataType "string"
+        string source "products"
+    }
+    products ||--o{ product_subcategory : contains
+    order_date {
+        string description "Date of the order"
+        string dataType "date"
+        string source "orders"
+    }
+    orders ||--o{ order_date : contains
+    order_status {
+        string description "Status of the order"
+        string dataType "string"
+        string source "orders"
+    }
+    orders ||--o{ order_status : contains
+    payment_method {
+        string description "Payment method used"
+        string dataType "string"
+        string source "orders"
+    }
+    orders ||--o{ payment_method : contains
+    average_order_value {
+        string description "Average order value"
+    }
+    total_revenue ||--o{ average_order_value : used_in
+    order_count ||--o{ average_order_value : used_in
+    discount_rate {
+        string description "Average discount rate"
+    }
+    total_discount ||--o{ discount_rate : used_in
+    total_revenue ||--o{ discount_rate : used_in
+    gross_margin {
+        string description "Gross margin percentage"
+    }
+    total_revenue ||--o{ gross_margin : used_in
+    product_cost_sum ||--o{ gross_margin : used_in
+    order_completion_rate {
+        string description "Percentage of orders that are completed"
+    }
+    completed_order_count ||--o{ order_completion_rate : used_in
+    order_count ||--o{ order_completion_rate : used_in
+    customers ||--o{ orders : "customer_orders"
+    orders ||--o{ order_items : "order_items_rel"
+    products ||--o{ order_items : "product_order_items"
