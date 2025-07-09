@@ -71,7 +71,7 @@ class Measure:
             "min": "MIN",
             "max": "MAX",
             "count": "COUNT",
-            "count_distinct": "COUNT(DISTINCT"
+            "count_distinct": "COUNT(DISTINCT {expr})"
         }
         
         # The column reference will be replaced at query time
@@ -85,7 +85,7 @@ class Measure:
         
         # Apply aggregation
         if self.aggregation == "count_distinct":
-            return f"{agg_functions[self.aggregation]}({filter_clause}))"
+            return agg_functions[self.aggregation].format(expr=filter_clause)
         else:
             return f"{agg_functions[self.aggregation]}({filter_clause})"
 
@@ -372,11 +372,12 @@ class QueryEngine:
             return []  # Already joined
             
         # Simple BFS to find a join path
+        from collections import deque
         visited = set(source_tables)
-        queue = [(table, []) for table in source_tables]
+        queue = deque((table, []) for table in source_tables)
         
         while queue:
-            current_table, path = queue.pop(0)
+            current_table, path = queue.popleft()
             
             # Check all relationships for this table
             for rel_name, rel in self.semantic_layer.relationships.items():
