@@ -1,20 +1,26 @@
-# Modular “Talk to Your Data” Platform Design
+# SemaLoom: Modular “Talk to Your Data” Platform Design
 
 **Status:** Approved design
 **Date:** 2026-07-23
 
 ## 1. Purpose
 
-Evolve `selayer` from the current promising MVP into a modular, local-or-team business-intelligence platform with these properties:
+Evolve the current `selayer` MVP into **SemaLoom**, a modular, local-or-team business-intelligence platform with these properties:
 
 - `selayer` is a standalone Python distribution for semantic contracts and knowledge bundles.
-- `selayer-chat` is an optional agentic analysis distribution rather than part of the semantic core.
+- `semaloom-agents` is an optional agentic analysis distribution rather than part of the semantic core.
 - The same capabilities are usable from the owned UI, standard chat UIs, Python, CLI, MCP, Claude Code, and OpenCode.
 - Agents propose plans and changes; deterministic modules validate and execute them.
 - The local edition is frictionless and does not require authentication or hosted Git.
 - The trusted-team edition adds role enforcement, shared state, and private GitLab publication.
 
 The product identity is **platform first**. No UI or agent harness is the system's primary interface.
+
+The naming model is:
+
+- **SemaLoom**: the umbrella platform, repository, CLI, and user-facing product.
+- **selayer**: the standalone semantic-layer and OKF library, retaining its original precise meaning.
+- **Luminary**: the built-in analyst persona used by SemaLoom clients that do not provide their own orchestrating agent.
 
 ## 2. Current-state observations
 
@@ -43,21 +49,22 @@ The refactor must first preserve and characterize useful MVP behavior. It must n
 13. Reuse `fsspeckit` where useful for filesystems and storage configuration.
 14. Do not depend on `flowerpower-io`; only borrow selected design patterns.
 15. Use trusted reverse-proxy identity headers for the first team-server authentication adapter.
+16. Name the platform SemaLoom, retain `selayer` for the semantic library, and call the built-in analyst persona Luminary.
 
 ## 4. Workspace and dependency design
 
 ```text
-selayer/
+semaloom/
 ├── pyproject.toml                 # uv workspace, Python 3.14
 ├── uv.lock
 ├── packages/
 │   ├── selayer/                   # semantic + OKF domain
-│   ├── selayer-runtime/           # connectors, DuckDB, SQL policy
-│   └── selayer-chat/              # optional agents and orchestration
+│   ├── semaloom-runtime/           # connectors, DuckDB, SQL policy
+│   └── semaloom-agents/            # optional agents and orchestration
 ├── services/
-│   └── selayer-server/            # HTTP, OpenAI-compatible, MCP, team composition
+│   └── semaloom-server/            # HTTP, OpenAI-compatible, MCP, team composition
 ├── apps/
-│   └── selayer-web/               # Stario workbench
+│   └── semaloom-web/               # Stario workbench
 ├── skills/                        # Claude Code/OpenCode Agent Skills
 └── deploy/
     ├── local/                     # Docker Compose, no auth/Git required
@@ -77,7 +84,7 @@ Responsibilities:
 - YAML-to-OKF projection.
 - Catalog revisions, proposals, semantic diffs, and validation reports.
 
-### 4.2 `selayer-runtime`
+### 4.2 `semaloom-runtime`
 
 Responsibilities:
 
@@ -90,11 +97,11 @@ Responsibilities:
 
 It depends on `selayer`. Lake connectors may depend on `fsspeckit` and format-specific libraries through extras.
 
-### 4.3 `selayer-chat`
+### 4.3 `semaloom-agents`
 
 Responsibilities:
 
-- Main analyst orchestration for clients that do not provide their own agent.
+- Luminary main-analyst orchestration for clients that do not provide their own agent.
 - Typed analysis planner.
 - Constrained SQL fallback planner.
 - BI/chart planner.
@@ -103,13 +110,13 @@ Responsibilities:
 - Streaming domain events.
 - PydanticAI model/provider adapters.
 
-It depends on `selayer-runtime` and `selayer`. Deterministic policy is never implemented in prompts.
+It depends on `semaloom-runtime` and `selayer`. Deterministic policy is never implemented in prompts.
 
 ### 4.4 Composition roots
 
-`selayer-server` selects identity, operational-store, catalog-repository, artifact-store, secret-provider, model-provider, and transport adapters for the team deployment.
+`semaloom-server` selects identity, operational-store, catalog-repository, artifact-store, secret-provider, model-provider, and transport adapters for the team deployment.
 
-`selayer-web` is a Stario client of the native server interface. Stario does not host the platform's authentication, OpenAI-compatible API, or MCP server. This matters because Stario is not ASGI and intentionally does not supply the broader server infrastructure ecosystem.
+`semaloom-web` is a Stario client of the native server interface. Stario does not host the platform's authentication, OpenAI-compatible API, or MCP server. This matters because Stario is not ASGI and intentionally does not supply the broader server infrastructure ecosystem.
 
 Modules are promoted to separately versioned packages only when independent installation or release cadence becomes necessary. There will not initially be one package per agent, connector, or protocol.
 
@@ -151,7 +158,7 @@ The planner produces an `AnalysisPlan` containing stable semantic IDs and typed 
 - desired result shape
 - visualization intent
 
-`selayer-runtime` resolves IDs, validates relationships, chooses declared join paths, compiles metric expressions, binds parameters, and emits SQL plus provenance.
+`semaloom-runtime` resolves IDs, validates relationships, chooses declared join paths, compiles metric expressions, binds parameters, and emits SQL plus provenance.
 
 ### 6.2 SQL fallback
 
@@ -427,7 +434,7 @@ This design should be implemented as vertical slices, not as a large rewrite.
 1. **Characterize and separate:** add tests for valuable MVP behavior, create the uv workspace, and extract the three packages without adding new product behavior.
 2. **Catalog foundation:** typed semantic IDs, YAML validation/migration, OKF bundle support, proposals, semantic diffs, local catalog repository.
 3. **Trusted local query path:** typed `AnalysisPlan`, deterministic compiler, DuckDB sessions, SQL policy, cancellation, Parquet connector, CLI.
-4. **Agent and protocol path:** built-in analyst, bounded context, MCP, native HTTP, OpenAI-compatible HTTP, and streaming artifacts.
+4. **Agent and protocol path:** Luminary, bounded context, MCP, native HTTP, OpenAI-compatible HTTP, and streaming artifacts.
 5. **Local product:** Stario workbench and no-auth Docker Compose profile.
 6. **Onboarding and memory:** metadata profiling, local-file proposal flow, nomination/approval of query examples.
 7. **Team profile:** reverse-proxy identity, role matrix, PostgreSQL, GitLab direct-push and MR publication.
