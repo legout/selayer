@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.next.conftest import VALID_CATALOG_YAML
+from tests.conftest import VALID_CATALOG_YAML
 
 
 @pytest.fixture

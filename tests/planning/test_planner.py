@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from selayer._next.model import Dimension, Relationship, SemanticLayer
+from selayer.model import Dimension, Relationship, SemanticLayer
 from selayer.planning import (
     ListFilter,
     QueryPlanningError,

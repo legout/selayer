@@ -4,7 +4,6 @@ from dataclasses import replace
 
 import pytest
 
-from selayer._next.model import SemanticLayer
 from selayer.compilation import (
     compile_duckdb,
     compile_metric_expression,
@@ -20,6 +19,7 @@ from selayer.expressions.ast import (
     Reference,
     UnaryOperation,
 )
+from selayer.model import SemanticLayer
 from selayer.planning import (
     ListFilter,
     PlannedFilter,
@@ -28,7 +28,7 @@ from selayer.planning import (
     ScalarFilter,
     plan_query,
 )
-from tests.next.conftest import VALID_CATALOG_YAML
+from tests.conftest import VALID_CATALOG_YAML
 
 
 @pytest.fixture

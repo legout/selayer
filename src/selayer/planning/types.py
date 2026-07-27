@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
-from selayer._next.model import (
+from selayer.expressions.ast import Expression
+from selayer.model import (
     Aggregation,
     Dimension,
     Fact,
@@ -13,7 +14,6 @@ from selayer._next.model import (
     Metric,
     Relationship,
 )
-from selayer.expressions.ast import Expression
 
 type FilterScalar = str | int | float | bool | None
 

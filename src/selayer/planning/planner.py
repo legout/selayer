@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from collections import deque
 
-from selayer._next.model import Relationship, SemanticLayer
 from selayer.expressions.validation import references
+from selayer.model import Relationship, SemanticLayer
 from selayer.planning.types import (
     JoinStep,
     PlannedDimension,

@@ -10,7 +10,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from selayer._next.model import Aggregation
 from selayer.expressions.ast import (
     BinaryOperation,
     Expression,
@@ -22,6 +21,7 @@ from selayer.expressions.ast import (
     Literal as LiteralExpression,
 )
 from selayer.expressions.validation import METRIC_FUNCTIONS, ROW_FUNCTIONS
+from selayer.model import Aggregation
 from selayer.planning.types import (
     ListFilter,
     PlannedFilter,

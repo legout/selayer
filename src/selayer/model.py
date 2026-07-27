@@ -1,146 +1,173 @@
+"""Immutable schema-version-1 catalog model types.
+
+These frozen dataclasses define the immutable breaking-cutover catalog
+model used by the public ``selayer`` package.
+
+Conventions enforced by the catalog loader (not by the dataclasses themselves):
+
+- schema version is exactly ``1``;
+- every collection mapping key is a stable lowercase identifier matching
+  ``[a-z][a-z0-9_]*``;
+- every data source declares a non-empty ``grain``;
+- relationship ``type`` is mapped onto the :data:`Cardinality` literal and may
+  take any of its four values (``many_to_many`` is valid here; planning it is
+  deferred to the planner task).
+"""
+
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from types import MappingProxyType
+from typing import Literal
 
-import duckdb
-import polars as pl
+from selayer.expressions.ast import Expression
 
-if TYPE_CHECKING:
-    from selayer.query import QueryEngine
+type Aggregation = Literal["sum", "avg", "min", "max", "count", "count_distinct"]
+
+type Cardinality = Literal["one_to_one", "one_to_many", "many_to_one", "many_to_many"]
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class DataSource:
-    """A named tabular source used by a semantic layer."""
+    """A named tabular source and the columns that identify one of its rows."""
 
     name: str
     type: str
     path: str
-    schema: dict[str, str] | None = None
-    connection_params: dict[str, Any] | None = None
-
-    def get_data(self) -> pl.DataFrame:
-        """Load the source into a Polars DataFrame."""
-        if self.type == "parquet":
-            return pl.read_parquet(self.path)
-        if self.type == "csv":
-            return pl.read_csv(self.path)
-        if self.type in {"postgres", "sqlite"}:
-            return self._get_database_data()
-        raise ValueError(f"Unsupported data source type: {self.type}")
-
-    def _get_database_data(self) -> pl.DataFrame:
-        params = self.connection_params or {}
-        table = params.get("table")
-        if not isinstance(table, str) or not table:
-            raise ValueError(
-                f"Data source '{self.name}' requires connection_params.table"
-            )
-
-        connection = duckdb.connect(":memory:")
-        try:
-            if self.type == "postgres":
-                connection_string = params.get("connection_string")
-                if not isinstance(connection_string, str) or not connection_string:
-                    raise ValueError(
-                        f"Data source '{self.name}' requires "
-                        "connection_params.connection_string"
-                    )
-                connection.execute("INSTALL postgres_scanner; LOAD postgres_scanner;")
-                relation = connection.sql(
-                    "SELECT * FROM postgres_scan($connection, 'public', $table)",
-                    params={"connection": connection_string, "table": table},
-                )
-            else:
-                connection.execute("INSTALL sqlite; LOAD sqlite;")
-                relation = connection.sql(
-                    "SELECT * FROM sqlite_scan($path, $table)",
-                    params={"path": self.path, "table": table},
-                )
-            return relation.pl()
-        finally:
-            connection.close()
+    grain: tuple[str, ...]
 
 
-@dataclass
-class Fact:
-    """An atomic value in a fact table."""
-
-    name: str
-    description: str
-    data_type: str
-    source: str
-    column: str
-    is_additive: bool = True
-
-
-@dataclass
-class Measure:
-    """An aggregation of a fact."""
-
-    name: str
-    description: str
-    fact: str
-    aggregation: Literal["sum", "avg", "min", "max", "count", "count_distinct"] = "sum"
-    filter_expression: str | None = None
-
-    def to_sql(self) -> str:
-        """Compile the measure to SQL with fact placeholders."""
-        aggregate_functions = {
-            "sum": "SUM",
-            "avg": "AVG",
-            "min": "MIN",
-            "max": "MAX",
-            "count": "COUNT",
-        }
-        fact_reference = "{fact_source}.{fact_column}"
-        expression = fact_reference
-        if self.filter_expression:
-            expression = (
-                f"CASE WHEN {self.filter_expression} THEN {fact_reference} "
-                "ELSE NULL END"
-            )
-        if self.aggregation == "count_distinct":
-            return f"COUNT(DISTINCT {expression})"
-        return f"{aggregate_functions[self.aggregation]}({expression})"
-
-
-@dataclass
+@dataclass(frozen=True, slots=True)
 class Dimension:
+    """A named grouping/filtering field backed by a source column."""
+
     name: str
-    description: str
-    data_type: str
     source: str
     column: str
-    hierarchies: list[str] = field(default_factory=list)
+    data_type: str
+    description: str = ""
 
 
-@dataclass
-class Hierarchy:
+@dataclass(frozen=True, slots=True)
+class Fact:
+    """A row-level value evaluated at its anchor source grain."""
+
     name: str
-    description: str
-    levels: list[str]
+    source: str
+    expression: Expression
+    data_type: str
+    description: str = ""
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
+class Measure:
+    """An aggregation of one fact; its grain is inherited from the fact."""
+
+    name: str
+    fact: str
+    aggregation: Aggregation
+    description: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class Metric:
+    """An aggregate-level formula over declared measures."""
+
     name: str
-    description: str
-    expression: str
-    measures: list[str] = field(default_factory=list)
-    dependencies: list[str] = field(default_factory=list)
-
-    def evaluate(self, context: dict[str, Any], engine: QueryEngine) -> Any:
-        """Evaluate this metric expression with a query engine."""
-        return engine.evaluate_expression(self.expression, context)
+    expression: Expression
+    measures: tuple[str, ...]
+    description: str = ""
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class Relationship:
+    """A declared join between two data sources."""
+
     name: str
     source: str
     target: str
-    type: str = "one_to_many"
-    source_column: str = ""
-    target_column: str = ""
+    type: Cardinality
+    source_column: str
+    target_column: str
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticLayer:
+    """A validated, immutable collection of semantic model definitions.
+
+    Each collection is a read-only :class:`~types.MappingProxyType` so a loaded
+    layer cannot be mutated after construction. Lookup helpers raise a
+    deterministic :class:`KeyError` for internal programmer mistakes;
+    user-facing catalog and planning code converts lookup failures into domain
+    errors.
+    """
+
+    version: int
+    name: str
+    label: str
+    description: str
+    data_sources: Mapping[str, DataSource]
+    dimensions: Mapping[str, Dimension]
+    facts: Mapping[str, Fact]
+    measures: Mapping[str, Measure]
+    metrics: Mapping[str, Metric]
+    relationships: Mapping[str, Relationship]
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "data_sources",
+            "dimensions",
+            "facts",
+            "measures",
+            "metrics",
+            "relationships",
+        ):
+            object.__setattr__(
+                self, field_name, MappingProxyType(dict(getattr(self, field_name)))
+            )
+
+    def source(self, name: str) -> DataSource:
+        return self.data_sources[name]
+
+    def dimension(self, name: str) -> Dimension:
+        return self.dimensions[name]
+
+    def fact(self, name: str) -> Fact:
+        return self.facts[name]
+
+    def measure(self, name: str) -> Measure:
+        return self.measures[name]
+
+    def metric(self, name: str) -> Metric:
+        return self.metrics[name]
+
+    def relationship(self, name: str) -> Relationship:
+        return self.relationships[name]
+
+    @classmethod
+    def load(cls, path: str | Path) -> SemanticLayer:
+        """Load and validate a schema-version-1 catalog from ``path``.
+
+        Defined as a thin delegate so callers use ``SemanticLayer.load`` while
+        the parsing and validation logic lives in
+        :mod:`selayer.catalog`. The import is local to avoid a module-load
+        cycle (``catalog`` imports this model module).
+        """
+        from selayer.catalog import load
+
+        return load(path)
+
+
+__all__ = [
+    "Aggregation",
+    "Cardinality",
+    "DataSource",
+    "Dimension",
+    "Fact",
+    "Measure",
+    "Metric",
+    "Relationship",
+    "SemanticLayer",
+]
