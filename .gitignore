@@ -6,8 +6,9 @@ dist/
 wheels/
 *.egg-info/
 
-# Virtual environments and tool caches
+# Virtual environments, worktrees, and tool caches
 .venv/
+.worktrees/
 .ruff_cache/
 .pytest_cache/
 .pyright/
