@@ -32,6 +32,7 @@ packages = ["src/selayer"]
 [tool.pyright]
 venvPath = "."
 venv = ".venv"
+pythonVersion = "3.13"
 extraPaths = ["src", ".venv/lib/python3.13/site-packages"]
 
 [tool.pytest.ini_options]
