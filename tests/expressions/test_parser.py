@@ -105,3 +105,41 @@ def test_syntax_error_reports_first_invalid_offset() -> None:
 def test_rejects_unsupported_keywords_and_reference_depth(source: str) -> None:
     with pytest.raises(ExpressionSyntaxError):
         parse_expression(source)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "INTO",
+        "SET",
+        "RETURNING",
+        "EXISTS",
+        "BETWEEN",
+        # Representative DDL and DML keywords.
+        "DATABASE",
+        "SCHEMA",
+        "VIEW",
+        "MERGE",
+        "CALL",
+        "COPY",
+        # Representative join keywords.
+        "INNER",
+        "LEFT",
+        "RIGHT",
+        "FULL",
+        "CROSS",
+        "NATURAL",
+        "USING",
+        # Representative window keywords.
+        "WINDOW",
+        "OVER",
+        "PARTITION",
+        "ROWS",
+        "RANGE",
+        "PRECEDING",
+        "FOLLOWING",
+    ],
+)
+def test_rejects_sql_keywords_as_references(source: str) -> None:
+    with pytest.raises(ExpressionSyntaxError, match="SQL keyword is not allowed"):
+        parse_expression(source)
