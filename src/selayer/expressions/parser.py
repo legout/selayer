@@ -60,6 +60,8 @@ _SQL_KEYWORDS: Final = frozenset(
         "like",
         "in",
         "is",
+        "with",
+        "values",
     }
 )
 
