@@ -12,6 +12,20 @@ from selayer.compilation import compile_duckdb
 from selayer.errors import QueryExecutionError
 from selayer.planning import QueryPlan, QueryRequest, plan_query
 
+_REDACTED_PARAMETER = "<redacted>"
+
+
+def _redact_parameter_values(message: str, parameters: tuple[object, ...]) -> str:
+    """Remove every useful scalar representation from a driver diagnostic."""
+    candidates: set[str] = set()
+    for value in parameters:
+        candidates.add(str(value))
+        candidates.add(repr(value))
+    for candidate in sorted(candidates, key=lambda item: (-len(item), item)):
+        if candidate:
+            message = message.replace(candidate, _REDACTED_PARAMETER)
+    return message
+
 
 class QueryEngine:
     """Orchestrate catalog loading, planning, compilation, and execution."""
@@ -79,9 +93,8 @@ class QueryEngine:
             result = self.conn.execute(compiled.sql, compiled.parameters).pl()
         except duckdb.Error as error:
             if compiled.parameters:
-                # Bound values and engine details are intentionally hidden for
-                # parameterized queries. Do not chain the driver exception.
-                message = "query execution failed"
+                diagnostic = _redact_parameter_values(str(error), compiled.parameters)
+                message = f"query execution failed: {diagnostic}"
             else:
                 # With no caller-provided values, the generated SQL and the
                 # DuckDB diagnostic are useful debugging information.

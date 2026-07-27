@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from selayer.model import Dimension, Relationship, SemanticLayer
@@ -242,6 +244,107 @@ def test_planner_no_path_ambiguous_and_row_expansion_matrix(valid_catalog_path) 
             QueryRequest(("gross_margin",), ("extra",)),
         )
     assert error.value.code == "row_expanding_path"
+
+
+def _metric_without_product_reference(layer: SemanticLayer) -> SemanticLayer:
+    metrics = dict(layer.metrics)
+    metrics["revenue_only"] = replace(
+        metrics["gross_margin"], name="revenue_only", measures=("total_item_revenue",)
+    )
+    return replace(layer, metrics=metrics)
+
+
+def _path_test_layer(
+    layer: SemanticLayer, relationships: tuple[Relationship, ...]
+) -> SemanticLayer:
+    return replace(
+        _metric_without_product_reference(layer),
+        dimensions={
+            **layer.dimensions,
+            "target": Dimension("target", "products", "id", "integer"),
+        },
+        relationships={
+            relationship.name: relationship for relationship in relationships
+        },
+    )
+
+
+def test_planner_prefers_longer_safe_path_over_shorter_unsafe_direct_edge(
+    valid_catalog_path,
+) -> None:  # type: ignore[no-untyped-def]
+    layer = SemanticLayer.load(valid_catalog_path)
+    layer = _path_test_layer(
+        layer,
+        (
+            Relationship(
+                "a_unsafe", "order_items", "products", "one_to_many", "product_id", "id"
+            ),
+            Relationship(
+                "b_safe", "orders", "order_items", "one_to_many", "id", "order_id"
+            ),
+            Relationship("c_safe", "orders", "products", "one_to_one", "id", "id"),
+        ),
+    )
+    plan = plan_query(layer, QueryRequest(("revenue_only",), ("target",)))
+    assert [join.relationship_id for join in plan.joins] == ["b_safe", "c_safe"]
+
+
+def test_planner_rejects_equal_shortest_safe_paths_even_with_unsafe_edge(
+    valid_catalog_path,
+) -> None:  # type: ignore[no-untyped-def]
+    layer = SemanticLayer.load(valid_catalog_path)
+    layer = _path_test_layer(
+        layer,
+        (
+            Relationship(
+                "a_unsafe", "order_items", "products", "one_to_many", "product_id", "id"
+            ),
+            Relationship(
+                "b_orders", "orders", "order_items", "one_to_many", "id", "order_id"
+            ),
+            Relationship("c_orders", "orders", "products", "one_to_one", "id", "id"),
+            Relationship(
+                "d_customers",
+                "customers",
+                "order_items",
+                "one_to_many",
+                "id",
+                "order_id",
+            ),
+            Relationship(
+                "e_customers", "customers", "products", "one_to_one", "id", "id"
+            ),
+        ),
+    )
+    with pytest.raises(QueryPlanningError) as error:
+        plan_query(layer, QueryRequest(("revenue_only",), ("target",)))
+    assert error.value.code == "ambiguous_relationship_path"
+
+
+def test_planner_reports_row_expansion_for_unsafe_only_relationship_path(
+    valid_catalog_path,
+) -> None:  # type: ignore[no-untyped-def]
+    layer = SemanticLayer.load(valid_catalog_path)
+    layer = _path_test_layer(
+        layer,
+        (
+            Relationship(
+                "unsafe", "order_items", "products", "one_to_many", "product_id", "id"
+            ),
+        ),
+    )
+    with pytest.raises(QueryPlanningError) as error:
+        plan_query(layer, QueryRequest(("revenue_only",), ("target",)))
+    assert error.value.code == "row_expanding_path"
+
+
+def test_planner_reports_no_path_when_sources_are_disconnected(
+    valid_catalog_path,
+) -> None:  # type: ignore[no-untyped-def]
+    layer = _path_test_layer(SemanticLayer.load(valid_catalog_path), ())
+    with pytest.raises(QueryPlanningError) as error:
+        plan_query(layer, QueryRequest(("revenue_only",), ("target",)))
+    assert error.value.code == "no_relationship_path"
 
 
 def test_reversed_relationship_insertion_order_has_equal_plan(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import date
 from pathlib import Path
 from uuid import UUID
 
@@ -78,6 +79,42 @@ def test_query_execution_error_does_not_leak_bound_values(
     assert error.__cause__ is None
     assert error.__context__ is None
     assert secret not in formatted
+
+
+@pytest.mark.parametrize(
+    ("value", "diagnostic", "context"),
+    [
+        ("UNIQUE_SECRET_BOUND_VALUE", "Conversion Error", "INT64"),
+        ("x' OR 1=1 -- \\ metachar", "Conversion Error", "INT64"),
+        (10**100, "Invalid Input Error", "128-bit"),
+        (date(2024, 1, 2), "Conversion Error", "DATE"),
+    ],
+)
+def test_parameterized_query_errors_redact_values_but_keep_diagnostics(
+    valid_catalog_path: Path, value: object, diagnostic: str, context: str
+) -> None:
+    layer = SemanticLayer.load(valid_catalog_path)
+    layer = replace(
+        layer,
+        dimensions={
+            **layer.dimensions,
+            "stock": Dimension("stock", "products", "in_stock", "integer"),
+        },
+    )
+    engine = QueryEngine(layer)
+    with pytest.raises(QueryExecutionError) as caught:
+        engine.query(["gross_margin"], filters={"stock": value})
+    error = caught.value
+    formatted = "".join(__import__("traceback").format_exception(error))
+    for candidate in (str(value), repr(value)):
+        assert candidate not in error.message
+        assert candidate not in str(error)
+        assert candidate not in repr(error.args)
+        assert candidate not in formatted
+    assert diagnostic in error.message
+    assert context in error.message
+    assert error.__cause__ is None
+    assert error.__context__ is None
 
 
 def test_query_execution_errors_have_distinct_uuid_ids(

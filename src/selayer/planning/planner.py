@@ -26,17 +26,28 @@ def expands_rows(relationship: Relationship, current_source: str) -> bool:
     return True
 
 
-def _paths(layer: SemanticLayer, start: str, goal: str) -> list[tuple[str, ...]]:
+def _paths(
+    layer: SemanticLayer, start: str, goal: str, *, safe_only: bool = False
+) -> list[tuple[str, ...]]:
+    """Return all deterministic shortest paths in the requested graph.
+
+    The fallback graph is undirected so callers can distinguish a genuine
+    disconnect from a path that would expand the anchor grain.  Safe paths,
+    in contrast, are directed by cardinality and only retain grain-preserving
+    traversals.
+    """
     if start == goal:
         return [()]
     edges: dict[str, list[tuple[str, str]]] = {}
     for rid, rel in sorted(layer.relationships.items()):
-        if rel.type == "many_to_many":
-            # It is still traversable here so the caller gets the stable
-            # row-expansion diagnostic rather than a graph-specific failure.
-            pass
-        edges.setdefault(rel.source, []).append((rid, rel.target))
-        edges.setdefault(rel.target, []).append((rid, rel.source))
+        if safe_only:
+            if not expands_rows(rel, rel.source):
+                edges.setdefault(rel.source, []).append((rid, rel.target))
+            if not expands_rows(rel, rel.target):
+                edges.setdefault(rel.target, []).append((rid, rel.source))
+        else:
+            edges.setdefault(rel.source, []).append((rid, rel.target))
+            edges.setdefault(rel.target, []).append((rid, rel.source))
     distances = {start: 0}
     queue: deque[str] = deque([start])
     while queue:
@@ -62,6 +73,10 @@ def _paths(layer: SemanticLayer, start: str, goal: str) -> list[tuple[str, ...]]
 
     walk(start, (), frozenset())
     return result
+
+
+def _safe_paths(layer: SemanticLayer, start: str, goal: str) -> list[tuple[str, ...]]:
+    return _paths(layer, start, goal, safe_only=True)
 
 
 def plan_query(layer: SemanticLayer, request: QueryRequest) -> QueryPlan:
@@ -144,8 +159,12 @@ def plan_query(layer: SemanticLayer, request: QueryRequest) -> QueryPlan:
     joins: list[JoinStep] = []
     joined: set[str] = set()
     for goal in required_sources:
-        paths = _paths(layer, anchor, goal)
+        paths = _safe_paths(layer, anchor, goal)
         if not paths:
+            if _paths(layer, anchor, goal):
+                raise QueryPlanningError(
+                    "row_expanding_path", f"relationship path to '{goal}' expands rows"
+                )
             raise QueryPlanningError(
                 "no_relationship_path",
                 f"no relationship path from '{anchor}' to '{goal}'",
