@@ -129,26 +129,6 @@ def _reachable(anchor: str, adjacency: dict[str, list[tuple[str, str]]]) -> set[
     return reachable
 
 
-def _shortest_path(
-    layer: SemanticLayer, start: str, goal: str, *, safe_only: bool = False
-) -> tuple[tuple[str, ...] | None, bool, bool]:
-    """Find one shortest path and whether shortest paths are ambiguous.
-
-    This compatibility helper is intentionally a single indexed traversal. The
-    planner itself builds both indexes once and reuses them for every goal.
-    """
-    safe, full = _build_adjacency(layer)
-    if safe_only:
-        return _safe_path_index(start, safe).path_to(goal)
-    return _safe_path_index(start, full).path_to(goal)
-
-
-def _safe_path(
-    layer: SemanticLayer, start: str, goal: str
-) -> tuple[tuple[str, ...] | None, bool, bool]:
-    return _safe_path_index(start, _build_adjacency(layer)[0]).path_to(goal)
-
-
 def plan_query(layer: SemanticLayer, request: QueryRequest) -> QueryPlan:
     if not request.metrics:
         raise QueryPlanningError("unknown_metric", "at least one metric is required")
@@ -203,11 +183,17 @@ def plan_query(layer: SemanticLayer, request: QueryRequest) -> QueryPlan:
             )
     dimensions: list[PlannedDimension] = []
     required_sources: list[str] = []
+    required_source_set: set[str] = set()
+
+    def require_source(source: str) -> None:
+        if source not in required_source_set:
+            required_source_set.add(source)
+            required_sources.append(source)
+
     for dimension_id in request.dimensions:
         dimension = layer.dimensions[dimension_id]
         dimensions.append(PlannedDimension(dimension_id, dimension))
-        if dimension.source not in required_sources:
-            required_sources.append(dimension.source)
+        require_source(dimension.source)
     filters: list[PlannedFilter] = []
     for dimension_id in sorted(request.filters):
         raw_value = request.filters[dimension_id]
@@ -218,13 +204,12 @@ def plan_query(layer: SemanticLayer, request: QueryRequest) -> QueryPlan:
                 f"filter dimension '{dimension_id}' is not known",
             )
         filters.append(PlannedFilter(dimension_id, dimension, raw_value))
-        if dimension.source not in required_sources:
-            required_sources.append(dimension.source)
+        require_source(dimension.source)
     for planned in measures:
         for reference in references(planned.fact.expression):
             source = reference.parts[0]
-            if source != anchor and source not in required_sources:
-                required_sources.append(source)
+            if source != anchor:
+                require_source(source)
 
     # Construct both graph views once, then index all safe paths from the
     # anchor. Full reachability distinguishes a blocked (row-expanding) path

@@ -105,13 +105,26 @@ def test_diagnostic_category_requires_an_anchored_token(
     engine = QueryEngine(layer)
 
     class FailingConnection:
-        def execute(self, _sql: str, _parameters: tuple[object, ...]) -> object:
+        def __init__(self) -> None:
+            self.sql: str | None = None
+
+        def execute(self, sql: str, _parameters: tuple[object, ...]) -> object:
+            self.sql = sql
             raise duckdb.ConversionException(diagnostic)
 
-    monkeypatch.setattr(engine, "conn", FailingConnection())
+    connection = FailingConnection()
+    monkeypatch.setattr(engine, "conn", connection)
     with pytest.raises(QueryExecutionError) as caught:
         engine.query(["gross_margin"], filters={"stock": "secret"})
-    assert caught.value.message == (
+    error = caught.value
+    assert connection.sql is not None
+    formatted = "".join(__import__("traceback").format_exception(error))
+    for leaked in (connection.sql, diagnostic):
+        assert leaked not in str(error)
+        assert leaked not in error.message
+        assert leaked not in repr(error.args)
+        assert leaked not in formatted
+    assert error.message == (
         "query execution failed: parameterized query failed (DuckDB Error)"
     )
 
@@ -156,12 +169,16 @@ def test_parameterized_query_errors_expose_only_allowlisted_diagnostic_category(
     assert error.message in formatted
 
 
+_UNPRINTABLE_STR_ERROR = "parameter __str__ must not be called"
+_UNPRINTABLE_REPR_ERROR = "parameter __repr__ must not be called"
+
+
 class _UnprintableParameter:
     def __str__(self) -> str:
-        raise AssertionError("parameter __str__ must not be called")
+        raise AssertionError(_UNPRINTABLE_STR_ERROR)
 
     def __repr__(self) -> str:
-        raise AssertionError("parameter __repr__ must not be called")
+        raise AssertionError(_UNPRINTABLE_REPR_ERROR)
 
 
 def test_parameterized_errors_reach_execution_with_immutable_parameters_and_sanitize(
@@ -177,15 +194,15 @@ def test_parameterized_errors_reach_execution_with_immutable_parameters_and_sani
     )
     engine = QueryEngine(layer)
 
+    raw_diagnostic = "Conversion Error: raw SQL and bound secret must not escape"
+
     class FailingConnection:
         def __init__(self) -> None:
             self.calls: list[tuple[str, tuple[object, ...]]] = []
 
         def execute(self, sql: str, parameters: tuple[object, ...]) -> object:
             self.calls.append((sql, parameters))
-            raise duckdb.ConversionException(
-                "Conversion Error: raw SQL and bound secret must not escape"
-            )
+            raise duckdb.ConversionException(raw_diagnostic)
 
     connection = FailingConnection()
     monkeypatch.setattr(engine, "conn", connection)
@@ -207,19 +224,17 @@ def test_parameterized_errors_reach_execution_with_immutable_parameters_and_sani
             engine.query(["gross_margin"], filters={"stock": value})
         error = caught.value
         formatted = "".join(__import__("traceback").format_exception(error))
-        assert connection.calls[-1][1] == expected_parameters
-        assert connection.calls[-1][0].startswith('WITH "aggregated"')
-        printable_values = (
-            ("parameter __str__ must be called", "parameter __repr__ must be called")
-            if value is custom
-            else (str(value), repr(value))
+        sql, parameters = connection.calls[-1]
+        assert parameters == expected_parameters
+        assert sql.startswith('WITH "aggregated"')
+        leaked_values = (
+            (_UNPRINTABLE_STR_ERROR, _UNPRINTABLE_REPR_ERROR) if value is custom else ()
         )
-        for printable in printable_values:
-            assert printable not in str(error)
-            assert printable not in repr(error.args)
-            assert printable not in error.message
-            assert printable not in formatted
-        assert "Conversion Error: raw SQL" not in error.message
+        for leaked in (sql, raw_diagnostic, *leaked_values):
+            assert leaked not in str(error)
+            assert leaked not in error.message
+            assert leaked not in repr(error.args)
+            assert leaked not in formatted
         assert "SQL:" not in error.message
         assert error.__cause__ is None
         assert error.__context__ is None
@@ -238,13 +253,18 @@ def test_parameterized_errors_never_format_values_or_driver_messages(
     )
     engine = QueryEngine(layer)
 
-    class FailingConnection:
-        def execute(self, _sql: str, _parameters: tuple[object, ...]) -> object:
-            raise duckdb.ConversionException(
-                "Conversion Error: leaked raw diagnostic and <redacted> marker"
-            )
+    raw_diagnostic = "Conversion Error: leaked raw diagnostic and <redacted> marker"
 
-    monkeypatch.setattr(engine, "conn", FailingConnection())
+    class FailingConnection:
+        def __init__(self) -> None:
+            self.sql: str | None = None
+
+        def execute(self, sql: str, _parameters: tuple[object, ...]) -> object:
+            self.sql = sql
+            raise duckdb.ConversionException(raw_diagnostic)
+
+    connection = FailingConnection()
+    monkeypatch.setattr(engine, "conn", connection)
     secret_values = (
         "<redacted>",
         b"secret-bytes",
@@ -257,10 +277,15 @@ def test_parameterized_errors_never_format_values_or_driver_messages(
         with pytest.raises(QueryExecutionError) as caught:
             engine.query(["gross_margin"], filters={"stock": secret})
         error = caught.value
+        assert connection.sql is not None
+        formatted = "".join(__import__("traceback").format_exception(error))
+        for leaked in (connection.sql, raw_diagnostic):
+            assert leaked not in str(error)
+            assert leaked not in error.message
+            assert leaked not in repr(error.args)
+            assert leaked not in formatted
         assert "Conversion Error" in error.message
         assert "parameterized query" in error.message
-        assert "leaked raw diagnostic" not in error.message
-        assert "<redacted>" not in error.message
         assert "SQL:" not in error.message
         assert error.__cause__ is None
         assert error.__context__ is None
@@ -279,14 +304,29 @@ def test_parameterized_errors_use_generic_category_for_unknown_driver_error(
     )
     engine = QueryEngine(layer)
 
-    class FailingConnection:
-        def execute(self, _sql: str, _parameters: tuple[object, ...]) -> object:
-            raise duckdb.Error("Parser Error: raw details must not escape")
+    raw_diagnostic = "Parser Error: raw details must not escape"
 
-    monkeypatch.setattr(engine, "conn", FailingConnection())
+    class FailingConnection:
+        def __init__(self) -> None:
+            self.sql: str | None = None
+
+        def execute(self, sql: str, _parameters: tuple[object, ...]) -> object:
+            self.sql = sql
+            raise duckdb.Error(raw_diagnostic)
+
+    connection = FailingConnection()
+    monkeypatch.setattr(engine, "conn", connection)
     with pytest.raises(QueryExecutionError) as caught:
         engine.query(["gross_margin"], filters={"stock": "secret"})
-    assert caught.value.message == (
+    error = caught.value
+    assert connection.sql is not None
+    formatted = "".join(__import__("traceback").format_exception(error))
+    for leaked in (connection.sql, raw_diagnostic):
+        assert leaked not in str(error)
+        assert leaked not in error.message
+        assert leaked not in repr(error.args)
+        assert leaked not in formatted
+    assert error.message == (
         "query execution failed: parameterized query failed (DuckDB Error)"
     )
 
