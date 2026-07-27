@@ -35,7 +35,9 @@ class FunctionCall:
     arguments: tuple[Expression, ...]
 
 
-Expression: TypeAlias = Literal | Reference | UnaryOperation | BinaryOperation | FunctionCall  # noqa: UP040
+Expression: TypeAlias = (  # noqa: UP040
+    Literal | Reference | UnaryOperation | BinaryOperation | FunctionCall
+)
 
 
 class ExpressionSyntaxError(ValueError):

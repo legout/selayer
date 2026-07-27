@@ -88,7 +88,9 @@ def tokenize(source: str) -> tuple[Token, ...]:
             elif lowered == "not":
                 tokens.append(Token("operator", "not", offset))
             elif lowered in _SQL_KEYWORDS:
-                raise _syntax_error(source, offset, f"SQL keyword is not allowed: {value}")
+                raise _syntax_error(
+                    source, offset, f"SQL keyword is not allowed: {value}"
+                )
             else:
                 tokens.append(Token("identifier", value, offset))
             offset = identifier.end()
@@ -115,7 +117,9 @@ def tokenize(source: str) -> tuple[Token, ...]:
                 if character == "\\":
                     offset += 1
                     if offset >= len(source):
-                        raise _syntax_error(source, start, "unterminated string literal")
+                        raise _syntax_error(
+                            source, start, "unterminated string literal"
+                        )
                     escaped = source[offset]
                     characters.append(
                         {
@@ -137,7 +141,11 @@ def tokenize(source: str) -> tuple[Token, ...]:
                 raise _syntax_error(source, start, "unterminated string literal")
             continue
 
-        if source.startswith("!=", offset) or source.startswith("<=", offset) or source.startswith(">=", offset):
+        if (
+            source.startswith("!=", offset)
+            or source.startswith("<=", offset)
+            or source.startswith(">=", offset)
+        ):
             tokens.append(Token("operator", source[offset : offset + 2], offset))
             offset += 2
             continue
@@ -202,7 +210,9 @@ class Parser:
         expression = self.parse_multiplicative()
         while self.current().value in {"+", "-"}:
             operator = self.advance().value
-            expression = BinaryOperation(operator, expression, self.parse_multiplicative())
+            expression = BinaryOperation(
+                operator, expression, self.parse_multiplicative()
+            )
         return expression
 
     def parse_multiplicative(self) -> Expression:

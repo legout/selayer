@@ -43,7 +43,6 @@ def test_expression_nodes_are_immutable() -> None:
         ("+1", UnaryOperation(operator="+", operand=Literal(value=1))),
         ("not a", UnaryOperation("not", Reference(("a",)))),
         ("a = b", BinaryOperation("=", Reference(("a",)), Reference(("b",)))),
-
         ("a != b", BinaryOperation("!=", Reference(("a",)), Reference(("b",)))),
         ("a < b", BinaryOperation("<", Reference(("a",)), Reference(("b",)))),
         ("a <= b", BinaryOperation("<=", Reference(("a",)), Reference(("b",)))),
