@@ -173,7 +173,7 @@ def test_next_package_is_absent() -> None:
     assert not (Path(selayer.__file__).parent / "_next").exists()
 
 
-def test_query_execution_error_contains_sql_without_parameters(
+def test_query_execution_error_contains_duckdb_message_and_sql_without_parameters(
     valid_catalog_path: Path,
 ) -> None:
     engine = QueryEngine(SemanticLayer.load(valid_catalog_path))
@@ -181,4 +181,5 @@ def test_query_execution_error_contains_sql_without_parameters(
     with pytest.raises(QueryExecutionError) as caught:
         engine.query(["gross_margin"])
     assert "WITH" in caught.value.message
+    assert "Connection already closed" in caught.value.message
     assert caught.value.query_id in str(caught.value)

@@ -35,6 +35,19 @@ ROW_FUNCTIONS = frozenset({"abs", "coalesce", "if", "lower", "nullif", "upper"})
 # strict subset of ``ROW_FUNCTIONS``: ``lower``/``upper``/``if`` are row-only.
 METRIC_FUNCTIONS = frozenset({"abs", "coalesce", "nullif"})
 
+# The DSL deliberately exposes fixed-arity scalar functions. Keeping this
+# contract in semantic validation (rather than the parser) lets the parser
+# remain context-neutral while both row and metric validators report ordinary
+# catalog issues for malformed calls.
+_FUNCTION_ARITIES = {
+    "abs": 1,
+    "lower": 1,
+    "upper": 1,
+    "coalesce": 2,
+    "nullif": 2,
+    "if": 3,
+}
+
 
 def _walk(expression: Expression) -> Iterator[Expression]:
     """Yield ``expression`` and every sub-expression, depth-first left to right."""
@@ -89,6 +102,12 @@ def validate_row_expression(
     for call in _function_calls(expression):
         if call.name not in ROW_FUNCTIONS:
             issues.append(f"function '{call.name}' is not allowed in row expressions")
+        expected = _FUNCTION_ARITIES.get(call.name)
+        if expected is not None and len(call.arguments) != expected:
+            issues.append(
+                f"function '{call.name}' expects {expected} argument(s), "
+                f"got {len(call.arguments)}"
+            )
     return tuple(sorted(set(issues)))
 
 
@@ -123,5 +142,11 @@ def validate_metric_expression(
         if call.name not in METRIC_FUNCTIONS:
             issues.append(
                 f"function '{call.name}' is not allowed in metric expressions"
+            )
+        expected = _FUNCTION_ARITIES.get(call.name)
+        if expected is not None and len(call.arguments) != expected:
+            issues.append(
+                f"function '{call.name}' expects {expected} argument(s), "
+                f"got {len(call.arguments)}"
             )
     return tuple(sorted(set(issues)))

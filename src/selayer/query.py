@@ -77,10 +77,15 @@ class QueryEngine:
         result: pl.DataFrame | None = None
         try:
             result = self.conn.execute(compiled.sql, compiled.parameters).pl()
-        except duckdb.Error:
-            message = "query execution failed"
-            if not compiled.parameters:
-                message = f"query execution failed: {compiled.sql}"
+        except duckdb.Error as error:
+            if compiled.parameters:
+                # Bound values and engine details are intentionally hidden for
+                # parameterized queries. Do not chain the driver exception.
+                message = "query execution failed"
+            else:
+                # With no caller-provided values, the generated SQL and the
+                # DuckDB diagnostic are useful debugging information.
+                message = f"query execution failed: {error}; SQL: {compiled.sql}"
             execution_error = QueryExecutionError(query_id, message)
         if execution_error is not None:
             raise execution_error

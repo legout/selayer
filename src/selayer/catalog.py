@@ -15,11 +15,10 @@ Validation pipeline:
 5. resolve all references (sources, facts, measures);
 6. validate relationship endpoints/cardinalities;
 7. collect all independent issues;
-8. sort by ``(path, message)``;
-9. raise one error when any issue exists;
-10. return only immutable objects otherwise.
-
-Same-grain and relationship reachability are deferred to the planner task.
+8. validate metric grains and fact-expression reachability;
+9. sort by ``(path, message)``;
+10. raise one error when any issue exists;
+11. return only immutable objects otherwise.
 """
 
 from __future__ import annotations
@@ -36,6 +35,7 @@ import yaml
 from selayer.expressions import ExpressionSyntaxError, parse_expression
 from selayer.expressions.ast import Expression
 from selayer.expressions.validation import (
+    references,
     validate_metric_expression,
     validate_row_expression,
 )
@@ -451,6 +451,134 @@ def _parse_and_validate_metric(
 
 
 # ---------------------------------------------------------------------------
+# Grain and reachability validation
+# ---------------------------------------------------------------------------
+
+
+def _safe_relationship_graph(
+    relationships: Mapping[str, Any], known_sources: frozenset[str]
+) -> dict[str, tuple[str, ...]]:
+    """Return directed grain-preserving source traversal edges.
+
+    Cardinality is interpreted from the relationship's declared source to
+    target: one-to-many is safe only from target (many) to source (one), while
+    many-to-one is safe only from source (many) to target (one). Many-to-many
+    contributes no edges.
+    """
+    graph: dict[str, list[str]] = {}
+    for raw in relationships.values():
+        if not isinstance(raw, Mapping):
+            continue
+        source = raw.get("source")
+        target = raw.get("target")
+        cardinality = raw.get("type")
+        if (
+            not isinstance(source, str)
+            or not isinstance(target, str)
+            or source not in known_sources
+            or target not in known_sources
+        ):
+            continue
+        if cardinality == "one_to_one":
+            graph.setdefault(source, []).append(target)
+            graph.setdefault(target, []).append(source)
+        elif cardinality == "one_to_many":
+            graph.setdefault(target, []).append(source)
+        elif cardinality == "many_to_one":
+            graph.setdefault(source, []).append(target)
+    return {source: tuple(sorted(targets)) for source, targets in graph.items()}
+
+
+def _has_safe_path(graph: Mapping[str, tuple[str, ...]], start: str, goal: str) -> bool:
+    if start == goal:
+        return True
+    pending = [start]
+    seen = {start}
+    while pending:
+        current = pending.pop(0)
+        for target in graph.get(current, ()):
+            if target == goal:
+                return True
+            if target not in seen:
+                seen.add(target)
+                pending.append(target)
+    return False
+
+
+def _validate_fact_expression_reachability(
+    facts: Mapping[str, Any],
+    sources: Mapping[str, Any],
+    relationships: Mapping[str, Any],
+    parsed: Mapping[str, Expression],
+    known_sources: frozenset[str],
+    collector: _Collector,
+) -> None:
+    graph = _safe_relationship_graph(relationships, known_sources)
+    reported: set[tuple[str, str]] = set()
+    for fact_name, expression in parsed.items():
+        raw = facts.get(fact_name)
+        if not isinstance(raw, Mapping):
+            continue
+        anchor = raw.get("source")
+        if not isinstance(anchor, str) or anchor not in sources:
+            continue
+        for reference in references(expression):
+            if len(reference.parts) != 2:
+                continue
+            referenced_source = reference.parts[0]
+            if referenced_source not in known_sources or referenced_source == anchor:
+                continue
+            if not _has_safe_path(graph, anchor, referenced_source):
+                issue_key = (fact_name, referenced_source)
+                if issue_key in reported:
+                    continue
+                reported.add(issue_key)
+                collector.add(
+                    f"facts.{fact_name}.expression",
+                    f"source '{referenced_source}' is not reachable from anchor "
+                    f"'{anchor}' through grain-preserving relationships",
+                )
+
+
+def _validate_metric_grains(
+    metrics: Mapping[str, Any],
+    measures: Mapping[str, Any],
+    facts: Mapping[str, Any],
+    sources: Mapping[str, Any],
+    collector: _Collector,
+) -> None:
+    for metric_name, raw_metric in metrics.items():
+        if not isinstance(raw_metric, Mapping):
+            continue
+        declared = raw_metric.get("measures")
+        if not isinstance(declared, list) or not all(
+            isinstance(measure_id, str) for measure_id in declared
+        ):
+            continue
+        resolved: list[tuple[str, tuple[str, ...]]] = []
+        for measure_id in declared:
+            raw_measure = measures.get(measure_id)
+            if not isinstance(raw_measure, Mapping):
+                continue
+            fact_id = raw_measure.get("fact")
+            raw_fact = facts.get(fact_id) if isinstance(fact_id, str) else None
+            anchor = raw_fact.get("source") if isinstance(raw_fact, Mapping) else None
+            raw_source = sources.get(anchor) if isinstance(anchor, str) else None
+            grain = raw_source.get("grain") if isinstance(raw_source, Mapping) else None
+            if (
+                isinstance(anchor, str)
+                and isinstance(grain, list)
+                and all(isinstance(column, str) for column in grain)
+            ):
+                resolved.append((anchor, tuple(grain)))
+        if len(resolved) > 1 and any(item != resolved[0] for item in resolved[1:]):
+            collector.add(
+                f"metrics.{metric_name}.measures",
+                "declared measures must share exactly the same anchor source and grain",
+            )
+
+
+# ---------------------------------------------------------------------------
 # Model construction (only reached when there are no issues)
 # ---------------------------------------------------------------------------
 
@@ -595,6 +723,15 @@ def load(path: str | Path) -> SemanticLayer:
     _validate_measures(measures, known_facts, collector)
     _validate_metrics(metrics, known_measures, collector, metric_expressions)
     _validate_relationships(relationships, known_sources, collector)
+    _validate_metric_grains(metrics, measures, facts, sources, collector)
+    _validate_fact_expression_reachability(
+        facts,
+        sources,
+        relationships,
+        fact_expressions,
+        known_sources,
+        collector,
+    )
 
     collector.raise_if_any()
     return _build_layer(catalog, fact_expressions, metric_expressions)

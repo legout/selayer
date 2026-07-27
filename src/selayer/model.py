@@ -20,9 +20,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal
+from typing import Literal, Self
 
 from selayer.expressions.ast import Expression
+from selayer.expressions.parser import parse_expression
 
 type Aggregation = Literal["sum", "avg", "min", "max", "count", "count_distinct"]
 
@@ -52,13 +53,30 @@ class Dimension:
 
 @dataclass(frozen=True, slots=True)
 class Fact:
-    """A row-level value evaluated at its anchor source grain."""
+    """A row-level value evaluated at its anchor source grain.
+
+    The normal programmatic entry point is :meth:`from_expression`, which
+    accepts the same restricted expression text used by YAML catalogs. The
+    direct constructor remains AST-valued for internal validated construction.
+    """
 
     name: str
     source: str
     expression: Expression
     data_type: str
     description: str = ""
+
+    @classmethod
+    def from_expression(
+        cls,
+        name: str,
+        source: str,
+        expression: str,
+        data_type: str,
+        description: str = "",
+    ) -> Self:
+        """Build a fact by parsing one restricted DSL expression."""
+        return cls(name, source, parse_expression(expression), data_type, description)
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,12 +91,27 @@ class Measure:
 
 @dataclass(frozen=True, slots=True)
 class Metric:
-    """An aggregate-level formula over declared measures."""
+    """An aggregate-level formula over declared measures.
+
+    :meth:`from_expression` parses the same restricted expression language as a
+    YAML metric. The direct constructor remains available for validated ASTs.
+    """
 
     name: str
     expression: Expression
     measures: tuple[str, ...]
     description: str = ""
+
+    @classmethod
+    def from_expression(
+        cls,
+        name: str,
+        expression: str,
+        measures: tuple[str, ...],
+        description: str = "",
+    ) -> Self:
+        """Build a metric by parsing one restricted DSL expression."""
+        return cls(name, parse_expression(expression), tuple(measures), description)
 
 
 @dataclass(frozen=True, slots=True)

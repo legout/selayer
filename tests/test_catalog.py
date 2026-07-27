@@ -123,6 +123,24 @@ def test_catalog_model_objects_are_frozen(
         layer.data_sources["orders"].path = "tampered"  # type: ignore[misc]
 
 
+def test_fact_and_metric_expression_factories_parse_and_preserve_ast() -> None:
+    fact = Fact.from_expression("amount", "orders", "orders.amount + 1", "decimal")
+    metric = Metric.from_expression("ratio", "abs(total)", ("total",))
+    from selayer.expressions import parse_expression
+
+    assert fact.expression == parse_expression("orders.amount + 1")
+    assert metric.expression == parse_expression("abs(total)")
+
+
+def test_fact_and_metric_expression_factories_reject_invalid_syntax() -> None:
+    from selayer.expressions import ExpressionSyntaxError
+
+    with pytest.raises(ExpressionSyntaxError):
+        Fact.from_expression("amount", "orders", "orders.amount +", "decimal")
+    with pytest.raises(ExpressionSyntaxError):
+        Metric.from_expression("ratio", "abs(", ("total",))
+
+
 def test_catalog_lookup_helpers_raise_keyerror(valid_catalog_path: Path) -> None:
     layer = SemanticLayer.load(valid_catalog_path)
     with pytest.raises(KeyError):
@@ -405,6 +423,43 @@ def test_catalog_fact_row_expression_rejects_one_part_reference(tmp_path: Path) 
     assert any(issue.path == "facts.amount.expression" for issue in caught.value.issues)
 
 
+@pytest.mark.parametrize(
+    ("function", "arguments", "expected"),
+    [
+        ("abs", "", 1),
+        ("abs", "orders.value, orders.value", 1),
+        ("lower", "", 1),
+        ("lower", "orders.value, orders.value", 1),
+        ("upper", "", 1),
+        ("upper", "orders.value, orders.value", 1),
+        ("coalesce", "orders.value", 2),
+        ("coalesce", "orders.value, orders.value, orders.value", 2),
+        ("nullif", "orders.value", 2),
+        ("nullif", "orders.value, orders.value, orders.value", 2),
+        ("if", "orders.value, orders.value", 3),
+        ("if", "orders.value, orders.value, orders.value, orders.value", 3),
+    ],
+)
+def test_catalog_rejects_invalid_row_function_arity(
+    tmp_path: Path, function: str, arguments: str, expected: int
+) -> None:
+    expression = f"{function}({arguments})"
+    path = _write(
+        tmp_path,
+        "version: 1\nname: generic\ndata_sources:\n"
+        "  orders:\n    type: parquet\n    path: x\n    grain: [id]\n"
+        "facts:\n  value:\n    source: orders\n"
+        f"    expression: {expression}\n    data_type: decimal\n",
+    )
+    with pytest.raises(CatalogValidationError) as caught:
+        SemanticLayer.load(path)
+    assert any(
+        issue.path == "facts.value.expression"
+        and f"function '{function}' expects {expected} argument(s)" in issue.message
+        for issue in caught.value.issues
+    )
+
+
 # ---------------------------------------------------------------------------
 # Measures
 # ---------------------------------------------------------------------------
@@ -524,6 +579,134 @@ def test_catalog_metric_rejects_row_only_function(tmp_path: Path) -> None:
         SemanticLayer.load(path)
     assert any(
         issue.path == "metrics.ratio.expression" for issue in caught.value.issues
+    )
+
+
+# ---------------------------------------------------------------------------
+# Grain and reachability validation
+# ---------------------------------------------------------------------------
+
+
+def _grain_catalog(measure_grain: str = "[id]") -> str:
+    return (
+        "version: 1\nname: generic\ndata_sources:\n"
+        "  anchor:\n    type: parquet\n    path: anchor\n    grain: [id]\n"
+        f"  other:\n    type: parquet\n    path: other\n    grain: {measure_grain}\n"
+        "facts:\n"
+        "  anchor_value:\n    source: anchor\n    expression: anchor.value\n    data_type: decimal\n"
+        "  other_value:\n    source: other\n    expression: other.value\n    data_type: decimal\n"
+        "measures:\n"
+        "  anchor_total:\n    fact: anchor_value\n    aggregation: sum\n"
+        "  other_total:\n    fact: other_value\n    aggregation: sum\n"
+        "metrics:\n"
+        "  combined:\n    expression: anchor_total + other_total\n    measures: [anchor_total, other_total]\n"
+    )
+
+
+@pytest.mark.parametrize("other_grain", ["[id]", "[other_id]"])
+def test_catalog_rejects_metric_measures_with_different_anchor_or_grain(
+    tmp_path: Path, other_grain: str
+) -> None:
+    path = _write(tmp_path, _grain_catalog(other_grain))
+    with pytest.raises(CatalogValidationError) as caught:
+        SemanticLayer.load(path)
+    assert any(
+        issue.path == "metrics.combined.measures"
+        and "same anchor source and grain" in issue.message
+        for issue in caught.value.issues
+    )
+
+
+def _fact_reachability_catalog(
+    relationship: str, referenced_source: str = "leaf"
+) -> str:
+    return (
+        "version: 1\nname: generic\ndata_sources:\n"
+        "  anchor:\n    type: parquet\n    path: anchor\n    grain: [id]\n"
+        "  middle:\n    type: parquet\n    path: middle\n    grain: [id]\n"
+        "  leaf:\n    type: parquet\n    path: leaf\n    grain: [id]\n"
+        "facts:\n"
+        f"  value:\n    source: anchor\n    expression: {referenced_source}.value\n    data_type: decimal\n"
+        f"relationships:\n{relationship}"
+    )
+
+
+@pytest.mark.parametrize(
+    "relationships",
+    [
+        (
+            "  anchor_middle:\n    source: anchor\n    target: middle\n    type: many_to_one\n    source_column: id\n    target_column: id\n"
+            "  middle_leaf:\n    source: middle\n    target: leaf\n    type: many_to_one\n    source_column: id\n    target_column: id\n"
+        ),
+    ],
+)
+def test_catalog_accepts_safe_many_to_one_fact_chain(
+    tmp_path: Path, relationships: str
+) -> None:
+    layer = SemanticLayer.load(
+        _write(tmp_path, _fact_reachability_catalog(relationships))
+    )
+    assert layer.facts["value"].source == "anchor"
+
+
+@pytest.mark.parametrize(
+    "relationship",
+    [
+        "",
+        "  anchor_middle:\n    source: anchor\n    target: middle\n    type: one_to_many\n    source_column: id\n    target_column: id\n",
+        "  anchor_middle:\n    source: anchor\n    target: middle\n    type: many_to_many\n    source_column: id\n    target_column: id\n",
+    ],
+)
+def test_catalog_rejects_fact_with_no_safe_reachability_path(
+    tmp_path: Path, relationship: str
+) -> None:
+    path = _write(tmp_path, _fact_reachability_catalog(relationship))
+    with pytest.raises(CatalogValidationError) as caught:
+        SemanticLayer.load(path)
+    assert any(
+        issue.path == "facts.value.expression"
+        and "not reachable from anchor" in issue.message
+        for issue in caught.value.issues
+    )
+
+
+@pytest.mark.parametrize(
+    ("function", "arguments", "expected"),
+    [
+        ("abs", "", 1),
+        ("abs", "total, total", 1),
+        ("coalesce", "total", 2),
+        ("coalesce", "total, total, total", 2),
+        ("nullif", "total", 2),
+        ("nullif", "total, total, total", 2),
+        ("lower", "", 1),
+        ("lower", "total, total", 1),
+        ("upper", "", 1),
+        ("upper", "total, total", 1),
+        ("if", "total, total", 3),
+        ("if", "total, total, total, total", 3),
+    ],
+)
+def test_catalog_rejects_invalid_metric_function_arity(
+    tmp_path: Path, function: str, arguments: str, expected: int
+) -> None:
+    expression = f"{function}({arguments})"
+    path = _write(
+        tmp_path,
+        "version: 1\nname: generic\ndata_sources:\n"
+        "  orders:\n    type: parquet\n    path: x\n    grain: [id]\n"
+        "facts:\n  value:\n    source: orders\n"
+        "    expression: orders.value\n    data_type: decimal\n"
+        "measures:\n  total:\n    fact: value\n    aggregation: sum\n"
+        "metrics:\n  result:\n"
+        f"    expression: {expression}\n    measures: [total]\n",
+    )
+    with pytest.raises(CatalogValidationError) as caught:
+        SemanticLayer.load(path)
+    assert any(
+        issue.path == "metrics.result.expression"
+        and f"function '{function}' expects {expected} argument(s)" in issue.message
+        for issue in caught.value.issues
     )
 
 

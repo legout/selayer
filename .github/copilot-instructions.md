@@ -27,8 +27,10 @@ be imported, packaged, linted, or extended as active product code.
 - Metric formulas reference only their declared measures and use the restricted
   metric-expression DSL.
 - Measures in one metric must share one anchor source and grain.
-- From an `order_items` anchor, only grain-preserving many-to-one traversal is
-  supported (`order_items -> products` and `order_items -> orders -> customers`).
+- In the migrated e-commerce catalog, from an `order_items` anchor, only
+  grain-preserving many-to-one traversal is supported (`order_items -> products`
+  and `order_items -> orders -> customers`). This documents that catalog's
+  current path restriction; it is not a hardcoded rule for the generic planner.
 - Never add raw SQL, OKF, re-graining/allocation, many-to-many analytics, or an
   additional execution engine.
 - Bind user-provided filter values as DuckDB parameters.

@@ -113,6 +113,29 @@ def test_validate_row_expression_rejects_unknown_source() -> None:
     assert issues == ("source 'products' is not known",)
 
 
+@pytest.mark.parametrize(
+    ("name", "arguments", "expected"),
+    [
+        ("abs", (), 1),
+        ("abs", (Reference(("orders", "value")), Reference(("orders", "value"))), 1),
+        ("lower", (), 1),
+        ("upper", (), 1),
+        ("coalesce", (Reference(("orders", "value")),), 2),
+        ("nullif", (Reference(("orders", "value")),), 2),
+        ("if", (Literal(True), Reference(("orders", "value"))), 3),
+    ],
+)
+def test_validate_row_expression_rejects_invalid_function_arity(
+    name: str, arguments: tuple[Expression, ...], expected: int
+) -> None:
+    issues = validate_row_expression(
+        FunctionCall(name, arguments), frozenset({"orders"})
+    )
+    assert issues == (
+        f"function '{name}' expects {expected} argument(s), got {len(arguments)}",
+    )
+
+
 def test_validate_row_expression_rejects_function_outside_row_allowlist() -> None:
     # The parser already restricts function names, so construct a call with a
     # name outside ``ROW_FUNCTIONS`` directly to exercise the validator branch.
@@ -171,6 +194,27 @@ def test_validate_metric_expression_rejects_declared_but_unreferenced() -> None:
     )
     assert issues == (
         "declared measure 'total_cost' is not referenced in the expression",
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments", "expected"),
+    [
+        ("abs", (), 1),
+        ("abs", (Reference(("measure",)), Reference(("measure",))), 1),
+        ("coalesce", (Reference(("measure",)),), 2),
+        ("nullif", (Reference(("measure",)),), 2),
+    ],
+)
+def test_validate_metric_expression_rejects_invalid_function_arity(
+    name: str, arguments: tuple[Expression, ...], expected: int
+) -> None:
+    issues = validate_metric_expression(
+        FunctionCall(name, arguments), frozenset({"measure"})
+    )
+    assert (
+        f"function '{name}' expects {expected} argument(s), got {len(arguments)}"
+        in issues
     )
 
 
