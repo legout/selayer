@@ -4,7 +4,30 @@ __pycache__/
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
 
-# Virtual environments
-.venv
+# Virtual environments and tool caches
+.venv/
+.ruff_cache/
+.pytest_cache/
+.pyright/
+.coverage
+htmlcov/
+
+# Local environment / secrets — never commit these
+.env
+.env.local
+.env.*.local
+**/.DS_Store
+
+# Local agent and brainstorming state
+.agents/
+.pi/
+.pi-subagents/
+.roo/
+.superpowers/
+skills-lock.json
+
+# Generated query outputs
+country_x_quarter_*.csv
+polars_country_x_quarter_*.csv
