@@ -1,4 +1,4 @@
-"""Tests for the staged immutable schema-version-1 catalog loader.
+"""Tests for the immutable schema-version-1 catalog loader.
 
 Every catalog rule in the grain-aware design is pinned here: schema version,
 required fields, identifier syntax, duplicate keys, reference resolution,
@@ -587,7 +587,7 @@ def test_relationship_has_type_not_cardinality() -> None:
 
 def test_catalog_accepts_many_to_many_type(tmp_path: Path) -> None:
     # many_to_many is a valid cardinality value; planning it is deferred to the
-    # planner task, so the catalog must not reject it.
+    # planner, so the catalog must not reject it.
     path = _write(
         tmp_path,
         "version: 1\nname: ecommerce\ndata_sources:\n"

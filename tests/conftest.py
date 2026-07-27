@@ -1,4 +1,4 @@
-"""Shared fixtures for the staged immutable catalog tests."""
+"""Shared fixtures for the immutable catalog tests."""
 
 from __future__ import annotations
 

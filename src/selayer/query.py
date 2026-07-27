@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import suppress
 from typing import Self
 from uuid import uuid4
 
@@ -18,14 +19,18 @@ class QueryEngine:
     def __init__(self, semantic_layer: SemanticLayer) -> None:
         self.semantic_layer = semantic_layer
         self.conn = duckdb.connect(":memory:")
+        source_error: QueryExecutionError | None = None
         try:
             for name, data_source in semantic_layer.data_sources.items():
                 self.conn.register(
                     name, self._load_source(data_source.type, data_source.path)
                 )
-        except Exception:
-            self.conn.close()
-            raise
+        except Exception:  # noqa: BLE001 - every source failure must be sanitized
+            with suppress(Exception):
+                self.conn.close()
+            source_error = QueryExecutionError(str(uuid4()), "source loading failed")
+        if source_error is not None:
+            raise source_error
 
     @staticmethod
     def _load_source(source_type: str, path: str) -> pl.DataFrame:
@@ -68,13 +73,19 @@ class QueryEngine:
         plan = self.plan(metrics, dimensions, filters)
         compiled = compile_duckdb(plan)
         query_id = str(uuid4())
+        execution_error: QueryExecutionError | None = None
+        result: pl.DataFrame | None = None
         try:
-            return self.conn.execute(compiled.sql, compiled.parameters).pl()
-        except duckdb.Error as error:
+            result = self.conn.execute(compiled.sql, compiled.parameters).pl()
+        except duckdb.Error:
             message = "query execution failed"
             if not compiled.parameters:
                 message = f"query execution failed: {compiled.sql}"
-            raise QueryExecutionError(query_id, message) from error
+            execution_error = QueryExecutionError(query_id, message)
+        if execution_error is not None:
+            raise execution_error
+        assert result is not None
+        return result
 
 
 __all__ = ["QueryEngine"]
