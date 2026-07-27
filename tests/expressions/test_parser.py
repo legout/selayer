@@ -98,6 +98,37 @@ def test_syntax_error_reports_first_invalid_offset() -> None:
     assert error.value.offset == 4
 
 
+def test_syntax_error_prefers_earlier_parser_error() -> None:
+    with pytest.raises(ExpressionSyntaxError, match="trailing tokens") as error:
+        parse_expression("a b @")
+    assert error.value.offset == 2
+
+
+def test_unterminated_string_reports_its_start_offset() -> None:
+    with pytest.raises(ExpressionSyntaxError, match="unterminated string") as error:
+        parse_expression("a + 'unterminated")
+    assert error.value.offset == 4
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            "COALESCE(a, 0)",
+            FunctionCall("coalesce", (Reference(("a",)), Literal(0))),
+        ),
+        (
+            "NuLlIf(a, 0)",
+            FunctionCall("nullif", (Reference(("a",)), Literal(0))),
+        ),
+    ],
+)
+def test_allowlisted_function_calls_are_case_insensitive(
+    source: str, expected: FunctionCall
+) -> None:
+    assert parse_expression(source) == expected
+
+
 @pytest.mark.parametrize(
     "source",
     ["a AND b", "a OR b", "a LIKE b", "a IN b", "FROM", "WITH", "VALUES", "a.b.c"],

@@ -116,6 +116,11 @@ def _syntax_error(source: str, offset: int, message: str) -> ExpressionSyntaxErr
 
 def tokenize(source: str) -> tuple[Token, ...]:
     tokens: list[Token] = []
+    _tokenize_into(source, tokens)
+    return tuple(tokens)
+
+
+def _tokenize_into(source: str, tokens: list[Token]) -> None:
     offset = 0
     while offset < len(source):
         character = source[offset]
@@ -206,7 +211,6 @@ def tokenize(source: str) -> tuple[Token, ...]:
         raise _syntax_error(source, offset, f"unexpected character: {character!r}")
 
     tokens.append(Token("eof", "", len(source)))
-    return tuple(tokens)
 
 
 class Parser:
@@ -300,9 +304,10 @@ class Parser:
         if token.kind == "identifier":
             self.advance()
             if self.accept("(") is not None:
-                if token.value not in _FUNCTIONS:
+                function_name = token.value.lower()
+                if function_name not in _FUNCTIONS:
                     self.fail(f"function is not allowed: {token.value}", token)
-                return FunctionCall(token.value, self.parse_arguments())
+                return FunctionCall(function_name, self.parse_arguments())
             parts = [token.value]
             if self.accept(".") is not None:
                 next_token = self.current()
@@ -330,4 +335,15 @@ class Parser:
 
 
 def parse_expression(source: str) -> Expression:
-    return Parser(tokenize(source), source).parse()
+    tokens: list[Token] = []
+    try:
+        _tokenize_into(source, tokens)
+    except ExpressionSyntaxError as tokenization_error:
+        tokens.append(Token("eof", "", tokenization_error.offset))
+        try:
+            Parser(tuple(tokens), source).parse()
+        except ExpressionSyntaxError as parser_error:
+            if parser_error.offset < tokenization_error.offset:
+                raise parser_error from None
+        raise
+    return Parser(tuple(tokens), source).parse()
