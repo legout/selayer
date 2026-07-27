@@ -153,6 +153,24 @@ def _assert_error(
     return caught.value
 
 
+def test_list_filter_defensively_copies_mutable_values_before_planning() -> None:
+    values = ["a"]
+    layer = _basic_layer(
+        dimensions={"kind": Dimension("kind", "events", "kind", "string")}
+    )
+    request = QueryRequest(metrics=("revenue",), filters={"kind": ListFilter(values)})
+    plan = plan_query(layer, request)
+
+    values.append("b")
+
+    assert request.filters["kind"] == ListFilter(("a",))
+    stored = plan.filters[0].value
+    assert isinstance(stored, ListFilter)
+    assert stored == ListFilter(("a",))
+    assert stored.values == ("a",)
+    assert isinstance(stored.values, tuple)
+
+
 def test_query_request_normalizes_and_copies_filter_values() -> None:
     raw_filters: dict[str, object] = {
         "scalar": "Books",
