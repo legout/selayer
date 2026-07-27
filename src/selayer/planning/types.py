@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass, field
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from types import MappingProxyType
 
 from selayer._next.model import (
@@ -33,23 +33,41 @@ class RangeFilter:
     end: FilterScalar
 
 
-type FilterValue = (
-    ScalarFilter
-    | ListFilter
-    | RangeFilter
-    | FilterScalar
-    | tuple[FilterScalar, ...]
-    | list[FilterScalar]
-)
+type FilterValue = ScalarFilter | ListFilter | RangeFilter
+type FilterInput = FilterValue | FilterScalar | Sequence[FilterScalar]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class QueryRequest:
     metrics: tuple[str, ...]
-    dimensions: tuple[str, ...] = ()
-    filters: Mapping[str, FilterValue] = field(
-        default_factory=lambda: MappingProxyType({})
-    )
+    dimensions: tuple[str, ...]
+    filters: Mapping[str, FilterValue]
+
+    def __init__(
+        self,
+        metrics: Sequence[str],
+        dimensions: Sequence[str] = (),
+        filters: Mapping[str, FilterInput] | None = None,
+    ) -> None:
+        normalized: dict[str, FilterValue] = {}
+        for key, value in (filters or {}).items():
+            if isinstance(value, (ScalarFilter, ListFilter, RangeFilter)):
+                normalized[key] = value
+            elif isinstance(value, list):
+                normalized[key] = ListFilter(tuple(value))
+            elif isinstance(value, tuple):
+                normalized[key] = (
+                    RangeFilter(value[0], value[1])
+                    if len(value) == 2
+                    else ListFilter(tuple(value))
+                )
+            elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                normalized[key] = ListFilter(tuple(value))
+            else:
+                normalized[key] = ScalarFilter(value)  # type: ignore[arg-type]
+        object.__setattr__(self, "metrics", tuple(metrics))
+        object.__setattr__(self, "dimensions", tuple(dimensions))
+        object.__setattr__(self, "filters", MappingProxyType(normalized))
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +120,7 @@ class QueryPlan:
 
 
 __all__ = [
+    "FilterInput",
     "FilterValue",
     "JoinStep",
     "ListFilter",

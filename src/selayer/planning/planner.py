@@ -5,9 +5,7 @@ from collections import deque
 from selayer._next.model import Relationship, SemanticLayer
 from selayer.expressions.validation import references
 from selayer.planning.types import (
-    FilterValue,
     JoinStep,
-    ListFilter,
     PlannedDimension,
     PlannedFilter,
     PlannedMeasure,
@@ -15,8 +13,6 @@ from selayer.planning.types import (
     QueryPlan,
     QueryPlanningError,
     QueryRequest,
-    RangeFilter,
-    ScalarFilter,
 )
 
 
@@ -68,18 +64,6 @@ def _paths(layer: SemanticLayer, start: str, goal: str) -> list[tuple[str, ...]]
     return result
 
 
-def _normalize_filter(value: FilterValue) -> ScalarFilter | ListFilter | RangeFilter:
-    if isinstance(value, (ScalarFilter, ListFilter, RangeFilter)):
-        return value
-    if isinstance(value, list):
-        return ListFilter(tuple(value))
-    if isinstance(value, tuple):
-        if len(value) == 2:
-            return RangeFilter(value[0], value[1])
-        return ListFilter(tuple(value))
-    return ScalarFilter(value)
-
-
 def plan_query(layer: SemanticLayer, request: QueryRequest) -> QueryPlan:
     if not request.metrics:
         raise QueryPlanningError("unknown_metric", "at least one metric is required")
@@ -113,6 +97,11 @@ def plan_query(layer: SemanticLayer, request: QueryRequest) -> QueryPlan:
     if not measures:
         raise QueryPlanningError("mixed_grain", "requested metrics contain no measures")
     anchor = measures[0].fact.source
+    sources = {item.fact.source for item in measures}
+    if len(sources) != 1:
+        raise QueryPlanningError(
+            "mixed_grain", "requested measures do not share one anchor source"
+        )
     grain = layer.data_sources[anchor].grain
     if any(layer.data_sources[item.fact.source].grain != grain for item in measures):
         raise QueryPlanningError(
@@ -139,9 +128,7 @@ def plan_query(layer: SemanticLayer, request: QueryRequest) -> QueryPlan:
                 "unknown_filter_dimension",
                 f"filter dimension '{dimension_id}' is not known",
             )
-        filters.append(
-            PlannedFilter(dimension_id, dimension, _normalize_filter(raw_value))
-        )
+        filters.append(PlannedFilter(dimension_id, dimension, raw_value))
         if dimension.source not in required_sources:
             required_sources.append(dimension.source)
     for planned in measures:
