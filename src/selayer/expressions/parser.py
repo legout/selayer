@@ -26,9 +26,9 @@ _IDENTIFIER_RE: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _NUMBER_RE: Final = re.compile(r"(?:[0-9]+\.[0-9]+|[0-9]+)")
 _COMPARISON_OPERATORS: Final = ("!=", "<=", ">=", "=", "<", ">")
 _FUNCTIONS: Final = frozenset({"coalesce", "nullif", "abs", "lower", "upper", "if"})
-# Static union of ISO/IEC 9075:2023 reserved words and the DuckDB keyword
-# catalog. Some DuckDB keywords are categorized as unreserved, but references in
-# this engine-neutral DSL intentionally reject SQL vocabulary in every category.
+# Static union of ISO/IEC 9075:2023 words and the DuckDB keyword catalog. This
+# source vocabulary includes unreserved words such as domain-friendly ``cost``
+# and ``label``; the parser denies only the reserved/structural subset below.
 # Sources (snapshotted; never queried at runtime):
 # - https://en.wikipedia.org/wiki/SQL_reserved_words (SQL:2023 column)
 # - https://duckdb.org/docs/stable/sql/dialect/keywords_and_identifiers
@@ -107,7 +107,23 @@ within without work wrapper write xml xmlattributes xmlconcat xmlelement
 xmlexists xmlforest xmlnamespaces xmlparse xmlpi xmlroot xmlserialize xmltable
 year years yes zone
 """
-_SQL_KEYWORDS: Final[frozenset[str]] = frozenset(_SQL_KEYWORDS_TEXT.split())
+_RESERVED_SQL_KEYWORDS_TEXT: Final = """
+all alter analyse analyze and anti any array as asc asymmetric attach begin
+between both by call cascade case cast check collate column commit constraint
+copy create cross database default deferrable delete desc describe detach
+distinct do drop else end escape except exclude exists explain export false
+fetch following for foreign from full function glob grant group groups having
+ilike import in index initially inner insert intersect into is join lambda
+lateral leading left like limit load macro materialized merge minus natural
+not null offset on only or order outer over partition pivot pivot_longer
+pivot_wider placing pragma preceding primary procedure prune qualify range
+recursive references restrict return returning returns revoke right rollback
+rows sample savepoint schema select semi sequence set show similar some
+summarize symmetric table tablesample temporary then to trailing transaction
+trigger true unbounded union unique unpivot update using vacuum values variadic
+view when where window with
+"""
+_SQL_KEYWORDS: Final[frozenset[str]] = frozenset(_RESERVED_SQL_KEYWORDS_TEXT.split())
 
 
 def _syntax_error(source: str, offset: int, message: str) -> ExpressionSyntaxError:

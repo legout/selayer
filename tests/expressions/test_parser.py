@@ -82,6 +82,11 @@ def test_rejects_non_dsl_syntax(source: str) -> None:
         parse_expression(source)
 
 
+def test_accepts_qualified_domain_fields_that_are_unreserved_keywords() -> None:
+    assert parse_expression("products.cost") == Reference(("products", "cost"))
+    assert parse_expression("orders.label") == Reference(("orders", "label"))
+
+
 @pytest.mark.parametrize(
     "source", ["a @ b", "a +", "(a + b", "a b", "fn(a,)", "fn(", "unknown(a)"]
 )
