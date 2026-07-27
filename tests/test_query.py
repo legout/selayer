@@ -174,10 +174,16 @@ _UNPRINTABLE_REPR_ERROR = "parameter __repr__ must not be called"
 
 
 class _UnprintableParameter:
+    def __init__(self) -> None:
+        self.str_calls = 0
+        self.repr_calls = 0
+
     def __str__(self) -> str:
+        self.str_calls += 1
         raise AssertionError(_UNPRINTABLE_STR_ERROR)
 
     def __repr__(self) -> str:
+        self.repr_calls += 1
         raise AssertionError(_UNPRINTABLE_REPR_ERROR)
 
 
@@ -275,6 +281,8 @@ def test_parameterized_errors_reach_execution_with_immutable_parameters_and_sani
         assert "SQL:" not in error.message
         assert error.__cause__ is None
         assert error.__context__ is None
+        assert custom.str_calls == 0
+        assert custom.repr_calls == 0
 
 
 def test_parameterized_errors_never_format_values_or_driver_messages(
@@ -345,6 +353,8 @@ def test_parameterized_errors_never_format_values_or_driver_messages(
         assert "SQL:" not in error.message
         assert error.__cause__ is None
         assert error.__context__ is None
+        assert custom.str_calls == 0
+        assert custom.repr_calls == 0
 
 
 def test_parameterized_errors_use_generic_category_for_unknown_driver_error(
