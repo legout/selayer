@@ -223,7 +223,8 @@ def compile_duckdb(plan: QueryPlan) -> CompiledQuery:
         if dimensions
         else ""
     )
-    cte = f"WITH aggregated AS (SELECT {inner_select} {from_sql}{where_sql}{group_sql})"
+    cte_name = quote_identifier("aggregated")
+    cte = f"WITH {cte_name} AS (SELECT {inner_select} {from_sql}{where_sql}{group_sql})"
 
     outer_items = [quote_identifier(item.id) for item in plan.dimensions]
     outer_items.extend(
@@ -231,7 +232,7 @@ def compile_duckdb(plan: QueryPlan) -> CompiledQuery:
         for item in plan.metrics
     )
     outer_select = ", ".join(outer_items)
-    sql = f"{cte} SELECT {outer_select} FROM aggregated"
+    sql = f"{cte} SELECT {outer_select} FROM {cte_name}"
     return CompiledQuery(sql=sql, parameters=tuple(parameters))
 
 
