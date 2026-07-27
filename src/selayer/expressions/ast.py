@@ -47,8 +47,8 @@ type Expression = Literal | Reference | UnaryOperation | BinaryOperation | Funct
 class ExpressionSyntaxError(ValueError):
     """Raised when source text is not valid restricted-DSL syntax.
 
-    Carries the original expression, the byte offset of the first invalid token,
-    and a concise explanation so callers can report a precise location.
+    Carries the original expression, the code-point offset of the first invalid
+    token, and a concise explanation so callers can report a precise location.
     """
 
     def __init__(self, expression: str, offset: int, message: str) -> None:

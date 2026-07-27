@@ -415,3 +415,77 @@ def test_syntax_error_records_offset_and_source() -> None:
     assert info.value.expression == "a + @"
     assert info.value.offset == 4
     assert info.value.message
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: ASCII-only numbers, keyword completeness, per-segment keywords
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("source", ["²", "³", "² + 1", "٢", "٣", "¹²"])
+def test_non_ascii_digits_are_rejected_as_unknown_characters(source: str) -> None:
+    # ``str.isdigit`` is Unicode-aware; only ASCII digits may start a number so
+    # unknown numeric syntax raises ExpressionSyntaxError instead of leaking a
+    # ValueError out of int()/float().
+    with pytest.raises(ExpressionSyntaxError):
+        parse_expression(source)
+
+
+def test_non_ascii_digit_error_reports_original_offset() -> None:
+    with pytest.raises(ExpressionSyntaxError) as info:
+        parse_expression("a + ²")
+    assert info.value.expression == "a + ²"
+    assert info.value.offset == 4
+    assert info.value.message
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "window",
+        "over",
+        "partition",
+        "qualify",
+        "ilike",
+        "glob",
+        "begin",
+        "commit",
+        "rollback",
+        "primary",
+        "foreign",
+        "references",
+        "constraint",
+        "unique",
+        "default",
+        "function",
+        "procedure",
+        "return",
+        "grant",
+        "revoke",
+        "right",
+        "left",
+        "union",
+        "between",
+    ],
+)
+def test_rejects_duckdb_sql_keywords(source: str) -> None:
+    with pytest.raises(ExpressionSyntaxError):
+        parse_expression(source)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "a.select",
+        "a.window",
+        "a.from",
+        "a.order",
+        "a.group",
+        "a.partition",
+        "a.over",
+        "a.distinct",
+    ],
+)
+def test_rejects_sql_keyword_in_any_reference_segment(source: str) -> None:
+    with pytest.raises(ExpressionSyntaxError):
+        parse_expression(source)

@@ -45,62 +45,128 @@ _UNARY_OPS = frozenset({"+", "-", "not"})
 # a later task; the parser only keeps raw SQL aggregates and arbitrary names out.
 _FUNCTION_NAMES = frozenset({"abs", "coalesce", "nullif", "lower", "upper", "if"})
 
-# Reserved SQL keywords. They would otherwise tokenize as identifiers, so they
-# are rejected explicitly. ``true``, ``false``, ``null``, and ``not`` are DSL
-# keywords and are recognized before this check runs.
+# Reserved SQL/DuckDB keywords. They would otherwise tokenize as identifiers,
+# so every reference segment is checked against this set and rejected. ``true``,
+# ``false``, ``null``, and ``not`` are DSL keywords recognized before this
+# check. SQL type names (``int``, ``date``, ``timestamp`` ...) are deliberately
+# not reserved so they remain usable as column references.
 _SQL_KEYWORDS = frozenset(
     {
         "all",
         "alter",
+        "analyze",
         "and",
+        "anti",
         "any",
         "as",
         "asc",
+        "attach",
+        "begin",
         "between",
         "by",
+        "cascade",
         "case",
         "cast",
+        "check",
+        "commit",
+        "constraint",
+        "copy",
         "create",
         "cross",
+        "database",
+        "default",
         "delete",
         "desc",
+        "detach",
         "distinct",
         "drop",
         "else",
         "end",
+        "escape",
+        "except",
+        "exclude",
         "exists",
+        "explain",
+        "export",
+        "fetch",
+        "following",
+        "foreign",
         "from",
         "full",
+        "function",
+        "glob",
+        "grant",
         "group",
+        "groups",
         "having",
+        "ilike",
+        "import",
         "in",
+        "index",
         "inner",
         "insert",
+        "intersect",
         "into",
         "is",
         "join",
+        "lateral",
         "left",
         "like",
         "limit",
+        "load",
+        "macro",
+        "materialized",
+        "minus",
         "natural",
         "offset",
         "on",
         "or",
         "order",
         "outer",
+        "over",
+        "partition",
+        "pragma",
+        "preceding",
+        "primary",
+        "procedure",
+        "prune",
+        "qualify",
+        "range",
+        "recursive",
+        "references",
+        "restrict",
+        "return",
+        "returns",
+        "revoke",
         "right",
+        "rollback",
+        "rows",
+        "sample",
+        "savepoint",
+        "schema",
         "select",
+        "semi",
+        "sequence",
         "set",
+        "similar",
         "some",
         "table",
+        "tablesample",
+        "temporary",
         "then",
+        "transaction",
+        "trigger",
+        "unbounded",
         "union",
+        "unique",
         "update",
         "using",
+        "vacuum",
         "values",
         "view",
         "when",
         "where",
+        "window",
         "with",
     }
 )
@@ -114,6 +180,9 @@ _STRING_ESCAPES = {
 }
 _IDENTIFIER_START = "abcdefghijklmnopqrstuvwxyz"
 _IDENTIFIER_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789_"
+# ASCII digits only: ``str.isdigit`` is Unicode-aware and would accept
+# superscripts/Arabic-Indic digits that ``int``/``float`` cannot consume.
+_DIGITS = "0123456789"
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,18 +209,18 @@ def tokenize(source: str) -> list[_Token]:
         if char == "/" and pos + 1 < length and source[pos + 1] == "*":
             raise ExpressionSyntaxError(source, pos, "comments are not allowed")
 
-        if char.isdigit():
+        if char in _DIGITS:
             start = pos
-            while pos < length and source[pos].isdigit():
+            while pos < length and source[pos] in _DIGITS:
                 pos += 1
             is_decimal = (
                 pos + 1 < length
                 and source[pos] == "."
-                and source[pos + 1].isdigit()
+                and source[pos + 1] in _DIGITS
             )
             if is_decimal:
                 pos += 1
-                while pos < length and source[pos].isdigit():
+                while pos < length and source[pos] in _DIGITS:
                     pos += 1
             text = source[start:pos]
             value: object = float(text) if is_decimal else int(text)
@@ -230,7 +299,12 @@ def tokenize(source: str) -> list[_Token]:
                 pos += 1
                 while pos < length and source[pos] in _IDENTIFIER_CHARS:
                     pos += 1
-                parts.append(source[part_start:pos])
+                segment = source[part_start:pos]
+                if segment in _SQL_KEYWORDS:
+                    raise ExpressionSyntaxError(
+                        source, part_start, f"sql keyword '{segment}' is not allowed"
+                    )
+                parts.append(segment)
                 dot_offsets.append(dot_offset)
             if len(parts) > 2:
                 raise ExpressionSyntaxError(
