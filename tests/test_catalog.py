@@ -141,6 +141,25 @@ def test_fact_and_metric_expression_factories_reject_invalid_syntax() -> None:
         Metric.from_expression("ratio", "abs(", ("total",))
 
 
+def test_metric_factory_rejects_bare_string_measures() -> None:
+    with pytest.raises(TypeError, match="measures must be a list or tuple"):
+        Metric.from_expression("ratio", "total", "total")  # type: ignore[arg-type]
+
+
+def test_metric_factory_rejects_non_builtin_string_measure() -> None:
+    with pytest.raises(TypeError, match="measures entries must be built-in str"):
+        Metric.from_expression("ratio", "total", ["total", ["nested"]])  # type: ignore[list-item]
+
+
+def test_metric_factory_copies_mutable_measure_input() -> None:
+    measures = ["total"]
+    metric = Metric.from_expression("ratio", "total", measures)  # type: ignore[arg-type]
+
+    measures.append("other")
+
+    assert metric.measures == ("total",)
+
+
 def test_catalog_lookup_helpers_raise_keyerror(valid_catalog_path: Path) -> None:
     layer = SemanticLayer.load(valid_catalog_path)
     with pytest.raises(KeyError):
@@ -647,6 +666,58 @@ def test_catalog_accepts_safe_many_to_one_fact_chain(
         _write(tmp_path, _fact_reachability_catalog(relationships))
     )
     assert layer.facts["value"].source == "anchor"
+
+
+def test_catalog_accepts_forward_one_to_one_fact_reachability(tmp_path: Path) -> None:
+    relationship = (
+        "  anchor_leaf:\n    source: anchor\n    target: leaf\n"
+        "    type: one_to_one\n    source_column: id\n    target_column: id\n"
+    )
+    layer = SemanticLayer.load(
+        _write(tmp_path, _fact_reachability_catalog(relationship))
+    )
+    assert layer.facts["value"].source == "anchor"
+
+
+def test_catalog_accepts_reverse_one_to_one_fact_reachability(tmp_path: Path) -> None:
+    relationship = (
+        "  leaf_anchor:\n    source: leaf\n    target: anchor\n"
+        "    type: one_to_one\n    source_column: id\n    target_column: id\n"
+    )
+    layer = SemanticLayer.load(
+        _write(tmp_path, _fact_reachability_catalog(relationship))
+    )
+    assert layer.facts["value"].source == "anchor"
+
+
+def test_catalog_accepts_reverse_one_to_many_fact_reachability(tmp_path: Path) -> None:
+    relationship = (
+        "  leaf_anchor:\n    source: leaf\n    target: anchor\n"
+        "    type: one_to_many\n    source_column: id\n    target_column: id\n"
+    )
+    layer = SemanticLayer.load(
+        _write(tmp_path, _fact_reachability_catalog(relationship))
+    )
+    assert layer.facts["value"].source == "anchor"
+
+
+def test_catalog_rejects_reverse_many_to_one_fact_reachability(tmp_path: Path) -> None:
+    relationship = (
+        "  leaf_anchor:\n    source: leaf\n    target: anchor\n"
+        "    type: many_to_one\n    source_column: id\n    target_column: id\n"
+    )
+    path = _write(tmp_path, _fact_reachability_catalog(relationship))
+    with pytest.raises(CatalogValidationError) as caught:
+        SemanticLayer.load(path)
+    assert caught.value.issues == (
+        CatalogIssue(
+            path="facts.value.expression",
+            message=(
+                "source 'leaf' is not reachable from anchor 'anchor' through "
+                "grain-preserving relationships"
+            ),
+        ),
+    )
 
 
 @pytest.mark.parametrize(

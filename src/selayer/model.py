@@ -16,7 +16,7 @@ Conventions enforced by the catalog loader (not by the dataclasses themselves):
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -107,10 +107,16 @@ class Metric:
         cls,
         name: str,
         expression: str,
-        measures: tuple[str, ...],
+        measures: Sequence[str],
         description: str = "",
     ) -> Self:
         """Build a metric by parsing one restricted DSL expression."""
+        if isinstance(measures, str):
+            raise TypeError("measures must be a list or tuple of strings")
+        if not isinstance(measures, Sequence):
+            raise TypeError("measures must be a list or tuple of strings")
+        if any(type(measure) is not str for measure in measures):
+            raise TypeError("measures entries must be built-in str")
         return cls(name, parse_expression(expression), tuple(measures), description)
 
 
