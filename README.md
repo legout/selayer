@@ -63,17 +63,25 @@ compiler.
 
 ## Public semantic model
 
-The public interface exports:
+The public interface exports exactly the symbols in `selayer.__all__`:
 
+- `Aggregation`
+- `Cardinality`
+- `CatalogIssue`
+- `CatalogValidationError`
 - `DataSource`
+- `Dimension`
 - `Fact`
 - `Measure`
-- `Dimension`
 - `Metric`
+- `QueryEngine`
+- `QueryExecutionError`
+- `QueryPlan`
+- `QueryPlanningError`
 - `Relationship`
 - `SemanticLayer`
-- `QueryEngine`
-- `QueryPlan` and `QueryPlanningError`
+
+Compiler and parser internals are intentionally not public exports.
 
 Catalogs are loaded through the active schema-version-1 model:
 

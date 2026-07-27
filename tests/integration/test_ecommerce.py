@@ -210,40 +210,154 @@ def test_filtered_item_results_are_numerically_correct(root: Path) -> None:
     assert actual["gross_margin"].item() == pytest.approx(130 / 310)
 
 
-@pytest.mark.parametrize(
-    ("metrics", "dimensions", "error_code"),
-    [
-        (("average_order_value", "gross_margin"), (), "mixed_grain"),
-        (("average_order_value",), ("product_category",), "row_expanding_path"),
-    ],
-)
-def test_unsupported_example_combinations_have_stable_errors(
+# These sets are deliberately explicit: the exhaustive cases below are generated
+# from the loaded catalog, and this equality check makes a catalog addition fail
+# until its independently calculated expectations and classification are added.
+_ORDER_METRICS = {
+    "total_revenue",
+    "order_count",
+    "total_discount",
+    "total_shipping",
+    "completed_order_count",
+    "average_order_value",
+    "discount_rate",
+    "order_completion_rate",
+}
+_ITEM_METRICS = {
+    "total_item_revenue",
+    "total_item_cost",
+    "units_sold",
+    "average_item_price",
+    "gross_margin",
+}
+_CUSTOMER_DIMENSIONS = {"customer_id", "customer_segment", "customer_country"}
+_PRODUCT_DIMENSIONS = {"product_id", "product_category", "product_subcategory"}
+_ORDER_DIMENSIONS = {"order_date", "order_status", "payment_method"}
+
+
+def _expected_metric_by_dimension(
+    root: Path, metric: str, dimension: str
+) -> pl.DataFrame:
+    """Calculate one complete result using Polars, independently of selayer."""
+    orders = pl.read_parquet(root / "data/orders.parquet")
+    dimension_columns = {
+        "customer_id": "customer_id",
+        "customer_segment": "segment",
+        "customer_country": "country",
+        "product_id": "product_id",
+        "product_category": "category",
+        "product_subcategory": "subcategory",
+        "order_date": "created_at",
+        "order_status": "status",
+        "payment_method": "payment_method",
+    }
+    if metric in _ORDER_METRICS:
+        frame = orders
+    else:
+        items = pl.read_parquet(root / "data/order_items.parquet")
+        products = pl.read_parquet(root / "data/products.parquet")
+        customers = pl.read_parquet(root / "data/customers.parquet")
+        frame = (
+            items.join(products, left_on="product_id", right_on="id")
+            .join(orders, left_on="order_id", right_on="id", suffix="_order")
+            .join(customers, left_on="customer_id", right_on="id", suffix="_customer")
+            .with_columns((pl.col("quantity") * pl.col("cost")).alias("item_cost"))
+        )
+    if dimension in _CUSTOMER_DIMENSIONS and metric in _ORDER_METRICS:
+        frame = frame.join(
+            pl.read_parquet(root / "data/customers.parquet"),
+            left_on="customer_id",
+            right_on="id",
+            suffix="_customer",
+        )
+    source_column = dimension_columns[dimension]
+    if metric in _ORDER_METRICS:
+        grouped = frame.group_by(source_column).agg(
+            pl.col("amount").sum().alias("total_revenue"),
+            pl.col("id").n_unique().alias("order_count"),
+            pl.col("discount_amount").sum().alias("total_discount"),
+            pl.col("shipping_cost").sum().alias("total_shipping"),
+            pl.col("id")
+            .filter(pl.col("status") == "completed")
+            .n_unique()
+            .alias("completed_order_count"),
+        )
+        grouped = grouped.with_columns(
+            (pl.col("total_revenue") / pl.col("order_count")).alias(
+                "average_order_value"
+            ),
+            (pl.col("total_discount") / pl.col("total_revenue")).alias("discount_rate"),
+            (pl.col("completed_order_count") / pl.col("order_count")).alias(
+                "order_completion_rate"
+            ),
+        )
+    else:
+        grouped = frame.group_by(source_column).agg(
+            pl.col("total").sum().alias("total_item_revenue"),
+            pl.col("item_cost").sum().alias("total_item_cost"),
+            pl.col("quantity").sum().alias("units_sold"),
+        )
+        grouped = grouped.with_columns(
+            (pl.col("total_item_revenue") / pl.col("units_sold")).alias(
+                "average_item_price"
+            ),
+            (
+                (pl.col("total_item_revenue") - pl.col("total_item_cost"))
+                / pl.col("total_item_revenue")
+            ).alias("gross_margin"),
+        )
+    return grouped.select(pl.col(source_column).alias(dimension), pl.col(metric)).sort(
+        dimension
+    )
+
+
+def _metric_anchor(layer: SemanticLayer, metric: str) -> str:
+    measure = layer.metrics[metric].measures[0]
+    return layer.facts[layer.measures[measure].fact].source
+
+
+def test_every_catalog_metric_dimension_pair_is_numerically_verified(
     root: Path,
-    metrics: tuple[str, ...],
-    dimensions: tuple[str, ...],
-    error_code: str,
 ) -> None:
-    engine = QueryEngine(SemanticLayer.load(root / "ecommerce_semantic_layer.yaml"))
-    with pytest.raises(QueryPlanningError) as error:
-        engine.plan(list(metrics), list(dimensions))
-    assert error.value.code == error_code
+    layer = SemanticLayer.load(root / "ecommerce_semantic_layer.yaml")
+    assert set(layer.metrics) == _ORDER_METRICS | _ITEM_METRICS
+    assert set(layer.dimensions) == (
+        _CUSTOMER_DIMENSIONS | _PRODUCT_DIMENSIONS | _ORDER_DIMENSIONS
+    )
+    engine = QueryEngine(layer)
+    for metric in layer.metrics:
+        for dimension in layer.dimensions:
+            is_fan_out = metric in _ORDER_METRICS and dimension in _PRODUCT_DIMENSIONS
+            if is_fan_out:
+                with pytest.raises(QueryPlanningError) as error:
+                    engine.plan([metric], [dimension])
+                assert error.value.code == "row_expanding_path"
+                continue
+            actual = engine.query([metric], [dimension]).sort(dimension)
+            expected = _expected_metric_by_dimension(root, metric, dimension)
+            assert actual.columns == [dimension, metric]
+            assert actual.height == expected.height
+            assert actual[dimension].to_list() == expected[dimension].to_list()
+            assert actual[metric].to_list() == pytest.approx(
+                expected[metric].to_list()
+            ), f"{metric} by {dimension}"
 
 
-@pytest.mark.parametrize(
-    ("metrics", "dimensions"),
-    [
-        (("average_order_value",), ("customer_segment",)),
-        (("average_order_value",), ("order_date",)),
-        (("gross_margin",), ("product_category",)),
-        (("gross_margin",), ("customer_segment",)),
-        (("average_item_price",), ("order_date",)),
-        (("units_sold",), ("customer_country",)),
-    ],
-)
-def test_supported_metric_dimension_combinations_execute(
-    root: Path, metrics: tuple[str, ...], dimensions: tuple[str, ...]
-) -> None:
-    engine = QueryEngine(SemanticLayer.load(root / "ecommerce_semantic_layer.yaml"))
-    result = engine.query(list(metrics), list(dimensions))
-    assert result.columns == [*dimensions, *metrics]
-    assert result.height > 0
+def test_every_mixed_order_item_metric_pair_has_stable_error(root: Path) -> None:
+    layer = SemanticLayer.load(root / "ecommerce_semantic_layer.yaml")
+    order_metrics = [
+        metric for metric in layer.metrics if _metric_anchor(layer, metric) == "orders"
+    ]
+    item_metrics = [
+        metric
+        for metric in layer.metrics
+        if _metric_anchor(layer, metric) == "order_items"
+    ]
+    assert set(order_metrics) == _ORDER_METRICS
+    assert set(item_metrics) == _ITEM_METRICS
+    engine = QueryEngine(layer)
+    for order_metric in order_metrics:
+        for item_metric in item_metrics:
+            with pytest.raises(QueryPlanningError) as error:
+                engine.plan([order_metric, item_metric])
+            assert error.value.code == "mixed_grain"
