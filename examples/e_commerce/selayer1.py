@@ -19,9 +19,7 @@ def main() -> None:
 
     # Data paths in the example catalog are repository-relative.
     with QueryEngine(layer) as engine:
-        order_plan = engine.plan(
-            ["average_order_value"], ["customer_segment"]
-        )
+        order_plan = engine.plan(["average_order_value"], ["customer_segment"])
         print("Order plan anchor:", order_plan.anchor_source)
         print("Order revenue by customer segment:")
         print(engine.query(["average_order_value"], ["customer_segment"]))
@@ -39,9 +37,7 @@ def main() -> None:
         )
 
         try:
-            engine.plan(
-                ["average_order_value", "gross_margin"], ["product_category"]
-            )
+            engine.plan(["average_order_value", "gross_margin"], ["product_category"])
         except QueryPlanningError as error:
             print(f"Expected mixed-grain rejection: {error.code}")
 

@@ -125,7 +125,8 @@ def test_product_category_metrics_match_independent_polars(root: Path) -> None:
             "units_sold",
             "average_item_price",
             "gross_margin",
-        ],        ["product_category"],
+        ],
+        ["product_category"],
     ).sort("product_category")
     expected = expected_product_metrics(root)
     assert actual["product_category"].to_list() == expected["category"].to_list()
@@ -145,18 +146,14 @@ def test_overall_order_metrics_match_independent_polars(root: Path) -> None:
     expected = {
         "total_revenue": revenue,
         "order_count": orders.height,
-        "average_order_value": float(
-            cast(Any, orders["amount"].mean()) or 0
-        ),
+        "average_order_value": float(cast(Any, orders["amount"].mean()) or 0),
         "discount_rate": float(orders["discount_amount"].sum() or 0) / revenue,
         "order_completion_rate": (
             orders.filter(pl.col("status") == "completed").height / orders.height
         ),
     }
     engine = QueryEngine(SemanticLayer.load(root / "ecommerce_semantic_layer.yaml"))
-    actual = engine.query(
-        list(expected), ["order_status"]
-    ).select(list(expected))
+    actual = engine.query(list(expected), ["order_status"]).select(list(expected))
     totals = engine.query(list(expected))
     for column, value in expected.items():
         assert totals[column].item() == pytest.approx(value)
