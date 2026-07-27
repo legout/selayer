@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
+from typing import Any
 
 from selayer._next.model import (
     Aggregation,
@@ -17,20 +18,49 @@ from selayer.expressions.ast import Expression
 type FilterScalar = str | int | float | bool | None
 
 
+def _freeze_value(value: Any) -> Any:
+    """Copy common mutable containers into immutable equivalents.
+
+    Runtime callers are not constrained by the FilterScalar annotation, so the
+    boundary must remain immutable even for invalid values supplied directly.
+    """
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _freeze_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_value(item) for item in value)
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class ScalarFilter:
     value: FilterScalar
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", _freeze_value(self.value))
 
 
 @dataclass(frozen=True, slots=True)
 class ListFilter:
     values: tuple[FilterScalar, ...]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "values", tuple(_freeze_value(item) for item in self.values)
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class RangeFilter:
     start: FilterScalar
     end: FilterScalar
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "start", _freeze_value(self.start))
+        object.__setattr__(self, "end", _freeze_value(self.end))
 
 
 type FilterValue = ScalarFilter | ListFilter | RangeFilter
@@ -51,8 +81,12 @@ class QueryRequest:
     ) -> None:
         normalized: dict[str, FilterValue] = {}
         for key, value in (filters or {}).items():
-            if isinstance(value, (ScalarFilter, ListFilter, RangeFilter)):
-                normalized[key] = value
+            if isinstance(value, ScalarFilter):
+                normalized[key] = ScalarFilter(value.value)
+            elif isinstance(value, ListFilter):
+                normalized[key] = ListFilter(value.values)
+            elif isinstance(value, RangeFilter):
+                normalized[key] = RangeFilter(value.start, value.end)
             elif isinstance(value, list):
                 normalized[key] = ListFilter(tuple(value))
             elif isinstance(value, tuple):

@@ -67,14 +67,17 @@ def _paths(layer: SemanticLayer, start: str, goal: str) -> list[tuple[str, ...]]
 def plan_query(layer: SemanticLayer, request: QueryRequest) -> QueryPlan:
     if not request.metrics:
         raise QueryPlanningError("unknown_metric", "at least one metric is required")
-    metrics = []
-    for metric_id in request.metrics:
-        metric = layer.metrics.get(metric_id)
-        if metric is None:
+    for metric_id in sorted(set(request.metrics)):
+        if metric_id not in layer.metrics:
             raise QueryPlanningError(
                 "unknown_metric", f"metric '{metric_id}' is not known"
             )
-        metrics.append(PlannedMetric(metric_id, metric, metric.expression))
+    metrics = [
+        PlannedMetric(
+            metric_id, layer.metrics[metric_id], layer.metrics[metric_id].expression
+        )
+        for metric_id in request.metrics
+    ]
 
     measure_ids: list[str] = []
     for metric in metrics:
@@ -108,14 +111,15 @@ def plan_query(layer: SemanticLayer, request: QueryRequest) -> QueryPlan:
             "mixed_grain", "requested measures do not share one source grain"
         )
 
-    dimensions: list[PlannedDimension] = []
-    required_sources: list[str] = []
-    for dimension_id in request.dimensions:
-        dimension = layer.dimensions.get(dimension_id)
-        if dimension is None:
+    for dimension_id in sorted(set(request.dimensions)):
+        if dimension_id not in layer.dimensions:
             raise QueryPlanningError(
                 "unknown_dimension", f"dimension '{dimension_id}' is not known"
             )
+    dimensions: list[PlannedDimension] = []
+    required_sources: list[str] = []
+    for dimension_id in request.dimensions:
+        dimension = layer.dimensions[dimension_id]
         dimensions.append(PlannedDimension(dimension_id, dimension))
         if dimension.source not in required_sources:
             required_sources.append(dimension.source)
