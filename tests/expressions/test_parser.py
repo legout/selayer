@@ -8,6 +8,7 @@ unknown function names).
 
 from __future__ import annotations
 
+import duckdb
 import pytest
 
 from selayer.expressions import (
@@ -489,3 +490,54 @@ def test_rejects_duckdb_sql_keywords(source: str) -> None:
 def test_rejects_sql_keyword_in_any_reference_segment(source: str) -> None:
     with pytest.raises(ExpressionSyntaxError):
         parse_expression(source)
+
+
+# ---------------------------------------------------------------------------
+# Review fix (round 2): the reserved-keyword set must be a superset of the
+# DuckDB reserved vocabulary reported by the installed engine.
+# ---------------------------------------------------------------------------
+
+# DuckDB publishes its reserved words through the ``duckdb_keywords()`` table.
+# Every reserved word must be rejected as a reference, both as a bare one-part
+# name and as the second segment of a qualified ``source.<keyword>`` reference,
+# so engine-reserved vocabulary can never leak through as an identifier.
+#
+# ``true``, ``false``, ``null``, and ``not`` are also reported as reserved, but
+# the tokenizer recognizes them as DSL keywords (boolean/null literals and the
+# unary ``not`` operator) *before* the reserved-word check runs, so they are
+# excluded here: they cannot be rejected as one-part references by design, and
+# the representative tests above pin them as literals/operators.
+_RESERVED_DSL_KEYWORDS = frozenset({"true", "false", "null", "not"})
+
+
+def _duckdb_reserved_references() -> list[str]:
+    connection = duckdb.connect()
+    rows = connection.execute(
+        "select keyword_name from duckdb_keywords() "
+        "where keyword_category = 'reserved' order by keyword_name"
+    ).fetchall()
+    keywords: list[str] = []
+    for row in rows:
+        word = row[0]
+        if isinstance(word, str) and word not in _RESERVED_DSL_KEYWORDS:
+            keywords.append(word)
+    return keywords
+
+
+_DUCKDB_RESERVED_REFERENCES = _duckdb_reserved_references()
+
+
+@pytest.mark.parametrize("keyword", _DUCKDB_RESERVED_REFERENCES)
+def test_rejects_every_duckdb_reserved_word_as_reference(keyword: str) -> None:
+    # A reserved word must not parse as a bare one-part reference.
+    with pytest.raises(ExpressionSyntaxError):
+        parse_expression(keyword)
+
+
+@pytest.mark.parametrize("keyword", _DUCKDB_RESERVED_REFERENCES)
+def test_rejects_every_duckdb_reserved_word_in_qualified_segment(
+    keyword: str,
+) -> None:
+    # A reserved word must not parse as the second segment of ``source.<kw>``.
+    with pytest.raises(ExpressionSyntaxError):
+        parse_expression(f"source.{keyword}")
