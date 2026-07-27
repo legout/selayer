@@ -214,9 +214,7 @@ def tokenize(source: str) -> list[_Token]:
             while pos < length and source[pos] in _DIGITS:
                 pos += 1
             is_decimal = (
-                pos + 1 < length
-                and source[pos] == "."
-                and source[pos + 1] in _DIGITS
+                pos + 1 < length and source[pos] == "." and source[pos + 1] in _DIGITS
             )
             if is_decimal:
                 pos += 1
@@ -383,7 +381,9 @@ class Parser:
         while self._peek().kind in _ADDITIVE_OPS:
             operator = self._advance().kind
             right = self.parse_multiplicative()
-            expression = BinaryOperation(operator=operator, left=expression, right=right)
+            expression = BinaryOperation(
+                operator=operator, left=expression, right=right
+            )
         return expression
 
     def parse_multiplicative(self) -> Expression:
@@ -391,7 +391,9 @@ class Parser:
         while self._peek().kind in _MULTIPLICATIVE_OPS:
             operator = self._advance().kind
             right = self.parse_unary()
-            expression = BinaryOperation(operator=operator, left=expression, right=right)
+            expression = BinaryOperation(
+                operator=operator, left=expression, right=right
+            )
         return expression
 
     def parse_unary(self) -> Expression:
