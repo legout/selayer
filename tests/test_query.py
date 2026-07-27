@@ -207,19 +207,59 @@ def test_parameterized_errors_reach_execution_with_immutable_parameters_and_sani
     connection = FailingConnection()
     monkeypatch.setattr(engine, "conn", connection)
     custom = _UnprintableParameter()
-    cases: tuple[tuple[object, tuple[object, ...]], ...] = (
-        (b"secret-bytes", (b"secret-bytes",)),
+    cases: tuple[tuple[object, tuple[object, ...], tuple[str, ...]], ...] = (
+        (
+            b"secret-bytes",
+            (b"secret-bytes",),
+            ("secret-bytes", "b'secret-bytes'"),
+        ),
         (
             {"secret-key": "secret-value"},
             (MappingProxyType({"secret-key": "secret-value"}),),
+            (
+                "secret-key",
+                "secret-value",
+                "{'secret-key': 'secret-value'}",
+                "mappingproxy({'secret-key': 'secret-value'})",
+            ),
         ),
-        (["list-secret-a", "list-secret-b"], ("list-secret-a", "list-secret-b")),
-        (True, (True,)),
-        (10**100, (10**100,)),
-        ("<redacted>", ("<redacted>",)),
-        (custom, (custom,)),
+        (
+            ["list-secret-a", "list-secret-b"],
+            ("list-secret-a", "list-secret-b"),
+            (
+                "list-secret-a",
+                "list-secret-b",
+                "['list-secret-a', 'list-secret-b']",
+                "('list-secret-a', 'list-secret-b')",
+            ),
+        ),
+        (True, (True,), ("True",)),
+        (1.0, (1.0,), ("1.0",)),
+        (
+            10**100,
+            (10**100,),
+            (
+                "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            ),
+        ),
+        ("<redacted>", ("<redacted>",), ("<redacted>",)),
+        (
+            "x' OR 1=1 -- \\ metachar",
+            ("x' OR 1=1 -- \\ metachar",),
+            ("x' OR 1=1 -- \\ metachar", "x' OR 1=1 -- \\\\ metachar"),
+        ),
+        (
+            date(2024, 1, 2),
+            (date(2024, 1, 2),),
+            ("2024-01-02", "datetime.date(2024, 1, 2)"),
+        ),
+        (
+            custom,
+            (custom,),
+            (_UNPRINTABLE_STR_ERROR, _UNPRINTABLE_REPR_ERROR),
+        ),
     )
-    for value, expected_parameters in cases:
+    for value, expected_parameters, leak_sentinels in cases:
         with pytest.raises(QueryExecutionError) as caught:
             engine.query(["gross_margin"], filters={"stock": value})
         error = caught.value
@@ -227,10 +267,7 @@ def test_parameterized_errors_reach_execution_with_immutable_parameters_and_sani
         sql, parameters = connection.calls[-1]
         assert parameters == expected_parameters
         assert sql.startswith('WITH "aggregated"')
-        leaked_values = (
-            (_UNPRINTABLE_STR_ERROR, _UNPRINTABLE_REPR_ERROR) if value is custom else ()
-        )
-        for leaked in (sql, raw_diagnostic, *leaked_values):
+        for leaked in (sql, raw_diagnostic, *leak_sentinels):
             assert leaked not in str(error)
             assert leaked not in error.message
             assert leaked not in repr(error.args)
@@ -265,21 +302,40 @@ def test_parameterized_errors_never_format_values_or_driver_messages(
 
     connection = FailingConnection()
     monkeypatch.setattr(engine, "conn", connection)
-    secret_values = (
-        "<redacted>",
-        b"secret-bytes",
-        {"secret-key": "secret-value"},
-        True,
-        1.0,
-        _UnprintableParameter(),
+    custom = _UnprintableParameter()
+    secret_values: tuple[tuple[object, tuple[str, ...]], ...] = (
+        ("<redacted>", ("<redacted>",)),
+        (b"secret-bytes", ("secret-bytes", "b'secret-bytes'")),
+        (
+            {"secret-key": "secret-value"},
+            (
+                "secret-key",
+                "secret-value",
+                "{'secret-key': 'secret-value'}",
+                "mappingproxy({'secret-key': 'secret-value'})",
+            ),
+        ),
+        (True, ("True",)),
+        (1.0, ("1.0",)),
+        (
+            10**100,
+            (
+                "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            ),
+        ),
+        (
+            "x' OR 1=1 -- \\ metachar",
+            ("x' OR 1=1 -- \\ metachar", "x' OR 1=1 -- \\\\ metachar"),
+        ),
+        (custom, (_UNPRINTABLE_STR_ERROR, _UNPRINTABLE_REPR_ERROR)),
     )
-    for secret in secret_values:
+    for secret, leak_sentinels in secret_values:
         with pytest.raises(QueryExecutionError) as caught:
             engine.query(["gross_margin"], filters={"stock": secret})
         error = caught.value
         assert connection.sql is not None
         formatted = "".join(__import__("traceback").format_exception(error))
-        for leaked in (connection.sql, raw_diagnostic):
+        for leaked in (connection.sql, raw_diagnostic, *leak_sentinels):
             assert leaked not in str(error)
             assert leaked not in error.message
             assert leaked not in repr(error.args)
