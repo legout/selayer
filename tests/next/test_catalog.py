@@ -69,7 +69,16 @@ def test_catalog_loads_complete_valid_catalog(
 
     assert isinstance(layer.dimensions["product_category"], Dimension)
     assert isinstance(layer.relationships["product_order_items"], Relationship)
-    assert layer.relationships["product_order_items"].cardinality == "one_to_many"
+    assert layer.relationships["product_order_items"].type == "one_to_many"
+
+
+def test_direct_layer_construction_copies_mappings() -> None:
+    sources = {"orders": DataSource("orders", "parquet", "x", ("id",))}
+    layer = SemanticLayer(1, "ecommerce", "", "", sources, {}, {}, {}, {}, {})
+    sources["new"] = sources["orders"]
+    assert "new" not in layer.data_sources
+    with pytest.raises(TypeError):
+        layer.data_sources["new"] = sources["orders"]  # type: ignore[index]
 
 
 def test_catalog_collections_are_immutable(
@@ -86,6 +95,24 @@ def test_catalog_collections_are_immutable(
         layer.data_sources["extra"] = DataSource(  # type: ignore[index]
             name="extra", type="parquet", path="x", grain=("id",)
         )
+
+
+def test_direct_layer_copies_all_collection_mappings() -> None:
+    collections = [{"x": object()} for _ in range(6)]
+    layer = SemanticLayer(1, "x", "", "", *collections)  # type: ignore[arg-type]
+    for original, field in zip(
+        collections,
+        (
+            layer.data_sources,
+            layer.dimensions,
+            layer.facts,
+            layer.measures,
+            layer.metrics,
+            layer.relationships,
+        ),
+    ):
+        original["y"] = object()
+        assert "y" not in field
 
 
 def test_catalog_model_objects_are_frozen(
@@ -109,6 +136,20 @@ def test_catalog_lookup_helpers_raise_keyerror(valid_catalog_path: Path) -> None
 # ---------------------------------------------------------------------------
 # Top-level structure and version
 # ---------------------------------------------------------------------------
+
+
+def test_catalog_rejects_non_int_schema_versions(tmp_path: Path) -> None:
+    for version in ("true", "1.0"):
+        path = _write(
+            tmp_path,
+            f"version: {version}\nname: ecommerce\ndata_sources: {{}}\n",
+            version + ".yaml",
+        )
+        with pytest.raises(CatalogValidationError) as caught:
+            SemanticLayer.load(path)
+        assert caught.value.issues == (
+            CatalogIssue("version", "expected schema version 1"),
+        )
 
 
 def test_catalog_requires_schema_version_one(tmp_path: Path) -> None:
@@ -145,11 +186,29 @@ def test_catalog_invalid_name_identifier(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "section", ["dimensions", "facts", "measures", "metrics", "relationships"]
+)
+def test_optional_sections_must_be_mappings(tmp_path: Path, section: str) -> None:
+    path = _write(
+        tmp_path, f"version: 1\nname: ecommerce\ndata_sources: {{}}\n{section}: []\n"
+    )
+    with pytest.raises(CatalogValidationError) as caught:
+        SemanticLayer.load(path)
+    assert any(issue.path == section for issue in caught.value.issues)
+
+
 def test_catalog_missing_data_sources(tmp_path: Path) -> None:
     path = _write(tmp_path, "version: 1\nname: ecommerce\n")
     with pytest.raises(CatalogValidationError) as caught:
         SemanticLayer.load(path)
     assert "data_sources" in {issue.path for issue in caught.value.issues}
+
+
+def test_catalog_malformed_yaml_is_catalog_error(tmp_path: Path) -> None:
+    path = _write(tmp_path, "version: [1\nname: ecommerce\n")
+    with pytest.raises(CatalogValidationError):
+        SemanticLayer.load(path)
 
 
 def test_catalog_root_must_be_mapping(tmp_path: Path) -> None:
@@ -168,6 +227,32 @@ def test_catalog_empty_data_sources_is_valid(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Data sources
 # ---------------------------------------------------------------------------
+
+
+def test_catalog_rejects_unhashable_field_types_without_typeerror(
+    tmp_path: Path,
+) -> None:
+    path = _write(
+        tmp_path,
+        "version: 1\nname: ecommerce\ndata_sources:\n  orders:\n    type: [parquet]\n    path: [x]\n    grain: [id]\nmeasures:\n  total:\n    fact: [amount]\n    aggregation: [sum]\nrelationships:\n  rel:\n    source: orders\n    target: orders\n    type: [one_to_one]\n    source_column: id\n    target_column: id\n",
+    )
+    with pytest.raises(CatalogValidationError):
+        SemanticLayer.load(path)
+
+
+def test_catalog_rejects_wrong_field_types_without_typeerror(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        "version: 1\nname: ecommerce\ndata_sources:\n  orders:\n    type: [parquet]\n    path: 1\n    grain: [id, 2]\n",
+    )
+    with pytest.raises(CatalogValidationError) as caught:
+        SemanticLayer.load(path)
+    paths = {issue.path for issue in caught.value.issues}
+    assert {
+        "data_sources.orders.type",
+        "data_sources.orders.path",
+        "data_sources.orders.grain",
+    } <= paths
 
 
 def test_catalog_data_source_missing_type(tmp_path: Path) -> None:
@@ -494,7 +579,13 @@ def test_catalog_relationship_unsupported_cardinality(
     assert any(issue.path == "relationships.rel.type" for issue in caught.value.issues)
 
 
-def test_catalog_relationship_accepts_many_to_many_cardinality(tmp_path: Path) -> None:
+def test_relationship_has_type_not_cardinality() -> None:
+    relationship = Relationship("rel", "a", "b", "one_to_one", "id", "id")
+    assert relationship.type == "one_to_one"
+    assert not hasattr(relationship, "cardinality")
+
+
+def test_catalog_accepts_many_to_many_type(tmp_path: Path) -> None:
     # many_to_many is a valid cardinality value; planning it is deferred to the
     # planner task, so the catalog must not reject it.
     path = _write(
@@ -506,7 +597,7 @@ def test_catalog_relationship_accepts_many_to_many_cardinality(tmp_path: Path) -
         "    type: many_to_many\n    source_column: id\n    target_column: id\n",
     )
     layer = SemanticLayer.load(path)
-    assert layer.relationships["rel"].cardinality == "many_to_many"
+    assert layer.relationships["rel"].type == "many_to_many"
 
 
 # ---------------------------------------------------------------------------

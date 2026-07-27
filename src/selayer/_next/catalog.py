@@ -114,9 +114,32 @@ def _require(
         collector.add(f"{base_path}.{field}", f"{field} is required")
 
 
+_COLLECTIONS = (
+    "data_sources",
+    "dimensions",
+    "facts",
+    "measures",
+    "metrics",
+    "relationships",
+)
+
+
 def _collection(data: Mapping[str, Any], key: str) -> Mapping[str, Any]:
     value = data.get(key)
     return value if isinstance(value, Mapping) else {}
+
+
+def _check_string(value: object, path: str, field: str, collector: _Collector) -> None:
+    if not isinstance(value, str):
+        collector.add(path, f"{field} must be a string")
+
+
+def _check_optional_string(
+    raw: Mapping[str, Any], field: str, path: str, collector: _Collector
+) -> None:
+    if field in raw:
+        field_path = f"{path}.{field}" if path else field
+        _check_string(raw[field], field_path, field, collector)
 
 
 def _validate_identifier_key(
@@ -176,7 +199,8 @@ def _collect_duplicate_keys(node: yaml.Node, path: str, collector: _Collector) -
 
 
 def _validate_top_level(data: Mapping[str, Any], collector: _Collector) -> None:
-    if data.get("version") != 1:
+    version = data.get("version")
+    if type(version) is not int or version != 1:
         collector.add("version", "expected schema version 1")
     name = data.get("name")
     if name is None:
@@ -188,6 +212,11 @@ def _validate_top_level(data: Mapping[str, Any], collector: _Collector) -> None:
         collector.add("data_sources", "data_sources is required")
     elif not isinstance(data_sources, Mapping):
         collector.add("data_sources", "data_sources must be a mapping")
+    for field in ("label", "description"):
+        _check_optional_string(data, field, "", collector)
+    for section in _COLLECTIONS[1:]:
+        if section in data and not isinstance(data[section], Mapping):
+            collector.add(section, f"{section} must be a mapping")
 
 
 def _validate_data_sources(sources: Mapping[str, Any], collector: _Collector) -> None:
@@ -199,6 +228,8 @@ def _validate_data_sources(sources: Mapping[str, Any], collector: _Collector) ->
             continue
         _require(raw, "type", base, collector)
         _require(raw, "path", base, collector)
+        _check_optional_string(raw, "type", base, collector)
+        _check_optional_string(raw, "path", base, collector)
         grain = raw.get("grain")
         grain_path = f"{base}.grain"
         if grain is None:
@@ -223,6 +254,9 @@ def _validate_dimensions(
         _require(raw, "source", base, collector)
         _require(raw, "column", base, collector)
         _require(raw, "data_type", base, collector)
+        for field in ("source", "column", "data_type"):
+            _check_optional_string(raw, field, base, collector)
+        _check_optional_string(raw, "description", base, collector)
         _check_known_source(
             raw.get("source"), known_sources, f"{base}.source", collector
         )
@@ -243,6 +277,9 @@ def _validate_facts(
         _require(raw, "source", base, collector)
         _require(raw, "data_type", base, collector)
         _require(raw, "expression", base, collector)
+        for field in ("source", "data_type", "expression"):
+            _check_optional_string(raw, field, base, collector)
+        _check_optional_string(raw, "description", base, collector)
         _check_known_source(
             raw.get("source"), known_sources, f"{base}.source", collector
         )
@@ -267,11 +304,14 @@ def _validate_measures(
             continue
         _require(raw, "fact", base, collector)
         _require(raw, "aggregation", base, collector)
+        _check_optional_string(raw, "fact", base, collector)
+        _check_optional_string(raw, "aggregation", base, collector)
+        _check_optional_string(raw, "description", base, collector)
         fact = raw.get("fact")
         if isinstance(fact, str) and fact not in known_facts:
             collector.add(f"{base}.fact", f"fact '{fact}' is not a known fact")
         aggregation = raw.get("aggregation")
-        if aggregation is not None and aggregation not in _AGGREGATIONS:
+        if isinstance(aggregation, str) and aggregation not in _AGGREGATIONS:
             collector.add(
                 f"{base}.aggregation", f"unsupported aggregation '{aggregation}'"
             )
@@ -291,11 +331,17 @@ def _validate_metrics(
             continue
         _require(raw, "expression", base, collector)
         _require(raw, "measures", base, collector)
+        _check_optional_string(raw, "expression", base, collector)
+        _check_optional_string(raw, "description", base, collector)
         declared = raw.get("measures")
         declared_set = _declared_measures(declared)
-        if isinstance(declared, list):
+        if not isinstance(declared, list):
+            collector.add(f"{base}.measures", "measures must be a list of strings")
+        elif not all(isinstance(measure, str) for measure in declared):
+            collector.add(f"{base}.measures", "measures entries must be strings")
+        else:
             for measure in declared:
-                if isinstance(measure, str) and measure not in known_measures:
+                if measure not in known_measures:
                     collector.add(
                         f"{base}.measures",
                         f"measure '{measure}' is not a known measure",
@@ -326,6 +372,8 @@ def _validate_relationships(
         _require(raw, "type", base, collector)
         _require(raw, "source_column", base, collector)
         _require(raw, "target_column", base, collector)
+        for field in ("source", "target", "type", "source_column", "target_column"):
+            _check_optional_string(raw, field, base, collector)
         _check_known_source(
             raw.get("source"), known_sources, f"{base}.source", collector
         )
@@ -333,7 +381,7 @@ def _validate_relationships(
             raw.get("target"), known_sources, f"{base}.target", collector
         )
         cardinality = raw.get("type")
-        if cardinality is not None and cardinality not in _CARDINALITIES:
+        if isinstance(cardinality, str) and cardinality not in _CARDINALITIES:
             collector.add(f"{base}.type", f"unsupported cardinality '{cardinality}'")
 
 
@@ -487,7 +535,7 @@ def _build_layer(
                     name=key,
                     source=raw["source"],
                     target=raw["target"],
-                    cardinality=raw["type"],
+                    type=raw["type"],
                     source_column=raw["source_column"],
                     target_column=raw["target_column"],
                 )
@@ -504,10 +552,19 @@ def load(path: str | Path) -> SemanticLayer:
     :class:`CatalogValidationError` whose ``issues`` are sorted by
     ``(path, message)``.
     """
-    text = Path(path).read_text(encoding="utf-8")
-    node, data = _compose_and_construct(text)
-
     collector = _Collector(issues=[])
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+        node, data = _compose_and_construct(text)
+    except yaml.YAMLError as error:
+        collector.add("", f"invalid YAML: {error}")
+        collector.raise_if_any()
+        raise AssertionError("unreachable")
+    except (TypeError, ValueError) as error:
+        collector.add("", f"invalid catalog structure: {error}")
+        collector.raise_if_any()
+        raise AssertionError("unreachable")
+
     if node is not None:
         _collect_duplicate_keys(node, "", collector)
 

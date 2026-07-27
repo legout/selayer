@@ -21,6 +21,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal
 
 from selayer.expressions.ast import Expression
@@ -89,7 +90,7 @@ class Relationship:
     name: str
     source: str
     target: str
-    cardinality: Cardinality
+    type: Cardinality
     source_column: str
     target_column: str
 
@@ -115,6 +116,19 @@ class SemanticLayer:
     measures: Mapping[str, Measure]
     metrics: Mapping[str, Metric]
     relationships: Mapping[str, Relationship]
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "data_sources",
+            "dimensions",
+            "facts",
+            "measures",
+            "metrics",
+            "relationships",
+        ):
+            object.__setattr__(
+                self, field_name, MappingProxyType(dict(getattr(self, field_name)))
+            )
 
     def source(self, name: str) -> DataSource:
         return self.data_sources[name]
