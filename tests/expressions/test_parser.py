@@ -99,7 +99,8 @@ def test_syntax_error_reports_first_invalid_offset() -> None:
 
 
 @pytest.mark.parametrize(
-    "source", ["a AND b", "a OR b", "a LIKE b", "a IN b", "FROM", "WITH", "VALUES", "a.b.c"]
+    "source",
+    ["a AND b", "a OR b", "a LIKE b", "a IN b", "FROM", "WITH", "VALUES", "a.b.c"],
 )
 def test_rejects_unsupported_keywords_and_reference_depth(source: str) -> None:
     with pytest.raises(ExpressionSyntaxError):
