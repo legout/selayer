@@ -321,6 +321,80 @@ def test_planner_rejects_equal_shortest_safe_paths_even_with_unsafe_edge(
     assert error.value.code == "ambiguous_relationship_path"
 
 
+def test_layered_diamond_shortest_paths_fail_without_path_enumeration(
+    valid_catalog_path,
+) -> None:  # type: ignore[no-untyped-def]
+    layer = SemanticLayer.load(valid_catalog_path)
+    branch_count = 24
+    relationships: list[Relationship] = []
+    left, right = "left_0", "right_0"
+    relationships.extend(
+        (
+            Relationship("edge_0_left", "order_items", left, "one_to_one", "id", "id"),
+            Relationship(
+                "edge_0_right", "order_items", right, "one_to_one", "id", "id"
+            ),
+        )
+    )
+    for index in range(1, branch_count):
+        next_left, next_right = f"left_{index}", f"right_{index}"
+        for source in (left, right):
+            relationships.extend(
+                (
+                    Relationship(
+                        f"edge_{index}_{source}_left",
+                        source,
+                        next_left,
+                        "one_to_one",
+                        "id",
+                        "id",
+                    ),
+                    Relationship(
+                        f"edge_{index}_{source}_right",
+                        source,
+                        next_right,
+                        "one_to_one",
+                        "id",
+                        "id",
+                    ),
+                )
+            )
+        left, right = next_left, next_right
+    relationships.extend(
+        (
+            Relationship("edge_final_left", left, "products", "one_to_one", "id", "id"),
+            Relationship(
+                "edge_final_right", right, "products", "one_to_one", "id", "id"
+            ),
+        )
+    )
+    with pytest.raises(QueryPlanningError) as error:
+        plan_query(
+            _path_test_layer(layer, tuple(relationships)),
+            QueryRequest(("revenue_only",), ("target",)),
+        )
+    assert error.value.code == "ambiguous_relationship_path"
+
+
+def test_unique_shortest_path_ignores_longer_branch_noise(valid_catalog_path) -> None:  # type: ignore[no-untyped-def]
+    layer = SemanticLayer.load(valid_catalog_path)
+    relationships = (
+        Relationship("canonical_a", "order_items", "middle", "one_to_one", "id", "id"),
+        Relationship("canonical_b", "middle", "products", "one_to_one", "id", "id"),
+        Relationship("noise_a", "order_items", "noise", "one_to_one", "id", "id"),
+        Relationship("noise_b", "noise", "noise_2", "one_to_one", "id", "id"),
+        Relationship("noise_c", "noise_2", "products", "one_to_one", "id", "id"),
+    )
+    plan = plan_query(
+        _path_test_layer(layer, relationships),
+        QueryRequest(("revenue_only",), ("target",)),
+    )
+    assert [join.relationship_id for join in plan.joins] == [
+        "canonical_a",
+        "canonical_b",
+    ]
+
+
 def test_planner_reports_row_expansion_for_unsafe_only_relationship_path(
     valid_catalog_path,
 ) -> None:  # type: ignore[no-untyped-def]

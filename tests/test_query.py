@@ -90,7 +90,7 @@ def test_query_execution_error_does_not_leak_bound_values(
         (date(2024, 1, 2), "Conversion Error", "DATE"),
     ],
 )
-def test_parameterized_query_errors_redact_values_but_keep_diagnostics(
+def test_parameterized_query_errors_expose_only_allowlisted_diagnostic_category(
     valid_catalog_path: Path, value: object, diagnostic: str, context: str
 ) -> None:
     layer = SemanticLayer.load(valid_catalog_path)
@@ -106,15 +106,86 @@ def test_parameterized_query_errors_redact_values_but_keep_diagnostics(
         engine.query(["gross_margin"], filters={"stock": value})
     error = caught.value
     formatted = "".join(__import__("traceback").format_exception(error))
-    for candidate in (str(value), repr(value)):
-        assert candidate not in error.message
-        assert candidate not in str(error)
-        assert candidate not in repr(error.args)
-        assert candidate not in formatted
     assert diagnostic in error.message
-    assert context in error.message
+    assert "parameterized query" in error.message
+    assert "SQL:" not in error.message
     assert error.__cause__ is None
     assert error.__context__ is None
+    assert error.message in formatted
+
+
+class _UnprintableParameter:
+    def __str__(self) -> str:
+        raise AssertionError("parameter __str__ must not be called")
+
+    def __repr__(self) -> str:
+        raise AssertionError("parameter __repr__ must not be called")
+
+
+def test_parameterized_errors_never_format_values_or_driver_messages(
+    valid_catalog_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layer = SemanticLayer.load(valid_catalog_path)
+    layer = replace(
+        layer,
+        dimensions={
+            **layer.dimensions,
+            "stock": Dimension("stock", "products", "in_stock", "integer"),
+        },
+    )
+    engine = QueryEngine(layer)
+
+    class FailingConnection:
+        def execute(self, _sql: str, _parameters: tuple[object, ...]) -> object:
+            raise duckdb.ConversionException(
+                "Conversion Error: leaked raw diagnostic and <redacted> marker"
+            )
+
+    monkeypatch.setattr(engine, "conn", FailingConnection())
+    secret_values = (
+        "<redacted>",
+        b"secret-bytes",
+        {"secret-key": "secret-value"},
+        True,
+        1.0,
+        _UnprintableParameter(),
+    )
+    for secret in secret_values:
+        with pytest.raises(QueryExecutionError) as caught:
+            engine.query(["gross_margin"], filters={"stock": secret})
+        error = caught.value
+        assert "Conversion Error" in error.message
+        assert "parameterized query" in error.message
+        assert "leaked raw diagnostic" not in error.message
+        assert "<redacted>" not in error.message
+        assert "SQL:" not in error.message
+        assert error.__cause__ is None
+        assert error.__context__ is None
+
+
+def test_parameterized_errors_use_generic_category_for_unknown_driver_error(
+    valid_catalog_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layer = SemanticLayer.load(valid_catalog_path)
+    layer = replace(
+        layer,
+        dimensions={
+            **layer.dimensions,
+            "stock": Dimension("stock", "products", "in_stock", "integer"),
+        },
+    )
+    engine = QueryEngine(layer)
+
+    class FailingConnection:
+        def execute(self, _sql: str, _parameters: tuple[object, ...]) -> object:
+            raise duckdb.Error("Parser Error: raw details must not escape")
+
+    monkeypatch.setattr(engine, "conn", FailingConnection())
+    with pytest.raises(QueryExecutionError) as caught:
+        engine.query(["gross_margin"], filters={"stock": "secret"})
+    assert caught.value.message == (
+        "query execution failed: parameterized query failed (DuckDB Error)"
+    )
 
 
 def test_query_execution_errors_have_distinct_uuid_ids(

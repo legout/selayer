@@ -12,19 +12,25 @@ from selayer.compilation import compile_duckdb
 from selayer.errors import QueryExecutionError
 from selayer.planning import QueryPlan, QueryRequest, plan_query
 
-_REDACTED_PARAMETER = "<redacted>"
+_DUCKDB_DIAGNOSTIC_CATEGORIES = (
+    "Conversion Error",
+    "Binder Error",
+    "Catalog Error",
+    "Constraint Error",
+    "Invalid Input Error",
+)
 
 
-def _redact_parameter_values(message: str, parameters: tuple[object, ...]) -> str:
-    """Remove every useful scalar representation from a driver diagnostic."""
-    candidates: set[str] = set()
-    for value in parameters:
-        candidates.add(str(value))
-        candidates.add(repr(value))
-    for candidate in sorted(candidates, key=lambda item: (-len(item), item)):
-        if candidate:
-            message = message.replace(candidate, _REDACTED_PARAMETER)
-    return message
+def _duckdb_diagnostic_category(error: duckdb.Error) -> str:
+    """Return only an anchored, allowlisted category from a driver error."""
+    diagnostic = str(error)
+    for category in _DUCKDB_DIAGNOSTIC_CATEGORIES:
+        if diagnostic.startswith(category) and (
+            len(diagnostic) == len(category)
+            or diagnostic[len(category)] in (":", " ", "\n")
+        ):
+            return category
+    return "DuckDB Error"
 
 
 class QueryEngine:
@@ -93,8 +99,10 @@ class QueryEngine:
             result = self.conn.execute(compiled.sql, compiled.parameters).pl()
         except duckdb.Error as error:
             if compiled.parameters:
-                diagnostic = _redact_parameter_values(str(error), compiled.parameters)
-                message = f"query execution failed: {diagnostic}"
+                category = _duckdb_diagnostic_category(error)
+                message = (
+                    f"query execution failed: parameterized query failed ({category})"
+                )
             else:
                 # With no caller-provided values, the generated SQL and the
                 # DuckDB diagnostic are useful debugging information.

@@ -26,18 +26,17 @@ def expands_rows(relationship: Relationship, current_source: str) -> bool:
     return True
 
 
-def _paths(
+def _shortest_path(
     layer: SemanticLayer, start: str, goal: str, *, safe_only: bool = False
-) -> list[tuple[str, ...]]:
-    """Return all deterministic shortest paths in the requested graph.
+) -> tuple[tuple[str, ...] | None, bool, bool]:
+    """Find one shortest path and whether shortest paths are ambiguous.
 
-    The fallback graph is undirected so callers can distinguish a genuine
-    disconnect from a path that would expand the anchor grain.  Safe paths,
-    in contrast, are directed by cardinality and only retain grain-preserving
-    traversals.
+    Distances and capped path multiplicities are computed over the shortest-path
+    DAG.  This deliberately never materializes path combinations: the caller
+    only needs one path when it is unique, or an ambiguity bit otherwise.
     """
     if start == goal:
-        return [()]
+        return (), False, True
     edges: dict[str, list[tuple[str, str]]] = {}
     for rid, rel in sorted(layer.relationships.items()):
         if safe_only:
@@ -49,34 +48,63 @@ def _paths(
             edges.setdefault(rel.source, []).append((rid, rel.target))
             edges.setdefault(rel.target, []).append((rid, rel.source))
     distances = {start: 0}
+    order = [start]
     queue: deque[str] = deque([start])
     while queue:
         node = queue.popleft()
         for _, nxt in edges.get(node, ()):
             if nxt not in distances:
                 distances[nxt] = distances[node] + 1
+                order.append(nxt)
                 queue.append(nxt)
     if goal not in distances:
-        return []
-    length = distances[goal]
-    result: list[tuple[str, ...]] = []
+        return None, False, False
 
-    def walk(node: str, path: tuple[str, ...], seen: frozenset[str]) -> None:
-        if len(path) == length:
-            if node == goal:
-                result.append(path)
-            return
-        for rid, nxt in edges.get(node, ()):
-            if rid in seen or distances.get(nxt) != distances[node] + 1:
+    shortest_length = distances[goal]
+    # BFS discovery order is already layer ordered.
+    layers = order
+    multiplicity: dict[str, int] = {start: 1}
+    for node in layers:
+        if distances[node] >= shortest_length:
+            continue
+        count = multiplicity.get(node, 0)
+        if not count:
+            continue
+        for _, nxt in edges.get(node, ()):
+            if distances.get(nxt) != distances[node] + 1:
                 continue
-            walk(nxt, path + (rid,), seen | {rid})
+            multiplicity[nxt] = min(2, multiplicity.get(nxt, 0) + count)
+    if multiplicity.get(goal, 0) > 1:
+        return None, True, True
 
-    walk(start, (), frozenset())
-    return result
+    # With exactly one path, walk the shortest-path DAG in relationship-ID
+    # order.  Reverse counts identify which edges can reach the goal without
+    # constructing any alternative path.
+    suffix: dict[str, int] = {goal: 1}
+    for node in reversed(layers):
+        if node == goal or distances[node] >= shortest_length:
+            continue
+        for _, nxt in edges.get(node, ()):
+            if distances.get(nxt) != distances[node] + 1:
+                continue
+            suffix[node] = min(2, suffix.get(node, 0) + suffix.get(nxt, 0))
+    path: list[str] = []
+    node = start
+    while node != goal:
+        for rid, nxt in edges.get(node, ()):
+            if distances.get(nxt) == distances[node] + 1 and suffix.get(nxt, 0):
+                path.append(rid)
+                node = nxt
+                break
+        else:  # pragma: no cover - guarded by the unique-path count
+            return None, False, True
+    return tuple(path), False, True
 
 
-def _safe_paths(layer: SemanticLayer, start: str, goal: str) -> list[tuple[str, ...]]:
-    return _paths(layer, start, goal, safe_only=True)
+def _safe_path(
+    layer: SemanticLayer, start: str, goal: str
+) -> tuple[tuple[str, ...] | None, bool, bool]:
+    return _shortest_path(layer, start, goal, safe_only=True)
 
 
 def plan_query(layer: SemanticLayer, request: QueryRequest) -> QueryPlan:
@@ -159,9 +187,15 @@ def plan_query(layer: SemanticLayer, request: QueryRequest) -> QueryPlan:
     joins: list[JoinStep] = []
     joined: set[str] = set()
     for goal in required_sources:
-        paths = _safe_paths(layer, anchor, goal)
-        if not paths:
-            if _paths(layer, anchor, goal):
+        path, ambiguous, _ = _safe_path(layer, anchor, goal)
+        if ambiguous:
+            raise QueryPlanningError(
+                "ambiguous_relationship_path",
+                f"multiple shortest relationship paths from '{anchor}' to '{goal}'",
+            )
+        if path is None:
+            _, _, fallback_reachable = _shortest_path(layer, anchor, goal)
+            if fallback_reachable:
                 raise QueryPlanningError(
                     "row_expanding_path", f"relationship path to '{goal}' expands rows"
                 )
@@ -169,13 +203,8 @@ def plan_query(layer: SemanticLayer, request: QueryRequest) -> QueryPlan:
                 "no_relationship_path",
                 f"no relationship path from '{anchor}' to '{goal}'",
             )
-        if len(paths) > 1:
-            raise QueryPlanningError(
-                "ambiguous_relationship_path",
-                f"multiple shortest relationship paths from '{anchor}' to '{goal}'",
-            )
         node = anchor
-        for rid in paths[0]:
+        for rid in path:
             rel = layer.relationships[rid]
             if expands_rows(rel, node):
                 raise QueryPlanningError(
