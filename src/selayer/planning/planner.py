@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 
 from selayer.expressions.validation import references
 from selayer.model import Relationship, SemanticLayer
@@ -26,85 +27,126 @@ def expands_rows(relationship: Relationship, current_source: str) -> bool:
     return True
 
 
+@dataclass(slots=True)
+class _PathIndex:
+    """Shortest safe paths from one anchor, with bounded multiplicity."""
+
+    distances: dict[str, int]
+    multiplicities: dict[str, int]
+    predecessors: dict[str, tuple[str, str]]
+
+    def path_to(self, goal: str) -> tuple[tuple[str, ...] | None, bool, bool]:
+        """Return (path, ambiguous, reachable) for a previously indexed goal."""
+        distance = self.distances.get(goal)
+        if distance is None:
+            return None, False, False
+        if self.multiplicities.get(goal, 0) > 1:
+            return None, True, True
+        if distance == 0:
+            return (), False, True
+
+        path: list[str] = []
+        node = goal
+        while distance:
+            previous = self.predecessors.get(node)
+            if previous is None:  # pragma: no cover - guarded by the index
+                return None, False, True
+            node, relationship_id = previous
+            path.append(relationship_id)
+            distance -= 1
+        path.reverse()
+        return tuple(path), False, True
+
+
+def _build_adjacency(
+    layer: SemanticLayer,
+) -> tuple[dict[str, list[tuple[str, str]]], dict[str, list[tuple[str, str]]]]:
+    """Build safe directed and full undirected adjacency in one sorted pass."""
+    safe: dict[str, list[tuple[str, str]]] = {}
+    full: dict[str, list[tuple[str, str]]] = {}
+    # Relationship IDs are the stable tie-breaker for both traversal and paths.
+    for relationship_id, relationship in sorted(
+        layer.relationships.items(), key=lambda item: item[0]
+    ):
+        full.setdefault(relationship.source, []).append(
+            (relationship_id, relationship.target)
+        )
+        full.setdefault(relationship.target, []).append(
+            (relationship_id, relationship.source)
+        )
+        if not expands_rows(relationship, relationship.source):
+            safe.setdefault(relationship.source, []).append(
+                (relationship_id, relationship.target)
+            )
+        if not expands_rows(relationship, relationship.target):
+            safe.setdefault(relationship.target, []).append(
+                (relationship_id, relationship.source)
+            )
+    return safe, full
+
+
+def _safe_path_index(
+    anchor: str, adjacency: dict[str, list[tuple[str, str]]]
+) -> _PathIndex:
+    distances = {anchor: 0}
+    order: list[str] = []
+    queue: deque[str] = deque([anchor])
+    while queue:
+        node = queue.popleft()
+        order.append(node)
+        for _, next_node in adjacency.get(node, ()):
+            if next_node not in distances:
+                distances[next_node] = distances[node] + 1
+                queue.append(next_node)
+
+    # Every predecessor is one BFS layer closer to the anchor. Capping counts
+    # at two is enough to distinguish unique paths from ambiguous paths.
+    multiplicities: dict[str, int] = {anchor: 1}
+    predecessors: dict[str, tuple[str, str]] = {}
+    for node in order:
+        count = multiplicities.get(node, 0)
+        if not count:
+            continue
+        for relationship_id, next_node in adjacency.get(node, ()):
+            if distances.get(next_node) != distances[node] + 1:
+                continue
+            prior = multiplicities.get(next_node, 0)
+            if prior == 0:
+                predecessors[next_node] = (node, relationship_id)
+            multiplicities[next_node] = min(2, prior + count)
+    return _PathIndex(distances, multiplicities, predecessors)
+
+
+def _reachable(anchor: str, adjacency: dict[str, list[tuple[str, str]]]) -> set[str]:
+    reachable = {anchor}
+    queue: deque[str] = deque([anchor])
+    while queue:
+        node = queue.popleft()
+        for _, next_node in adjacency.get(node, ()):
+            if next_node not in reachable:
+                reachable.add(next_node)
+                queue.append(next_node)
+    return reachable
+
+
 def _shortest_path(
     layer: SemanticLayer, start: str, goal: str, *, safe_only: bool = False
 ) -> tuple[tuple[str, ...] | None, bool, bool]:
     """Find one shortest path and whether shortest paths are ambiguous.
 
-    Distances and capped path multiplicities are computed over the shortest-path
-    DAG.  This deliberately never materializes path combinations: the caller
-    only needs one path when it is unique, or an ambiguity bit otherwise.
+    This compatibility helper is intentionally a single indexed traversal. The
+    planner itself builds both indexes once and reuses them for every goal.
     """
-    if start == goal:
-        return (), False, True
-    edges: dict[str, list[tuple[str, str]]] = {}
-    for rid, rel in sorted(layer.relationships.items()):
-        if safe_only:
-            if not expands_rows(rel, rel.source):
-                edges.setdefault(rel.source, []).append((rid, rel.target))
-            if not expands_rows(rel, rel.target):
-                edges.setdefault(rel.target, []).append((rid, rel.source))
-        else:
-            edges.setdefault(rel.source, []).append((rid, rel.target))
-            edges.setdefault(rel.target, []).append((rid, rel.source))
-    distances = {start: 0}
-    order = [start]
-    queue: deque[str] = deque([start])
-    while queue:
-        node = queue.popleft()
-        for _, nxt in edges.get(node, ()):
-            if nxt not in distances:
-                distances[nxt] = distances[node] + 1
-                order.append(nxt)
-                queue.append(nxt)
-    if goal not in distances:
-        return None, False, False
-
-    shortest_length = distances[goal]
-    # BFS discovery order is already layer ordered.
-    layers = order
-    multiplicity: dict[str, int] = {start: 1}
-    for node in layers:
-        if distances[node] >= shortest_length:
-            continue
-        count = multiplicity.get(node, 0)
-        if not count:
-            continue
-        for _, nxt in edges.get(node, ()):
-            if distances.get(nxt) != distances[node] + 1:
-                continue
-            multiplicity[nxt] = min(2, multiplicity.get(nxt, 0) + count)
-    if multiplicity.get(goal, 0) > 1:
-        return None, True, True
-
-    # With exactly one path, walk the shortest-path DAG in relationship-ID
-    # order.  Reverse counts identify which edges can reach the goal without
-    # constructing any alternative path.
-    suffix: dict[str, int] = {goal: 1}
-    for node in reversed(layers):
-        if node == goal or distances[node] >= shortest_length:
-            continue
-        for _, nxt in edges.get(node, ()):
-            if distances.get(nxt) != distances[node] + 1:
-                continue
-            suffix[node] = min(2, suffix.get(node, 0) + suffix.get(nxt, 0))
-    path: list[str] = []
-    node = start
-    while node != goal:
-        for rid, nxt in edges.get(node, ()):
-            if distances.get(nxt) == distances[node] + 1 and suffix.get(nxt, 0):
-                path.append(rid)
-                node = nxt
-                break
-        else:  # pragma: no cover - guarded by the unique-path count
-            return None, False, True
-    return tuple(path), False, True
+    safe, full = _build_adjacency(layer)
+    if safe_only:
+        return _safe_path_index(start, safe).path_to(goal)
+    return _safe_path_index(start, full).path_to(goal)
 
 
 def _safe_path(
     layer: SemanticLayer, start: str, goal: str
 ) -> tuple[tuple[str, ...] | None, bool, bool]:
-    return _shortest_path(layer, start, goal, safe_only=True)
+    return _safe_path_index(start, _build_adjacency(layer)[0]).path_to(goal)
 
 
 def plan_query(layer: SemanticLayer, request: QueryRequest) -> QueryPlan:
@@ -184,18 +226,24 @@ def plan_query(layer: SemanticLayer, request: QueryRequest) -> QueryPlan:
             if source != anchor and source not in required_sources:
                 required_sources.append(source)
 
+    # Construct both graph views once, then index all safe paths from the
+    # anchor. Full reachability distinguishes a blocked (row-expanding) path
+    # from a genuinely disconnected source without rescanning per goal.
+    safe_adjacency, full_adjacency = _build_adjacency(layer)
+    safe_index = _safe_path_index(anchor, safe_adjacency)
+    full_reachable = _reachable(anchor, full_adjacency)
+
     joins: list[JoinStep] = []
     joined: set[str] = set()
     for goal in required_sources:
-        path, ambiguous, _ = _safe_path(layer, anchor, goal)
+        path, ambiguous, _ = safe_index.path_to(goal)
         if ambiguous:
             raise QueryPlanningError(
                 "ambiguous_relationship_path",
                 f"multiple shortest relationship paths from '{anchor}' to '{goal}'",
             )
         if path is None:
-            _, _, fallback_reachable = _shortest_path(layer, anchor, goal)
-            if fallback_reachable:
+            if goal in full_reachable:
                 raise QueryPlanningError(
                     "row_expanding_path", f"relationship path to '{goal}' expands rows"
                 )
@@ -204,25 +252,29 @@ def plan_query(layer: SemanticLayer, request: QueryRequest) -> QueryPlan:
                 f"no relationship path from '{anchor}' to '{goal}'",
             )
         node = anchor
-        for rid in path:
-            rel = layer.relationships[rid]
-            if expands_rows(rel, node):
+        for relationship_id in path:
+            relationship = layer.relationships[relationship_id]
+            if expands_rows(relationship, node):
                 raise QueryPlanningError(
                     "row_expanding_path", f"relationship path to '{goal}' expands rows"
                 )
-            if rid not in joined:
+            if relationship_id not in joined:
                 joins.append(
                     JoinStep(
-                        rid,
-                        rel,
-                        rel.source,
-                        rel.target,
-                        rel.source_column,
-                        rel.target_column,
+                        relationship_id,
+                        relationship,
+                        relationship.source,
+                        relationship.target,
+                        relationship.source_column,
+                        relationship.target_column,
                     )
                 )
-                joined.add(rid)
-            node = rel.target if node == rel.source else rel.source
+                joined.add(relationship_id)
+            node = (
+                relationship.target
+                if node == relationship.source
+                else relationship.source
+            )
 
     return QueryPlan(
         anchor,

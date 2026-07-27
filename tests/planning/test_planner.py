@@ -376,6 +376,26 @@ def test_layered_diamond_shortest_paths_fail_without_path_enumeration(
     assert error.value.code == "ambiguous_relationship_path"
 
 
+def test_cyclic_graph_terminates_and_keeps_unique_shortest_path(
+    valid_catalog_path,
+) -> None:  # type: ignore[no-untyped-def]
+    layer = SemanticLayer.load(valid_catalog_path)
+    relationships = (
+        Relationship("cycle_entry", "order_items", "middle", "one_to_one", "id", "id"),
+        Relationship("cycle_forward", "middle", "cycle", "one_to_one", "id", "id"),
+        Relationship("cycle_back", "cycle", "middle", "one_to_one", "id", "id"),
+        Relationship("cycle_exit", "middle", "products", "one_to_one", "id", "id"),
+    )
+    plan = plan_query(
+        _path_test_layer(layer, relationships),
+        QueryRequest(("revenue_only",), ("target",)),
+    )
+    assert [join.relationship_id for join in plan.joins] == [
+        "cycle_entry",
+        "cycle_exit",
+    ]
+
+
 def test_unique_shortest_path_ignores_longer_branch_noise(valid_catalog_path) -> None:  # type: ignore[no-untyped-def]
     layer = SemanticLayer.load(valid_catalog_path)
     relationships = (

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
+from types import MappingProxyType
 from uuid import UUID
 
 import duckdb
@@ -82,6 +83,40 @@ def test_query_execution_error_does_not_leak_bound_values(
 
 
 @pytest.mark.parametrize(
+    "diagnostic",
+    [
+        "prefix Conversion Error: leaked",
+        "Conversion ErrorSuffix: leaked",
+    ],
+)
+def test_diagnostic_category_requires_an_anchored_token(
+    valid_catalog_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    diagnostic: str,
+) -> None:
+    layer = SemanticLayer.load(valid_catalog_path)
+    layer = replace(
+        layer,
+        dimensions={
+            **layer.dimensions,
+            "stock": Dimension("stock", "products", "in_stock", "integer"),
+        },
+    )
+    engine = QueryEngine(layer)
+
+    class FailingConnection:
+        def execute(self, _sql: str, _parameters: tuple[object, ...]) -> object:
+            raise duckdb.ConversionException(diagnostic)
+
+    monkeypatch.setattr(engine, "conn", FailingConnection())
+    with pytest.raises(QueryExecutionError) as caught:
+        engine.query(["gross_margin"], filters={"stock": "secret"})
+    assert caught.value.message == (
+        "query execution failed: parameterized query failed (DuckDB Error)"
+    )
+
+
+@pytest.mark.parametrize(
     ("value", "diagnostic", "context"),
     [
         ("UNIQUE_SECRET_BOUND_VALUE", "Conversion Error", "INT64"),
@@ -109,6 +144,13 @@ def test_parameterized_query_errors_expose_only_allowlisted_diagnostic_category(
     assert diagnostic in error.message
     assert "parameterized query" in error.message
     assert "SQL:" not in error.message
+    assert context not in error.message
+    assert context not in formatted
+    for printable in (str(value), repr(value)):
+        assert printable not in str(error)
+        assert printable not in repr(error.args)
+        assert printable not in error.message
+        assert printable not in formatted
     assert error.__cause__ is None
     assert error.__context__ is None
     assert error.message in formatted
@@ -120,6 +162,67 @@ class _UnprintableParameter:
 
     def __repr__(self) -> str:
         raise AssertionError("parameter __repr__ must not be called")
+
+
+def test_parameterized_errors_reach_execution_with_immutable_parameters_and_sanitize(
+    valid_catalog_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layer = SemanticLayer.load(valid_catalog_path)
+    layer = replace(
+        layer,
+        dimensions={
+            **layer.dimensions,
+            "stock": Dimension("stock", "products", "in_stock", "integer"),
+        },
+    )
+    engine = QueryEngine(layer)
+
+    class FailingConnection:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+        def execute(self, sql: str, parameters: tuple[object, ...]) -> object:
+            self.calls.append((sql, parameters))
+            raise duckdb.ConversionException(
+                "Conversion Error: raw SQL and bound secret must not escape"
+            )
+
+    connection = FailingConnection()
+    monkeypatch.setattr(engine, "conn", connection)
+    custom = _UnprintableParameter()
+    cases: tuple[tuple[object, tuple[object, ...]], ...] = (
+        (b"secret-bytes", (b"secret-bytes",)),
+        (
+            {"secret-key": "secret-value"},
+            (MappingProxyType({"secret-key": "secret-value"}),),
+        ),
+        (["list-secret-a", "list-secret-b"], ("list-secret-a", "list-secret-b")),
+        (True, (True,)),
+        (10**100, (10**100,)),
+        ("<redacted>", ("<redacted>",)),
+        (custom, (custom,)),
+    )
+    for value, expected_parameters in cases:
+        with pytest.raises(QueryExecutionError) as caught:
+            engine.query(["gross_margin"], filters={"stock": value})
+        error = caught.value
+        formatted = "".join(__import__("traceback").format_exception(error))
+        assert connection.calls[-1][1] == expected_parameters
+        assert connection.calls[-1][0].startswith('WITH "aggregated"')
+        printable_values = (
+            ("parameter __str__ must be called", "parameter __repr__ must be called")
+            if value is custom
+            else (str(value), repr(value))
+        )
+        for printable in printable_values:
+            assert printable not in str(error)
+            assert printable not in repr(error.args)
+            assert printable not in error.message
+            assert printable not in formatted
+        assert "Conversion Error: raw SQL" not in error.message
+        assert "SQL:" not in error.message
+        assert error.__cause__ is None
+        assert error.__context__ is None
 
 
 def test_parameterized_errors_never_format_values_or_driver_messages(
@@ -288,6 +391,6 @@ def test_query_execution_error_contains_duckdb_message_and_sql_without_parameter
     engine.close()
     with pytest.raises(QueryExecutionError) as caught:
         engine.query(["gross_margin"])
-    assert "WITH" in caught.value.message
     assert "Connection already closed" in caught.value.message
+    assert 'SQL: WITH "aggregated"' in caught.value.message
     assert caught.value.query_id in str(caught.value)
