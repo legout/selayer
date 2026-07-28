@@ -133,6 +133,49 @@ def test_catalog_lookup_helpers_raise_keyerror(valid_catalog_path: Path) -> None
     assert layer.measure("total_item_cost").fact == "item_cost"
 
 
+def test_semantic_objects_have_stable_typed_identifiers(
+    valid_catalog_path: Path,
+) -> None:
+    layer = SemanticLayer.load(valid_catalog_path)
+    objects = layer.semantic_objects()
+
+    assert tuple(objects) == tuple(sorted(objects))
+    assert set(objects) == {
+        "source.order_items",
+        "source.orders",
+        "source.products",
+        "dimension.order_date",
+        "dimension.product_category",
+        "fact.item_cost",
+        "fact.item_revenue",
+        "measure.total_item_cost",
+        "measure.total_item_revenue",
+        "metric.gross_margin",
+        "relationship.product_order_items",
+    }
+    assert objects["source.order_items"] is layer.data_sources["order_items"]
+    assert objects["dimension.product_category"] is layer.dimensions["product_category"]
+    assert objects["metric.gross_margin"] is layer.metrics["gross_margin"]
+
+
+def test_semantic_objects_mapping_is_immutable(valid_catalog_path: Path) -> None:
+    layer = SemanticLayer.load(valid_catalog_path)
+    objects = layer.semantic_objects()
+
+    assert isinstance(objects, MappingProxyType)
+    with pytest.raises(TypeError):
+        objects["dimension.product_color"] = layer.dimensions["product_category"]  # type: ignore[index]
+
+
+def test_resolve_rejects_unknown_semantic_identifier(
+    valid_catalog_path: Path,
+) -> None:
+    layer = SemanticLayer.load(valid_catalog_path)
+
+    with pytest.raises(KeyError, match="dimension.product_color"):
+        layer.resolve("dimension.product_color")
+
+
 # ---------------------------------------------------------------------------
 # Top-level structure and version
 # ---------------------------------------------------------------------------

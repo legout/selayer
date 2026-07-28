@@ -48,8 +48,43 @@ from selayer.model import (
     Measure,
     Metric,
     Relationship,
-    SemanticLayer,
 )
+from selayer.model import (
+    SemanticLayer as _ModelSemanticLayer,
+)
+
+type SemanticObject = DataSource | Dimension | Fact | Measure | Metric | Relationship
+
+
+class SemanticLayer(_ModelSemanticLayer):
+    """Validated catalog model with stable semantic-object lookup helpers."""
+
+    @classmethod
+    def load(cls, path: str | Path) -> SemanticLayer:
+        return load(path)
+
+    def semantic_objects(self) -> Mapping[str, SemanticObject]:
+        collections: tuple[tuple[str, Mapping[str, SemanticObject]], ...] = (
+            ("source", self.data_sources),
+            ("dimension", self.dimensions),
+            ("fact", self.facts),
+            ("measure", self.measures),
+            ("metric", self.metrics),
+            ("relationship", self.relationships),
+        )
+        objects = {
+            f"{kind}.{name}": value
+            for kind, values in collections
+            for name, value in values.items()
+        }
+        return MappingProxyType(dict(sorted(objects.items())))
+
+    def resolve(self, semantic_id: str) -> SemanticObject:
+        try:
+            return self.semantic_objects()[semantic_id]
+        except KeyError:
+            raise KeyError(f"unknown semantic identifier: {semantic_id}") from None
+
 
 _IDENTIFIER = re.compile(r"[a-z][a-z0-9_]*")
 _AGGREGATIONS: frozenset[str] = frozenset(
@@ -604,5 +639,6 @@ __all__ = [
     "CatalogIssue",
     "CatalogValidationError",
     "SemanticLayer",
+    "SemanticObject",
     "load",
 ]
