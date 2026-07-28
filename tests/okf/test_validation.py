@@ -1,0 +1,289 @@
+from pathlib import Path
+
+import pytest
+
+from selayer import SemanticLayer
+from selayer.okf import OkfBundle, OkfValidationError
+
+
+def _write_concept(root: Path, frontmatter: str, body: str = "") -> Path:
+    path = root / "concept.md"
+    path.write_text(f"---\n{frontmatter}\n---\n{body}", encoding="utf-8")
+    return path
+
+
+def test_load_collects_and_sorts_invalid_documents(tmp_path: Path) -> None:
+    (tmp_path / "a.md").write_text("---\ntitle: Missing type\n---\n", encoding="utf-8")
+    (tmp_path / "b.md").write_text(
+        "---\ntype: Metric\nstatus: unknown\n---\n", encoding="utf-8"
+    )
+
+    with pytest.raises(OkfValidationError) as caught:
+        OkfBundle.load(tmp_path)
+
+    assert list(caught.value.issues) == sorted(
+        caught.value.issues,
+        key=lambda issue: (issue.path, issue.message),
+    )
+    assert {issue.path for issue in caught.value.issues} == {
+        "a.md.frontmatter.type",
+        "b.md.frontmatter.status",
+    }
+
+
+@pytest.mark.parametrize(
+    ("frontmatter", "issue_path"),
+    [
+        ("type: Metric\ngenerated: []", "concept.md.frontmatter.generated"),
+        ("type: Metric\nsources: nope", "concept.md.frontmatter.sources"),
+        (
+            "type: Metric\nstale_after: not-a-date",
+            "concept.md.frontmatter.stale_after",
+        ),
+        (
+            "type: Attested Computation",
+            "concept.md.frontmatter.runtime",
+        ),
+    ],
+)
+def test_invalid_optional_families_are_rejected(
+    tmp_path: Path,
+    frontmatter: str,
+    issue_path: str,
+) -> None:
+    _write_concept(tmp_path, frontmatter)
+    with pytest.raises(OkfValidationError) as caught:
+        OkfBundle.load(tmp_path)
+    assert issue_path in {issue.path for issue in caught.value.issues}
+
+
+@pytest.mark.parametrize(
+    "verified",
+    [
+        "{by: human:owner, at: 2026-07-27T10:00:00Z}",
+        "[{by: process:nightly, at: 2026-07-27T02:00:00Z}]",
+    ],
+)
+def test_verified_accepts_mapping_and_list_forms(
+    tmp_path: Path,
+    verified: str,
+) -> None:
+    _write_concept(tmp_path, f"type: Metric\nverified: {verified}")
+    assert OkfBundle.load(tmp_path).concepts["concept"]
+
+
+def test_valid_v02_optional_families_are_accepted(tmp_path: Path) -> None:
+    _write_concept(
+        tmp_path,
+        "type: Metric\n"
+        "status: stable\n"
+        "stale_after: 2026-09-23\n"
+        "generated: {by: process:selayer-okf, at: 2026-07-27T14:00:00Z}\n"
+        "verified: {by: human:owner, at: 2026-07-27T15:00:00Z}\n"
+        "sources:\n"
+        "  - id: policy\n"
+        "    resource: https://example.com/policy\n",
+    )
+
+    assert OkfBundle.load(tmp_path).concepts["concept"]
+
+
+@pytest.mark.parametrize(
+    ("family", "issue_path"),
+    [
+        ("generated: {at: 2026-07-27T10:00:00Z}", "generated.by"),
+        ("generated: {by: process:build, at: yesterday}", "generated.at"),
+        ("verified: [{by: human:owner}]", "verified[0].at"),
+        ("verified: nope", "verified"),
+        ("sources: [nope]", "sources[0]"),
+        ("sources: [{id: policy}]", "sources[0].resource"),
+    ],
+)
+def test_optional_family_members_are_validated(
+    tmp_path: Path,
+    family: str,
+    issue_path: str,
+) -> None:
+    _write_concept(tmp_path, f"type: Metric\n{family}")
+
+    with pytest.raises(OkfValidationError) as caught:
+        OkfBundle.load(tmp_path)
+
+    assert f"concept.md.frontmatter.{issue_path}" in {
+        issue.path for issue in caught.value.issues
+    }
+
+
+def test_unknown_type_and_extension_are_preserved(tmp_path: Path) -> None:
+    _write_concept(
+        tmp_path,
+        "type: Product Identifier Scheme\ncustom_owner: product",
+    )
+    concept = OkfBundle.load(tmp_path).concepts["concept"]
+    assert concept.frontmatter["custom_owner"] == "product"
+
+
+def test_malformed_yaml_is_reported_at_document_path(tmp_path: Path) -> None:
+    (tmp_path / "bad.md").write_text(
+        "---\ntype: [unterminated\n---\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(OkfValidationError) as caught:
+        OkfBundle.load(tmp_path)
+    assert caught.value.issues[0].path == "bad.md"
+
+
+def test_broken_internal_links_are_sorted_warnings(tmp_path: Path) -> None:
+    _write_concept(
+        tmp_path,
+        "type: Metric",
+        "\n# Related\n\n"
+        "[missing](missing.md) [absolute](/other.md) "
+        "[external](https://example.com) [anchor](#related)\n",
+    )
+
+    bundle = OkfBundle.load(tmp_path)
+
+    assert len(bundle.diagnostics) == 2
+    assert all(issue.severity == "warning" for issue in bundle.diagnostics)
+    assert list(bundle.diagnostics) == sorted(
+        bundle.diagnostics,
+        key=lambda issue: (issue.path, issue.message),
+    )
+
+
+def test_existing_internal_link_is_valid(tmp_path: Path) -> None:
+    _write_concept(
+        tmp_path,
+        "type: Metric",
+        "\n# Related\n\n[Other](other.md#meaning)\n",
+    )
+    (tmp_path / "other.md").write_text(
+        "---\ntype: Reference\n---\n\n# Meaning\n",
+        encoding="utf-8",
+    )
+
+    assert OkfBundle.load(tmp_path).diagnostics == ()
+
+
+def test_selayer_id_is_resolved_and_kind_checked(
+    tmp_path: Path, valid_catalog_path: Path
+) -> None:
+    layer = SemanticLayer.load(valid_catalog_path)
+    knowledge = tmp_path / "knowledge"
+    knowledge.mkdir()
+    _write_concept(
+        knowledge,
+        "type: Selayer Metric\nselayer_id: metric.gross_margin",
+    )
+
+    bundle = OkfBundle.load(knowledge, layer=layer)
+
+    assert bundle.layer is layer
+
+
+@pytest.mark.parametrize(
+    ("frontmatter", "issue_path"),
+    [
+        (
+            "type: Selayer Metric\nselayer_id: metric.unknown",
+            "concept.md.frontmatter.selayer_id",
+        ),
+        (
+            "type: Selayer Dimension\nselayer_id: metric.gross_margin",
+            "concept.md.frontmatter.type",
+        ),
+        (
+            "type: Selayer Metric\nselayer_id: [metric, gross_margin]",
+            "concept.md.frontmatter.selayer_id",
+        ),
+    ],
+)
+def test_invalid_selayer_bindings_are_rejected(
+    tmp_path: Path,
+    valid_catalog_path: Path,
+    frontmatter: str,
+    issue_path: str,
+) -> None:
+    layer = SemanticLayer.load(valid_catalog_path)
+    knowledge = tmp_path / "knowledge"
+    knowledge.mkdir()
+    _write_concept(knowledge, frontmatter)
+
+    with pytest.raises(OkfValidationError) as caught:
+        OkfBundle.load(knowledge, layer=layer)
+
+    assert issue_path in {issue.path for issue in caught.value.issues}
+
+
+def test_duplicate_selayer_bindings_are_rejected(
+    tmp_path: Path, valid_catalog_path: Path
+) -> None:
+    layer = SemanticLayer.load(valid_catalog_path)
+    for name in ("a.md", "b.md"):
+        (tmp_path / name).write_text(
+            "---\ntype: Selayer Metric\nselayer_id: metric.gross_margin\n---\n",
+            encoding="utf-8",
+        )
+
+    with pytest.raises(OkfValidationError) as caught:
+        OkfBundle.load(tmp_path, layer=layer)
+
+    assert {issue.path for issue in caught.value.issues} == {
+        "a.md.frontmatter.selayer_id",
+        "b.md.frontmatter.selayer_id",
+    }
+
+
+def test_nested_index_rejects_frontmatter(tmp_path: Path) -> None:
+    nested = tmp_path / "metrics"
+    nested.mkdir()
+    (nested / "index.md").write_text(
+        "---\nokf_version: '0.2'\n---\n\n# Metrics\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(OkfValidationError) as caught:
+        OkfBundle.load(tmp_path)
+    assert caught.value.issues[0].path == "metrics/index.md"
+
+
+def test_root_index_allows_only_okf_version_frontmatter(tmp_path: Path) -> None:
+    (tmp_path / "index.md").write_text(
+        "---\nokf_version: '0.2'\nextra: nope\n---\n\n# Concepts\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OkfValidationError) as caught:
+        OkfBundle.load(tmp_path)
+
+    assert caught.value.issues[0].path == "index.md"
+
+
+def test_root_index_accepts_optional_version_frontmatter(tmp_path: Path) -> None:
+    (tmp_path / "index.md").write_text(
+        "---\nokf_version: '0.2'\n---\n\n# Concepts\n",
+        encoding="utf-8",
+    )
+
+    assert OkfBundle.load(tmp_path).concepts == {}
+
+
+def test_log_requires_iso_date_headings(tmp_path: Path) -> None:
+    (tmp_path / "log.md").write_text(
+        "# Directory Update Log\n\n## July 27\n* Update\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(OkfValidationError) as caught:
+        OkfBundle.load(tmp_path)
+    assert caught.value.issues[0].path == "log.md"
+
+
+def test_log_accepts_iso_date_headings_at_any_level(tmp_path: Path) -> None:
+    nested = tmp_path / "metrics"
+    nested.mkdir()
+    (nested / "log.md").write_text(
+        "# Directory Update Log\n\n## 2026-07-27\n* Update\n",
+        encoding="utf-8",
+    )
+
+    assert OkfBundle.load(tmp_path).concepts == {}
