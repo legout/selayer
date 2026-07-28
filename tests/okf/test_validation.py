@@ -133,6 +133,20 @@ def test_malformed_yaml_is_reported_at_document_path(tmp_path: Path) -> None:
     assert caught.value.issues[0].path == "bad.md"
 
 
+def test_cyclic_yaml_alias_is_reported_at_document_path(tmp_path: Path) -> None:
+    (tmp_path / "cyclic.md").write_text(
+        "---\ntype: Metric\ncustom: &node {self: *node}\n---\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OkfValidationError) as caught:
+        OkfBundle.load(tmp_path)
+
+    assert [(issue.path, issue.message) for issue in caught.value.issues] == [
+        ("cyclic.md", "cyclic YAML frontmatter is not supported")
+    ]
+
+
 def test_broken_internal_links_are_sorted_warnings(tmp_path: Path) -> None:
     _write_concept(
         tmp_path,

@@ -108,6 +108,27 @@ def test_frontmatter_is_deeply_immutable_and_renders_as_plain_yaml(
     assert parse_concept(path, tmp_path) == concept
 
 
+def test_yaml_set_extension_is_immutable_and_round_trips(tmp_path: Path) -> None:
+    path = tmp_path / "concept.md"
+    path.write_text(
+        "---\ntype: Metric\ncustom_tags: !!set\n  finance:\n  retained:\n---\n",
+        encoding="utf-8",
+    )
+
+    concept = OkfBundle.load(tmp_path).concepts["concept"]
+
+    assert concept.frontmatter["custom_tags"] == frozenset({"finance", "retained"})
+    assert isinstance(concept.frontmatter["custom_tags"], frozenset)
+    rendered = render_concept(concept)
+    rendered_frontmatter = yaml.safe_load(rendered.split("---\n", 2)[1])
+    assert isinstance(rendered_frontmatter, dict)
+    assert type(rendered_frontmatter["custom_tags"]) is set
+    assert rendered_frontmatter["custom_tags"] == {"finance", "retained"}
+
+    path.write_text(rendered, encoding="utf-8")
+    assert parse_concept(path, tmp_path) == concept
+
+
 def test_heading_inside_fence_is_not_a_section(tmp_path: Path) -> None:
     path = tmp_path / "concept.md"
     path.write_text(

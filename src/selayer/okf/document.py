@@ -7,7 +7,7 @@ from typing import Any
 
 import yaml
 
-from .model import OkfConcept, OkfSection
+from .model import OkfConcept, OkfMetadataError, OkfSection
 
 _FRONTMATTER = re.compile(r"\A---\n(.*?)\n---(?:\n|\Z)", re.DOTALL)
 _HEADING = re.compile(r"^# ([^#].*)$")
@@ -33,14 +33,17 @@ def parse_concept(path: Path, root: Path) -> OkfConcept:
     body = text[match.end() :].lstrip("\n")
     preamble, sections = split_sections(body)
     relative_path = PurePosixPath(path.relative_to(root).as_posix())
-    return OkfConcept.create(
-        concept_id=relative_path.with_suffix("").as_posix(),
-        relative_path=relative_path,
-        frontmatter=loaded,
-        preamble=preamble,
-        sections=sections,
-        links=tuple(_LINK.findall(body)),
-    )
+    try:
+        return OkfConcept.create(
+            concept_id=relative_path.with_suffix("").as_posix(),
+            relative_path=relative_path,
+            frontmatter=loaded,
+            preamble=preamble,
+            sections=sections,
+            links=tuple(_LINK.findall(body)),
+        )
+    except OkfMetadataError as error:
+        raise OkfDocumentError("cyclic YAML frontmatter is not supported") from error
 
 
 def _fence_marker(line: str) -> str | None:
@@ -91,6 +94,8 @@ def _thaw(value: Any) -> Any:
         return {key: _thaw(item) for key, item in value.items()}
     if isinstance(value, tuple):
         return [_thaw(item) for item in value]
+    if isinstance(value, frozenset):
+        return {_thaw(item) for item in value}
     return value
 
 

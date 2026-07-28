@@ -11,12 +11,29 @@ TrustTier = Literal["unverified", "machine_confirmed", "human_reviewed"]
 Freshness = Literal["current", "stale", "unspecified"]
 
 
-def _freeze(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze(item) for item in value)
-    return value
+class OkfMetadataError(ValueError):
+    pass
+
+
+def _freeze(value: Any, identity_stack: set[int] | None = None) -> Any:
+    if not isinstance(value, (Mapping, list, tuple, set, frozenset)):
+        return value
+    if identity_stack is None:
+        identity_stack = set()
+    identity = id(value)
+    if identity in identity_stack:
+        raise OkfMetadataError("cyclic metadata")
+    identity_stack.add(identity)
+    try:
+        if isinstance(value, Mapping):
+            return MappingProxyType(
+                {key: _freeze(item, identity_stack) for key, item in value.items()}
+            )
+        if isinstance(value, (list, tuple)):
+            return tuple(_freeze(item, identity_stack) for item in value)
+        return frozenset(_freeze(item, identity_stack) for item in value)
+    finally:
+        identity_stack.remove(identity)
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +89,7 @@ __all__ = [
     "Freshness",
     "OkfConcept",
     "OkfIssue",
+    "OkfMetadataError",
     "OkfSection",
     "OkfValidationError",
     "Severity",
