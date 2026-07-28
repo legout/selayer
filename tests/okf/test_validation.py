@@ -12,6 +12,31 @@ def _write_concept(root: Path, frontmatter: str, body: str = "") -> Path:
     return path
 
 
+@pytest.mark.parametrize(
+    ("root_kind", "expected_error"),
+    [("missing", FileNotFoundError), ("file", NotADirectoryError)],
+)
+def test_load_rejects_missing_or_non_directory_root(
+    tmp_path: Path, root_kind: str, expected_error: type[OSError]
+) -> None:
+    root = tmp_path / "bundle"
+    if root_kind == "file":
+        root.write_text("not a bundle", encoding="utf-8")
+
+    with pytest.raises(expected_error, match="bundle root"):
+        OkfBundle.load(root)
+
+
+def test_load_accepts_empty_directory(tmp_path: Path) -> None:
+    root = tmp_path / "bundle"
+    root.mkdir()
+
+    bundle = OkfBundle.load(root)
+
+    assert bundle.concepts == {}
+    assert bundle.diagnostics == ()
+
+
 def test_load_collects_and_sorts_invalid_documents(tmp_path: Path) -> None:
     (tmp_path / "a.md").write_text("---\ntitle: Missing type\n---\n", encoding="utf-8")
     (tmp_path / "b.md").write_text(

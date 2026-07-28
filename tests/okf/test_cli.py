@@ -132,6 +132,46 @@ def test_retrieve_emits_attributed_context_as_json(
     assert payload["items"][0]["provider"] == "selayer"
 
 
+@pytest.mark.parametrize("root_kind", ["missing", "file"])
+def test_validate_rejects_missing_or_non_directory_root(
+    tmp_path: Path,
+    root_kind: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bundle = tmp_path / "bundle"
+    if root_kind == "file":
+        bundle.write_text("not a bundle", encoding="utf-8")
+
+    exit_code, stdout, stderr = _invoke(["validate", str(bundle)], capsys)
+
+    assert exit_code == 1
+    assert stdout == ""
+    assert stderr.startswith("error: bundle root")
+    assert stderr.count("\n") == 1
+    assert "Traceback" not in stderr
+
+
+@pytest.mark.parametrize("root_kind", ["missing", "file"])
+def test_context_rejects_missing_or_non_directory_root(
+    tmp_path: Path,
+    root_kind: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bundle = tmp_path / "bundle"
+    if root_kind == "file":
+        bundle.write_text("not a bundle", encoding="utf-8")
+
+    exit_code, stdout, stderr = _invoke(
+        ["retrieve", str(bundle), "dimension.missing"], capsys
+    )
+
+    assert exit_code == 1
+    assert stdout == ""
+    assert stderr.startswith("error: bundle root")
+    assert stderr.count("\n") == 1
+    assert "Traceback" not in stderr
+
+
 def test_domain_errors_use_stderr_and_exit_one(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

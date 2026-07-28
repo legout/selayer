@@ -528,6 +528,10 @@ class OkfBundle:
         layer: SemanticLayer | None = None,
     ) -> OkfBundle:
         root = Path(path)
+        if not root.exists():
+            raise FileNotFoundError(f"bundle root does not exist: '{root}'")
+        if not root.is_dir():
+            raise NotADirectoryError(f"bundle root is not a directory: '{root}'")
         concepts: dict[str, OkfConcept] = {}
         issues: list[OkfIssue] = []
         for concept_path in sorted(root.rglob("*.md")):
