@@ -72,6 +72,12 @@ relationships:
 
 
 @pytest.fixture
+def root() -> Path:
+    """Return the repository root for integration fixtures."""
+    return Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture
 def valid_catalog_path(tmp_path: Path) -> Path:
     """A path to a fully valid schema-version-1 catalog file."""
     path = tmp_path / "layer.yaml"

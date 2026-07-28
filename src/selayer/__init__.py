@@ -15,6 +15,8 @@ from selayer.model import (
 from selayer.planning import QueryPlan, QueryPlanningError
 from selayer.query import QueryEngine
 
+from .okf import OkfBundle
+
 __all__ = [
     "Aggregation",
     "Cardinality",
@@ -25,6 +27,7 @@ __all__ = [
     "Fact",
     "Measure",
     "Metric",
+    "OkfBundle",
     "QueryEngine",
     "QueryExecutionError",
     "QueryPlan",

@@ -1,7 +1,6 @@
-"""Open Knowledge Format document parsing and bundle validation."""
+"""Public interface for advisory Open Knowledge Format context."""
 
 from .bundle import OkfBundle
-from .document import OkfDocumentError, parse_concept, render_concept
 from .model import (
     ContextBudgetError,
     ContextItem,
@@ -9,7 +8,6 @@ from .model import (
     ContextResult,
     OkfConcept,
     OkfIssue,
-    OkfSection,
     OkfValidationError,
     SyncReport,
 )
@@ -21,11 +19,7 @@ __all__ = [
     "ContextResult",
     "OkfBundle",
     "OkfConcept",
-    "OkfDocumentError",
     "OkfIssue",
-    "OkfSection",
     "OkfValidationError",
     "SyncReport",
-    "parse_concept",
-    "render_concept",
 ]
