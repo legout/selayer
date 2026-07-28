@@ -83,6 +83,8 @@ def test_mlfb_retrieval_surfaces_the_attested_computation_contract(
     assert contract is not None
     assert contract.runtime == "python"
     assert contract.parameters[0].name == "mlfb"
+    assert contract.executor_resource == "../references/mlfb_coding_guide.md"
+    assert contract.executor_receipt == ("decoded_value",)
     assert contract.attester_resource is not None
     with pytest.raises(ContextLookupError):
         bundle.context_for(["dimension.product_color"])
