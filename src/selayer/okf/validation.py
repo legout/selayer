@@ -291,9 +291,7 @@ def _validate_executor(concept: OkfConcept, value: object) -> list[OkfIssue]:
     receipt = value.get("receipt")
     if "receipt" in value:
         if not isinstance(receipt, (list, tuple)):
-            issues.append(
-                _issue(concept, "executor.receipt", "receipt must be a list")
-            )
+            issues.append(_issue(concept, "executor.receipt", "receipt must be a list"))
         elif not receipt:
             issues.append(
                 _issue(
@@ -320,9 +318,7 @@ def _validate_attester(concept: OkfConcept, value: object) -> list[OkfIssue]:
         return [_issue(concept, "attester", "attester must be a mapping")]
     if not _is_nonempty_string(value.get("resource")):
         return [
-            _issue(
-                concept, "attester.resource", "resource must be a non-empty string"
-            )
+            _issue(concept, "attester.resource", "resource must be a non-empty string")
         ]
     return []
 

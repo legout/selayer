@@ -27,7 +27,9 @@ def _parameters(frontmatter: Mapping[str, object]) -> tuple[OkfParameter, ...]:
         if not isinstance(name, str) or not isinstance(param_type, str):
             continue
         required = entry.get("required", False)
-        derived.append(OkfParameter(name=name, type=param_type, required=bool(required)))
+        derived.append(
+            OkfParameter(name=name, type=param_type, required=bool(required))
+        )
     return tuple(derived)
 
 
