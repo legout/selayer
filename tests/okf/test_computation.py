@@ -5,9 +5,7 @@ from selayer.okf.computation import attested_computation
 from selayer.okf.model import AttestedComputation, OkfConcept, OkfParameter, OkfSection
 
 
-def _concept(
-    frontmatter: dict, sections: tuple[OkfSection, ...] = ()
-) -> OkfConcept:
+def _concept(frontmatter: dict, sections: tuple[OkfSection, ...] = ()) -> OkfConcept:
     return OkfConcept.create(
         concept_id="c",
         relative_path=PurePosixPath("c.md"),

@@ -21,12 +21,14 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
+  "deltalake>=1.6.2",
   "faker>=37.4.0",
   "ipython>=9.4.0",
   "pandas>=2.3.1",
   "pyright>=1.1.411",
   "pytest>=9.1.1",
   "ruff>=0.16.0",
+  "s3fs>=2026.6.0",
 ]
 
 [tool.hatch.build.targets.wheel]
