@@ -195,6 +195,70 @@ def test_regeneration_removes_stale_generated_concepts(
     assert curated.read_text(encoding="utf-8") == "human-authored guidance"
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Ownership marker example:\n\ngenerated:\n  by: process:selayer-okf\n",
+        "```yaml\ngenerated:\n  by: process:selayer-okf\n```\n",
+    ],
+    ids=["prose", "fenced-code-block"],
+)
+def test_regeneration_preserves_curated_marker_examples(
+    tmp_path: Path,
+    ecommerce_layer: SemanticLayer,
+    content: str,
+) -> None:
+    destination = tmp_path / "knowledge"
+    OkfBundle.generate(ecommerce_layer, destination)
+    curated = destination / "metrics" / "ownership_notes.md"
+    curated.write_text(content, encoding="utf-8")
+
+    OkfBundle.generate(ecommerce_layer, destination)
+
+    assert curated.read_text(encoding="utf-8") == content
+
+
+@pytest.mark.parametrize(
+    "frontmatter",
+    [
+        "generated:\n  by: process:selayer-okf\n  broken: [",
+        '"generated:\n  by: process:selayer-okf"',
+    ],
+    ids=["malformed", "non-mapping"],
+)
+def test_regeneration_preserves_invalid_frontmatter_with_marker(
+    tmp_path: Path,
+    ecommerce_layer: SemanticLayer,
+    frontmatter: str,
+) -> None:
+    destination = tmp_path / "knowledge"
+    OkfBundle.generate(ecommerce_layer, destination)
+    curated = destination / "metrics" / "ownership_notes.md"
+    content = f"---\n{frontmatter}\n---\n# Curated notes\n"
+    curated.write_text(content, encoding="utf-8")
+
+    OkfBundle.generate(ecommerce_layer, destination)
+
+    assert curated.read_text(encoding="utf-8") == content
+
+
+def test_regeneration_deletes_stale_frontmatter_owned_markdown(
+    tmp_path: Path,
+    ecommerce_layer: SemanticLayer,
+) -> None:
+    destination = tmp_path / "knowledge"
+    OkfBundle.generate(ecommerce_layer, destination)
+    stale = destination / "metrics" / "retired.md"
+    stale.write_text(
+        "---\ngenerated:\n  by: process:selayer-okf\n---\n# Retired metric\n",
+        encoding="utf-8",
+    )
+
+    OkfBundle.generate(ecommerce_layer, destination)
+
+    assert not stale.exists()
+
+
 def test_atomic_replacement_keeps_previous_file_when_replace_fails(
     tmp_path: Path,
     ecommerce_layer: SemanticLayer,

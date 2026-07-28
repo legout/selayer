@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
+
+import yaml
 
 from selayer.catalog import SemanticLayer
 
@@ -29,21 +32,39 @@ def _write_text(path: Path, content: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
+_LEADING_FRONTMATTER = re.compile(r"\A---\n(.*?)\n---(?:\n|\Z)", re.DOTALL)
+_GENERATOR_ID = "process:selayer-okf"
+
+
+def _has_generator_ownership(path: Path) -> bool:
+    text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+    match = _LEADING_FRONTMATTER.match(text)
+    if match is None:
+        return False
+    try:
+        frontmatter = yaml.safe_load(match.group(1))
+    except yaml.YAMLError:
+        return False
+    if not isinstance(frontmatter, Mapping):
+        return False
+    generated = frontmatter.get("generated")
+    return isinstance(generated, Mapping) and generated.get("by") == _GENERATOR_ID
+
+
 def _remove_stale_generated_files(
     destination: Path,
     directories: tuple[str, ...],
     expected: set[str],
 ) -> None:
-    marker = "generated:\n  by: process:selayer-okf"
     for directory in directories:
         managed = destination / directory
         if not managed.is_dir():
             continue
-        for path in managed.glob("*.md"):
+        for path in sorted(managed.glob("*.md")):
             relative = path.relative_to(destination).as_posix()
             if relative in expected:
                 continue
-            if path.name == "_index.md" or marker in path.read_text(encoding="utf-8"):
+            if path.name == "_index.md" or _has_generator_ownership(path):
                 path.unlink()
 
 
