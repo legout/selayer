@@ -166,6 +166,32 @@ def test_existing_internal_link_is_valid(tmp_path: Path) -> None:
     assert OkfBundle.load(tmp_path).diagnostics == ()
 
 
+@pytest.mark.parametrize(
+    "selayer_id",
+    [
+        "metric.",
+        ".gross_margin",
+        "metric.GrossMargin",
+        "metric.two.parts",
+    ],
+)
+def test_malformed_selayer_ids_are_rejected_without_a_layer(
+    tmp_path: Path,
+    selayer_id: str,
+) -> None:
+    _write_concept(
+        tmp_path,
+        f"type: Selayer Metric\nselayer_id: {selayer_id}",
+    )
+
+    with pytest.raises(OkfValidationError) as caught:
+        OkfBundle.load(tmp_path, layer=None)
+
+    assert {issue.path for issue in caught.value.issues} == {
+        "concept.md.frontmatter.selayer_id"
+    }
+
+
 def test_selayer_id_is_resolved_and_kind_checked(
     tmp_path: Path, valid_catalog_path: Path
 ) -> None:

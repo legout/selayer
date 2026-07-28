@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 import yaml
 
@@ -84,9 +86,17 @@ def split_sections(body: str) -> tuple[str, tuple[OkfSection, ...]]:
     return "\n".join(preamble).strip(), tuple(sections)
 
 
+def _thaw(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw(item) for item in value]
+    return value
+
+
 def render_concept(concept: OkfConcept) -> str:
     dumped = yaml.safe_dump(
-        dict(concept.frontmatter),
+        _thaw(concept.frontmatter),
         sort_keys=False,
         allow_unicode=True,
         default_flow_style=False,

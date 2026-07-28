@@ -11,6 +11,14 @@ TrustTier = Literal["unverified", "machine_confirmed", "human_reviewed"]
 Freshness = Literal["current", "stale", "unspecified"]
 
 
+def _freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class OkfIssue:
     path: str
@@ -53,7 +61,7 @@ class OkfConcept:
         return cls(
             concept_id=concept_id,
             relative_path=relative_path,
-            frontmatter=MappingProxyType(dict(frontmatter)),
+            frontmatter=_freeze(frontmatter),
             preamble=preamble,
             sections=sections,
             links=links,

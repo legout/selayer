@@ -1,5 +1,12 @@
+import operator
 from pathlib import Path
+from types import MappingProxyType
+from typing import Any, cast
 
+import pytest
+import yaml
+
+from selayer.okf import OkfBundle
 from selayer.okf.document import parse_concept, render_concept
 
 
@@ -28,6 +35,77 @@ def test_parse_and_render_preserves_extensions_and_curated_sections(
         "Usage Guidance",
     ]
     assert "Use item revenue." in render_concept(concept)
+
+
+def test_frontmatter_is_deeply_immutable_and_renders_as_plain_yaml(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "concept.md"
+    path.write_text(
+        "---\n"
+        "type: Metric\n"
+        "custom:\n"
+        "  nested:\n"
+        "    entries:\n"
+        "      - label: retained\n"
+        "sources:\n"
+        "  - resource: https://example.com/policy\n"
+        "    details:\n"
+        "      tags: [policy]\n"
+        "generated:\n"
+        "  by: process:selayer-okf\n"
+        "  details:\n"
+        "    steps: [parse]\n"
+        "verified:\n"
+        "  - by: human:owner\n"
+        "    at: '2026-07-27T15:00:00Z'\n"
+        "    evidence:\n"
+        "      reviewers: [owner]\n"
+        "---\n",
+        encoding="utf-8",
+    )
+
+    concept = OkfBundle.load(tmp_path).concepts["concept"]
+
+    assert isinstance(concept.frontmatter, MappingProxyType)
+    assert isinstance(concept.frontmatter["custom"], MappingProxyType)
+    assert isinstance(concept.frontmatter["custom"]["nested"], MappingProxyType)
+    assert isinstance(concept.frontmatter["custom"]["nested"]["entries"], tuple)
+    assert isinstance(
+        concept.frontmatter["custom"]["nested"]["entries"][0], MappingProxyType
+    )
+    assert isinstance(concept.frontmatter["sources"], tuple)
+    assert isinstance(concept.frontmatter["sources"][0], MappingProxyType)
+    assert isinstance(concept.frontmatter["sources"][0]["details"], MappingProxyType)
+    assert isinstance(concept.frontmatter["sources"][0]["details"]["tags"], tuple)
+    assert isinstance(concept.frontmatter["generated"], MappingProxyType)
+    assert isinstance(concept.frontmatter["generated"]["details"], MappingProxyType)
+    assert isinstance(concept.frontmatter["generated"]["details"]["steps"], tuple)
+    assert isinstance(concept.frontmatter["verified"], tuple)
+    assert isinstance(concept.frontmatter["verified"][0], MappingProxyType)
+    assert isinstance(concept.frontmatter["verified"][0]["evidence"], MappingProxyType)
+    assert isinstance(
+        concept.frontmatter["verified"][0]["evidence"]["reviewers"], tuple
+    )
+    with pytest.raises(TypeError):
+        operator.setitem(cast(Any, concept.frontmatter["custom"]), "new", "value")
+    with pytest.raises(TypeError):
+        operator.setitem(cast(Any, concept.frontmatter["sources"]), 0, {})
+
+    rendered = render_concept(concept)
+    rendered_frontmatter = yaml.safe_load(rendered.split("---\n", 2)[1])
+    assert type(rendered_frontmatter) is dict
+    assert type(rendered_frontmatter["custom"]["nested"]["entries"]) is list
+    assert type(rendered_frontmatter["sources"]) is list
+    assert type(rendered_frontmatter["sources"][0]) is dict
+    assert type(rendered_frontmatter["generated"]) is dict
+    assert type(rendered_frontmatter["verified"]) is list
+    assert rendered_frontmatter["custom"]["nested"]["entries"] == [
+        {"label": "retained"}
+    ]
+
+    path.write_text(rendered, encoding="utf-8")
+    assert parse_concept(path, tmp_path) == concept
 
 
 def test_heading_inside_fence_is_not_a_section(tmp_path: Path) -> None:

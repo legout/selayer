@@ -23,6 +23,9 @@ _KIND_TYPES = {
     "relationship": "Selayer Relationship",
 }
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_SELAYER_ID = re.compile(
+    r"(source|dimension|fact|measure|metric|relationship)\.([a-z][a-z0-9_]*)"
+)
 _FRONTMATTER = re.compile(r"\A---\n(.*?)\n---(?:\n|\Z)", re.DOTALL)
 _LOG_HEADING = re.compile(r"^## (.+?)\s*$")
 
@@ -89,9 +92,11 @@ def _validate_generated(concept: OkfConcept, value: object) -> list[OkfIssue]:
 
 def _validate_verified(concept: OkfConcept, value: object) -> list[OkfIssue]:
     if isinstance(value, Mapping):
-        events: list[object] = [value]
-    elif isinstance(value, list):
-        events = value
+        events: tuple[object, ...] = (value,)
+        is_sequence = False
+    elif isinstance(value, (list, tuple)):
+        events = tuple(value)
+        is_sequence = True
     else:
         return [_issue(concept, "verified", "verified must be a mapping or list")]
     return [
@@ -100,14 +105,14 @@ def _validate_verified(concept: OkfConcept, value: object) -> list[OkfIssue]:
         for issue in _validate_event(
             concept,
             event,
-            f"verified[{index}]" if isinstance(value, list) else "verified",
+            f"verified[{index}]" if is_sequence else "verified",
             require_at=True,
         )
     ]
 
 
 def _validate_sources(concept: OkfConcept, value: object) -> list[OkfIssue]:
-    if not isinstance(value, list):
+    if not isinstance(value, (list, tuple)):
         return [_issue(concept, "sources", "sources must be a list")]
     issues: list[OkfIssue] = []
     for index, source in enumerate(value):
@@ -135,18 +140,18 @@ def _validate_selayer_id(
         return [_issue(concept, "selayer_id", "selayer_id must be a non-empty string")]
     semantic_id = value
     assert isinstance(semantic_id, str)
-    prefix, separator, _ = semantic_id.partition(".")
-    expected_type = _KIND_TYPES.get(prefix)
-    issues: list[OkfIssue] = []
-    if not separator or expected_type is None:
-        issues.append(
+    if _SELAYER_ID.fullmatch(semantic_id) is None:
+        return [
             _issue(
                 concept,
                 "selayer_id",
-                f"unknown semantic identifier kind in '{semantic_id}'",
+                "selayer_id must use a canonical semantic kind and a local name "
+                "matching [a-z][a-z0-9_]*",
             )
-        )
-        return issues
+        ]
+    prefix = semantic_id.partition(".")[0]
+    expected_type = _KIND_TYPES[prefix]
+    issues: list[OkfIssue] = []
     if concept.frontmatter.get("type") != expected_type:
         issues.append(
             _issue(
