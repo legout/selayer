@@ -16,6 +16,7 @@ from selayer.expressions.ast import (
     Scalar,
     UnaryOperation,
 )
+from selayer.expressions.formatting import format_expression
 from selayer.expressions.parser import parse_expression
 from selayer.expressions.validation import (
     METRIC_FUNCTIONS,
@@ -36,6 +37,7 @@ __all__ = [
     "Reference",
     "Scalar",
     "UnaryOperation",
+    "format_expression",
     "parse_expression",
     "references",
     "validate_metric_expression",
