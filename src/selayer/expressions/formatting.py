@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import math
+from decimal import Decimal
+
 from .ast import (
     BinaryOperation,
     Expression,
@@ -11,7 +14,6 @@ from .ast import (
 
 _BINARY_PRECEDENCE = {
     "=": 1,
-    "==": 1,
     "!=": 1,
     "<": 1,
     "<=": 1,
@@ -24,6 +26,7 @@ _BINARY_PRECEDENCE = {
 }
 _UNARY_PRECEDENCE = 4
 _ATOM_PRECEDENCE = 5
+_INFINITY_MAGNITUDE = "1" + "0" * 309 + ".0"
 
 
 def format_expression(expression: Expression) -> str:
@@ -45,6 +48,8 @@ def _format(
             return "false"
         if isinstance(expression.value, str):
             return _format_string(expression.value)
+        if isinstance(expression.value, float):
+            return _format_float(expression.value)
         return str(expression.value)
 
     if isinstance(expression, Reference):
@@ -90,6 +95,13 @@ def _format(
         return rendered
 
     raise TypeError(f"unsupported expression node: {type(expression).__name__}")
+
+
+def _format_float(value: float) -> str:
+    if math.isinf(value):
+        return _INFINITY_MAGNITUDE if value > 0 else f"-{_INFINITY_MAGNITUDE}"
+    rendered = format(Decimal.from_float(value), "f")
+    return rendered if "." in rendered else f"{rendered}.0"
 
 
 def _format_string(value: str) -> str:
