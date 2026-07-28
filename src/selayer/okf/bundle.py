@@ -223,6 +223,33 @@ def _item_diagnostics(item: ContextItem, concept: OkfConcept) -> tuple[OkfIssue,
     return tuple(issues)
 
 
+def _item_chars(item: ContextItem) -> int:
+    """Explicit character size of a context item.
+
+    Counts the rendered content plus every string carried by a non-null
+    Attested Computation contract. An authored contract can carry
+    arbitrary-length valid parameter and receipt strings, so the structured
+    data a context item returns is bounded alongside its rendered text.
+    """
+    total = len(item.content)
+    contract = item.attested_computation
+    if contract is None:
+        return total
+    total += len(contract.runtime)
+    for parameter in contract.parameters:
+        total += len(parameter.name)
+        total += len(parameter.type)
+    if contract.computation_path is not None:
+        total += len(contract.computation_path)
+    total += len(contract.computation_body)
+    if contract.executor_resource is not None:
+        total += len(contract.executor_resource)
+    total += sum(len(receipt) for receipt in contract.executor_receipt)
+    if contract.attester_resource is not None:
+        total += len(contract.attester_resource)
+    return total
+
+
 @dataclass(frozen=True, slots=True)
 class OkfBundle:
     root: Path | None
@@ -467,7 +494,7 @@ class OkfBundle:
             today if today is not None else datetime.now(timezone(timedelta(0))).date()
         )
         items = [_context_item(concept, effective_today) for concept in required]
-        total_chars = sum(len(item.content) for item in items)
+        total_chars = sum(_item_chars(item) for item in items)
         if total_chars > max_chars:
             raise ContextBudgetError(total_chars, max_chars)
 
@@ -494,7 +521,7 @@ class OkfBundle:
                         continue
                     visited.add(linked.concept_id)
                     linked_item = _context_item(linked, effective_today)
-                    linked_chars = len(linked_item.content)
+                    linked_chars = _item_chars(linked_item)
                     if total_chars + linked_chars > max_chars:
                         omitted = True
                         break

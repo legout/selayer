@@ -12,6 +12,7 @@ from selayer.okf import (
     OkfBundle,
     OkfConcept,
 )
+from selayer.okf.model import OkfSection
 
 
 def _write_concept(
@@ -250,9 +251,17 @@ def test_mandatory_concept_must_fit_budget(
 def test_optional_context_stops_at_budget_with_one_diagnostic(
     loaded_okf_bundle: OkfBundle,
 ) -> None:
-    direct = loaded_okf_bundle.context_for(["dimension.mlfb"], include_linked=False)
-    first_link = loaded_okf_bundle.context_for(["dimension.mlfb"], max_depth=1).items[1]
-    budget = direct.total_chars + len(first_link.content)
+    ample = loaded_okf_bundle.context_for(
+        ["dimension.mlfb"], max_depth=1, max_chars=100_000
+    )
+
+    # Budget that fits the direct concept plus exactly the first linked item.
+    # Derived from the bundle's own total_chars accounting so it tracks the
+    # shared sizing contract (rendered content plus any structured contract);
+    # the trailing linked items carry no attested computation, so their content
+    # length is their full size.
+    trailing = ample.items[2:]
+    budget = ample.total_chars - sum(len(item.content) for item in trailing)
 
     result = loaded_okf_bundle.context_for(
         ["dimension.mlfb"], max_depth=1, max_chars=budget
@@ -380,3 +389,49 @@ def test_attested_computation_contract_is_surfaced_on_linked_context(
     assert contract.executor_resource == "run.md"
     assert contract.attester_resource == "check.py"
     assert "def decode" in contract.computation_body
+
+
+def test_attested_computation_structured_contract_is_bounded() -> None:
+    """A budget covering only rendered content must still reject an oversized
+    structured Attested Computation contract, reporting the full required count."""
+    oversized = "x" * 400
+    body = "y" * 400
+    concept = OkfConcept.create(
+        concept_id="computations/decoder",
+        relative_path=PurePosixPath("computations/decoder.md"),
+        frontmatter={
+            "type": "Attested Computation",
+            "selayer_id": "computation.decoder",
+            "runtime": oversized,
+            "parameters": [
+                {"name": oversized, "type": oversized, "required": True}
+            ],
+            "computation": oversized,
+            "executor": {"resource": oversized, "receipt": [oversized]},
+            "attester": {"resource": oversized},
+        },
+        sections=(OkfSection("Computation", body),),
+    )
+    bundle = OkfBundle(root=None, concepts={concept.concept_id: concept})
+
+    ample = bundle.context_for(
+        ["computation.decoder"], include_linked=False, max_chars=10_000
+    )
+    item = ample.items[0]
+    assert item.attested_computation is not None
+    content_chars = len(item.content)
+
+    # Seven oversized scalar fields (runtime, param name, param type, path,
+    # executor resource, one receipt field, attester resource) plus the
+    # computation body live outside the rendered content budget.
+    contract_chars = 7 * len(oversized) + len(body)
+    required = content_chars + contract_chars
+
+    budget = content_chars
+    with pytest.raises(ContextBudgetError) as caught:
+        bundle.context_for(
+            ["computation.decoder"], include_linked=False, max_chars=budget
+        )
+
+    assert caught.value.max_chars == budget
+    assert caught.value.required_chars == required
