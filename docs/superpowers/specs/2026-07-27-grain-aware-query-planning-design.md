@@ -6,6 +6,8 @@ Make analytical correctness explicit. selayer must execute a query only when it 
 
 This is a breaking redesign. No released catalog format or Python interface requires backward compatibility.
 
+> **Source-contract follow-up:** The data-source declaration and loading portions of this design are superseded by [Data Source Adapters, Schema Contracts, and Reload Design](2026-07-28-data-source-adapters-design.md). Grain semantics, expression validation, planning, and compilation remain authoritative here.
+
 ## Goals
 
 1. Require every data source to declare the columns that identify one row.

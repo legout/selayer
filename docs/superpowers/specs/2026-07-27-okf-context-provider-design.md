@@ -35,6 +35,7 @@ This design targets OKF v0.2 as specified by the [Open Knowledge Format specific
 
 The validated selayer catalog remains the sole authority for executable analytical semantics:
 
+- source connector declarations and complete physical schemas;
 - source grains;
 - relationships and join cardinality;
 - facts and expressions;
@@ -51,6 +52,8 @@ Agent ── retrieves ──▶ OKF + catalog ── requests query ──▶ Q
 ```
 
 If an OKF statement conflicts with the catalog, selayer uses the catalog for execution and exposes the conflict for review.
+
+The source-schema authority, generated OKF schema summaries, and reload lifecycle are defined by [Data Source Adapters, Schema Contracts, and Reload Design](2026-07-28-data-source-adapters-design.md). OKF may mirror bounded catalog-derived schema context but cannot configure connectors, credentials, registration, or reload behavior.
 
 ## Stable semantic references
 
