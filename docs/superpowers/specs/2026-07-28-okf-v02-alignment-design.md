@@ -155,27 +155,20 @@ retrieval is advisory only.
   contract; `dimension.mlfb` retrieval surfaces it without adding queryable
   dimensions.
 
-## Secondary alignment items (later tasks)
+## Secondary alignment items
 
-These are conformant today; they close value/interop gaps and receive separate
-tasks after the Attested Computation work lands:
+The deferred audit items are now grouped into three approved follow-up designs,
+implemented in this dependency order:
 
-1. **Lenient consumer mode** — §11 says consumers SHOULD treat optional-family
-   constraints as soft guidance. Add `OkfBundle.load(..., strict=False)` that
-   collects malformed optional fields as warnings instead of raising.
-2. **Type-naming decision** — `Selayer Metric` vs spec-standard `Metric`.
-   Document the policy; if adopting standard types, carry binding via
-   `selayer_id` alone.
-3. **Index descriptions** — §8: entries SHOULD include the concept's
-   `description`. Populate in `index_documents()`.
-4. **Absolute links** — §6.1 recommends absolute (`/…`) links. Switch
-   generated index links to absolute.
-5. **Fingerprint relocation** — move `generated.fingerprint` to a top-level
-   `selayer_fingerprint` extension key to keep the spec's `generated{}`
-   family clean.
-6. **Credibility signals** — surface `author`/`usage_count`/`last_modified`/
-   `usage_window` and per-claim `sources[].id` attribution in `ContextItem`.
-7. **Top-level `resource`** — generate `resource` for catalog-backed sources
-   and dimensions from physical paths.
-8. **v0.1 fallback** — read legacy `timestamp` as `generated.at` and legacy
-   `# Citations` as `sources` (spec: consumers MAY).
+1. [OKF Consumer Compatibility](2026-07-28-okf-consumer-compatibility-design.md)
+   — lenient optional-family validation and v0.1 `timestamp`/`# Citations`
+   fallbacks.
+2. [OKF Generation Interoperability](2026-07-28-okf-generation-interoperability-design.md)
+   — generic generated types, index descriptions, absolute links, fingerprint
+   relocation, and catalog-backed resources.
+3. [OKF Retrieval Credibility](2026-07-28-okf-retrieval-credibility-design.md)
+   — typed credibility signals, usage windows, and per-claim source IDs.
+
+The generation policy adopts generic type names while accepting legacy
+`Selayer …` names. Fingerprints use dual-read/new-write auto-upgrade semantics.
+Dimension resources use `<source-path>#column=<URL-encoded-column>`.
