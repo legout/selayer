@@ -1,286 +1,227 @@
-name: E-commerce Analytics
-description: Semantic layer for e-commerce analytics
+version: 1
+name: ecommerce
+label: E-commerce Analytics
+description: Grain-aware semantic model for the example store
+
 data_sources:
   orders:
-    name: orders
     type: parquet
     path: data/orders.parquet
-    schema: null
-    connection_params: null
+    grain: [id]
   order_items:
-    name: order_items
     type: parquet
     path: data/order_items.parquet
-    schema: null
-    connection_params: null
+    grain: [order_id, product_id]
   customers:
-    name: customers
     type: parquet
     path: data/customers.parquet
-    schema: null
-    connection_params: null
+    grain: [id]
   products:
-    name: products
     type: parquet
     path: data/products.parquet
-    schema: null
-    connection_params: null
-  campaigns:
-    name: campaigns
-    type: parquet
-    path: data/campaigns.parquet
-    schema: null
-    connection_params: null
-  marketing_touches:
-    name: marketing_touches
-    type: parquet
-    path: data/marketing_touches.parquet
-    schema: null
-    connection_params: null
-  website_visits:
-    name: website_visits
-    type: parquet
-    path: data/website_visits.parquet
-    schema: null
-    connection_params: null
-facts:
-  order_amount:
-    name: order_amount
-    description: Total amount of each order in USD
-    data_type: decimal
-    source: orders
-    column: amount
-    is_additive: true
-  order_total_amount:
-    name: order_total_amount
-    description: Total amount including shipping and discounts
-    data_type: decimal
-    source: orders
-    column: total_amount
-    is_additive: true
-  discount_amount:
-    name: discount_amount
-    description: Discount amount applied to each order
-    data_type: decimal
-    source: orders
-    column: discount_amount
-    is_additive: true
-  shipping_cost:
-    name: shipping_cost
-    description: Shipping cost for each order
-    data_type: decimal
-    source: orders
-    column: shipping_cost
-    is_additive: true
-  item_quantity:
-    name: item_quantity
-    description: Quantity of each product in an order
-    data_type: integer
-    source: order_items
-    column: quantity
-    is_additive: true
-  item_price:
-    name: item_price
-    description: Price of each product in an order
-    data_type: decimal
-    source: order_items
-    column: price
-    is_additive: false
-  item_total:
-    name: item_total
-    description: Total price for each line item
-    data_type: decimal
-    source: order_items
-    column: total
-    is_additive: true
-  product_base_price:
-    name: product_base_price
-    description: Base price of each product
-    data_type: decimal
-    source: products
-    column: base_price
-    is_additive: false
-  product_cost:
-    name: product_cost
-    description: Cost of each product
-    data_type: decimal
-    source: products
-    column: cost
-    is_additive: false
-measures:
-  total_revenue:
-    name: total_revenue
-    description: Sum of all order amounts
-    fact: order_amount
-    aggregation: sum
-    filter_expression: null
-  total_discount:
-    name: total_discount
-    description: Sum of all discounts
-    fact: discount_amount
-    aggregation: sum
-    filter_expression: null
-  total_shipping:
-    name: total_shipping
-    description: Sum of all shipping costs
-    fact: shipping_cost
-    aggregation: sum
-    filter_expression: null
-  order_count:
-    name: order_count
-    description: Count of orders
-    fact: order_amount
-    aggregation: count_distinct
-    filter_expression: null
-  completed_order_count:
-    name: completed_order_count
-    description: Count of completed orders
-    fact: order_amount
-    aggregation: count_distinct
-    filter_expression: orders.status = 'completed'
-  units_sold:
-    name: units_sold
-    description: Total quantity of items sold
-    fact: item_quantity
-    aggregation: sum
-    filter_expression: null
-  product_cost_sum:
-    name: product_cost_sum
-    description: Sum of product costs
-    fact: product_cost
-    aggregation: sum
-    filter_expression: null
+    grain: [id]
+
 dimensions:
   customer_id:
-    name: customer_id
-    description: Unique customer identifier
-    data_type: string
     source: customers
     column: id
-    hierarchies: []
-  customer_segment:
-    name: customer_segment
-    description: Customer segment
     data_type: string
+    description: Customer identifier
+  customer_segment:
     source: customers
     column: segment
-    hierarchies: []
-  customer_country:
-    name: customer_country
-    description: Customer country
     data_type: string
+    description: Customer segment
+  customer_country:
     source: customers
     column: country
-    hierarchies: []
-  product_id:
-    name: product_id
-    description: Unique product identifier
     data_type: string
+    description: Customer country
+  product_id:
     source: products
     column: id
-    hierarchies: []
-  product_category:
-    name: product_category
-    description: Product category
     data_type: string
+    description: Product identifier
+  product_category:
     source: products
     column: category
-    hierarchies: []
-  product_subcategory:
-    name: product_subcategory
-    description: Product subcategory
     data_type: string
+    description: Product category
+  product_subcategory:
     source: products
     column: subcategory
-    hierarchies:
-    - product_hierarchy
+    data_type: string
+    description: Product subcategory
   order_date:
-    name: order_date
-    description: Date of the order
-    data_type: date
     source: orders
     column: created_at
-    hierarchies:
-    - time_hierarchy
+    data_type: timestamp
+    description: Order creation timestamp
   order_status:
-    name: order_status
-    description: Status of the order
-    data_type: string
     source: orders
     column: status
-    hierarchies: []
-  payment_method:
-    name: payment_method
-    description: Payment method used
     data_type: string
+    description: Order status
+  payment_method:
     source: orders
     column: payment_method
-    hierarchies: []
-hierarchies:
-  time_hierarchy:
-    name: time_hierarchy
-    description: Time-based hierarchy for analysis
-    levels:
-    - year
-    - quarter
-    - month
-    - day
-  product_hierarchy:
-    name: product_hierarchy
-    description: Product category hierarchy
-    levels:
-    - product_category
-    - product_subcategory
+    data_type: string
+    description: Payment method
+
+facts:
+  order_amount:
+    source: orders
+    data_type: decimal
+    expression: orders.amount
+    description: Revenue recorded at order grain
+  order_total_amount:
+    source: orders
+    data_type: decimal
+    expression: orders.total_amount
+    description: Order total including shipping and discounts
+  discount_amount:
+    source: orders
+    data_type: decimal
+    expression: orders.discount_amount
+    description: Discount recorded at order grain
+  shipping_cost:
+    source: orders
+    data_type: decimal
+    expression: orders.shipping_cost
+    description: Shipping cost recorded at order grain
+  order_id:
+    source: orders
+    data_type: string
+    expression: orders.id
+    description: Stable order identifier
+  completed_order_id:
+    source: orders
+    data_type: string
+    expression: if(orders.status = 'completed', orders.id, null)
+    description: Identifier for completed orders
+  item_quantity:
+    source: order_items
+    data_type: integer
+    expression: order_items.quantity
+    description: Quantity on one order item
+  item_revenue:
+    source: order_items
+    data_type: decimal
+    expression: order_items.total
+    description: Revenue recorded on one order item
+  item_cost:
+    source: order_items
+    data_type: decimal
+    expression: order_items.quantity * products.cost
+    description: Extended product cost for one order item
+
+measures:
+  total_revenue:
+    fact: order_amount
+    aggregation: sum
+    description: Sum of order revenue
+  total_order_total:
+    fact: order_total_amount
+    aggregation: sum
+    description: Sum of order totals
+  total_discount:
+    fact: discount_amount
+    aggregation: sum
+    description: Sum of order discounts
+  total_shipping:
+    fact: shipping_cost
+    aggregation: sum
+    description: Sum of order shipping costs
+  order_count:
+    fact: order_id
+    aggregation: count_distinct
+    description: Number of orders
+  completed_order_count:
+    fact: completed_order_id
+    aggregation: count_distinct
+    description: Number of completed orders
+  units_sold:
+    fact: item_quantity
+    aggregation: sum
+    description: Sum of item quantities
+  total_item_revenue:
+    fact: item_revenue
+    aggregation: sum
+    description: Sum of item revenue
+  total_item_cost:
+    fact: item_cost
+    aggregation: sum
+    description: Sum of extended item cost
+
 metrics:
+  total_revenue:
+    expression: total_revenue
+    measures: [total_revenue]
+    description: Order revenue metric
+  order_count:
+    expression: order_count
+    measures: [order_count]
+    description: Order count metric
+  total_discount:
+    expression: total_discount
+    measures: [total_discount]
+    description: Order discount metric
+  total_shipping:
+    expression: total_shipping
+    measures: [total_shipping]
+    description: Order shipping metric
+  completed_order_count:
+    expression: completed_order_count
+    measures: [completed_order_count]
+    description: Completed order count metric
+  total_item_revenue:
+    expression: total_item_revenue
+    measures: [total_item_revenue]
+    description: Item revenue metric
+  total_item_cost:
+    expression: total_item_cost
+    measures: [total_item_cost]
+    description: Item cost metric
+  units_sold:
+    expression: units_sold
+    measures: [units_sold]
+    description: Units sold metric
   average_order_value:
-    name: average_order_value
-    description: Average order value
-    expression: '{{total_revenue}} / {{order_count}}'
-    measures:
-    - total_revenue
-    - order_count
-    dependencies: []
+    expression: total_revenue / nullif(order_count, 0)
+    measures: [total_revenue, order_count]
+    description: Average order revenue
   discount_rate:
-    name: discount_rate
-    description: Average discount rate
-    expression: '{{total_discount}} / {{total_revenue}}'
-    measures:
-    - total_discount
-    - total_revenue
-    dependencies: []
-  gross_margin:
-    name: gross_margin
-    description: Gross margin percentage
-    expression: ({{total_revenue}} - {{product_cost_sum}}) / {{total_revenue}}
-    measures:
-    - total_revenue
-    - product_cost_sum
-    dependencies: []
+    expression: total_discount / nullif(total_revenue, 0)
+    measures: [total_discount, total_revenue]
+    description: Discount as a share of order revenue
   order_completion_rate:
-    name: order_completion_rate
-    description: Percentage of orders that are completed
-    expression: '{{completed_order_count}} / {{order_count}}'
-    measures:
-    - completed_order_count
-    - order_count
-    dependencies: []
+    expression: completed_order_count / nullif(order_count, 0)
+    measures: [completed_order_count, order_count]
+    description: Completed orders as a share of all orders
+  average_item_price:
+    expression: total_item_revenue / nullif(units_sold, 0)
+    measures: [total_item_revenue, units_sold]
+    description: Average revenue per item unit
+  gross_margin:
+    expression: >-
+      (total_item_revenue - total_item_cost) / nullif(total_item_revenue, 0)
+    measures: [total_item_revenue, total_item_cost]
+    description: Item gross margin ratio
+
 relationships:
   customer_orders:
-    name: customer_orders
     source: customers
     target: orders
     type: one_to_many
     source_column: id
     target_column: customer_id
-  order_items_rel:
-    name: order_items_rel
+  order_items_orders:
     source: orders
     target: order_items
     type: one_to_many
     source_column: id
     target_column: order_id
   product_order_items:
-    name: product_order_items
     source: products
     target: order_items
     type: one_to_many
