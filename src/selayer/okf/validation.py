@@ -23,6 +23,7 @@ _KIND_TYPES = {
     "relationship": "Selayer Relationship",
 }
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_SHA256_HEX = re.compile(r"[0-9a-fA-F]{64}")
 _SELAYER_ID = re.compile(
     r"(source|dimension|fact|measure|metric|relationship)\.([a-z][a-z0-9_]*)"
 )
@@ -87,7 +88,21 @@ def _validate_event(
 
 
 def _validate_generated(concept: OkfConcept, value: object) -> list[OkfIssue]:
-    return _validate_event(concept, value, "generated", require_at=False)
+    issues = _validate_event(concept, value, "generated", require_at=False)
+    if isinstance(value, Mapping) and "fingerprint" in value:
+        fingerprint = value["fingerprint"]
+        if (
+            not isinstance(fingerprint, str)
+            or _SHA256_HEX.fullmatch(fingerprint) is None
+        ):
+            issues.append(
+                _issue(
+                    concept,
+                    "generated.fingerprint",
+                    "fingerprint must be a 64-character SHA-256 hex digest",
+                )
+            )
+    return issues
 
 
 def _validate_verified(concept: OkfConcept, value: object) -> list[OkfIssue]:

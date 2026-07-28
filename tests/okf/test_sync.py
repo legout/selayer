@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+import selayer.okf.bundle as bundle_module
 from selayer import SemanticLayer
 from selayer.okf import OkfBundle
 
@@ -62,6 +64,72 @@ def test_sync_preserves_curated_sections_and_extensions(
     assert report.conflicts == ()
 
 
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("description: Gross margin ratio", "description: Edited by hand"),
+        ("selayer_id: metric.gross_margin", "selayer_id: metric.hand_edited"),
+        (
+            "Expression: `(total_item_revenue - total_item_cost) / "
+            + "nullif(total_item_revenue, 0)`",
+            "Expression: `hand_edited`",
+        ),
+    ],
+    ids=["description", "selayer-id", "catalog-definition"],
+)
+def test_sync_conflicts_when_a_controlled_value_was_edited(
+    tmp_path: Path,
+    ecommerce_layer: SemanticLayer,
+    old: str,
+    new: str,
+) -> None:
+    destination = tmp_path / "knowledge"
+    OkfBundle.from_layer(ecommerce_layer).write(destination)
+    metric_path = destination / "metrics" / "gross_margin.md"
+    metric_path.write_text(
+        metric_path.read_text(encoding="utf-8").replace(old, new),
+        encoding="utf-8",
+    )
+    edited = metric_path.read_bytes()
+
+    report = OkfBundle.from_layer(ecommerce_layer).sync(destination)
+
+    assert report.conflicts == ("metrics/gross_margin.md",)
+    assert metric_path.read_bytes() == edited
+
+
+@pytest.mark.parametrize(
+    "fingerprint_replacement",
+    [
+        "",
+        "    fingerprint: not-a-digest\n",
+        "    fingerprint: " + "0" * 64 + "\n",
+    ],
+    ids=["absent", "invalid", "mismatched"],
+)
+def test_sync_conflicts_on_an_unprovable_generated_baseline(
+    tmp_path: Path,
+    ecommerce_layer: SemanticLayer,
+    fingerprint_replacement: str,
+) -> None:
+    destination = tmp_path / "knowledge"
+    OkfBundle.from_layer(ecommerce_layer).write(destination)
+    metric_path = destination / "metrics" / "gross_margin.md"
+    unsafe = re.sub(
+        r"^  fingerprint: [0-9a-f]{64}\n",
+        fingerprint_replacement,
+        metric_path.read_text(encoding="utf-8"),
+        count=1,
+        flags=re.MULTILINE,
+    ).encode()
+    metric_path.write_bytes(unsafe)
+
+    report = OkfBundle.from_layer(ecommerce_layer).sync(destination)
+
+    assert report.conflicts == ("metrics/gross_margin.md",)
+    assert metric_path.read_bytes() == unsafe
+
+
 def test_sync_refreshes_generated_description_only(
     tmp_path: Path,
     ecommerce_layer: SemanticLayer,
@@ -115,6 +183,84 @@ def test_sync_leaves_missing_generated_section_unchanged(
 
     assert report.conflicts == ("metrics/gross_margin.md",)
     assert metric_path.read_text(encoding="utf-8") == unsafe
+
+
+def test_controlled_merge_replaces_a_block_scalar_without_touching_next_key(
+    tmp_path: Path,
+    ecommerce_layer: SemanticLayer,
+    changed_ecommerce_layer: SemanticLayer,
+) -> None:
+    destination = tmp_path / "knowledge"
+    OkfBundle.from_layer(ecommerce_layer).write(destination)
+    dimension_path = destination / "dimensions" / "product_category.md"
+    edited = dimension_path.read_text(encoding="utf-8").replace(
+        "description: Product category\n",
+        "description: |- # generator-owned formatting\n  Product category\n",
+    )
+    dimension_path.write_text(edited, encoding="utf-8")
+
+    report = OkfBundle.from_layer(changed_ecommerce_layer).sync(destination)
+
+    updated = dimension_path.read_text(encoding="utf-8")
+    assert "dimensions/product_category.md" in report.written
+    assert (
+        "description: Product family\nselayer_id: dimension.product_category\n"
+        in updated
+    )
+    assert "status: stable\n" in updated
+
+
+def test_controlled_merge_preserves_all_curated_crlf_bytes(
+    tmp_path: Path,
+    ecommerce_layer: SemanticLayer,
+    changed_ecommerce_layer: SemanticLayer,
+) -> None:
+    destination = tmp_path / "knowledge"
+    original_bundle = OkfBundle.from_layer(ecommerce_layer)
+    changed_bundle = OkfBundle.from_layer(changed_ecommerce_layer)
+    original_bundle.write(destination)
+    metric_path = destination / "metrics" / "gross_margin.md"
+    original_fingerprint = original_bundle.concepts["metrics/gross_margin"].frontmatter[
+        "generated"
+    ]["fingerprint"]
+    changed_fingerprint = changed_bundle.concepts["metrics/gross_margin"].frontmatter[
+        "generated"
+    ]["fingerprint"]
+    original_definition = (
+        original_bundle.concepts["metrics/gross_margin"].sections[0].content
+    )
+    changed_definition = (
+        changed_bundle.concepts["metrics/gross_margin"].sections[0].content
+    )
+    curated = metric_path.read_text(encoding="utf-8").replace("\n", "\r\n")
+    curated = curated.replace(
+        "status: stable\r\n",
+        "status: stable\r\n"
+        "# preserve this unknown-field comment exactly\r\n"
+        "custom_owner :  finance  # and this inline comment\r\n",
+    ).replace(
+        "---\r\n\r\n# Catalog Definition",
+        "---\r\n\r\nPreamble with  deliberate spacing.  \r\n\r\n# Catalog Definition",
+    )
+    curated = curated.replace(
+        "# Usage Guidance\r\n\r\n# Examples",
+        "# Usage Guidance\r\n \r\n  Keep leading spaces.  \r\n\r\n"
+        "```text\r\n# Catalog Definition\r\nnot a section\r\n```\r\n\r\n\r\n"
+        "# Examples",
+    )
+    metric_path.write_bytes(curated.encode())
+    expected = curated.replace(
+        f"fingerprint: {original_fingerprint}",
+        f"fingerprint: {changed_fingerprint}",
+    ).replace(
+        original_definition.replace("\n", "\r\n"),
+        changed_definition.replace("\n", "\r\n"),
+    )
+
+    report = changed_bundle.sync(destination)
+
+    assert "metrics/gross_margin.md" in report.written
+    assert metric_path.read_bytes() == expected.encode()
 
 
 def test_changed_definition_removes_current_verification(
@@ -225,6 +371,7 @@ def test_dry_run_reports_changes_without_writing_any_file(
     tmp_path: Path,
     ecommerce_layer: SemanticLayer,
     changed_ecommerce_layer: SemanticLayer,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     destination = tmp_path / "knowledge"
     OkfBundle.from_layer(ecommerce_layer).write(destination)
@@ -233,6 +380,14 @@ def test_dry_run_reports_changes_without_writing_any_file(
         for path in destination.rglob("*")
         if path.is_file()
     }
+    writes: list[Path] = []
+    original_write = bundle_module._write_text
+
+    def count_write(path: Path, content: str) -> None:
+        writes.append(path)
+        original_write(path, content)
+
+    monkeypatch.setattr(bundle_module, "_write_text", count_write)
 
     report = OkfBundle.from_layer(changed_ecommerce_layer).sync(
         destination, dry_run=True
@@ -244,6 +399,7 @@ def test_dry_run_reports_changes_without_writing_any_file(
         if path.is_file()
     }
     assert "metrics/gross_margin.md" in report.written
+    assert writes == []
     assert after == before
     assert not tuple(destination.rglob("*.tmp"))
 
@@ -264,9 +420,10 @@ def test_sync_preserves_append_only_change_log(
     assert change_log.read_bytes() == original
 
 
-def test_no_op_sync_is_byte_stable_and_reports_concepts_unchanged(
+def test_no_op_sync_is_byte_stable_and_performs_zero_replacements(
     tmp_path: Path,
     ecommerce_layer: SemanticLayer,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     destination = tmp_path / "knowledge"
     OkfBundle.from_layer(ecommerce_layer).write(destination)
@@ -274,6 +431,14 @@ def test_no_op_sync_is_byte_stable_and_reports_concepts_unchanged(
         path.relative_to(destination).as_posix(): path.read_bytes()
         for path in destination.rglob("*.md")
     }
+    writes: list[Path] = []
+    original_write = bundle_module._write_text
+
+    def count_write(path: Path, content: str) -> None:
+        writes.append(path)
+        original_write(path, content)
+
+    monkeypatch.setattr(bundle_module, "_write_text", count_write)
 
     report = OkfBundle.from_layer(ecommerce_layer).sync(destination)
 
@@ -282,6 +447,7 @@ def test_no_op_sync_is_byte_stable_and_reports_concepts_unchanged(
         for path in destination.rglob("*.md")
     }
     assert report.written == ()
+    assert writes == []
     assert len(report.unchanged) == len(ecommerce_layer.semantic_objects())
     assert after == before
 

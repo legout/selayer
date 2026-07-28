@@ -1,3 +1,4 @@
+import re
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,6 +29,7 @@ def test_generate_metric_concept(ecommerce_layer: SemanticLayer) -> None:
         "generated": {
             "by": "process:selayer-okf",
             "at": "2026-07-27T12:00:00Z",
+            "fingerprint": "14c8c17f850c1e0b580437e2a03de7c325cee3ebb36502570ae53e1297195d6f",
         },
         "status": "stable",
     }
@@ -52,9 +54,9 @@ def test_generation_without_timestamp_is_deterministic(
     second = OkfBundle.from_layer(ecommerce_layer)
 
     assert first.concepts == second.concepts
-    assert first.concepts["metrics/gross_margin"].frontmatter["generated"] == {
-        "by": "process:selayer-okf"
-    }
+    generated = first.concepts["metrics/gross_margin"].frontmatter["generated"]
+    assert generated["by"] == "process:selayer-okf"
+    assert re.fullmatch(r"[0-9a-f]{64}", generated["fingerprint"])
 
 
 def test_projection_contains_every_semantic_object(

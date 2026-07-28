@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -11,8 +12,15 @@ import yaml
 
 from selayer.catalog import SemanticLayer
 
-from .document import OkfDocumentError, parse_concept, render_concept
-from .model import OkfConcept, OkfIssue, OkfSection, OkfValidationError, SyncReport
+from .document import (
+    OkfControlledMergeError,
+    OkfDocumentError,
+    generated_fingerprint,
+    merge_generated_concept_text,
+    parse_concept,
+    render_concept,
+)
+from .model import OkfConcept, OkfIssue, OkfValidationError, SyncReport
 from .validation import (
     validate_concept,
     validate_duplicate_bindings,
@@ -34,8 +42,8 @@ def _write_text(path: Path, content: str) -> None:
 
 _LEADING_FRONTMATTER = re.compile(r"\A---\n(.*?)\n---(?:\n|\Z)", re.DOTALL)
 _GENERATOR_ID = "process:selayer-okf"
-_GENERATED_KEYS = frozenset({"type", "title", "description", "selayer_id", "generated"})
 _GENERATED_SECTION = "Catalog Definition"
+_SHA256_HEX = re.compile(r"[0-9a-fA-F]{64}")
 
 
 def _has_generator_ownership(path: Path) -> bool:
@@ -185,7 +193,9 @@ class OkfBundle:
 
             try:
                 existing = parse_concept(concept_path, destination)
-            except OkfDocumentError:
+                existing_bytes = concept_path.read_bytes()
+                existing_text = existing_bytes.decode("utf-8")
+            except (OkfDocumentError, UnicodeError):
                 conflicts.append(relative)
                 continue
             existing_definitions = tuple(
@@ -197,35 +207,50 @@ class OkfBundle:
                 conflicts.append(relative)
                 continue
             existing_definition = existing_definitions[0]
-            generated_definition = next(
+            existing_generated = existing.frontmatter.get("generated")
+            fingerprint = (
+                existing_generated.get("fingerprint")
+                if isinstance(existing_generated, Mapping)
+                else None
+            )
+            if (
+                not isinstance(fingerprint, str)
+                or _SHA256_HEX.fullmatch(fingerprint) is None
+            ):
+                conflicts.append(relative)
+                continue
+            try:
+                baseline_fingerprint = generated_fingerprint(
+                    existing.frontmatter, existing_definition.content
+                )
+            except (TypeError, ValueError):
+                conflicts.append(relative)
+                continue
+            if not hmac.compare_digest(fingerprint.lower(), baseline_fingerprint):
+                conflicts.append(relative)
+                continue
+            generated_definitions = tuple(
                 section
                 for section in generated.sections
                 if section.title == _GENERATED_SECTION
             )
-            frontmatter = dict(existing.frontmatter)
-            for key in _GENERATED_KEYS - generated.frontmatter.keys():
-                frontmatter.pop(key, None)
-            for key, value in generated.frontmatter.items():
-                if key in _GENERATED_KEYS:
-                    frontmatter[key] = value
-            if existing_definition.content != generated_definition.content:
-                frontmatter.pop("verified", None)
-            sections = tuple(
-                OkfSection(section.title, generated_definition.content)
-                if section is existing_definition
-                else section
-                for section in existing.sections
+            if len(generated_definitions) != 1:
+                raise AssertionError("generated concept has no unique definition")
+            generated_definition = generated_definitions[0]
+            definition_changed = (
+                existing_definition.content != generated_definition.content
             )
-            merged = OkfConcept.create(
-                concept_id=existing.concept_id,
-                relative_path=existing.relative_path,
-                frontmatter=frontmatter,
-                preamble=existing.preamble,
-                sections=sections,
-                links=existing.links,
-            )
-            content = render_concept(merged)
-            if content == concept_path.read_text(encoding="utf-8"):
+            try:
+                content = merge_generated_concept_text(
+                    existing_text,
+                    generated,
+                    definition_changed=definition_changed,
+                )
+            except OkfControlledMergeError:
+                conflicts.append(relative)
+                continue
+            encoded = content.encode("utf-8")
+            if encoded == existing_bytes:
                 unchanged.append(relative)
             else:
                 if not dry_run:
@@ -260,7 +285,12 @@ class OkfBundle:
             for relative_path, content in index_documents(
                 self.layer, self.concepts
             ).items():
-                _write_text(destination / Path(relative_path.as_posix()), content)
+                index_path = destination / Path(relative_path.as_posix())
+                if index_path.is_file() and index_path.read_bytes() == content.encode(
+                    "utf-8"
+                ):
+                    continue
+                _write_text(index_path, content)
 
         return SyncReport(
             written=tuple(sorted(written)),

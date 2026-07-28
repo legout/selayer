@@ -95,13 +95,35 @@ def test_verified_accepts_mapping_and_list_forms(
     assert OkfBundle.load(tmp_path).concepts["concept"]
 
 
+@pytest.mark.parametrize(
+    "fingerprint",
+    ["short", "g" * 64, 123],
+)
+def test_generated_fingerprint_must_be_a_sha256_hex_digest_when_present(
+    tmp_path: Path,
+    fingerprint: object,
+) -> None:
+    _write_concept(
+        tmp_path,
+        f"type: Metric\ngenerated: {{by: process:build, fingerprint: {fingerprint}}}",
+    )
+
+    with pytest.raises(OkfValidationError) as caught:
+        OkfBundle.load(tmp_path)
+
+    assert "concept.md.frontmatter.generated.fingerprint" in {
+        issue.path for issue in caught.value.issues
+    }
+
+
 def test_valid_v02_optional_families_are_accepted(tmp_path: Path) -> None:
     _write_concept(
         tmp_path,
         "type: Metric\n"
         "status: stable\n"
         "stale_after: 2026-09-23\n"
-        "generated: {by: process:selayer-okf, at: 2026-07-27T14:00:00Z}\n"
+        "generated: {by: process:selayer-okf, at: 2026-07-27T14:00:00Z, "
+        f"fingerprint: {'a' * 64}}}\n"
         "verified: {by: human:owner, at: 2026-07-27T15:00:00Z}\n"
         "sources:\n"
         "  - id: policy\n"

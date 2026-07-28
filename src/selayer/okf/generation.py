@@ -9,6 +9,7 @@ from selayer.catalog import SemanticLayer, SemanticObject
 from selayer.expressions import format_expression
 from selayer.model import DataSource, Dimension, Fact, Measure, Metric, Relationship
 
+from .document import generated_fingerprint
 from .model import OkfConcept, OkfSection
 
 _KIND_DIRECTORIES = {
@@ -131,15 +132,18 @@ def concepts_from_layer(
         description = getattr(value, "description", "")
         if include_descriptive and isinstance(description, str) and description:
             frontmatter["description"] = description
+        definition = catalog_definition(semantic_id, value)
+        generated = _generated_metadata(generated_at)
         frontmatter.update(
             {
                 "selayer_id": semantic_id,
-                "generated": _generated_metadata(generated_at),
-                "status": "stable",
+                "generated": generated,
             }
         )
+        generated["fingerprint"] = generated_fingerprint(frontmatter, definition)
+        frontmatter["status"] = "stable"
         sections = (
-            OkfSection("Catalog Definition", catalog_definition(semantic_id, value)),
+            OkfSection("Catalog Definition", definition),
             *(OkfSection(title, "") for title in _CURATED_SECTION_TITLES),
         )
         concept_id = path.with_suffix("").as_posix()
