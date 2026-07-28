@@ -5,13 +5,11 @@ import posixpath
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any
 from urllib.parse import unquote, urlsplit
-
-import yaml
 
 from selayer.catalog import SemanticLayer
 
@@ -54,42 +52,8 @@ def _write_text(path: Path, content: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
-_LEADING_FRONTMATTER = re.compile(r"\A---\n(.*?)\n---(?:\n|\Z)", re.DOTALL)
-_GENERATOR_ID = "process:selayer-okf"
 _GENERATED_SECTION = "Catalog Definition"
 _SHA256_HEX = re.compile(r"[0-9a-fA-F]{64}")
-
-
-def _has_generator_ownership(path: Path) -> bool:
-    text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
-    match = _LEADING_FRONTMATTER.match(text)
-    if match is None:
-        return False
-    try:
-        frontmatter = yaml.safe_load(match.group(1))
-    except yaml.YAMLError:
-        return False
-    if not isinstance(frontmatter, Mapping):
-        return False
-    generated = frontmatter.get("generated")
-    return isinstance(generated, Mapping) and generated.get("by") == _GENERATOR_ID
-
-
-def _remove_stale_generated_files(
-    destination: Path,
-    directories: tuple[str, ...],
-    expected: set[str],
-) -> None:
-    for directory in directories:
-        managed = destination / directory
-        if not managed.is_dir():
-            continue
-        for path in sorted(managed.glob("*.md")):
-            relative = path.relative_to(destination).as_posix()
-            if relative in expected:
-                continue
-            if path.name == "_index.md" or _has_generator_ownership(path):
-                path.unlink()
 
 
 def trust_tier(frontmatter: Mapping[str, Any]) -> TrustTier:
@@ -240,40 +204,10 @@ class OkfBundle:
         *,
         include_descriptive: bool = False,
     ) -> OkfBundle:
-        from .generation import generated_directories, index_documents
-
         destination = Path(output_dir)
-        if destination.is_file():
-            raise FileExistsError(f"destination '{destination}' is a file")
-        destination.mkdir(parents=True, exist_ok=True)
         bundle = cls.from_layer(layer, include_descriptive=include_descriptive)
-        for concept_id in sorted(bundle.concepts):
-            concept = bundle.concepts[concept_id]
-            _write_text(
-                destination / Path(concept.relative_path.as_posix()),
-                render_concept(concept),
-            )
-        indexes = index_documents(layer, bundle.concepts)
-        for relative_path, content in indexes.items():
-            _write_text(destination / Path(relative_path.as_posix()), content)
-        change_log = destination / "_change_log.md"
-        if not change_log.exists():
-            _write_text(change_log, "# Change Log\n")
-        expected = {
-            concept.relative_path.as_posix() for concept in bundle.concepts.values()
-        }
-        expected.update(path.as_posix() for path in indexes)
-        _remove_stale_generated_files(
-            destination,
-            generated_directories(),
-            expected,
-        )
-        return cls(
-            root=destination,
-            concepts=bundle.concepts,
-            diagnostics=bundle.diagnostics,
-            layer=layer,
-        )
+        bundle.write(destination)
+        return cls.load(destination, layer=layer)
 
     def write(self, path: str | Path) -> None:
         from .generation import index_documents
@@ -297,7 +231,7 @@ class OkfBundle:
             self.layer, self.concepts
         ).items():
             _write_text(destination / Path(relative_path.as_posix()), content)
-        _write_text(destination / "_change_log.md", "# Change Log\n")
+        _write_text(destination / "log.md", "# Change Log\n")
 
     def sync(self, path: str | Path, *, dry_run: bool = False) -> SyncReport:
         from .generation import generated_directories, index_documents
@@ -394,7 +328,7 @@ class OkfBundle:
             if not managed.is_dir():
                 continue
             for concept_path in sorted(managed.rglob("*.md")):
-                if concept_path.name == "_index.md":
+                if concept_path.name == "index.md":
                     continue
                 relative = concept_path.relative_to(destination).as_posix()
                 if relative in classified:
@@ -409,15 +343,23 @@ class OkfBundle:
                     unchanged.append(relative)
 
         if not dry_run:
-            for relative_path, content in index_documents(
-                self.layer, self.concepts
-            ).items():
+            indexes = index_documents(self.layer, self.concepts)
+            for relative_path, content in indexes.items():
                 index_path = destination / Path(relative_path.as_posix())
                 if index_path.is_file() and index_path.read_bytes() == content.encode(
                     "utf-8"
                 ):
                     continue
                 _write_text(index_path, content)
+            expected_indexes = {path.as_posix() for path in indexes}
+            for directory in generated_directories():
+                index_path = destination / directory / "index.md"
+                relative = index_path.relative_to(destination).as_posix()
+                if index_path.is_file() and relative not in expected_indexes:
+                    index_path.unlink()
+            log_path = destination / "log.md"
+            if not log_path.exists():
+                _write_text(log_path, "# Change Log\n")
 
         return SyncReport(
             written=tuple(sorted(written)),
@@ -465,7 +407,9 @@ class OkfBundle:
                     f"unknown semantic identifier '{semantic_id}'"
                 ) from None
 
-        effective_today = today if today is not None else datetime.now(UTC).date()
+        effective_today = (
+            today if today is not None else datetime.now(timezone(timedelta(0))).date()
+        )
         items = [_context_item(concept, effective_today) for concept in required]
         total_chars = sum(len(item.content) for item in items)
         if total_chars > max_chars:
@@ -535,10 +479,10 @@ class OkfBundle:
         concepts: dict[str, OkfConcept] = {}
         issues: list[OkfIssue] = []
         for concept_path in sorted(root.rglob("*.md")):
-            if concept_path.name in {"_index.md", "index.md"}:
+            if concept_path.name == "index.md":
                 issues.extend(validate_index(concept_path, root))
                 continue
-            if concept_path.name in {"_change_log.md", "log.md"}:
+            if concept_path == root / "log.md":
                 issues.extend(validate_log(concept_path, root))
                 continue
             try:

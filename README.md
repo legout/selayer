@@ -118,7 +118,10 @@ context = bundle.context_for(
 )
 ```
 
+Bundles use root `index.md`, per-kind `index.md`, and root append-only `log.md`.
 `write()` creates new bundles and refuses to overwrite a populated destination.
+`generate()` follows the same new-bundle-only safety contract and directs callers
+to `sync()` instead of overwriting any existing file.
 `sync()` preserves curated sections while updating generator-owned catalog
 sections; conflicts remain explicit for human review. A decoded attribute such as
 MLFB color requires a real catalog dimension before it is queryable.
@@ -149,7 +152,8 @@ uv run selayer-okf retrieve knowledge metric.gross_margin dimension.product_cate
   --catalog ecommerce_semantic_layer.yaml --max-chars 12000 --max-depth 1
 ```
 
-`generate CATALOG DESTINATION` creates a new bundle. `sync CATALOG BUNDLE`
+`generate CATALOG DESTINATION` creates a new bundle and fails without changing
+files when the destination is populated. `sync CATALOG BUNDLE`
 updates generator-owned definitions and accepts `--dry-run`. `validate BUNDLE`
 and `retrieve BUNDLE SEMANTIC_ID...` accept an optional `--catalog`; retrieval
 also accepts `--no-linked`, `--max-chars`, and `--max-depth`.

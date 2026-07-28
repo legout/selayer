@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Final
 
@@ -94,31 +95,45 @@ def compile_row_expression(expression: Expression) -> str:
     raise AssertionError("unsupported row expression node")
 
 
-def compile_metric_expression(expression: Expression) -> str:
+def compile_metric_expression(
+    expression: Expression,
+    measure_aliases: Mapping[str, str] | None = None,
+) -> str:
     """Compile an expression resolved in the aggregate-level symbol environment."""
     if isinstance(expression, Literal):
         return _compile_literal(expression)
     if isinstance(expression, Reference):
         if len(expression.parts) != 1:
             raise AssertionError("invalid validated metric reference")
-        return quote_identifier(expression.parts[0])
+        identifier = expression.parts[0]
+        if measure_aliases is not None:
+            try:
+                identifier = measure_aliases[identifier]
+            except KeyError:
+                raise AssertionError("unknown validated metric reference") from None
+        return quote_identifier(identifier)
     if isinstance(expression, UnaryOperation):
         if expression.operator not in _UNARY_OPERATORS:
             raise AssertionError("invalid validated unary operator")
         operator = "NOT " if expression.operator == "not" else expression.operator
-        return f"({operator}{compile_metric_expression(expression.operand)})"
+        return (
+            f"({operator}"
+            f"{compile_metric_expression(expression.operand, measure_aliases)})"
+        )
     if isinstance(expression, BinaryOperation):
         if expression.operator not in _BINARY_OPERATORS:
             raise AssertionError("invalid validated binary operator")
         return (
-            f"({compile_metric_expression(expression.left)} {expression.operator} "
-            f"{compile_metric_expression(expression.right)})"
+            f"({compile_metric_expression(expression.left, measure_aliases)} "
+            f"{expression.operator} "
+            f"{compile_metric_expression(expression.right, measure_aliases)})"
         )
     if isinstance(expression, FunctionCall):
         if expression.name not in METRIC_FUNCTIONS:
             raise AssertionError("invalid validated metric function")
         arguments = ", ".join(
-            compile_metric_expression(argument) for argument in expression.arguments
+            compile_metric_expression(argument, measure_aliases)
+            for argument in expression.arguments
         )
         return f"{expression.name.upper()}({arguments})"
     raise AssertionError("unsupported metric expression node")
@@ -183,14 +198,20 @@ def _compile_filters(plan: QueryPlan) -> tuple[str, tuple[object, ...]]:
 
 def compile_duckdb(plan: QueryPlan) -> CompiledQuery:
     """Compile a fully resolved plan without consulting its source catalog."""
+    dimension_aliases = {
+        item.id: f"__selayer_dimension_{item.id}" for item in plan.dimensions
+    }
+    measure_aliases = {
+        item.id: f"__selayer_measure_{item.id}" for item in plan.measures
+    }
     projections = [
         f"{quote_identifier(item.source)}.{quote_identifier(item.column)} "
-        f"AS {quote_identifier(item.id)}"
+        f"AS {quote_identifier(dimension_aliases[item.id])}"
         for item in plan.dimensions
     ]
     projections.extend(
         f"{_compile_aggregation(measure.aggregation, measure.expression)} "
-        f"AS {quote_identifier(measure.id)}"
+        f"AS {quote_identifier(measure_aliases[measure.id])}"
         for measure in plan.measures
     )
 
@@ -201,9 +222,13 @@ def compile_duckdb(plan: QueryPlan) -> CompiledQuery:
         if plan.dimensions
         else ""
     )
-    outer = [quote_identifier(item.id) for item in plan.dimensions]
+    outer = [
+        f"{quote_identifier(dimension_aliases[item.id])} AS {quote_identifier(item.id)}"
+        for item in plan.dimensions
+    ]
     outer.extend(
-        f"{compile_metric_expression(item.expression)} AS {quote_identifier(item.id)}"
+        f"{compile_metric_expression(item.expression, measure_aliases)} "
+        f"AS {quote_identifier(item.id)}"
         for item in plan.metrics
     )
     sql = (

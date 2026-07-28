@@ -143,6 +143,13 @@ def _validate_identifiers(layer: SemanticLayer, request: QueryRequest) -> None:
                 "unknown_filter_dimension",
                 f"filter dimension '{dimension_id}' is not known",
             )
+    duplicate_output_names = sorted(set(request.dimensions) & set(request.metrics))
+    if duplicate_output_names:
+        name = duplicate_output_names[0]
+        raise QueryPlanningError(
+            "duplicate_output_name",
+            f"requested dimension and metric share output name '{name}'",
+        )
 
 
 def _measure_ids(layer: SemanticLayer, request: QueryRequest) -> tuple[str, ...]:

@@ -388,12 +388,32 @@ def test_log_requires_iso_date_headings(tmp_path: Path) -> None:
     assert caught.value.issues[0].path == "log.md"
 
 
-def test_log_accepts_iso_date_headings_at_any_level(tmp_path: Path) -> None:
+def test_root_log_and_per_kind_indexes_are_reserved_not_concepts(
+    tmp_path: Path,
+) -> None:
     nested = tmp_path / "metrics"
     nested.mkdir()
-    (nested / "log.md").write_text(
+    (nested / "index.md").write_text("# Metrics\n", encoding="utf-8")
+    (tmp_path / "log.md").write_text(
         "# Directory Update Log\n\n## 2026-07-27\n* Update\n",
         encoding="utf-8",
     )
 
     assert OkfBundle.load(tmp_path).concepts == {}
+
+
+def test_underscore_layout_files_are_loaded_as_ordinary_unknown_concepts(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "_index.md").write_text(
+        "---\ntype: Domain Concept\ntitle: Legacy Index\n---\n# Meaning\n\nCurated.\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "_change_log.md").write_text(
+        "---\ntype: Reference\ntitle: Legacy Change Log\n---\n# Meaning\n\nCurated.\n",
+        encoding="utf-8",
+    )
+
+    bundle = OkfBundle.load(tmp_path)
+
+    assert tuple(bundle.concepts) == ("_change_log", "_index")

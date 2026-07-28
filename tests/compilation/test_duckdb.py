@@ -101,7 +101,10 @@ def test_compiles_metrics_outside_aggregate_cte(item_margin_plan: QueryPlan) -> 
     compiled = compile_duckdb(item_margin_plan)
 
     assert compiled.sql.startswith("WITH aggregated AS (")
-    assert 'SUM("order_items"."total") AS "total_item_revenue"' in compiled.sql
+    assert (
+        'SUM("order_items"."total") AS "__selayer_measure_total_item_revenue"'
+        in compiled.sql
+    )
     assert 'AS "gross_margin"' in compiled.sql.split(") SELECT", maxsplit=1)[1]
     assert compiled.parameters == ()
 
@@ -242,10 +245,10 @@ def test_compiles_dimensions_then_measures_and_groups_positionally() -> None:
     aggregate_projection, outer_projection = sql.split(") SELECT", maxsplit=1)
 
     assert (
-        aggregate_projection.index('AS "second"')
-        < aggregate_projection.index('AS "first"')
-        < aggregate_projection.index('AS "units"')
-        < aggregate_projection.index('AS "total"')
+        aggregate_projection.index('AS "__selayer_dimension_second"')
+        < aggregate_projection.index('AS "__selayer_dimension_first"')
+        < aggregate_projection.index('AS "__selayer_measure_units"')
+        < aggregate_projection.index('AS "__selayer_measure_total"')
     )
     assert " GROUP BY 1, 2" in aggregate_projection
     assert (
@@ -254,6 +257,25 @@ def test_compiles_dimensions_then_measures_and_groups_positionally() -> None:
         < outer_projection.index('AS "combined"')
         < outer_projection.index('AS "revenue"')
     )
+
+
+def test_cross_kind_names_use_distinct_internal_aggregate_aliases() -> None:
+    plan = QueryPlan(
+        anchor_source="events",
+        joins=(),
+        dimensions=(PlannedDimension("total", "events", "total", "integer"),),
+        measures=(PlannedMeasure("total", parse_expression("events.value"), "sum"),),
+        metrics=(PlannedMetric("m", parse_expression("total")),),
+        filters=(),
+    )
+
+    sql = compile_duckdb(plan).sql
+    aggregate_projection, outer_projection = sql.split(") SELECT", maxsplit=1)
+
+    assert 'AS "__selayer_dimension_total"' in aggregate_projection
+    assert 'AS "__selayer_measure_total"' in aggregate_projection
+    assert '"__selayer_dimension_total" AS "total"' in outer_projection
+    assert '"__selayer_measure_total" AS "m"' in outer_projection
 
 
 def test_compiles_join_endpoint_not_already_available_and_shared_join_once() -> None:

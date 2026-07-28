@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import PurePosixPath
 from types import MappingProxyType
 
@@ -108,9 +108,11 @@ def _generated_metadata(generated_at: datetime | None) -> dict[str, str]:
     generated = {"by": "process:selayer-okf"}
     if generated_at is not None:
         if generated_at.tzinfo is None:
-            generated_at = generated_at.replace(tzinfo=UTC)
+            generated_at = generated_at.replace(tzinfo=timezone(timedelta(0)))
         generated["at"] = (
-            generated_at.astimezone(UTC).isoformat().replace("+00:00", "Z")
+            generated_at.astimezone(timezone(timedelta(0)))
+            .isoformat()
+            .replace("+00:00", "Z")
         )
     return generated
 
@@ -125,6 +127,11 @@ def concepts_from_layer(
     for semantic_id, value in layer.semantic_objects().items():
         kind, name = semantic_id.split(".", 1)
         path = concept_path(semantic_id)
+        if path.name == "index.md":
+            raise ValueError(
+                f"semantic object '{semantic_id}' collides with reserved "
+                f"index path '{path.as_posix()}'"
+            )
         frontmatter: dict[str, object] = {
             "type": _KIND_TYPES[kind],
             "title": display_title(name),
@@ -189,10 +196,10 @@ def index_documents(
             f"- [{concept.frontmatter['title']}]({concept.relative_path.name})"
             for concept in entries
         )
-        documents[PurePosixPath(directory, "_index.md")] = (
+        documents[PurePosixPath(directory, "index.md")] = (
             f"# {heading}\n\n{local_links}\n"
         )
-    documents[PurePosixPath("_index.md")] = "\n\n".join(root_parts) + "\n"
+    documents[PurePosixPath("index.md")] = "\n\n".join(root_parts) + "\n"
     return MappingProxyType(dict(sorted(documents.items(), key=lambda item: item[0])))
 
 

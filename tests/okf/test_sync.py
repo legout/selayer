@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -53,7 +53,12 @@ def test_sync_preserves_curated_sections_and_extensions(
 
     report = OkfBundle.from_layer(
         ecommerce_layer,
-        generated_at=datetime(2026, 7, 28, tzinfo=UTC),
+        generated_at=datetime(
+            2026,
+            7,
+            28,
+            tzinfo=timezone.utc,  # noqa: UP017
+        ),
     ).sync(destination)
     updated = metric_path.read_text(encoding="utf-8")
 
@@ -301,7 +306,12 @@ def test_provenance_refresh_preserves_current_verification(
 
     OkfBundle.from_layer(
         ecommerce_layer,
-        generated_at=datetime(2026, 7, 28, tzinfo=UTC),
+        generated_at=datetime(
+            2026,
+            7,
+            28,
+            tzinfo=timezone.utc,  # noqa: UP017
+        ),
     ).sync(destination)
 
     assert "verified:" in metric_path.read_text(encoding="utf-8")
@@ -324,6 +334,24 @@ def test_sync_reports_stale_concepts_as_unchanged_orphans(
     assert report.orphaned == ("metrics/gross_margin.md",)
     assert "metrics/gross_margin.md" in report.unchanged
     assert metric_path.read_bytes() == original
+    assert not (destination / "metrics" / "index.md").exists()
+
+
+def test_sync_preserves_legacy_underscore_files_as_ordinary_unknown_files(
+    tmp_path: Path,
+    ecommerce_layer: SemanticLayer,
+) -> None:
+    destination = tmp_path / "knowledge"
+    OkfBundle.from_layer(ecommerce_layer).write(destination)
+    legacy_index = destination / "metrics" / "_index.md"
+    legacy_log = destination / "_change_log.md"
+    legacy_index.write_bytes(b"curated legacy index bytes\n")
+    legacy_log.write_bytes(b"curated legacy log bytes\n")
+
+    OkfBundle.from_layer(ecommerce_layer).sync(destination)
+
+    assert legacy_index.read_bytes() == b"curated legacy index bytes\n"
+    assert legacy_log.read_bytes() == b"curated legacy log bytes\n"
 
 
 def test_conflict_does_not_block_other_safe_updates(
@@ -362,9 +390,9 @@ def test_sync_writes_new_concepts_and_regenerates_indexes(
     assert "metrics/gross_margin.md" in report.written
     assert (destination / "metrics" / "gross_margin.md").is_file()
     assert "[Gross margin](metrics/gross_margin.md)" in (
-        destination / "_index.md"
+        destination / "index.md"
     ).read_text(encoding="utf-8")
-    assert (destination / "metrics" / "_index.md").is_file()
+    assert (destination / "metrics" / "index.md").is_file()
 
 
 def test_dry_run_reports_changes_without_writing_any_file(
@@ -411,7 +439,7 @@ def test_sync_preserves_append_only_change_log(
 ) -> None:
     destination = tmp_path / "knowledge"
     OkfBundle.from_layer(ecommerce_layer).write(destination)
-    change_log = destination / "_change_log.md"
+    change_log = destination / "log.md"
     original = b"# Change Log\n\n## 2026-07-28\n\n- Human review completed.\n"
     change_log.write_bytes(original)
 

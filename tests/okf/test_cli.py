@@ -43,6 +43,30 @@ def test_generate_creates_a_bundle_and_reports_json(
     assert (destination / "metrics/gross_margin.md").is_file()
 
 
+def test_generate_refuses_existing_bundle_and_preserves_curated_bytes(
+    tmp_path: Path,
+    valid_catalog_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    destination = tmp_path / "knowledge"
+    main(["generate", str(valid_catalog_path), str(destination)])
+    capsys.readouterr()
+    concept = destination / "metrics" / "gross_margin.md"
+    curated = b"\n# Usage Guidance\n\nFinance-approved wording.\n"
+    concept.write_bytes(concept.read_bytes() + curated)
+    before = concept.read_bytes()
+
+    exit_code, stdout, stderr = _invoke(
+        ["generate", str(valid_catalog_path), str(destination)], capsys
+    )
+
+    assert exit_code == 1
+    assert stdout == ""
+    assert "contains files; use sync" in stderr
+    assert concept.read_bytes() == before
+    assert curated in concept.read_bytes()
+
+
 def test_sync_dry_run_reports_classified_paths_without_writing(
     tmp_path: Path,
     valid_catalog_path: Path,

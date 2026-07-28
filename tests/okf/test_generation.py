@@ -1,11 +1,12 @@
 import re
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from selayer import SemanticLayer
+from selayer.model import Dimension
 from selayer.okf import OkfBundle
 
 
@@ -17,7 +18,14 @@ def ecommerce_layer(valid_catalog_path: Path) -> SemanticLayer:
 def test_generate_metric_concept(ecommerce_layer: SemanticLayer) -> None:
     bundle = OkfBundle.from_layer(
         ecommerce_layer,
-        generated_at=datetime(2026, 7, 27, 12, 0, tzinfo=UTC),
+        generated_at=datetime(
+            2026,
+            7,
+            27,
+            12,
+            0,
+            tzinfo=timezone.utc,  # noqa: UP017
+        ),
     )
 
     concept = bundle.concepts["metrics/gross_margin"]
@@ -107,6 +115,23 @@ def test_projection_contains_every_semantic_object(
     )
 
 
+def test_semantic_object_named_index_is_rejected_before_reserved_file_collision(
+    ecommerce_layer: SemanticLayer,
+) -> None:
+    layer = replace(
+        ecommerce_layer,
+        dimensions={
+            **ecommerce_layer.dimensions,
+            "index": Dimension(
+                name="index", source="orders", column="id", data_type="string"
+            ),
+        },
+    )
+
+    with pytest.raises(ValueError, match="dimension.index.*reserved.*index.md"):
+        OkfBundle.from_layer(layer)
+
+
 def test_write_creates_progressive_indexes(
     tmp_path: Path,
     ecommerce_layer: SemanticLayer,
@@ -116,15 +141,13 @@ def test_write_creates_progressive_indexes(
     OkfBundle.from_layer(ecommerce_layer).write(destination)
 
     assert (destination / "metrics" / "gross_margin.md").is_file()
-    root_index = (destination / "_index.md").read_text(encoding="utf-8")
+    root_index = (destination / "index.md").read_text(encoding="utf-8")
     assert "# Metrics" in root_index
     assert "[Gross margin](metrics/gross_margin.md)" in root_index
-    metric_index = (destination / "metrics" / "_index.md").read_text(encoding="utf-8")
+    metric_index = (destination / "metrics" / "index.md").read_text(encoding="utf-8")
     assert "[Gross margin](gross_margin.md)" in metric_index
     assert "\r\n" not in root_index
-    assert (destination / "_change_log.md").read_text(encoding="utf-8") == (
-        "# Change Log\n"
-    )
+    assert (destination / "log.md").read_text(encoding="utf-8") == "# Change Log\n"
 
 
 def test_write_refuses_to_replace_existing_bundle(
@@ -159,117 +182,59 @@ def test_generate_maps_descriptions_only_when_requested(
     assert "description" not in descriptive.concepts["sources/orders"].frontmatter
 
 
-def test_generate_preserves_append_only_change_log_on_regeneration(
+def test_generate_refuses_populated_destination_without_changing_any_bytes(
     tmp_path: Path,
     ecommerce_layer: SemanticLayer,
 ) -> None:
     destination = tmp_path / "knowledge"
     OkfBundle.generate(ecommerce_layer, destination)
-    change_log = destination / "_change_log.md"
-    original = "# Change Log\n\n## 2026-07-27\n\n- Reviewed catalog.\n"
-    change_log.write_bytes(original.encode())
     concept = destination / "metrics" / "gross_margin.md"
-    concept.write_text("stale generated output", encoding="utf-8")
-
-    OkfBundle.generate(ecommerce_layer, destination)
-
-    assert change_log.read_bytes() == original.encode()
-    assert concept.read_text(encoding="utf-8").startswith("---\ntype: Selayer Metric\n")
-    assert not tuple(destination.rglob("*.tmp"))
-    loaded = OkfBundle.load(destination, layer=ecommerce_layer)
-    assert loaded.concepts["metrics/gross_margin"]
-
-
-def test_regeneration_removes_stale_generated_concepts(
-    tmp_path: Path,
-    ecommerce_layer: SemanticLayer,
-) -> None:
-    destination = tmp_path / "knowledge"
-    OkfBundle.generate(ecommerce_layer, destination)
-    without_metrics = replace(ecommerce_layer, metrics={})
-    curated = destination / "metrics" / "business_notes.md"
-    curated.write_text("human-authored guidance", encoding="utf-8")
-
-    OkfBundle.generate(without_metrics, destination)
-
-    assert not (destination / "metrics" / "gross_margin.md").exists()
-    assert not (destination / "metrics" / "_index.md").exists()
-    assert curated.read_text(encoding="utf-8") == "human-authored guidance"
-
-
-@pytest.mark.parametrize(
-    "content",
-    [
-        "Ownership marker example:\n\ngenerated:\n  by: process:selayer-okf\n",
-        "```yaml\ngenerated:\n  by: process:selayer-okf\n```\n",
-    ],
-    ids=["prose", "fenced-code-block"],
-)
-def test_regeneration_preserves_curated_marker_examples(
-    tmp_path: Path,
-    ecommerce_layer: SemanticLayer,
-    content: str,
-) -> None:
-    destination = tmp_path / "knowledge"
-    OkfBundle.generate(ecommerce_layer, destination)
-    curated = destination / "metrics" / "ownership_notes.md"
-    curated.write_text(content, encoding="utf-8")
-
-    OkfBundle.generate(ecommerce_layer, destination)
-
-    assert curated.read_text(encoding="utf-8") == content
-
-
-@pytest.mark.parametrize(
-    "frontmatter",
-    [
-        "generated:\n  by: process:selayer-okf\n  broken: [",
-        '"generated:\n  by: process:selayer-okf"',
-    ],
-    ids=["malformed", "non-mapping"],
-)
-def test_regeneration_preserves_invalid_frontmatter_with_marker(
-    tmp_path: Path,
-    ecommerce_layer: SemanticLayer,
-    frontmatter: str,
-) -> None:
-    destination = tmp_path / "knowledge"
-    OkfBundle.generate(ecommerce_layer, destination)
-    curated = destination / "metrics" / "ownership_notes.md"
-    content = f"---\n{frontmatter}\n---\n# Curated notes\n"
-    curated.write_text(content, encoding="utf-8")
-
-    OkfBundle.generate(ecommerce_layer, destination)
-
-    assert curated.read_text(encoding="utf-8") == content
-
-
-def test_regeneration_deletes_stale_frontmatter_owned_markdown(
-    tmp_path: Path,
-    ecommerce_layer: SemanticLayer,
-) -> None:
-    destination = tmp_path / "knowledge"
-    OkfBundle.generate(ecommerce_layer, destination)
-    stale = destination / "metrics" / "retired.md"
-    stale.write_text(
-        "---\ngenerated:\n  by: process:selayer-okf\n---\n# Retired metric\n",
+    curated = "\n# Usage Guidance\n\nKeep this finance-approved wording.\n"
+    concept.write_text(
+        concept.read_text(encoding="utf-8") + curated,
         encoding="utf-8",
     )
+    before = {
+        path.relative_to(destination).as_posix(): path.read_bytes()
+        for path in destination.rglob("*")
+        if path.is_file()
+    }
 
-    OkfBundle.generate(ecommerce_layer, destination)
+    with pytest.raises(FileExistsError, match="contains files; use sync"):
+        OkfBundle.generate(ecommerce_layer, destination)
 
-    assert not stale.exists()
+    after = {
+        path.relative_to(destination).as_posix(): path.read_bytes()
+        for path in destination.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+    assert curated.encode() in concept.read_bytes()
 
 
-def test_atomic_replacement_keeps_previous_file_when_replace_fails(
+def test_generate_returns_loaded_bundle_bound_to_layer(
+    tmp_path: Path,
+    ecommerce_layer: SemanticLayer,
+) -> None:
+    destination = tmp_path / "knowledge"
+    destination.mkdir()
+
+    bundle = OkfBundle.generate(ecommerce_layer, destination)
+
+    assert bundle.root == destination
+    assert bundle.layer is ecommerce_layer
+    assert bundle.context_for(["metric.gross_margin"], include_linked=False).items[
+        0
+    ].semantic_refs == ("metric.gross_margin",)
+
+
+def test_atomic_generation_removes_temporary_file_when_replace_fails(
     tmp_path: Path,
     ecommerce_layer: SemanticLayer,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     destination = tmp_path / "knowledge"
-    OkfBundle.generate(ecommerce_layer, destination)
     concept = destination / "metrics" / "gross_margin.md"
-    concept.write_text("previous bytes", encoding="utf-8")
     original_replace = Path.replace
 
     def fail_gross_margin(temporary: Path, target: Path) -> Path:
@@ -282,7 +247,7 @@ def test_atomic_replacement_keeps_previous_file_when_replace_fails(
     with pytest.raises(OSError, match="injected replacement failure"):
         OkfBundle.generate(ecommerce_layer, destination)
 
-    assert concept.read_text(encoding="utf-8") == "previous bytes"
+    assert not concept.exists()
     assert not (concept.parent / "gross_margin.md.tmp").exists()
 
 

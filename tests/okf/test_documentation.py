@@ -25,6 +25,8 @@ def test_readme_documents_api_authority_and_explicit_exclusions(root: Path) -> N
     for statement in (
         "The YAML catalog controls execution; OKF is advisory context only.",
         "`write()` creates new bundles",
+        "`generate()` follows the same new-bundle-only safety contract",
+        "root `index.md`, per-kind `index.md`, and root append-only `log.md`",
         "`sync()` preserves curated sections",
         "MLFB color requires a real catalog dimension before it is queryable",
         "Data values are never exported",
