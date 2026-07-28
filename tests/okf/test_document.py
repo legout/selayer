@@ -1,4 +1,7 @@
 import operator
+import os
+import subprocess
+import sys
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, cast
@@ -127,6 +130,44 @@ def test_yaml_set_extension_is_immutable_and_round_trips(tmp_path: Path) -> None
 
     path.write_text(rendered, encoding="utf-8")
     assert parse_concept(path, tmp_path) == concept
+
+
+def test_yaml_set_rendering_is_deterministic_across_hash_seeds(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "concept.md"
+    path.write_text(
+        "---\ntype: Metric\ncustom_tags: !!set\n"
+        "  finance:\n  retained:\n  operations:\n  alpha:\n---\n",
+        encoding="utf-8",
+    )
+    script = (
+        "import pathlib, sys; "
+        "from selayer.okf.document import parse_concept, render_concept; "
+        "path = pathlib.Path(sys.argv[1]); "
+        "sys.stdout.write(render_concept(parse_concept(path, path.parent)))"
+    )
+
+    rendered = [
+        subprocess.run(
+            [sys.executable, "-c", script, str(path)],
+            check=True,
+            env={**os.environ, "PYTHONHASHSEED": seed},
+            stdout=subprocess.PIPE,
+        ).stdout
+        for seed in ("1", "2")
+    ]
+
+    assert rendered[0] == rendered[1]
+    rendered_frontmatter = yaml.safe_load(rendered[0].decode().split("---\n", 2)[1])
+    assert isinstance(rendered_frontmatter, dict)
+    assert type(rendered_frontmatter["custom_tags"]) is set
+    assert rendered_frontmatter["custom_tags"] == {
+        "finance",
+        "retained",
+        "operations",
+        "alpha",
+    }
 
 
 def test_heading_inside_fence_is_not_a_section(tmp_path: Path) -> None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, cast
 
 import yaml
 
@@ -13,6 +13,11 @@ _FRONTMATTER = re.compile(r"\A---\n(.*?)\n---(?:\n|\Z)", re.DOTALL)
 _HEADING = re.compile(r"^# ([^#].*)$")
 _FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,}).*$")
 _LINK = re.compile(r"\[[^]]+\]\(([^)]+)\)")
+_YAML_SET_TAG = "tag:yaml.org,2002:set"
+
+
+class _OkfSafeDumper(yaml.SafeDumper):
+    pass
 
 
 class OkfDocumentError(ValueError):
@@ -94,14 +99,39 @@ def _thaw(value: Any) -> Any:
         return {key: _thaw(item) for key, item in value.items()}
     if isinstance(value, tuple):
         return [_thaw(item) for item in value]
-    if isinstance(value, frozenset):
-        return {_thaw(item) for item in value}
     return value
 
 
+def _canonical_set_member_key(value: Any) -> str:
+    dumped = yaml.dump(
+        _thaw(value),
+        Dumper=cast(type[yaml.Dumper], _OkfSafeDumper),
+        sort_keys=False,
+        allow_unicode=True,
+        default_flow_style=False,
+        canonical=True,
+    )
+    if dumped is None:
+        raise AssertionError("YAML string serialization returned no content")
+    return cast(str, dumped)
+
+
+def _represent_frozenset(
+    dumper: yaml.SafeDumper, value: frozenset[Any]
+) -> yaml.nodes.MappingNode:
+    members = sorted(value, key=_canonical_set_member_key)
+    return dumper.represent_mapping(
+        _YAML_SET_TAG, [(_thaw(member), None) for member in members]
+    )
+
+
+_OkfSafeDumper.add_representer(frozenset, _represent_frozenset)
+
+
 def render_concept(concept: OkfConcept) -> str:
-    dumped = yaml.safe_dump(
+    dumped = yaml.dump(
         _thaw(concept.frontmatter),
+        Dumper=cast(type[yaml.Dumper], _OkfSafeDumper),
         sort_keys=False,
         allow_unicode=True,
         default_flow_style=False,
