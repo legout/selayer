@@ -239,6 +239,8 @@ def _item_chars(item: ContextItem) -> int:
     for parameter in contract.parameters:
         total += len(parameter.name)
         total += len(parameter.type)
+        # Bound the serialized `required` flag token (true/false), not repr.
+        total += len("true") if parameter.required else len("false")
     if contract.computation_path is not None:
         total += len(contract.computation_path)
     total += len(contract.computation_body)

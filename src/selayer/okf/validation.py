@@ -14,6 +14,7 @@ from selayer.catalog import SemanticLayer
 from .model import OkfConcept, OkfIssue
 
 _STATUS = frozenset({"draft", "stable", "deprecated"})
+_COMPUTATION_SECTION = "Computation"
 _KIND_TYPES = {
     "source": "Selayer Data Source",
     "dimension": "Selayer Dimension",
@@ -237,6 +238,17 @@ def validate_concept(
             issues.extend(_validate_parameters(concept, frontmatter["parameters"]))
         if "computation" in frontmatter:
             issues.extend(_validate_computation(concept, frontmatter["computation"]))
+        if _is_nonempty_string(frontmatter.get("computation")) and any(
+            section.title == _COMPUTATION_SECTION for section in concept.sections
+        ):
+            issues.append(
+                _issue(
+                    concept,
+                    "computation",
+                    "computation path and inline Computation section are "
+                    "mutually exclusive; provide exactly one computation source",
+                )
+            )
         if "executor" in frontmatter:
             issues.extend(_validate_executor(concept, frontmatter["executor"]))
         if "attester" in frontmatter:

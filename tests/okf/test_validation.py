@@ -490,6 +490,34 @@ def test_minimal_attested_computation_remains_valid(tmp_path: Path) -> None:
     assert OkfBundle.load(tmp_path).concepts["concept"]
 
 
+def test_inline_computation_section_without_path_is_valid(tmp_path: Path) -> None:
+    _write_concept(
+        tmp_path,
+        "type: Attested Computation\nruntime: python",
+        "\n# Computation\n\n    def decode(mlfb): ...\n",
+    )
+    assert OkfBundle.load(tmp_path).concepts["concept"]
+
+
+def test_computation_path_and_inline_section_are_mutually_exclusive(
+    tmp_path: Path,
+) -> None:
+    _write_concept(
+        tmp_path,
+        "type: Attested Computation\n"
+        "runtime: python\n"
+        "computation: references/computations/decode.sql\n",
+        "\n# Computation\n\n    def decode(mlfb): ...\n",
+    )
+    with pytest.raises(OkfValidationError) as caught:
+        OkfBundle.load(tmp_path)
+    assert any(
+        issue.path == "concept.md.frontmatter.computation"
+        and "mutually exclusive" in issue.message.lower()
+        for issue in caught.value.issues
+    )
+
+
 def test_full_attested_computation_contract_is_valid(tmp_path: Path) -> None:
     _write_concept(
         tmp_path,

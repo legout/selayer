@@ -423,8 +423,9 @@ def test_attested_computation_structured_contract_is_bounded() -> None:
 
     # Seven oversized scalar fields (runtime, param name, param type, path,
     # executor resource, one receipt field, attester resource) plus the
-    # computation body live outside the rendered content budget.
-    contract_chars = 7 * len(oversized) + len(body)
+    # computation body and the parameter's serialized `required` token
+    # (``true`` = 4) live outside the rendered content budget.
+    contract_chars = 7 * len(oversized) + len(body) + len("true")
     required = content_chars + contract_chars
 
     budget = content_chars
@@ -435,3 +436,100 @@ def test_attested_computation_structured_contract_is_bounded() -> None:
 
     assert caught.value.max_chars == budget
     assert caught.value.required_chars == required
+
+
+def _decoder_contract_chars(body: str) -> int:
+    """Exact structured-contract size for the shared decoder fixture.
+
+    Counts every string the contract returns plus each parameter's
+    serialized ``required`` token (``true``/``false``), not Python repr.
+    """
+    return (
+        len("python")
+        + len("mlfb")
+        + len("string")
+        + len("true")
+        + len("year")
+        + len("integer")
+        + len("false")
+        + len(body)
+        + len("run.md")
+        + len("decoded")
+        + len("check.py")
+    )
+
+
+def test_direct_attested_computation_counts_required_flags_in_budget() -> None:
+    """The required (direct) retrieval path bounds every returned contract
+    value, including each parameter's ``required`` boolean token."""
+    body = "def decode(mlfb): ..."
+    concept = OkfConcept.create(
+        concept_id="computations/decoder",
+        relative_path=PurePosixPath("computations/decoder.md"),
+        frontmatter={
+            "type": "Attested Computation",
+            "selayer_id": "computation.decoder",
+            "runtime": "python",
+            "parameters": [
+                {"name": "mlfb", "type": "string", "required": True},
+                {"name": "year", "type": "integer", "required": False},
+            ],
+            "executor": {"resource": "run.md", "receipt": ["decoded"]},
+            "attester": {"resource": "check.py"},
+        },
+        sections=(OkfSection("Computation", body),),
+    )
+    bundle = OkfBundle(root=None, concepts={concept.concept_id: concept})
+
+    result = bundle.context_for(["computation.decoder"], include_linked=False)
+
+    item = result.items[0]
+    assert item.attested_computation is not None
+    assert result.total_chars == len(item.content) + _decoder_contract_chars(body)
+
+
+def test_linked_attested_computation_counts_required_flags_in_budget(
+    tmp_path: Path,
+) -> None:
+    """The linked retrieval path bounds every returned contract value,
+    including each parameter's ``required`` boolean token."""
+    (tmp_path / "computations").mkdir()
+    (tmp_path / "computations" / "decoder.md").write_text(
+        "---\n"
+        "type: Attested Computation\n"
+        "runtime: python\n"
+        "parameters:\n"
+        "  - {name: mlfb, type: string, required: true}\n"
+        "  - {name: year, type: integer}\n"
+        "executor:\n"
+        "  resource: run.md\n"
+        "  receipt: [decoded]\n"
+        "attester:\n"
+        "  resource: check.py\n"
+        "---\n\n"
+        "# Computation\n\n"
+        "def decode(mlfb): ...\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "metrics").mkdir()
+    (tmp_path / "metrics" / "m.md").write_text(
+        "---\ntype: Selayer Metric\nselayer_id: metric.m\n---\n\n"
+        "# Definition\n\nDecoded by [the decoder](../computations/decoder.md).\n",
+        encoding="utf-8",
+    )
+
+    bundle = OkfBundle.load(tmp_path)
+    result = bundle.context_for(["metric.m"], max_depth=1)
+
+    assert [item.concept_id for item in result.items] == [
+        "metrics/m",
+        "computations/decoder",
+    ]
+    metric_item, decoder_item = result.items
+    assert decoder_item.attested_computation is not None
+    body = "def decode(mlfb): ..."
+    assert result.total_chars == (
+        len(metric_item.content)
+        + len(decoder_item.content)
+        + _decoder_contract_chars(body)
+    )

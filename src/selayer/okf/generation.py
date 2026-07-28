@@ -173,7 +173,9 @@ def index_documents(
     }
     for concept_id in sorted(concepts):
         concept = concepts[concept_id]
-        grouped[concept.relative_path.parts[0]].append(concept)
+        top = concept.relative_path.parts[0]
+        if top in grouped:
+            grouped[top].append(concept)
 
     root_title = (
         (layer.label or display_title(layer.name)) if layer is not None else "Knowledge"
