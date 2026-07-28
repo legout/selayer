@@ -110,6 +110,14 @@ def _validate_verified(concept: OkfConcept, value: object) -> list[OkfIssue]:
         events: tuple[object, ...] = (value,)
         is_sequence = False
     elif isinstance(value, (list, tuple)):
+        if not value:
+            return [
+                _issue(
+                    concept,
+                    "verified",
+                    "verified must contain at least one event",
+                )
+            ]
         events = tuple(value)
         is_sequence = True
     else:

@@ -164,6 +164,77 @@ def test_write_refuses_to_replace_existing_bundle(
     assert (destination / "notes.md").read_text(encoding="utf-8") == "keep me"
 
 
+@pytest.mark.parametrize("operation", ["generate", "write"])
+def test_new_bundle_refuses_symlinked_destination_root_without_external_changes(
+    tmp_path: Path,
+    ecommerce_layer: SemanticLayer,
+    operation: str,
+) -> None:
+    external = tmp_path / "external"
+    external.mkdir()
+    destination = tmp_path / "knowledge"
+    destination.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(FileExistsError, match="symbolic link"):
+        bundle = OkfBundle.from_layer(ecommerce_layer)
+        if operation == "generate":
+            OkfBundle.generate(ecommerce_layer, destination)
+        else:
+            bundle.write(destination)
+
+    assert list(external.iterdir()) == []
+    assert destination.is_symlink()
+
+
+@pytest.mark.parametrize("operation", ["generate", "write"])
+def test_new_bundle_refuses_symlinked_kind_directory_without_external_changes(
+    tmp_path: Path,
+    ecommerce_layer: SemanticLayer,
+    operation: str,
+) -> None:
+    external = tmp_path / "external"
+    external.mkdir()
+    curated = external / "gross_margin.md"
+    original = b"finance-curated metric\n"
+    curated.write_bytes(original)
+    destination = tmp_path / "knowledge"
+    destination.mkdir()
+    (destination / "metrics").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(FileExistsError, match="symbolic link"):
+        bundle = OkfBundle.from_layer(ecommerce_layer)
+        if operation == "generate":
+            OkfBundle.generate(ecommerce_layer, destination)
+        else:
+            bundle.write(destination)
+
+    assert curated.read_bytes() == original
+    assert sorted(path.name for path in external.iterdir()) == ["gross_margin.md"]
+    assert (destination / "metrics").is_symlink()
+
+
+@pytest.mark.parametrize("operation", ["generate", "write"])
+def test_new_bundle_refuses_broken_symlink_without_writing(
+    tmp_path: Path,
+    ecommerce_layer: SemanticLayer,
+    operation: str,
+) -> None:
+    destination = tmp_path / "knowledge"
+    destination.mkdir()
+    broken = destination / "broken"
+    broken.symlink_to(tmp_path / "missing", target_is_directory=True)
+
+    with pytest.raises(FileExistsError, match="symbolic link"):
+        bundle = OkfBundle.from_layer(ecommerce_layer)
+        if operation == "generate":
+            OkfBundle.generate(ecommerce_layer, destination)
+        else:
+            bundle.write(destination)
+
+    assert broken.is_symlink()
+    assert list(destination.iterdir()) == [broken]
+
+
 def test_generate_maps_descriptions_only_when_requested(
     tmp_path: Path,
     ecommerce_layer: SemanticLayer,

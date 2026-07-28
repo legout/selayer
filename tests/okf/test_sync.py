@@ -337,6 +337,29 @@ def test_sync_reports_stale_concepts_as_unchanged_orphans(
     assert not (destination / "metrics" / "index.md").exists()
 
 
+def test_sync_refuses_symlinked_stale_index_without_external_changes(
+    tmp_path: Path,
+    ecommerce_layer: SemanticLayer,
+) -> None:
+    destination = tmp_path / "knowledge"
+    OkfBundle.from_layer(ecommerce_layer).write(destination)
+    index_path = destination / "metrics" / "index.md"
+    index_path.unlink()
+    external = tmp_path / "curated-index.md"
+    original = b"# Curated external index\n"
+    external.write_bytes(original)
+    index_path.symlink_to(external)
+    without_metrics = SemanticLayer.load(
+        _catalog_without_metrics(tmp_path, ecommerce_layer)
+    )
+
+    with pytest.raises(FileExistsError, match="symbolic link"):
+        OkfBundle.from_layer(without_metrics).sync(destination)
+
+    assert external.read_bytes() == original
+    assert index_path.is_symlink()
+
+
 def test_sync_preserves_legacy_underscore_files_as_ordinary_unknown_files(
     tmp_path: Path,
     ecommerce_layer: SemanticLayer,

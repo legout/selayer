@@ -34,12 +34,30 @@ from .model import (
     TrustTier,
 )
 from .validation import (
+    _is_iso_datetime,
     validate_concept,
     validate_duplicate_bindings,
     validate_index,
     validate_links,
     validate_log,
 )
+
+
+def _reject_destination_symlinks(destination: Path) -> None:
+    symlink = destination if destination.is_symlink() else None
+    if symlink is None and destination.exists():
+        symlink = next(
+            (
+                candidate
+                for candidate in destination.rglob("*")
+                if candidate.is_symlink()
+            ),
+            None,
+        )
+    if symlink is not None:
+        raise FileExistsError(
+            f"destination '{destination}' contains symbolic link '{symlink}'"
+        )
 
 
 def _write_text(path: Path, content: str) -> None:
@@ -58,10 +76,25 @@ _SHA256_HEX = re.compile(r"[0-9a-fA-F]{64}")
 
 def trust_tier(frontmatter: Mapping[str, Any]) -> TrustTier:
     verified = frontmatter.get("verified")
-    if verified is None:
+    if isinstance(verified, Mapping):
+        events = (verified,)
+    elif isinstance(verified, (list, tuple)) and verified:
+        events = verified
+    else:
         return "unverified"
-    events = (verified,) if isinstance(verified, Mapping) else verified
-    actors = [event["by"] for event in events]
+
+    actors: list[str] = []
+    for event in events:
+        if not isinstance(event, Mapping):
+            return "unverified"
+        actor = event.get("by")
+        if (
+            not isinstance(actor, str)
+            or not actor.strip()
+            or not _is_iso_datetime(event.get("at"))
+        ):
+            return "unverified"
+        actors.append(actor)
     if any(actor.startswith("human:") for actor in actors):
         return "human_reviewed"
     return "machine_confirmed"
@@ -213,6 +246,7 @@ class OkfBundle:
         from .generation import index_documents
 
         destination = Path(path)
+        _reject_destination_symlinks(destination)
         if destination.is_file() or (
             destination.exists()
             and any(candidate.is_file() for candidate in destination.rglob("*"))
@@ -237,6 +271,7 @@ class OkfBundle:
         from .generation import generated_directories, index_documents
 
         destination = Path(path)
+        _reject_destination_symlinks(destination)
         if destination.is_file():
             raise FileExistsError(f"destination '{destination}' is a file")
         written: list[str] = []

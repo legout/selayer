@@ -179,6 +179,60 @@ def test_machine_verification_is_visible(loaded_okf_bundle: OkfBundle) -> None:
     assert item.freshness == "unspecified"
 
 
+@pytest.mark.parametrize(
+    ("verified", "expected_trust"),
+    [
+        ([], "unverified"),
+        ("invalid", "unverified"),
+        ([{"by": "human:finance"}], "unverified"),
+        ([{"by": "human:finance", "at": "not-a-datetime"}], "unverified"),
+        (
+            [{"by": "human:finance", "at": "2026-07-20T10:00:00Z"}],
+            "human_reviewed",
+        ),
+        (
+            [{"by": "process:nightly", "at": "2026-07-20T10:00:00Z"}],
+            "machine_confirmed",
+        ),
+        (
+            {"by": "human:finance", "at": "2026-07-20T10:00:00Z"},
+            "human_reviewed",
+        ),
+    ],
+    ids=[
+        "empty-list",
+        "wrong-type",
+        "missing-at",
+        "invalid-at",
+        "human-list",
+        "machine-list",
+        "human-mapping",
+    ],
+)
+def test_in_memory_verification_is_defensive_and_preserves_valid_forms(
+    verified: object,
+    expected_trust: str,
+) -> None:
+    concept = OkfConcept.create(
+        concept_id="metrics/gross_margin",
+        relative_path=PurePosixPath("metrics/gross_margin.md"),
+        frontmatter={
+            "type": "Selayer Metric",
+            "selayer_id": "metric.gross_margin",
+            "verified": verified,
+        },
+    )
+    bundle = OkfBundle(root=None, concepts={concept.concept_id: concept})
+
+    result = bundle.context_for(["metric.gross_margin"], include_linked=False)
+
+    assert result.items[0].trust == expected_trust
+    has_unverified_warning = any(
+        "unverified" in issue.message for issue in result.diagnostics
+    )
+    assert has_unverified_warning is (expected_trust == "unverified")
+
+
 def test_mandatory_concept_must_fit_budget(
     loaded_okf_bundle: OkfBundle,
 ) -> None:

@@ -105,6 +105,20 @@ def test_invalid_optional_families_are_rejected(
     assert issue_path in {issue.path for issue in caught.value.issues}
 
 
+def test_verified_rejects_empty_list_with_deterministic_issue(tmp_path: Path) -> None:
+    _write_concept(tmp_path, "type: Metric\nverified: []")
+
+    with pytest.raises(OkfValidationError) as caught:
+        OkfBundle.load(tmp_path)
+
+    assert [(issue.path, issue.message) for issue in caught.value.issues] == [
+        (
+            "concept.md.frontmatter.verified",
+            "verified must contain at least one event",
+        )
+    ]
+
+
 @pytest.mark.parametrize(
     "verified",
     [
