@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import hmac
+import posixpath
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
+from datetime import UTC, date, datetime
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
+from typing import Any
+from urllib.parse import unquote, urlsplit
 
 import yaml
 
@@ -20,7 +23,18 @@ from .document import (
     parse_concept,
     render_concept,
 )
-from .model import OkfConcept, OkfIssue, OkfValidationError, SyncReport
+from .model import (
+    ContextBudgetError,
+    ContextItem,
+    ContextLookupError,
+    ContextResult,
+    Freshness,
+    OkfConcept,
+    OkfIssue,
+    OkfValidationError,
+    SyncReport,
+    TrustTier,
+)
 from .validation import (
     validate_concept,
     validate_duplicate_bindings,
@@ -76,6 +90,119 @@ def _remove_stale_generated_files(
                 continue
             if path.name == "_index.md" or _has_generator_ownership(path):
                 path.unlink()
+
+
+def trust_tier(frontmatter: Mapping[str, Any]) -> TrustTier:
+    verified = frontmatter.get("verified")
+    if verified is None:
+        return "unverified"
+    events = (verified,) if isinstance(verified, Mapping) else verified
+    actors = [event["by"] for event in events]
+    if any(actor.startswith("human:") for actor in actors):
+        return "human_reviewed"
+    return "machine_confirmed"
+
+
+def freshness(frontmatter: Mapping[str, Any], today: date) -> Freshness:
+    value = frontmatter.get("stale_after")
+    if value is None:
+        return "unspecified"
+    stale_after = value if isinstance(value, date) else date.fromisoformat(value)
+    return "stale" if today >= stale_after else "current"
+
+
+def _sources(frontmatter: Mapping[str, Any]) -> tuple[str, ...]:
+    return tuple(source["resource"] for source in frontmatter.get("sources", ()))
+
+
+def _render_context(concept: OkfConcept, sources: tuple[str, ...]) -> str:
+    frontmatter = concept.frontmatter
+    parts: list[str] = []
+    title = frontmatter.get("title")
+    if isinstance(title, str) and title:
+        parts.append(f"# {title}")
+    description = frontmatter.get("description")
+    if isinstance(description, str) and description:
+        parts.append(description)
+    if concept.preamble:
+        parts.append(concept.preamble)
+    parts.extend(
+        f"# {section.title}\n\n{section.content}".rstrip()
+        for section in concept.sections
+    )
+    if sources:
+        parts.append("## Sources\n\n" + "\n".join(f"- {source}" for source in sources))
+    return "\n\n".join(parts)
+
+
+def _context_item(concept: OkfConcept, today: date) -> ContextItem:
+    frontmatter = concept.frontmatter
+    sources = _sources(frontmatter)
+    semantic_id = frontmatter.get("selayer_id")
+    return ContextItem(
+        concept_id=concept.concept_id,
+        kind=frontmatter["type"],
+        content=_render_context(concept, sources),
+        provider="selayer",
+        semantic_refs=(semantic_id,) if isinstance(semantic_id, str) else (),
+        trust=trust_tier(frontmatter),
+        freshness=freshness(frontmatter, today),
+        sources=sources,
+    )
+
+
+def _resolved_link(
+    source: OkfConcept,
+    link: str,
+    concepts_by_path: Mapping[PurePosixPath, OkfConcept],
+) -> OkfConcept | None:
+    try:
+        split = urlsplit(link)
+    except ValueError:
+        return None
+    if split.scheme or split.netloc or (not split.path and split.fragment):
+        return None
+    path_text = unquote(split.path)
+    if not path_text:
+        return None
+    if path_text.startswith("/"):
+        normalized = posixpath.normpath(path_text.lstrip("/"))
+    else:
+        normalized = posixpath.normpath(
+            posixpath.join(source.relative_path.parent.as_posix(), path_text)
+        )
+    if normalized == ".." or normalized.startswith("../"):
+        return None
+    return concepts_by_path.get(PurePosixPath(normalized))
+
+
+def _linked_concepts(
+    source: OkfConcept,
+    concepts_by_path: Mapping[PurePosixPath, OkfConcept],
+) -> tuple[OkfConcept, ...]:
+    resolved = {
+        concept.concept_id: concept
+        for link in source.links
+        if (concept := _resolved_link(source, link, concepts_by_path)) is not None
+    }
+    return tuple(resolved[concept_id] for concept_id in sorted(resolved))
+
+
+def _context_warning(concept: OkfConcept, message: str) -> OkfIssue:
+    return OkfIssue(
+        path=concept.relative_path.as_posix(),
+        message=message,
+        severity="warning",
+    )
+
+
+def _item_diagnostics(item: ContextItem, concept: OkfConcept) -> tuple[OkfIssue, ...]:
+    issues: list[OkfIssue] = []
+    if item.freshness == "stale":
+        issues.append(_context_warning(concept, "returned context is stale"))
+    if item.trust == "unverified":
+        issues.append(_context_warning(concept, "returned context is unverified"))
+    return tuple(issues)
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,6 +424,100 @@ class OkfBundle:
             unchanged=tuple(sorted(unchanged)),
             conflicts=tuple(sorted(conflicts)),
             orphaned=tuple(sorted(orphaned)),
+        )
+
+    def context_for(
+        self,
+        semantic_ids: Iterable[str],
+        *,
+        include_linked: bool = True,
+        max_chars: int = 12_000,
+        max_depth: int = 1,
+        today: date | None = None,
+    ) -> ContextResult:
+        if max_chars <= 0:
+            raise ValueError("max_chars must be positive")
+        if max_depth < 0:
+            raise ValueError("max_depth must not be negative")
+
+        concepts_by_semantic_id: dict[str, OkfConcept] = {}
+        for concept_id in sorted(self.concepts):
+            concept = self.concepts[concept_id]
+            semantic_id = concept.frontmatter.get("selayer_id")
+            if not isinstance(semantic_id, str):
+                continue
+            if semantic_id in concepts_by_semantic_id:
+                raise ContextLookupError(
+                    f"duplicate concept binding for semantic identifier '{semantic_id}'"
+                )
+            concepts_by_semantic_id[semantic_id] = concept
+
+        required: list[OkfConcept] = []
+        seen_semantic_ids: set[str] = set()
+        for semantic_id in semantic_ids:
+            if semantic_id in seen_semantic_ids:
+                continue
+            seen_semantic_ids.add(semantic_id)
+            try:
+                required.append(concepts_by_semantic_id[semantic_id])
+            except KeyError:
+                raise ContextLookupError(
+                    f"unknown semantic identifier '{semantic_id}'"
+                ) from None
+
+        effective_today = today if today is not None else datetime.now(UTC).date()
+        items = [_context_item(concept, effective_today) for concept in required]
+        total_chars = sum(len(item.content) for item in items)
+        if total_chars > max_chars:
+            raise ContextBudgetError(total_chars, max_chars)
+
+        dynamic_diagnostics = [
+            issue
+            for item, concept in zip(items, required, strict=True)
+            for issue in _item_diagnostics(item, concept)
+        ]
+        if include_linked and max_depth > 0:
+            concepts_by_path = {
+                concept.relative_path: concept for concept in self.concepts.values()
+            }
+            visited = {concept.concept_id for concept in required}
+            queue = [(concept, 0) for concept in required]
+            omitted = False
+            position = 0
+            while position < len(queue) and not omitted:
+                source, depth = queue[position]
+                position += 1
+                if depth >= max_depth:
+                    continue
+                for linked in _linked_concepts(source, concepts_by_path):
+                    if linked.concept_id in visited:
+                        continue
+                    visited.add(linked.concept_id)
+                    linked_item = _context_item(linked, effective_today)
+                    linked_chars = len(linked_item.content)
+                    if total_chars + linked_chars > max_chars:
+                        omitted = True
+                        break
+                    items.append(linked_item)
+                    total_chars += linked_chars
+                    dynamic_diagnostics.extend(_item_diagnostics(linked_item, linked))
+                    queue.append((linked, depth + 1))
+            if omitted:
+                dynamic_diagnostics.append(
+                    OkfIssue(
+                        path="context",
+                        message=(
+                            "omitted linked context because it exceeds "
+                            f"the max_chars budget of {max_chars}"
+                        ),
+                        severity="warning",
+                    )
+                )
+
+        return ContextResult(
+            items=tuple(items),
+            diagnostics=self.diagnostics + tuple(dynamic_diagnostics),
+            total_chars=total_chars,
         )
 
     @classmethod

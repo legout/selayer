@@ -49,6 +49,39 @@ class OkfValidationError(ValueError):
         super().__init__("; ".join(f"{i.path}: {i.message}" for i in issues))
 
 
+class ContextLookupError(LookupError):
+    pass
+
+
+class ContextBudgetError(ValueError):
+    def __init__(self, required_chars: int, max_chars: int) -> None:
+        self.required_chars = required_chars
+        self.max_chars = max_chars
+        super().__init__(
+            f"mandatory context requires {required_chars} characters; "
+            f"budget is {max_chars}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ContextItem:
+    concept_id: str
+    kind: str
+    content: str
+    provider: str
+    semantic_refs: tuple[str, ...]
+    trust: TrustTier
+    freshness: Freshness
+    sources: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ContextResult:
+    items: tuple[ContextItem, ...]
+    diagnostics: tuple[OkfIssue, ...]
+    total_chars: int
+
+
 @dataclass(frozen=True, slots=True)
 class SyncReport:
     written: tuple[str, ...]
@@ -94,6 +127,10 @@ class OkfConcept:
 
 
 __all__ = [
+    "ContextBudgetError",
+    "ContextItem",
+    "ContextLookupError",
+    "ContextResult",
     "Freshness",
     "OkfConcept",
     "OkfIssue",

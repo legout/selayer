@@ -2,9 +2,23 @@
 
 from .bundle import OkfBundle
 from .document import OkfDocumentError, parse_concept, render_concept
-from .model import OkfConcept, OkfIssue, OkfSection, OkfValidationError, SyncReport
+from .model import (
+    ContextBudgetError,
+    ContextItem,
+    ContextLookupError,
+    ContextResult,
+    OkfConcept,
+    OkfIssue,
+    OkfSection,
+    OkfValidationError,
+    SyncReport,
+)
 
 __all__ = [
+    "ContextBudgetError",
+    "ContextItem",
+    "ContextLookupError",
+    "ContextResult",
     "OkfBundle",
     "OkfConcept",
     "OkfDocumentError",
