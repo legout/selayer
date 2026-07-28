@@ -337,3 +337,46 @@ def test_context_result_is_immutable(loaded_okf_bundle: OkfBundle) -> None:
         result.total_chars = 0  # type: ignore[misc]
     with pytest.raises(FrozenInstanceError):
         result.items[0].content = "changed"  # type: ignore[misc]
+
+
+def test_attested_computation_contract_is_surfaced_on_linked_context(
+    tmp_path: Path,
+) -> None:
+    decoder = tmp_path / "computations" / "decoder.md"
+    decoder.parent.mkdir(parents=True)
+    decoder.write_text(
+        "---\n"
+        "type: Attested Computation\n"
+        "runtime: python\n"
+        "parameters:\n"
+        "  - {name: mlfb, type: string, required: true}\n"
+        "executor:\n"
+        "  resource: run.md\n"
+        "  receipt: [decoded]\n"
+        "attester:\n"
+        "  resource: check.py\n"
+        "---\n\n"
+        "# Computation\n\n"
+        "    def decode(mlfb): ...\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "metrics").mkdir()
+    (tmp_path / "metrics" / "m.md").write_text(
+        "---\ntype: Selayer Metric\nselayer_id: metric.gross_margin\n---\n\n"
+        "# Definition\n\nDecoded by [the decoder](../computations/decoder.md).\n",
+        encoding="utf-8",
+    )
+
+    bundle = OkfBundle.load(tmp_path)
+    result = bundle.context_for(["metric.gross_margin"], max_depth=1)
+
+    decoder_item = next(
+        item for item in result.items if item.concept_id == "computations/decoder"
+    )
+    contract = decoder_item.attested_computation
+    assert contract is not None
+    assert contract.runtime == "python"
+    assert contract.parameters[0].name == "mlfb"
+    assert contract.executor_resource == "run.md"
+    assert contract.attester_resource == "check.py"
+    assert "def decode" in contract.computation_body

@@ -13,6 +13,7 @@ from urllib.parse import unquote, urlsplit
 
 from selayer.catalog import SemanticLayer
 
+from .computation import attested_computation
 from .document import (
     OkfControlledMergeError,
     OkfDocumentError,
@@ -164,6 +165,7 @@ def _context_item(concept: OkfConcept, today: date) -> ContextItem:
         trust=trust_tier(frontmatter),
         freshness=freshness(frontmatter, today),
         sources=sources,
+        attested_computation=attested_computation(concept),
     )
 
 
