@@ -38,6 +38,7 @@ def _format(
     *,
     parent_precedence: int,
     right_child: bool,
+    parent_is_comparison: bool = False,
 ) -> str:
     if isinstance(expression, Literal):
         if expression.value is None:
@@ -69,6 +70,11 @@ def _format(
             right_child=True,
         )
         separator = " " if expression.operator == "not" else ""
+        if (
+            isinstance(expression.operand, UnaryOperation)
+            and expression.operator + expression.operand.operator == "--"
+        ):
+            operand = f"({operand})"
         rendered = f"{expression.operator}{separator}{operand}"
         if _UNARY_PRECEDENCE < parent_precedence:
             return f"({rendered})"
@@ -80,15 +86,19 @@ def _format(
             expression.left,
             parent_precedence=precedence,
             right_child=False,
+            parent_is_comparison=precedence == _BINARY_PRECEDENCE["="],
         )
         right = _format(
             expression.right,
             parent_precedence=precedence,
             right_child=True,
+            parent_is_comparison=precedence == _BINARY_PRECEDENCE["="],
         )
         rendered = f"{left} {expression.operator} {right}"
-        needs_parentheses = precedence < parent_precedence or (
-            right_child and precedence == parent_precedence
+        needs_parentheses = (
+            precedence < parent_precedence
+            or (parent_is_comparison and precedence == parent_precedence)
+            or (right_child and precedence == parent_precedence)
         )
         if needs_parentheses:
             return f"({rendered})"

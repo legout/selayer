@@ -15,6 +15,10 @@ from selayer.expressions import Literal, format_expression, parse_expression
         'coalesce(name, "unknown")',
         "enabled = true",
         "value = null",
+        "- -a",
+        "+ -a",
+        "(a = b) = c",
+        "(a < b) != c",
     ],
 )
 def test_formatted_expression_round_trips(source: str) -> None:
@@ -24,6 +28,10 @@ def test_formatted_expression_round_trips(source: str) -> None:
 
 def test_formatting_is_canonical() -> None:
     assert format_expression(parse_expression("a+(b*2)")) == "a + b * 2"
+
+
+def test_formatting_keeps_associative_arithmetic_minimal() -> None:
+    assert format_expression(parse_expression("(a + b) + c")) == "a + b + c"
 
 
 def test_parser_produced_tiny_float_round_trips_as_fixed_point() -> None:
