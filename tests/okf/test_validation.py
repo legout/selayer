@@ -431,3 +431,77 @@ def test_underscore_layout_files_are_loaded_as_ordinary_unknown_concepts(
     bundle = OkfBundle.load(tmp_path)
 
     assert tuple(bundle.concepts) == ("_change_log", "_index")
+
+
+@pytest.mark.parametrize(
+    ("frontmatter", "issue_path"),
+    [
+        ("type: Attested Computation\nruntime: python\nparameters: nope", "parameters"),
+        (
+            "type: Attested Computation\nruntime: python\nparameters: [{type: year}]",
+            "parameters[0].name",
+        ),
+        (
+            "type: Attested Computation\nruntime: python\nparameters: [{name: year}]",
+            "parameters[0].type",
+        ),
+        (
+            "type: Attested Computation\nruntime: python\nparameters: [{name: year, type: int, required: 1}]",
+            "parameters[0].required",
+        ),
+        ("type: Attested Computation\nruntime: python\ncomputation: ''", "computation"),
+        (
+            "type: Attested Computation\nruntime: python\nexecutor: nope",
+            "executor",
+        ),
+        (
+            "type: Attested Computation\nruntime: python\nexecutor: {receipt: nope}",
+            "executor.resource",
+        ),
+        (
+            "type: Attested Computation\nruntime: python\nexecutor: {resource: run.md, receipt: []}",
+            "executor.receipt",
+        ),
+        (
+            "type: Attested Computation\nruntime: python\nattester: nope",
+            "attester",
+        ),
+        (
+            "type: Attested Computation\nruntime: python\nattester: {}",
+            "attester.resource",
+        ),
+    ],
+)
+def test_invalid_attested_computation_fields_are_rejected(
+    tmp_path: Path,
+    frontmatter: str,
+    issue_path: str,
+) -> None:
+    _write_concept(tmp_path, frontmatter)
+    with pytest.raises(OkfValidationError) as caught:
+        OkfBundle.load(tmp_path)
+    assert f"concept.md.frontmatter.{issue_path}" in {
+        issue.path for issue in caught.value.issues
+    }
+
+
+def test_minimal_attested_computation_remains_valid(tmp_path: Path) -> None:
+    _write_concept(tmp_path, "type: Attested Computation\nruntime: python")
+    assert OkfBundle.load(tmp_path).concepts["concept"]
+
+
+def test_full_attested_computation_contract_is_valid(tmp_path: Path) -> None:
+    _write_concept(
+        tmp_path,
+        "type: Attested Computation\n"
+        "runtime: bigquery\n"
+        "parameters:\n"
+        "  - {name: year, type: integer, required: true}\n"
+        "computation: references/computations/revenue.sql\n"
+        "executor:\n"
+        "  resource: references/skills/run-on-bq.md\n"
+        "  receipt: [job_id, executed_sql, result]\n"
+        "attester:\n"
+        "  resource: references/attesters/revenue.py\n",
+    )
+    assert OkfBundle.load(tmp_path).concepts["concept"]
