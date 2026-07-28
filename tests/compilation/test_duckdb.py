@@ -5,7 +5,6 @@ from typing import cast
 
 import pytest
 
-from selayer._next.model import Aggregation
 from selayer.compilation.duckdb import (
     CompiledQuery,
     compile_duckdb,
@@ -21,6 +20,7 @@ from selayer.expressions import (
     Reference,
     parse_expression,
 )
+from selayer.model import Aggregation
 from selayer.planning import (
     JoinStep,
     ListFilter,

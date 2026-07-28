@@ -6,8 +6,8 @@ from collections import deque
 from dataclasses import dataclass
 from typing import cast
 
-from selayer._next.model import Relationship, SemanticLayer
 from selayer.expressions import references
+from selayer.model import Relationship, SemanticLayer
 from selayer.planning.types import (
     FilterValue,
     JoinStep,

@@ -7,8 +7,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TypeAlias, Union
 
-from selayer._next.model import Aggregation
 from selayer.expressions import Expression, Scalar
+from selayer.model import Aggregation
 
 
 @dataclass(frozen=True, slots=True)

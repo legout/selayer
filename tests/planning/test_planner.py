@@ -4,7 +4,7 @@ from collections.abc import Mapping
 
 import pytest
 
-from selayer._next import (
+from selayer import (
     DataSource,
     Dimension,
     Fact,
