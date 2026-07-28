@@ -132,6 +132,9 @@ class Relationship:
     target_column: str
 
 
+type SemanticObject = DataSource | Dimension | Fact | Measure | Metric | Relationship
+
+
 @dataclass(frozen=True, slots=True)
 class SemanticLayer:
     """A validated, immutable collection of semantic model definitions.
@@ -185,6 +188,30 @@ class SemanticLayer:
     def relationship(self, name: str) -> Relationship:
         return self.relationships[name]
 
+    def semantic_objects(self) -> Mapping[str, SemanticObject]:
+        """Return every catalog object under a stable typed identifier."""
+        collections: tuple[tuple[str, Mapping[str, SemanticObject]], ...] = (
+            ("source", self.data_sources),
+            ("dimension", self.dimensions),
+            ("fact", self.facts),
+            ("measure", self.measures),
+            ("metric", self.metrics),
+            ("relationship", self.relationships),
+        )
+        objects = {
+            f"{kind}.{name}": value
+            for kind, values in collections
+            for name, value in values.items()
+        }
+        return MappingProxyType(dict(sorted(objects.items())))
+
+    def resolve(self, semantic_id: str) -> SemanticObject:
+        """Resolve one typed semantic identifier or raise a stable ``KeyError``."""
+        try:
+            return self.semantic_objects()[semantic_id]
+        except KeyError:
+            raise KeyError(f"unknown semantic identifier: {semantic_id}") from None
+
     @classmethod
     def load(cls, path: str | Path) -> SemanticLayer:
         """Load and validate a schema-version-1 catalog from ``path``.
@@ -209,4 +236,5 @@ __all__ = [
     "Metric",
     "Relationship",
     "SemanticLayer",
+    "SemanticObject",
 ]

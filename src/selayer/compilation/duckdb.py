@@ -7,6 +7,7 @@ name resolution and grain checks have already happened in planning.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -64,7 +65,11 @@ def _compile_literal(literal: LiteralExpression) -> str:
     )
 
 
-def _compile_expression(expression: Expression, mode: Literal["row", "metric"]) -> str:
+def _compile_expression(
+    expression: Expression,
+    mode: Literal["row", "metric"],
+    measure_aliases: Mapping[str, str] | None = None,
+) -> str:
     if isinstance(expression, LiteralExpression):
         return _compile_literal(expression)
     if isinstance(expression, Reference):
@@ -75,12 +80,18 @@ def _compile_expression(expression: Expression, mode: Literal["row", "metric"]) 
             source, column = expression.parts
             return f"{quote_identifier(source)}.{quote_identifier(column)}"
         assert len(expression.parts) == 1, "validated metric reference is not a measure"
-        return quote_identifier(expression.parts[0])
+        identifier = expression.parts[0]
+        if measure_aliases is not None:
+            try:
+                identifier = measure_aliases[identifier]
+            except KeyError:
+                raise AssertionError("unknown validated metric reference") from None
+        return quote_identifier(identifier)
     if isinstance(expression, UnaryOperation):
         assert expression.operator in {"+", "-", "not"}, (
             "validated unary operator is not allowlisted"
         )
-        operand = _compile_expression(expression.operand, mode)
+        operand = _compile_expression(expression.operand, mode, measure_aliases)
         if expression.operator == "not":
             return f"(NOT {operand})"
         return f"({expression.operator}{operand})"
@@ -97,8 +108,8 @@ def _compile_expression(expression: Expression, mode: Literal["row", "metric"]) 
             ">",
             ">=",
         }, "validated binary operator is not allowlisted"
-        left = _compile_expression(expression.left, mode)
-        right = _compile_expression(expression.right, mode)
+        left = _compile_expression(expression.left, mode, measure_aliases)
+        right = _compile_expression(expression.right, mode, measure_aliases)
         return f"({left} {expression.operator} {right})"
     if isinstance(expression, FunctionCall):
         allowed = ROW_FUNCTIONS if mode == "row" else METRIC_FUNCTIONS
@@ -106,7 +117,8 @@ def _compile_expression(expression: Expression, mode: Literal["row", "metric"]) 
         # Names come from the AST allowlist, rather than user SQL, and are
         # rendered as function keywords. Arguments remain recursively typed.
         arguments = ", ".join(
-            _compile_expression(argument, mode) for argument in expression.arguments
+            _compile_expression(argument, mode, measure_aliases)
+            for argument in expression.arguments
         )
         return f"{expression.name.upper()}({arguments})"
     raise AssertionError("validated expression has an unknown node type")
@@ -118,10 +130,13 @@ def compile_row_expression(expression: Expression) -> str:
     return _compile_expression(expression, "row")
 
 
-def compile_metric_expression(expression: Expression) -> str:
+def compile_metric_expression(
+    expression: Expression,
+    measure_aliases: Mapping[str, str] | None = None,
+) -> str:
     """Compile a validated metric formula using aggregate aliases."""
 
-    return _compile_expression(expression, "metric")
+    return _compile_expression(expression, "metric", measure_aliases)
 
 
 def _filter_column(item: PlannedFilter) -> str:
@@ -201,14 +216,20 @@ def compile_duckdb(plan: QueryPlan) -> CompiledQuery:
     """Compile a validated plan into a grain-safe parameterized query."""
 
     parameters: list[object] = []
+    dimension_aliases = {
+        item.id: f"__selayer_dimension_{item.id}" for item in plan.dimensions
+    }
+    measure_aliases = {
+        item.id: f"__selayer_measure_{item.id}" for item in plan.measures
+    }
     dimensions = [
         f"{quote_identifier(item.dimension.source)}.{quote_identifier(item.dimension.column)} "
-        f"AS {quote_identifier(item.id)}"
+        f"AS {quote_identifier(dimension_aliases[item.id])}"
         for item in plan.dimensions
     ]
     measures = [
         f"{_aggregate_sql(item.aggregation, compile_row_expression(item.expression))} "
-        f"AS {quote_identifier(item.id)}"
+        f"AS {quote_identifier(measure_aliases[item.id])}"
         for item in plan.measures
     ]
     inner_select = ", ".join(dimensions + measures)
@@ -226,9 +247,13 @@ def compile_duckdb(plan: QueryPlan) -> CompiledQuery:
     cte_name = quote_identifier("aggregated")
     cte = f"WITH {cte_name} AS (SELECT {inner_select} {from_sql}{where_sql}{group_sql})"
 
-    outer_items = [quote_identifier(item.id) for item in plan.dimensions]
+    outer_items = [
+        f"{quote_identifier(dimension_aliases[item.id])} AS {quote_identifier(item.id)}"
+        for item in plan.dimensions
+    ]
     outer_items.extend(
-        f"{compile_metric_expression(item.expression)} AS {quote_identifier(item.id)}"
+        f"{compile_metric_expression(item.expression, measure_aliases)} "
+        f"AS {quote_identifier(item.id)}"
         for item in plan.metrics
     )
     outer_select = ", ".join(outer_items)

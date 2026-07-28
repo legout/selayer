@@ -474,6 +474,7 @@ def test_public_exports_exclude_compiler_internals() -> None:
         "Fact",
         "Measure",
         "Metric",
+        "OkfBundle",
         "QueryEngine",
         "QueryExecutionError",
         "QueryPlan",

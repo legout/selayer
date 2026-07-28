@@ -1,4 +1,4 @@
-"""Shared fixtures for the immutable catalog tests."""
+"""Shared fixtures for the immutable catalog and query tests."""
 
 from __future__ import annotations
 
@@ -69,6 +69,12 @@ relationships:
     source_column: id
     target_column: product_id
 """
+
+
+@pytest.fixture
+def root() -> Path:
+    """Return the repository root for integration fixtures."""
+    return Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture

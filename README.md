@@ -57,7 +57,7 @@ declared measures, such as `total_item_revenue / nullif(units_sold, 0)`.
 Identifiers are typed by their catalog section (`source.products`,
 `measure.total_item_cost`, and so on) and use stable lowercase names.
 
-OKF, automatic or explicit re-graining/allocation, many-to-many planning, and
+Automatic or explicit re-graining/allocation, many-to-many planning, and
 additional query engines are out of scope. DuckDB is the only execution
 compiler.
 
@@ -74,6 +74,7 @@ The public interface exports exactly the symbols in `selayer.__all__`:
 - `Fact`
 - `Measure`
 - `Metric`
+- `OkfBundle`
 - `QueryEngine`
 - `QueryExecutionError`
 - `QueryPlan`
@@ -83,14 +84,97 @@ The public interface exports exactly the symbols in `selayer.__all__`:
 
 Compiler and parser internals are intentionally not public exports.
 
-Catalogs are loaded through the active schema-version-1 model:
+Catalogs are loaded through the active schema-version-1 model. Programmatic
+callers construct expression-bearing objects with the parser-backed factories:
 
 ```python
-from selayer import SemanticLayer
+from selayer import Fact, Metric, SemanticLayer
 
 layer = SemanticLayer.load("ecommerce_semantic_layer.yaml")
-print(layer.version, layer.data_sources.keys())
+fact = Fact.from_expression(
+    "item_revenue", "order_items", "order_items.total", "decimal"
+)
+metric = Metric.from_expression(
+    "gross_revenue", "total_item_revenue", ["total_item_revenue"]
+)
+print(layer.version, fact.expression, metric.measures)
 ```
+
+## Advisory OKF context
+
+The YAML catalog controls execution; OKF is advisory context only. The catalog
+is the executable authority for queryable dimensions, facts, measures, metrics,
+relationships, planning, and compilation. OKF Markdown can explain those
+objects, but it cannot add executable semantics or override the catalog.
+
+Create a knowledge bundle and retrieve bounded, attributed context through the
+public API:
+
+```python
+from selayer import OkfBundle, SemanticLayer
+
+layer = SemanticLayer.load("ecommerce_semantic_layer.yaml")
+
+OkfBundle.from_layer(layer).write("knowledge")
+
+bundle = OkfBundle.load("knowledge", layer=layer)
+context = bundle.context_for(
+    ["metric.gross_margin", "dimension.product_category"],
+    include_linked=True,
+    max_chars=12_000,
+)
+```
+
+Bundles use root `index.md`, per-kind `index.md`, and root append-only `log.md`.
+`write()` creates new bundles and refuses to overwrite a populated destination.
+`generate()` follows the same new-bundle-only safety contract and directs callers
+to `sync()` instead of overwriting any existing file.
+`sync()` preserves curated sections while updating generator-owned catalog
+sections; conflicts remain explicit for human review. A decoded attribute such as
+MLFB color requires a real catalog dimension before it is queryable.
+Data values are never exported by generation, synchronization,
+validation, or retrieval. Mutating bundle operations preflight the destination's
+lexical ancestors and existing tree and refuse every symbolic link without
+resolving through it. This is preflight protection only; descriptor-based
+protection against filesystem races after the check is outside the portable API.
+
+The deeper `selayer.okf` API exports `OkfBundle`, `OkfConcept`, `OkfIssue`,
+`OkfValidationError`, `SyncReport`, `ContextItem`, `ContextResult`,
+`ContextLookupError`, and `ContextBudgetError`. Only `OkfBundle` is also exposed
+at the package root; parsers, renderers, merge helpers, and validation internals
+are not public API.
+
+This boundary intentionally provides no semantic search or multi-provider brokering.
+It also provides no wiki publishing, RAG, embeddings, or orchestration. Those
+concerns belong outside `selayer`.
+
+### Dependency-free OKF CLI
+
+The `selayer-okf` console script uses only the Python standard library for its
+command-line and JSON presentation layer; it adds no CLI framework dependency.
+It wraps the same advisory API:
+
+```bash
+uv run selayer-okf generate ecommerce_semantic_layer.yaml knowledge
+uv run selayer-okf sync ecommerce_semantic_layer.yaml knowledge --dry-run
+uv run selayer-okf validate knowledge --catalog ecommerce_semantic_layer.yaml
+uv run selayer-okf retrieve knowledge metric.gross_margin dimension.product_category \
+  --catalog ecommerce_semantic_layer.yaml --max-chars 12000 --max-depth 1
+```
+
+`generate CATALOG DESTINATION` creates a new bundle and fails without changing
+files when the destination is populated. `sync CATALOG BUNDLE`
+updates generator-owned definitions and accepts `--dry-run`. `validate BUNDLE`
+and `retrieve BUNDLE SEMANTIC_ID...` accept an optional `--catalog`; retrieval
+also accepts `--no-linked`, `--max-chars`, and `--max-depth`.
+
+Successful commands exit 0 and write deterministic JSON to standard output;
+domain, validation, I/O, or sync-conflict errors exit 1 and write an `error:`
+message to standard error; a sync conflict also leaves its JSON report on
+standard output. As defined by `argparse`, invalid command-line usage exits 2.
+Diagnostics remain visible in the JSON rather than silently changing authority.
+See [`examples/e_commerce/okf_workflow.py`](examples/e_commerce/okf_workflow.py)
+for the API workflow.
 
 ## Development
 

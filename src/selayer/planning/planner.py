@@ -137,6 +137,24 @@ def plan_query(layer: SemanticLayer, request: QueryRequest) -> QueryPlan:
             raise QueryPlanningError(
                 "unknown_metric", f"metric '{metric_id}' is not known"
             )
+    for dimension_id in sorted(set(request.dimensions)):
+        if dimension_id not in layer.dimensions:
+            raise QueryPlanningError(
+                "unknown_dimension", f"dimension '{dimension_id}' is not known"
+            )
+    for dimension_id in sorted(request.filters):
+        if dimension_id not in layer.dimensions:
+            raise QueryPlanningError(
+                "unknown_filter_dimension",
+                f"filter dimension '{dimension_id}' is not known",
+            )
+    duplicate_output_names = sorted(set(request.dimensions) & set(request.metrics))
+    if duplicate_output_names:
+        name = duplicate_output_names[0]
+        raise QueryPlanningError(
+            "duplicate_output_name",
+            f"requested dimension and metric share output name '{name}'",
+        )
     metrics = [
         PlannedMetric(
             metric_id, layer.metrics[metric_id], layer.metrics[metric_id].expression
@@ -176,11 +194,6 @@ def plan_query(layer: SemanticLayer, request: QueryRequest) -> QueryPlan:
             "mixed_grain", "requested measures do not share one source grain"
         )
 
-    for dimension_id in sorted(set(request.dimensions)):
-        if dimension_id not in layer.dimensions:
-            raise QueryPlanningError(
-                "unknown_dimension", f"dimension '{dimension_id}' is not known"
-            )
     dimensions: list[PlannedDimension] = []
     required_sources: list[str] = []
     required_source_set: set[str] = set()

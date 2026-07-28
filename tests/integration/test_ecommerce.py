@@ -99,6 +99,70 @@ def expected_product_metrics(root: Path) -> pl.DataFrame:
     )
 
 
+def test_cross_kind_local_names_execute_with_distinct_internal_aliases(
+    tmp_path: Path,
+) -> None:
+    data_path = tmp_path / "events.csv"
+    pl.DataFrame({"total": [10, 10, 20], "value": [10, 10, 20]}).write_csv(data_path)
+    catalog_path = tmp_path / "colliding_names.yaml"
+    catalog_path.write_text(
+        cast(
+            str,
+            yaml.safe_dump(
+                {
+                    "version": 1,
+                    "name": "colliding_names",
+                    "data_sources": {
+                        "events": {
+                            "type": "csv",
+                            "path": str(data_path),
+                            "grain": ["total", "value"],
+                        }
+                    },
+                    "dimensions": {
+                        "total": {
+                            "source": "events",
+                            "column": "total",
+                            "data_type": "integer",
+                        }
+                    },
+                    "facts": {
+                        "total": {
+                            "source": "events",
+                            "data_type": "integer",
+                            "expression": "events.value",
+                        }
+                    },
+                    "measures": {"total": {"fact": "total", "aggregation": "sum"}},
+                    "metrics": {
+                        "m": {"measures": ["total"], "expression": "total"},
+                        "total": {"measures": ["total"], "expression": "total"},
+                    },
+                    "relationships": {},
+                },
+                sort_keys=False,
+            ),
+        ),
+        encoding="utf-8",
+    )
+    layer = SemanticLayer.load(catalog_path)
+
+    with QueryEngine(layer) as engine:
+        result = engine.query(["m"], ["total"]).sort("total")
+
+        assert result.columns == ["total", "m"]
+        assert result["total"].to_list() == [10, 20]
+        assert result["m"].to_list() == [20, 20]
+
+        with pytest.raises(QueryPlanningError) as caught:
+            engine.plan(["total"], ["total"])
+
+    assert caught.value.code == "duplicate_output_name"
+    assert caught.value.message == (
+        "requested dimension and metric share output name 'total'"
+    )
+
+
 def test_catalog_is_schema_version_one_and_executes_from_repo_path() -> None:
     repo = Path(__file__).parents[2]
     layer = SemanticLayer.load(repo / "ecommerce_semantic_layer.yaml")

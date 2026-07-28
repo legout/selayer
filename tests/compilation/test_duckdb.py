@@ -70,7 +70,10 @@ def two_join_plan(tmp_path):  # type: ignore[no-untyped-def]
 def test_compiles_metrics_outside_aggregate_cte(item_margin_plan) -> None:  # type: ignore[no-untyped-def]
     compiled = compile_duckdb(item_margin_plan)
     assert compiled.sql.startswith('WITH "aggregated" AS (')
-    assert 'SUM("order_items"."total") AS "total_item_revenue"' in compiled.sql
+    assert (
+        'SUM("order_items"."total") AS "__selayer_measure_total_item_revenue"'
+        in compiled.sql
+    )
     assert 'AS "gross_margin"' in compiled.sql.split(") SELECT", maxsplit=1)[1]
     assert 'FROM "aggregated"' in compiled.sql
 
@@ -162,7 +165,10 @@ def test_compiles_every_aggregation(item_margin_plan) -> None:  # type: ignore[n
     }
     for aggregation, prefix in expected.items():
         measure = replace(item_margin_plan.measures[0], aggregation=aggregation)
-        plan = replace(item_margin_plan, measures=(measure,))
+        plan = replace(
+            item_margin_plan,
+            measures=(measure, *item_margin_plan.measures[1:]),
+        )
         assert prefix in compile_duckdb(plan).sql
 
 
@@ -251,11 +257,35 @@ def test_aggregate_cte_preserves_dimension_and_measure_order(item_margin_plan) -
     )
     sql = compile_duckdb(plan).sql
     cte = sql.split(") SELECT", maxsplit=1)[0]
-    assert cte.index('AS "product_category"') < cte.index('AS "product_category_again"')
-    assert cte.index('AS "product_category_again"') < cte.index(
-        'AS "total_item_revenue"'
+    assert cte.index('AS "__selayer_dimension_product_category"') < cte.index(
+        'AS "__selayer_dimension_product_category_again"'
     )
-    assert cte.index('AS "total_item_revenue"') < cte.index('AS "total_item_cost"')
+    assert cte.index('AS "__selayer_dimension_product_category_again"') < cte.index(
+        'AS "__selayer_measure_total_item_revenue"'
+    )
+    assert cte.index('AS "__selayer_measure_total_item_revenue"') < cte.index(
+        'AS "__selayer_measure_total_item_cost"'
+    )
+
+
+def test_cross_kind_names_use_distinct_internal_aggregate_aliases(
+    item_margin_plan,
+) -> None:  # type: ignore[no-untyped-def]
+    colliding_dimension = replace(
+        item_margin_plan.dimensions[0], id="total_item_revenue"
+    )
+    plan = replace(item_margin_plan, dimensions=(colliding_dimension,))
+
+    sql = compile_duckdb(plan).sql
+    aggregate_projection, outer_projection = sql.split(") SELECT", maxsplit=1)
+
+    assert 'AS "__selayer_dimension_total_item_revenue"' in aggregate_projection
+    assert 'AS "__selayer_measure_total_item_revenue"' in aggregate_projection
+    assert (
+        '"__selayer_dimension_total_item_revenue" AS "total_item_revenue"'
+        in outer_projection
+    )
+    assert '"__selayer_measure_total_item_revenue"' in outer_projection
 
 
 def test_stable_dimension_and_metric_output_order(item_margin_plan) -> None:  # type: ignore[no-untyped-def]
@@ -265,10 +295,13 @@ def test_stable_dimension_and_metric_output_order(item_margin_plan) -> None:  # 
     sql = compile_duckdb(plan).sql
     projection = sql.split(") SELECT ", maxsplit=1)[1].split(" FROM ", maxsplit=1)[0]
     assert projection == (
-        '"product_category", (("total_item_revenue" - "total_item_cost") '
-        '/ NULLIF("total_item_revenue", 0)) AS "revenue_ratio", '
-        '(("total_item_revenue" - "total_item_cost") / '
-        'NULLIF("total_item_revenue", 0)) AS "gross_margin"'
+        '"__selayer_dimension_product_category" AS "product_category", '
+        '(("__selayer_measure_total_item_revenue" - '
+        '"__selayer_measure_total_item_cost") / '
+        'NULLIF("__selayer_measure_total_item_revenue", 0)) AS "revenue_ratio", '
+        '(("__selayer_measure_total_item_revenue" - '
+        '"__selayer_measure_total_item_cost") / '
+        'NULLIF("__selayer_measure_total_item_revenue", 0)) AS "gross_margin"'
     )
 
 

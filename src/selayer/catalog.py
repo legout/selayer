@@ -49,6 +49,7 @@ from selayer.model import (
     Metric,
     Relationship,
     SemanticLayer,
+    SemanticObject,
 )
 
 _IDENTIFIER = re.compile(r"[a-z][a-z0-9_]*")
@@ -741,5 +742,6 @@ __all__ = [
     "CatalogIssue",
     "CatalogValidationError",
     "SemanticLayer",
+    "SemanticObject",
     "load",
 ]
