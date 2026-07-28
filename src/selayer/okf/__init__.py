@@ -2,17 +2,20 @@
 
 from .bundle import OkfBundle
 from .model import (
+    AttestedComputation,
     ContextBudgetError,
     ContextItem,
     ContextLookupError,
     ContextResult,
     OkfConcept,
     OkfIssue,
+    OkfParameter,
     OkfValidationError,
     SyncReport,
 )
 
 __all__ = [
+    "AttestedComputation",
     "ContextBudgetError",
     "ContextItem",
     "ContextLookupError",
@@ -20,6 +23,7 @@ __all__ = [
     "OkfBundle",
     "OkfConcept",
     "OkfIssue",
+    "OkfParameter",
     "OkfValidationError",
     "SyncReport",
 ]

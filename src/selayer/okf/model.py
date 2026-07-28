@@ -73,6 +73,7 @@ class ContextItem:
     trust: TrustTier
     freshness: Freshness
     sources: tuple[str, ...]
+    attested_computation: AttestedComputation | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +95,24 @@ class SyncReport:
 class OkfSection:
     title: str
     content: str
+
+
+@dataclass(frozen=True, slots=True)
+class OkfParameter:
+    name: str
+    type: str
+    required: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AttestedComputation:
+    runtime: str
+    parameters: tuple[OkfParameter, ...]
+    computation_path: str | None
+    computation_body: str
+    executor_resource: str | None
+    executor_receipt: tuple[str, ...]
+    attester_resource: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +146,7 @@ class OkfConcept:
 
 
 __all__ = [
+    "AttestedComputation",
     "ContextBudgetError",
     "ContextItem",
     "ContextLookupError",
@@ -135,6 +155,7 @@ __all__ = [
     "OkfConcept",
     "OkfIssue",
     "OkfMetadataError",
+    "OkfParameter",
     "OkfSection",
     "OkfValidationError",
     "Severity",
