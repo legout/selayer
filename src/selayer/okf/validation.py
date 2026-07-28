@@ -185,7 +185,9 @@ def validate_concept(
     if not _is_nonempty_string(concept_type):
         issues.append(_issue(concept, "type", "type must be a non-empty string"))
     status = frontmatter.get("status")
-    if "status" in frontmatter and status not in _STATUS:
+    if "status" in frontmatter and (
+        not isinstance(status, str) or status not in _STATUS
+    ):
         issues.append(
             _issue(
                 concept,

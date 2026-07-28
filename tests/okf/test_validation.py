@@ -31,6 +31,29 @@ def test_load_collects_and_sorts_invalid_documents(tmp_path: Path) -> None:
     }
 
 
+def test_non_string_status_values_are_reported_and_sorted(tmp_path: Path) -> None:
+    (tmp_path / "z-sequence.md").write_text(
+        "---\ntype: Metric\nstatus: [draft, stable]\n---\n", encoding="utf-8"
+    )
+    (tmp_path / "a-mapping.md").write_text(
+        "---\ntype: Metric\nstatus: {bad: value}\n---\n", encoding="utf-8"
+    )
+
+    with pytest.raises(OkfValidationError) as caught:
+        OkfBundle.load(tmp_path)
+
+    assert [(issue.path, issue.message) for issue in caught.value.issues] == [
+        (
+            "a-mapping.md.frontmatter.status",
+            "status must be one of: deprecated, draft, stable",
+        ),
+        (
+            "z-sequence.md.frontmatter.status",
+            "status must be one of: deprecated, draft, stable",
+        ),
+    ]
+
+
 @pytest.mark.parametrize(
     ("frontmatter", "issue_path"),
     [
