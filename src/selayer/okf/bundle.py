@@ -12,7 +12,7 @@ import yaml
 from selayer.catalog import SemanticLayer
 
 from .document import OkfDocumentError, parse_concept, render_concept
-from .model import OkfConcept, OkfIssue, OkfValidationError
+from .model import OkfConcept, OkfIssue, OkfSection, OkfValidationError, SyncReport
 from .validation import (
     validate_concept,
     validate_duplicate_bindings,
@@ -34,6 +34,8 @@ def _write_text(path: Path, content: str) -> None:
 
 _LEADING_FRONTMATTER = re.compile(r"\A---\n(.*?)\n---(?:\n|\Z)", re.DOTALL)
 _GENERATOR_ID = "process:selayer-okf"
+_GENERATED_KEYS = frozenset({"type", "title", "description", "selayer_id", "generated"})
+_GENERATED_SECTION = "Catalog Definition"
 
 
 def _has_generator_ownership(path: Path) -> bool:
@@ -161,6 +163,111 @@ class OkfBundle:
         ).items():
             _write_text(destination / Path(relative_path.as_posix()), content)
         _write_text(destination / "_change_log.md", "# Change Log\n")
+
+    def sync(self, path: str | Path, *, dry_run: bool = False) -> SyncReport:
+        from .generation import generated_directories, index_documents
+
+        destination = Path(path)
+        if destination.is_file():
+            raise FileExistsError(f"destination '{destination}' is a file")
+        written: list[str] = []
+        unchanged: list[str] = []
+        conflicts: list[str] = []
+        for concept_id in sorted(self.concepts):
+            generated = self.concepts[concept_id]
+            relative = generated.relative_path.as_posix()
+            concept_path = destination / Path(relative)
+            if not concept_path.exists():
+                if not dry_run:
+                    _write_text(concept_path, render_concept(generated))
+                written.append(relative)
+                continue
+
+            try:
+                existing = parse_concept(concept_path, destination)
+            except OkfDocumentError:
+                conflicts.append(relative)
+                continue
+            existing_definitions = tuple(
+                section
+                for section in existing.sections
+                if section.title == _GENERATED_SECTION
+            )
+            if len(existing_definitions) != 1:
+                conflicts.append(relative)
+                continue
+            existing_definition = existing_definitions[0]
+            generated_definition = next(
+                section
+                for section in generated.sections
+                if section.title == _GENERATED_SECTION
+            )
+            frontmatter = dict(existing.frontmatter)
+            for key in _GENERATED_KEYS - generated.frontmatter.keys():
+                frontmatter.pop(key, None)
+            for key, value in generated.frontmatter.items():
+                if key in _GENERATED_KEYS:
+                    frontmatter[key] = value
+            if existing_definition.content != generated_definition.content:
+                frontmatter.pop("verified", None)
+            sections = tuple(
+                OkfSection(section.title, generated_definition.content)
+                if section is existing_definition
+                else section
+                for section in existing.sections
+            )
+            merged = OkfConcept.create(
+                concept_id=existing.concept_id,
+                relative_path=existing.relative_path,
+                frontmatter=frontmatter,
+                preamble=existing.preamble,
+                sections=sections,
+                links=existing.links,
+            )
+            content = render_concept(merged)
+            if content == concept_path.read_text(encoding="utf-8"):
+                unchanged.append(relative)
+            else:
+                if not dry_run:
+                    _write_text(concept_path, content)
+                written.append(relative)
+
+        classified = set(written) | set(unchanged) | set(conflicts)
+        semantic_ids = {
+            concept.frontmatter["selayer_id"] for concept in self.concepts.values()
+        }
+        orphaned: list[str] = []
+        for directory in generated_directories():
+            managed = destination / directory
+            if not managed.is_dir():
+                continue
+            for concept_path in sorted(managed.rglob("*.md")):
+                if concept_path.name == "_index.md":
+                    continue
+                relative = concept_path.relative_to(destination).as_posix()
+                if relative in classified:
+                    continue
+                try:
+                    existing = parse_concept(concept_path, destination)
+                except OkfDocumentError:
+                    continue
+                selayer_id = existing.frontmatter.get("selayer_id")
+                if isinstance(selayer_id, str) and selayer_id not in semantic_ids:
+                    orphaned.append(relative)
+                    unchanged.append(relative)
+
+        if not dry_run:
+            for relative_path, content in index_documents(
+                self.layer, self.concepts
+            ).items():
+                _write_text(destination / Path(relative_path.as_posix()), content)
+
+        return SyncReport(
+            written=tuple(sorted(written)),
+            unchanged=tuple(sorted(unchanged)),
+            conflicts=tuple(sorted(conflicts)),
+            orphaned=tuple(sorted(orphaned)),
+        )
 
     @classmethod
     def load(

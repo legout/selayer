@@ -50,6 +50,14 @@ class OkfValidationError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class SyncReport:
+    written: tuple[str, ...]
+    unchanged: tuple[str, ...]
+    conflicts: tuple[str, ...]
+    orphaned: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class OkfSection:
     title: str
     content: str
@@ -93,5 +101,6 @@ __all__ = [
     "OkfSection",
     "OkfValidationError",
     "Severity",
+    "SyncReport",
     "TrustTier",
 ]
