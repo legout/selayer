@@ -43,13 +43,30 @@ from .validation import (
 )
 
 
-def _reject_destination_symlinks(destination: Path) -> None:
-    symlink = destination if destination.is_symlink() else None
+def _preflight_mutation_path(destination: Path) -> None:
+    """Reject symlinks in a mutation path without resolving through them."""
+    cursor = Path(destination.anchor) if destination.is_absolute() else Path.cwd()
+    parts = destination.parts[1:] if destination.is_absolute() else destination.parts
+    symlink: Path | None = cursor if cursor.is_symlink() else None
+    for part in parts:
+        if symlink is not None:
+            break
+        if part in ("", "."):
+            continue
+        if part == "..":
+            cursor = cursor.parent
+            continue
+        cursor /= part
+        if cursor.is_symlink():
+            symlink = cursor
+
     if symlink is None and destination.exists():
         symlink = next(
             (
                 candidate
-                for candidate in destination.rglob("*")
+                for candidate in sorted(
+                    destination.rglob("*"), key=lambda path: path.as_posix()
+                )
                 if candidate.is_symlink()
             ),
             None,
@@ -61,8 +78,10 @@ def _reject_destination_symlinks(destination: Path) -> None:
 
 
 def _write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
+    _preflight_mutation_path(path)
+    _preflight_mutation_path(temporary)
+    path.parent.mkdir(parents=True, exist_ok=True)
     try:
         temporary.write_text(content, encoding="utf-8", newline="\n")
         temporary.replace(path)
@@ -246,7 +265,7 @@ class OkfBundle:
         from .generation import index_documents
 
         destination = Path(path)
-        _reject_destination_symlinks(destination)
+        _preflight_mutation_path(destination)
         if destination.is_file() or (
             destination.exists()
             and any(candidate.is_file() for candidate in destination.rglob("*"))
@@ -271,7 +290,7 @@ class OkfBundle:
         from .generation import generated_directories, index_documents
 
         destination = Path(path)
-        _reject_destination_symlinks(destination)
+        _preflight_mutation_path(destination)
         if destination.is_file():
             raise FileExistsError(f"destination '{destination}' is a file")
         written: list[str] = []

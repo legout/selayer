@@ -164,6 +164,31 @@ def test_write_refuses_to_replace_existing_bundle(
     assert (destination / "notes.md").read_text(encoding="utf-8") == "keep me"
 
 
+@pytest.mark.parametrize("operation", ["generate", "write", "sync"])
+def test_bundle_mutation_refuses_nonexistent_destination_beneath_symlinked_ancestor(
+    tmp_path: Path,
+    ecommerce_layer: SemanticLayer,
+    operation: str,
+) -> None:
+    external = tmp_path / "external"
+    external.mkdir()
+    symlinked_ancestor = tmp_path / "linked"
+    symlinked_ancestor.symlink_to(external, target_is_directory=True)
+    destination = symlinked_ancestor / "knowledge"
+    bundle = OkfBundle.from_layer(ecommerce_layer)
+
+    with pytest.raises(FileExistsError, match="symbolic link"):
+        if operation == "generate":
+            OkfBundle.generate(ecommerce_layer, destination)
+        elif operation == "write":
+            bundle.write(destination)
+        else:
+            bundle.sync(destination)
+
+    assert list(external.iterdir()) == []
+    assert symlinked_ancestor.is_symlink()
+
+
 @pytest.mark.parametrize("operation", ["generate", "write"])
 def test_new_bundle_refuses_symlinked_destination_root_without_external_changes(
     tmp_path: Path,

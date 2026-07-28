@@ -84,13 +84,20 @@ The public interface exports exactly the symbols in `selayer.__all__`:
 
 Compiler and parser internals are intentionally not public exports.
 
-Catalogs are loaded through the active schema-version-1 model:
+Catalogs are loaded through the active schema-version-1 model. Programmatic
+callers construct expression-bearing objects with the parser-backed factories:
 
 ```python
-from selayer import SemanticLayer
+from selayer import Fact, Metric, SemanticLayer
 
 layer = SemanticLayer.load("ecommerce_semantic_layer.yaml")
-print(layer.version, layer.data_sources.keys())
+fact = Fact.from_expression(
+    "item_revenue", "order_items", "order_items.total", "decimal"
+)
+metric = Metric.from_expression(
+    "gross_revenue", "total_item_revenue", ["total_item_revenue"]
+)
+print(layer.version, fact.expression, metric.measures)
 ```
 
 ## Advisory OKF context
@@ -126,7 +133,10 @@ to `sync()` instead of overwriting any existing file.
 sections; conflicts remain explicit for human review. A decoded attribute such as
 MLFB color requires a real catalog dimension before it is queryable.
 Data values are never exported by generation, synchronization,
-validation, or retrieval.
+validation, or retrieval. Mutating bundle operations preflight the destination's
+lexical ancestors and existing tree and refuse every symbolic link without
+resolving through it. This is preflight protection only; descriptor-based
+protection against filesystem races after the check is outside the portable API.
 
 The deeper `selayer.okf` API exports `OkfBundle`, `OkfConcept`, `OkfIssue`,
 `OkfValidationError`, `SyncReport`, `ContextItem`, `ContextResult`,

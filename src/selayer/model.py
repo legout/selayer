@@ -16,17 +16,21 @@ Conventions enforced by the catalog loader (not by the dataclasses themselves):
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal
+from typing import Literal, TypeAlias
 
 from selayer.expressions.ast import Expression
 
-type Aggregation = Literal["sum", "avg", "min", "max", "count", "count_distinct"]
+Aggregation: TypeAlias = Literal[  # noqa: UP040
+    "sum", "avg", "min", "max", "count", "count_distinct"
+]
 
-type Cardinality = Literal["one_to_one", "one_to_many", "many_to_one", "many_to_many"]
+Cardinality: TypeAlias = Literal[  # noqa: UP040
+    "one_to_one", "one_to_many", "many_to_one", "many_to_many"
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +64,20 @@ class Fact:
     data_type: str
     description: str = ""
 
+    @classmethod
+    def from_expression(
+        cls,
+        name: str,
+        source: str,
+        expression: str,
+        data_type: str,
+        description: str = "",
+    ) -> Fact:
+        """Create a fact by parsing an expression string with the active DSL parser."""
+        from selayer.expressions import parse_expression
+
+        return cls(name, source, parse_expression(expression), data_type, description)
+
 
 @dataclass(frozen=True, slots=True)
 class Measure:
@@ -79,6 +97,19 @@ class Metric:
     expression: Expression
     measures: tuple[str, ...]
     description: str = ""
+
+    @classmethod
+    def from_expression(
+        cls,
+        name: str,
+        expression: str,
+        measures: Iterable[str],
+        description: str = "",
+    ) -> Metric:
+        """Create a metric by parsing its formula and normalizing its measures."""
+        from selayer.expressions import parse_expression
+
+        return cls(name, parse_expression(expression), tuple(measures), description)
 
 
 @dataclass(frozen=True, slots=True)
