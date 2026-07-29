@@ -69,6 +69,40 @@ def test_runtime_profile_value_missing_raises_keyerror() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Follow-up 7: RuntimeProfile safe repr.  The auto-generated dataclass repr
+# rendered ``name`` through ``!r``, so a hostile ``str`` subclass name (whose
+# own ``__repr__`` leaks a secret) surfaced.  An explicit ``__repr__`` now
+# routes the name through a conservative exact-builtin-str helper so a hostile
+# subclass is redacted while ordinary profile names render; the ``_values``
+# mapping remains hidden.
+# ---------------------------------------------------------------------------
+
+
+class _LeakyProfileName(str):
+    """A ``str`` subclass whose repr leaks a secret — must never surface."""
+
+    def __repr__(self) -> str:
+        return "_LeakyProfileName(TOKENONLYSECRET)"
+
+
+def test_runtime_profile_name_str_subclass_is_redacted() -> None:
+    profile = RuntimeProfile(_LeakyProfileName("analytics_s3"), {"secret_key": "shh"})
+    text = repr(profile)
+    assert "TOKENONLYSECRET" not in text
+    assert "_LeakyProfileName" not in text
+    assert "<redacted>" in text
+    # The mapping still never surfaces.
+    assert "shh" not in text
+    assert "secret_key" not in text
+
+
+def test_runtime_profile_normal_name_renders_in_repr() -> None:
+    # Regression guard: an ordinary exact-builtin-str profile name still renders.
+    profile = RuntimeProfile("analytics_s3", {"a": 1})
+    assert "analytics_s3" in repr(profile)
+
+
+# ---------------------------------------------------------------------------
 # MappingProfileResolver
 # ---------------------------------------------------------------------------
 

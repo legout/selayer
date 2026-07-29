@@ -162,6 +162,30 @@ def _repr_literal(value: object) -> object:
     return "<redacted>"
 
 
+def _repr_scalar(value: object) -> object:
+    """Repr-safe projection of a closed-set / inherently-safe scalar field.
+
+    Unlike :func:`_repr_literal` — which redacts *every* string because a
+    free-form string may carry a secret — this helper is intended for fields
+    whose value is *already* validated to a known-safe closed set at
+    construction (e.g. :attr:`SourceFilter.operator`, validated against
+    :data:`_FILTER_OPERATORS`) or is an inherently-safe enum value extracted
+    via ``.value`` (e.g. :attr:`SourceStatus.health`).  It accepts only *exact*
+    builtin scalars (``str``, ``int``, ``float``, ``bool``) and ``None``,
+    returning the value unchanged so a closed-set operator token or enum value
+    renders normally; a hostile subclass (whose custom ``__repr__" could leak
+    a secret), an :class:`~enum.Enum` member rendered as an object, and every
+    other object type are redacted to ``"<redacted>"``.  ``type(value)`` is
+    used rather than ``isinstance`` so a subclass cannot satisfy the guard —
+    this is the same exact-builtin defense :func:`_repr_literal` applies, just
+    widened to also accept an exact builtin ``str``.
+    """
+
+    if value is None or type(value) in {str, int, float, bool}:
+        return value
+    return "<redacted>"
+
+
 def _render(name: str, fields: list[tuple[str, object]]) -> str:
     """Render a ``Name(field=value, ...)`` repr from pre-sanitized field values."""
 
@@ -256,7 +280,7 @@ class SourceFilter:
             "SourceFilter",
             [
                 ("column", _repr_column(self.column)),
-                ("operator", self.operator),
+                ("operator", _repr_scalar(self.operator)),
                 ("value", _repr_literal(self.value)),
             ],
         )
@@ -294,11 +318,17 @@ class SourceScanRequirement:
             column: object = raw_column
             if not (type(column) is str and _SQL_IDENT_RE.match(column)):
                 raise ValueError("invalid SourceScanRequirement column")
-        # Validate every filter is an actual SourceFilter: a raw string such as
-        # ``"SELECT password FROM users"`` is rejected with a clean TypeError so
-        # arbitrary SQL can never be stored as a planned filter.
+        # Validate every filter is an *exact* ``SourceFilter`` instance: a raw
+        # string such as ``"SELECT password FROM users"`` is rejected with a
+        # clean TypeError so arbitrary SQL can never be stored as a planned
+        # filter.  ``type(raw_filter) is SourceFilter`` (not ``isinstance``) is
+        # used so a ``SourceFilter`` *subclass* — whose custom ``__repr__``
+        # could leak a secret when the requirement renders its filter tuple —
+        # is rejected rather than stored and later rendered via the hostile
+        # subclass repr.  ``isinstance`` would accept such a subclass, so the
+        # exact-type identity check is load-bearing here.
         for raw_filter in filters:
-            if not isinstance(raw_filter, SourceFilter):
+            if type(raw_filter) is not SourceFilter:
                 raise TypeError(
                     "SourceScanRequirement filters must be SourceFilter instances"
                 )
@@ -347,7 +377,7 @@ class SourceHandle:
                 ("source_id", _repr_source_name(self.source_id)),
                 ("connector", _repr_source_name(self.connector)),
                 ("snapshot", _repr_literal(self.snapshot)),
-                ("query_scoped", self.query_scoped),
+                ("query_scoped", _repr_literal(self.query_scoped)),
             ],
         )
 
@@ -390,10 +420,10 @@ class SourceStatus:
             [
                 ("source_id", _repr_source_name(self.source_id)),
                 ("connector", _repr_source_name(self.connector)),
-                ("generation", self.generation),
+                ("generation", _repr_literal(self.generation)),
                 ("schema_fingerprint", _repr_literal(self.schema_fingerprint)),
                 ("snapshot", _repr_literal(self.snapshot)),
-                ("health", self.health.value),
+                ("health", _repr_scalar(self.health.value)),
             ],
         )
 
@@ -413,8 +443,8 @@ class ReloadResult:
             "ReloadResult",
             [
                 ("source_id", _repr_source_name(self.source_id)),
-                ("old_generation", self.old_generation),
-                ("new_generation", self.new_generation),
+                ("old_generation", _repr_literal(self.old_generation)),
+                ("new_generation", _repr_literal(self.new_generation)),
                 ("schema_fingerprint", _repr_literal(self.schema_fingerprint)),
                 ("snapshot", _repr_literal(self.snapshot)),
             ],

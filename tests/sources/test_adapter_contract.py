@@ -1191,6 +1191,162 @@ def test_exact_builtin_string_error_fields_preserved() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Follow-up 7: lifecycle repr scalars.  Direct scalar fields
+# (``SourceHandle.query_scoped``, ``SourceStatus.generation``,
+# ``ReloadResult.old_generation``/``new_generation``) were rendered straight
+# through ``_render``'s ``!r``, so a hostile ``int``/``bool`` subclass whose own
+# ``__repr__`` leaks a secret surfaced in diagnostics.  These fields now route
+# through ``_repr_literal`` (exact-builtin scalar projection).  Closed-set /
+# inherently-safe string scalars (``SourceFilter.operator``, validated at
+# construction; ``SourceStatus.health`` via ``.value``) route through
+# ``_repr_scalar`` — an exact-builtin-str scalar projection — so a hostile
+# ``str`` subclass never has its own ``__repr__`` invoked.  Finally,
+# ``SourceScanRequirement`` now accepts only *exact* ``SourceFilter`` instances
+# so a ``SourceFilter`` subclass with a custom ``__repr__`` can never be stored
+# and later rendered when the requirement reprs its filter tuple.
+# ---------------------------------------------------------------------------
+
+
+class _LeakyHealthValue:
+    """Object masquerading as a health enum whose ``.value`` leaks a secret."""
+
+    @property
+    def value(self) -> object:
+        return _LeakyString("ready")
+
+
+class _LeakySourceFilter(SourceFilter):
+    """A ``SourceFilter`` subclass whose repr leaks a secret — must be rejected."""
+
+    def __repr__(self) -> str:
+        return "_LeakySourceFilter(TOKENONLYSECRET)"
+
+
+def test_source_handle_query_scoped_scalar_subclass_redacted() -> None:
+    # ``query_scoped`` is rendered directly through ``!r``; a hostile scalar
+    # whose own ``__repr__" leaks a secret must be redacted.  ``bool`` is
+    # ``@final`` (it cannot be subclassed in well-typed code), so a hostile
+    # ``int`` subclass stands in for the non-exact-scalar value the field
+    # would accept at runtime absent type enforcement.
+    handle = SourceHandle(
+        source_id="orders",
+        connector="parquet",
+        resource=DemoResource(1),
+        schema=_schema(),
+        query_scoped=_LeakyInt(0),  # type: ignore[arg-type]
+    )
+    text = repr(handle)
+    assert "TOKENONLYSECRET" not in text
+    assert "_LeakyInt" not in text
+    assert "<redacted>" in text
+
+
+def test_source_status_generation_int_subclass_redacted() -> None:
+    # ``generation`` is an int rendered directly through ``!r``; a hostile
+    # ``int`` subclass whose own ``__repr__" leaks a secret must be redacted.
+    status = SourceStatus(
+        source_id="orders",
+        connector="parquet",
+        generation=_LeakyInt(3),
+        schema_fingerprint=schema_fingerprint(_schema()),
+        snapshot=None,
+        health=SourceHealth.READY,
+    )
+    text = repr(status)
+    assert "TOKENONLYSECRET" not in text
+    assert "_LeakyInt" not in text
+    assert "<redacted>" in text
+
+
+def test_reload_result_generation_int_subclass_redacted() -> None:
+    # Both generation fields are ints rendered directly through ``!r``; hostile
+    # ``int`` subclasses must be redacted.
+    result = ReloadResult(
+        "orders",
+        _LeakyInt(2),
+        _LeakyInt(3),
+        schema_fingerprint(_schema()),
+        None,
+    )
+    text = repr(result)
+    assert "TOKENONLYSECRET" not in text
+    assert "_LeakyInt" not in text
+    assert "<redacted>" in text
+
+
+def test_source_status_health_value_str_subclass_redacted() -> None:
+    # ``health`` renders through ``.value``; a hostile object whose ``.value``
+    # returns a ``str`` subclass must not surface that subclass's repr.
+    status = SourceStatus(
+        source_id="orders",
+        connector="parquet",
+        generation=1,
+        schema_fingerprint=schema_fingerprint(_schema()),
+        snapshot=None,
+        health=_LeakyHealthValue(),  # type: ignore[arg-type]
+    )
+    text = repr(status)
+    assert "TOKENONLYSECRET" not in text
+    assert "_LeakyString" not in text
+
+
+def test_source_filter_operator_renders_via_safe_helper() -> None:
+    # The closed-set operator token is rendered through the exact-value scalar
+    # helper, not a direct f-string; a normal validated operator still renders.
+    flt = SourceFilter(column="amount", operator="gt", value=0)
+    assert "operator='gt'" in repr(flt)
+
+
+def test_scan_requirement_rejects_source_filter_subclass() -> None:
+    # A ``SourceFilter`` subclass with a custom ``__repr__`` must be rejected at
+    # construction so its hostile repr can never be invoked when the
+    # requirement renders its filter tuple.
+    hostile = _LeakySourceFilter(column="id", operator="eq", value=1)
+    with pytest.raises(TypeError):
+        SourceScanRequirement(columns=("id",), filters=(hostile,))
+
+
+def test_exact_scalar_lifecycle_fields_still_render() -> None:
+    # Regression guard: normal exact-builtin int/bool scalar fields must still
+    # render unchanged after routing through the scalar projection helpers.
+    handle = SourceHandle(
+        source_id="orders",
+        connector="parquet",
+        resource=DemoResource(1),
+        schema=_schema(),
+        query_scoped=False,
+    )
+    status = SourceStatus(
+        source_id="orders",
+        connector="parquet",
+        generation=7,
+        schema_fingerprint=schema_fingerprint(_schema()),
+        snapshot=None,
+        health=SourceHealth.READY,
+    )
+    result = ReloadResult("orders", 6, 7, schema_fingerprint(_schema()), None)
+    assert "query_scoped=False" in repr(handle)
+    assert "generation=7" in repr(status)
+    assert "old_generation=6" in repr(result)
+    assert "new_generation=7" in repr(result)
+
+
+def test_source_status_normal_health_renders() -> None:
+    # Regression guard: a genuine SourceHealth value still renders its string
+    # value (not the enum object) after routing ``.value`` through the scalar
+    # projection helper.
+    status = SourceStatus(
+        source_id="orders",
+        connector="parquet",
+        generation=1,
+        schema_fingerprint=schema_fingerprint(_schema()),
+        snapshot=None,
+        health=SourceHealth.READY,
+    )
+    assert "health='ready'" in repr(status)
+
+
+# ---------------------------------------------------------------------------
 # SourceAdapter protocol acceptance
 # ---------------------------------------------------------------------------
 

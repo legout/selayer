@@ -22,6 +22,7 @@ Resolvers turn stable names into profiles (or arrow-object provider factories):
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -50,6 +51,28 @@ type ArrowObject = (
 )
 
 
+# Catalog source-name shape — the *exact* convention the catalog enforces for
+# declared source names (lowercase snake_case).  Only a profile name that
+# matches this shape renders; anything else (a hostile ``str`` subclass whose
+# own ``__repr__`` leaks a secret, a non-string, a credential-bearing name) is
+# redacted to ``"<redacted>"`` in the repr.
+_PROFILE_NAME_RE = re.compile(r"\A[a-z][a-z0-9_]*\Z")
+
+
+def _safe_profile_name(name: object) -> str:
+    """Render a profile name, redacting non-conformant / hostile values.
+
+    Only an *exact* builtin ``str`` that matches the catalog source-name shape
+    is rendered; a hostile ``str`` subclass (whose custom ``__repr__" could
+    leak a secret when rendered), a non-string, or a non-conformant name is
+    redacted to ``"<redacted>"``.  ``type(name) is str`` is used rather than
+    ``isinstance`` so a subclass cannot satisfy the guard — this is a *local*
+    sanitizer (no import from ``config``/``base``) to avoid any import cycle.
+    """
+
+    return name if type(name) is str and _PROFILE_NAME_RE.match(name) else "<redacted>"
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeProfile:
     """Opaque, defensively-copied named value bag.
@@ -76,6 +99,13 @@ class RuntimeProfile:
     def value(self, name: str) -> object:
         """Return a single named value for internal adapter use."""
         return self._values[name]
+
+    def __repr__(self) -> str:
+        # Only the safe profile name renders; the ``_values`` mapping is never
+        # exposed (it carries credential values).  The name is routed through a
+        # conservative exact-builtin-str helper so a hostile ``str`` subclass
+        # whose own ``__repr__" leaks a secret can never be rendered.
+        return f"RuntimeProfile(name={_safe_profile_name(self.name)!r})"
 
 
 class MappingProfileResolver:

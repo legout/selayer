@@ -719,3 +719,110 @@ Files staged: `src/selayer/sources/base.py`,
 `src/selayer/sources/errors.py`,
 `tests/sources/test_adapter_contract.py`,
 `.superpowers/sdd/task-3-report.md`.
+
+## Follow-up 7: harden lifecycle repr values — profiles and remaining lifecycle fields
+
+**Status: Complete.** The lifecycle repr hardening landed in the working tree
+but failed to collect: `src/selayer/sources/profiles.py` referenced `re.compile`
+for the new `_PROFILE_NAME_RE` sanitizer without an `import re` (NameError /
+Ruff F821). This follow-up restores the import, completes the remaining
+lifecycle repr hardening, and re-runs all gates green.
+
+### Root cause
+
+1. **Collection failure.** `_PROFILE_NAME_RE = re.compile(...)` ran at module
+   scope with `re` unbound → `NameError: name 're' is not defined` on import,
+   breaking both `test_profiles.py` and (transitively, via `base.py`)
+   `test_adapter_contract.py` collection.
+2. **Lifecycle repr bypasses.** Beyond the identifier fields closed in
+   Follow-up 6, several lifecycle fields still rendered *raw stored values*
+   through `_render`'s `!r` without an exact-builtin-type guard:
+   `SourceHandle.query_scoped`, `SourceStatus.generation`,
+   `SourceStatus.health`, `ReloadResult.old_generation`/`new_generation`, and
+   `SourceFilter.operator`. A hostile subclass stored on any of these rendered
+   via its custom `__repr__`. `RuntimeProfile` had no `__repr__` at all, so its
+   name (a credential-bearing / hostile `str`) surfaced in the auto-generated
+   repr. `SourceScanRequirement` accepted filter *subclasses* via `isinstance`,
+   letting a hostile `SourceFilter` subclass render through the requirement.
+
+### Changes
+
+**`src/selayer/sources/profiles.py`**
+
+- **Restored `import re`** (the collection-blocker fix).
+- **`_safe_profile_name`** + **`_PROFILE_NAME_RE`**: only an exact builtin
+  `str` matching the catalog source-name shape (`\A[a-z][a-z0-9_]*\Z`) renders;
+  a hostile `str` subclass, a non-string, or a non-conformant name is redacted
+  to `"<redacted>"`. Local sanitizer (no `config`/`base` import) to avoid
+  import cycles.
+- **`RuntimeProfile.__repr__`**: renders only the safe name; the `_values`
+  mapping (credentials) never surfaces.
+
+**`src/selayer/sources/base.py`**
+
+- **New `_repr_scalar`**: accepts only exact builtin `str`/`int`/`float`/`bool`
+  and `None` (for closed-set / inherently-safe fields); everything else →
+  `"<redacted>"`. Same exact-builtin defense as `_repr_literal`, widened to
+  accept an exact builtin `str`.
+- **`SourceFilter.operator`**: routed through `_repr_scalar`.
+- **`SourceStatus.health`**: `_repr_scalar(self.health.value)` (enum `.value`
+  extracted; a raw `Enum` member would be redacted).
+- **`SourceHandle.query_scoped`, `SourceStatus.generation`,
+  `ReloadResult.old_generation`/`new_generation`**: routed through `_repr_literal`.
+- **`SourceScanRequirement.__post_init__`**: filter validation
+  `isinstance(raw_filter, SourceFilter)` → `type(raw_filter) is not SourceFilter`
+  — a `SourceFilter` subclass (with a hostile `__repr__`) is now rejected at
+  construction rather than stored and later rendered.
+
+**`tests/sources/test_profiles.py`** — 2 new hostile subclass tests + guard.
+
+**`tests/sources/test_adapter_contract.py`** — 8 new hostile subclass /
+hardening tests + guards.
+
+### Validation gates
+
+| Gate | Result |
+| --- | --- |
+| `pytest -q tests/sources/test_profiles.py tests/sources/test_adapter_contract.py` | **113 passed** |
+| `pytest -q` (full suite) | **1075 passed** |
+| `ruff check ...` (scoped 4 files) | **All checks passed!** |
+| `ruff format --check ...` (scoped 4 files) | **4 files already formatted** |
+| `pyright src/selayer/sources/profiles.py src/selayer/sources/base.py` | **0 errors, 0 warnings, 0 informations** |
+
+### New regression tests
+
+- **RuntimeProfile name hostile subclass redacted:**
+  `test_runtime_profile_name_str_subclass_is_redacted`;
+  guard `test_runtime_profile_normal_name_renders_in_repr`.
+- **Lifecycle scalar subclass redacted:** `SourceHandle.query_scoped`
+  (`test_source_handle_query_scoped_scalar_subclass_redacted`),
+  `SourceStatus.generation` (`test_source_status_generation_int_subclass_redacted`),
+  `ReloadResult.new_generation`
+  (`test_reload_result_generation_int_subclass_redacted`),
+  `SourceStatus.health`
+  (`test_source_status_health_value_str_subclass_redacted`);
+  guards `test_exact_scalar_lifecycle_fields_still_render`,
+  `test_source_status_normal_health_renders`.
+- **SourceFilter operator via safe helper:**
+  `test_source_filter_operator_renders_via_safe_helper`.
+- **SourceScanRequirement rejects hostile filter subclass:**
+  `test_scan_requirement_rejects_source_filter_subclass`.
+
+### Public interfaces preserved
+
+No public constructor, stored field, or signature changed. All sanitization is
+repr-only; the `SourceScanRequirement` filter-type guard is tightened from a
+subtype check to an exact-type identity check (a subclass was never a valid
+filter; only the prior permissive `isinstance` admitted it).
+
+### Commit
+
+```
+fix(sources): harden lifecycle repr values
+```
+
+Files staged: `src/selayer/sources/base.py`,
+`src/selayer/sources/profiles.py`,
+`tests/sources/test_adapter_contract.py`,
+`tests/sources/test_profiles.py`,
+`.superpowers/sdd/task-3-report.md`.
