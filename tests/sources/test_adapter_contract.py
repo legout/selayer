@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import types
 import uuid
-from collections.abc import Callable
+from collections import UserDict
+from collections.abc import Callable, Mapping
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 
 import pytest
@@ -369,6 +372,33 @@ def test_scan_requirement_coerces_iterables_to_tuples() -> None:
     assert req.filters == ()
 
 
+def test_scan_requirement_accepts_column_generator() -> None:
+    # A single-pass generator of columns must be materialized exactly once so
+    # validation and coercion share the same items (previously the validation
+    # loop exhausted the generator and the later ``tuple(...)`` stored ()).
+    columns = (column for column in ("id", "amount"))
+    req = SourceScanRequirement(columns=columns, filters=())  # type: ignore[arg-type]
+    assert req.columns == ("id", "amount")
+
+
+def test_scan_requirement_accepts_filter_generator() -> None:
+    # A single-pass generator of filters must be materialized exactly once so
+    # validation and coercion share the same items (previously the validation
+    # loop exhausted the generator and the later ``tuple(...)`` stored ()).
+    filters = (SourceFilter(column="id", operator="eq", value=1) for _ in [None])
+    req = SourceScanRequirement(columns=("id",), filters=filters)  # type: ignore[arg-type]
+    assert len(req.filters) == 1
+    assert req.filters[0].column == "id"
+
+
+def test_scan_requirement_generator_validation_runs_before_storage() -> None:
+    # A generator yielding a hostile column must be rejected (and the materialized
+    # tuple discarded) rather than silently stored as an empty tuple.
+    columns = (column for column in ("id; DROP TABLE users--", "amount"))
+    with pytest.raises(ValueError):
+        SourceScanRequirement(columns=columns, filters=())  # type: ignore[arg-type]
+
+
 def test_scan_requirement_is_immutable() -> None:
     req = SourceScanRequirement(columns=("id",), filters=())
     with pytest.raises(AttributeError):
@@ -682,6 +712,143 @@ def test_source_filter_numeric_tuple_value_renders_safely() -> None:
     assert "TOKENONLYSECRET" not in secret_text
     assert "<redacted>" in secret_text
     assert "1" in numeric_text
+
+
+# ---------------------------------------------------------------------------
+# Follow-up 4: arbitrary Mapping/Set implementations and unknown object types
+# must be redacted wholesale — only safe scalars (int/float/bool/None/enum),
+# tuples, and lists are projected.  A custom mapping/set whose own ``__repr__``
+# leaks a secret, or an opaque handle object, must never surface via repr.
+# ---------------------------------------------------------------------------
+
+
+class _LeakyMapping(Mapping):
+    """A ``collections.abc.Mapping`` whose repr deliberately leaks a secret."""
+
+    def __init__(self, payload: dict[str, str]) -> None:
+        self._payload = payload
+
+    def __getitem__(self, key: str) -> str:
+        return self._payload[key]
+
+    def __iter__(self):
+        return iter(self._payload)
+
+    def __len__(self) -> int:
+        return len(self._payload)
+
+    def __repr__(self) -> str:
+        return f"_LeakyMapping({self._payload!r})"
+
+
+class _LeakySet(AbstractSet):
+    """A ``collections.abc.Set`` whose repr deliberately leaks a secret."""
+
+    def __init__(self, members: set[str]) -> None:
+        self._members = set(members)
+
+    def __contains__(self, item: object) -> bool:
+        return item in self._members
+
+    def __iter__(self):
+        return iter(self._members)
+
+    def __len__(self) -> int:
+        return len(self._members)
+
+    def __repr__(self) -> str:
+        return f"_LeakySet({self._members!r})"
+
+
+class _LeakyObject:
+    """An opaque handle whose repr leaks a secret; must never surface."""
+
+    secret = "TOKENONLYSECRET"
+
+    def __repr__(self) -> str:
+        return f"_LeakyObject(secret={self.secret!r})"
+
+
+def test_source_filter_mappingproxy_value_is_redacted() -> None:
+    # ``types.MappingProxyType`` is a Mapping but NOT a ``dict``; the previous
+    # ``isinstance(value, (dict, set, frozenset))`` guard let it fall through
+    # to ``return value``, leaking the proxied payload via its own repr.
+    flt = SourceFilter(
+        column="id",
+        operator="eq",
+        value=types.MappingProxyType({"token": "TOKENONLYSECRET"}),
+    )
+    text = repr(flt)
+    assert "TOKENONLYSECRET" not in text
+    assert "mappingproxy" not in text
+    assert "<redacted>" in text
+
+
+def test_source_filter_userdict_value_is_redacted() -> None:
+    # ``collections.UserDict`` is a Mapping (subclass of MutableMapping) but
+    # not a ``dict``; its repr renders the wrapped dict verbatim.
+    flt = SourceFilter(
+        column="id",
+        operator="eq",
+        value=UserDict({"token": "TOKENONLYSECRET", "password": "hunter2"}),
+    )
+    text = repr(flt)
+    assert "TOKENONLYSECRET" not in text
+    assert "hunter2" not in text
+    assert "password" not in text
+    assert "<redacted>" in text
+
+
+def test_source_filter_custom_mapping_value_is_redacted() -> None:
+    # A hand-rolled ``collections.abc.Mapping`` is not a ``dict``; its own
+    # (leaky) repr would surface if only concrete dict/set/frozenset were
+    # redacted.
+    flt = SourceFilter(
+        column="id",
+        operator="eq",
+        value=_LeakyMapping({"token": "TOKENONLYSECRET"}),
+    )
+    text = repr(flt)
+    assert "TOKENONLYSECRET" not in text
+    assert "_LeakyMapping" not in text
+    assert "<redacted>" in text
+
+
+def test_source_filter_custom_set_value_is_redacted() -> None:
+    # A hand-rolled ``collections.abc.Set`` is not a ``set``/``frozenset``;
+    # its own (leaky) repr would surface otherwise.
+    flt = SourceFilter(
+        column="id",
+        operator="in",
+        value=_LeakySet({"TOKENONLYSECRET", "x"}),
+    )
+    text = repr(flt)
+    assert "TOKENONLYSECRET" not in text
+    assert "_LeakySet" not in text
+    assert "<redacted>" in text
+
+
+def test_source_filter_unknown_object_value_is_redacted() -> None:
+    # Any object type that is not a safe scalar/tuple/list is now redacted by
+    # default, so an opaque handle's own repr can never leak a secret.
+    flt = SourceFilter(column="id", operator="eq", value=_LeakyObject())
+    text = repr(flt)
+    assert "TOKENONLYSECRET" not in text
+    assert "_LeakyObject" not in text
+    assert "<redacted>" in text
+
+
+def test_source_filter_scalar_and_tuple_still_render() -> None:
+    # Regression guard: safe scalars and ordered collections still project.
+    int_value = SourceFilter(column="id", operator="eq", value=42)
+    bool_value = SourceFilter(column="active", operator="eq", value=True)
+    none_value = SourceFilter(column="id", operator="is_null", value=None)
+    tuple_value = SourceFilter(column="id", operator="in", value=(1, 2))
+    assert "42" in repr(int_value)
+    assert "True" in repr(bool_value)
+    assert "None" in repr(none_value)
+    assert "1" in repr(tuple_value)
+    assert "2" in repr(tuple_value)
 
 
 def test_source_filter_rejects_arbitrary_sql_operator() -> None:

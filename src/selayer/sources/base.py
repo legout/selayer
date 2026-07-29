@@ -26,9 +26,10 @@ Secrecy invariants (load-bearing):
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import Enum, StrEnum
 from typing import Literal, Protocol, Self, runtime_checkable
 
 from selayer.sources.catalog import ParsedSource
@@ -114,22 +115,31 @@ def _repr_literal(value: object) -> object:
     placeholder: a free-form string may carry a secret token
     (``TOKENONLYSECRET``), a SQL fragment, or a credential-bearing URI, and no
     token-shaped regex can reliably separate a safe string from a secret.
-    Mappings (``dict``) and unordered collections (``set``/``frozenset``) are
-    redacted wholesale — their keys and members may each be a secret — while
-    ordered collections (``tuple``/``list``) are projected element-wise so that
-    bare numeric literals remain visible.  Non-string scalars (ints, bools,
-    floats, enums, ``None``) pass through unchanged.
+    Every :class:`~collections.abc.Mapping` and :class:`~collections.abc.Set`
+    implementation is redacted wholesale — their keys and members may each be
+    a secret, so a concrete ``dict``/``set``/``frozenset`` *and* a
+    ``MappingProxyType``, ``UserDict``, or hand-rolled ``Mapping``/``Set`` are
+    all covered by the ABC check.  Ordered collections (``tuple``/``list``) are
+    projected element-wise so that bare numeric literals remain visible.  The
+    only values that pass through unchanged are non-string scalars (ints,
+    bools, floats, ``None``) and :class:`~enum.Enum` members; every other
+    object type is redacted so an arbitrary handle's own ``__repr__`` can never
+    leak a secret.
     """
 
     if isinstance(value, (str, bytes)):
         return "<redacted>"
-    if isinstance(value, (dict, set, frozenset)):
+    if isinstance(value, (Mapping, AbstractSet)):
         return "<redacted>"
+    if isinstance(value, Enum):
+        return value
     if isinstance(value, tuple):
         return tuple(_repr_literal(item) for item in value)
     if isinstance(value, list):
         return tuple(_repr_literal(item) for item in value)
-    return value
+    if isinstance(value, (int, float)) or value is None:
+        return value
+    return "<redacted>"
 
 
 def _render(name: str, fields: list[tuple[str, object]]) -> str:
@@ -236,29 +246,35 @@ class SourceScanRequirement:
     filters: tuple[SourceFilter, ...] = ()
 
     def __post_init__(self) -> None:
-        # Validate every column is a string SQL identifier before coercing: a
-        # non-string or a SQL fragment (e.g. ``"id; DROP TABLE users--"``) is
-        # rejected so no arbitrary SQL can ever be carried as a planned column.
-        # The checks run against untyped locals so the type checker does not
-        # narrow them away as impossible.
-        for raw_column in self.columns:
+        # Materialize the caller's iterables into immutable tuples *before*
+        # validating them.  If the caller passed a single-pass iterable (a
+        # generator), validating by iterating ``self.columns``/``self.filters``
+        # and then coercing with a second ``tuple(...)`` call would exhaust it
+        # on the first pass and silently store an empty tuple.  Coerce once into
+        # a local, validate that local, then store it.
+        columns = tuple(self.columns)
+        filters = tuple(self.filters)
+        # Validate every column is a string SQL identifier: a non-string or a
+        # SQL fragment (e.g. ``"id; DROP TABLE users--"``) is rejected so no
+        # arbitrary SQL can ever be carried as a planned column.  The checks run
+        # against untyped locals so the type checker does not narrow them away
+        # as impossible.
+        for raw_column in columns:
             column: object = raw_column
             if not (isinstance(column, str) and _SQL_IDENT_RE.match(column)):
                 raise ValueError("invalid SourceScanRequirement column")
         # Validate every filter is an actual SourceFilter: a raw string such as
         # ``"SELECT password FROM users"`` is rejected with a clean TypeError so
         # arbitrary SQL can never be stored as a planned filter.
-        for raw_filter in self.filters:
+        for raw_filter in filters:
             if not isinstance(raw_filter, SourceFilter):
                 raise TypeError(
                     "SourceScanRequirement filters must be SourceFilter instances"
                 )
-        # Coerce any iterable (e.g. a mutable list) to an immutable tuple so
-        # the frozen requirement cannot be mutated by later caller changes.
-        if not isinstance(self.columns, tuple):
-            object.__setattr__(self, "columns", tuple(self.columns))
-        if not isinstance(self.filters, tuple):
-            object.__setattr__(self, "filters", tuple(self.filters))
+        # Store the materialized tuples so the frozen requirement cannot be
+        # mutated by later caller changes (and a generator is consumed once).
+        object.__setattr__(self, "columns", columns)
+        object.__setattr__(self, "filters", filters)
 
     def __repr__(self) -> str:
         return _render(

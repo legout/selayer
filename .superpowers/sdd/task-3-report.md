@@ -445,3 +445,89 @@ fix(sources): enforce structured scan requirements
 
 Files staged: `src/selayer/sources/base.py`,
 `tests/sources/test_adapter_contract.py`.
+
+---
+
+## Follow-up 4: harden scan repr containers and generator materialization
+
+**Status: Complete.** A final re-review found two residual gaps in the
+Follow-up 2/3 sanitizers:
+
+1. **`_repr_literal` only redacted concrete `dict`/`set`/`frozenset`.** A
+   `types.MappingProxyType`, `collections.UserDict`, or any hand-rolled
+   `collections.abc.Mapping`/`Set` subclass is *not* a `dict`/`set`/`frozenset`,
+   so it fell through to `return value` and surfaced its own (possibly leaky)
+   `__repr__`. Likewise any opaque object type not in the allowlist
+   (`int`/`float`/`None`/`tuple`/`list`/`str`/`bytes`/dict-family) reached the
+   bare `return value`, so an arbitrary handle's `__repr__` could leak.
+2. **`SourceScanRequirement.__post_init__` could silently store an empty
+   tuple.** The validation loop iterated `self.columns`/`self.filters`, then a
+   *separate* `tuple(self.columns)` coerced the same iterable. A single-pass
+   generator was exhausted by the validation pass, so the coercion stored
+   `()` — silently dropping a hostile column that the loop had already
+   validated against (the rejection raised, but for an accepted generator the
+   stored tuple was wrong).
+
+### Changes
+
+**`src/selayer/sources/base.py`**
+
+- **`_repr_literal`** now redacts every `collections.abc.Mapping` and
+  `collections.abc.Set` implementation (ABC checks catch `MappingProxyType`,
+  `UserDict`, and hand-rolled mappings/sets in addition to concrete
+  `dict`/`set`/`frozenset`). It keeps passing through non-string scalars
+  (`int`, `float`, `None`) and `enum.Enum` members, projects `tuple`/`list`
+  element-wise, redacts `str`/`bytes` to `<redacted>`, and — as the final
+  default — redacts **every other object type** so an opaque handle's own
+  `__repr__` can never leak a secret.
+- **`SourceScanRequirement.__post_init__`** materializes the caller's
+  `columns`/`filters` iterables into immutable local tuples *once*, before
+  validation, then validates and stores those locals. A single-pass generator
+  is now consumed exactly once: validation and storage share the same items,
+  and a hostile generator is rejected before any storage happens.
+
+**`tests/sources/test_adapter_contract.py`**
+
+- 9 new regression tests (3 generator-materialization, 6 repr-container).
+
+### Validation gates
+
+| Gate | Result |
+| --- | --- |
+| `pytest -q tests/sources/test_profiles.py tests/sources/test_adapter_contract.py` | **84 passed** |
+| `pytest -q` (full suite) | **1046 passed** |
+| `ruff check src/selayer/sources tests/sources` | **All checks passed!** |
+| `ruff format --check src/selayer/sources tests/sources` | **12 files already formatted** |
+| `pyright src/selayer/sources tests/sources` | **0 errors, 0 warnings, 0 infos** |
+
+### New regression tests
+
+- **Generator materialization (scan requirement):**
+  `test_scan_requirement_accepts_column_generator`,
+  `test_scan_requirement_accepts_filter_generator`,
+  `test_scan_requirement_generator_validation_runs_before_storage` (a hostile
+  generator is rejected and the materialized tuple discarded rather than
+  stored as `()`).
+- **Custom Mapping/Set and unknown objects redacted in repr:**
+  `test_source_filter_mappingproxy_value_is_redacted`,
+  `test_source_filter_userdict_value_is_redacted`,
+  `test_source_filter_custom_mapping_value_is_redacted`,
+  `test_source_filter_custom_set_value_is_redacted`,
+  `test_source_filter_unknown_object_value_is_redacted`,
+  `test_source_filter_scalar_and_tuple_still_render` (regression guard that
+  safe scalars and ordered collections still project).
+
+### Public interfaces preserved
+
+`SourceFilter` and `SourceScanRequirement` constructors and stored fields are
+unchanged — the only changes are repr-only redaction widening and
+pre-storage generator materialization. No other lifecycle object is touched.
+
+### Commit
+
+```
+fix(sources): harden scan repr containers
+```
+
+Files staged: `src/selayer/sources/base.py`,
+`tests/sources/test_adapter_contract.py`.
