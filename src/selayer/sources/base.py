@@ -186,6 +186,27 @@ def _repr_scalar(value: object) -> object:
     return "<redacted>"
 
 
+def _repr_health(value: object) -> str:
+    """Render a :class:`SourceHealth` value, redacting any forged object.
+
+    Only an *exact* ``SourceHealth`` instance may expose its ``.value``: a
+    genuine member's ``.value`` is one of the closed set (``ready`` /
+    ``stale`` / ``unhealthy``), all safe lowercase tokens that render
+    unchanged.  A forged object masquerading as health must *never* have its
+    ``.value`` attribute evaluated — a plain builtin ``str`` secret such as
+    ``"TOKENONLYSECRET"`` would pass :func:`_repr_scalar`'s exact-builtin-str
+    guard straight through, so the ``.value`` access *itself* is the leak.
+    The guard therefore runs *before* any ``.value`` access, and uses
+    ``type(value) is SourceHealth`` (not ``isinstance``) so a ``SourceHealth``
+    *subclass* — whose ``.value`` could be overridden to return a secret — is
+    redacted rather than evaluated.
+    """
+
+    if type(value) is SourceHealth:
+        return value.value
+    return "<redacted>"
+
+
 def _render(name: str, fields: list[tuple[str, object]]) -> str:
     """Render a ``Name(field=value, ...)`` repr from pre-sanitized field values."""
 
@@ -423,7 +444,7 @@ class SourceStatus:
                 ("generation", _repr_literal(self.generation)),
                 ("schema_fingerprint", _repr_literal(self.schema_fingerprint)),
                 ("snapshot", _repr_literal(self.snapshot)),
-                ("health", _repr_scalar(self.health.value)),
+                ("health", _repr_health(self.health)),
             ],
         )
 

@@ -826,3 +826,42 @@ Files staged: `src/selayer/sources/base.py`,
 `tests/sources/test_adapter_contract.py`,
 `tests/sources/test_profiles.py`,
 `.superpowers/sdd/task-3-report.md`.
+
+## Follow-up 8: close forged-health `.value` access-before-guard gap
+
+**Status: Complete.** Follow-up 7 hardened `SourceStatus.health` via
+`_repr_scalar(self.health.value)` — but that evaluates `.value` *before*
+sanitization. A forged object masquerading as health whose `.value` returns a
+*plain builtin* `str` secret (not a subclass) passed `_repr_scalar`'s
+exact-builtin-str guard straight through, so the `.value` access *itself* was
+the leak.
+
+### Fix
+
+`src/selayer/sources/base.py`: new `_repr_health()` runs the exact-type guard
+`type(value) is SourceHealth` (not `isinstance`) *before* any `.value` access.
+Only a genuine `SourceHealth` member exposes its `.value` (a closed set of safe
+lowercase tokens); everything else renders `<redacted>`. `SourceStatus.__repr__`
+now calls `_repr_health(self.health)`.
+
+### Regression test
+
+`tests/sources/test_adapter_contract.py`:
+`test_source_status_health_forged_value_secret_redacted` constructs a
+`_ForgedHealth` whose `.value` returns the plain builtin str `"TOKENONLYSECRET"`
+and asserts it is absent from `repr(status)`, the class name is absent, and
+`health='<redacted>'` is present.
+
+### Validation
+
+| Check | Result |
+| --- | --- |
+| `pytest tests/sources/test_adapter_contract.py` | **93 passed** |
+| `pyright src/selayer/sources/base.py` | **0 errors, 0 warnings, 0 informations** |
+| `ruff format --check` (2 files) | **No issues** |
+
+### Commit
+
+```
+fix(sources): guard health status repr
+```

@@ -1215,6 +1215,22 @@ class _LeakyHealthValue:
         return _LeakyString("ready")
 
 
+class _ForgedHealth:
+    """Forged health object whose ``.value`` is a *plain builtin str* secret.
+
+    Unlike :class:`_LeakyHealthValue` (whose ``.value`` returns a leaky ``str``
+    *subclass* that ``_repr_scalar`` redacts), this returns a plain builtin
+    ``str`` secret — the exact shape ``_repr_scalar``'s exact-builtin-str guard
+    passes through unchanged.  ``SourceStatus.__repr__`` must therefore never
+    evaluate ``.value`` on a non-``SourceHealth`` object; the exact-type guard
+    must run *before* any attribute access.
+    """
+
+    @property
+    def value(self) -> object:
+        return "TOKENONLYSECRET"
+
+
 class _LeakySourceFilter(SourceFilter):
     """A ``SourceFilter`` subclass whose repr leaks a secret — must be rejected."""
 
@@ -1288,6 +1304,27 @@ def test_source_status_health_value_str_subclass_redacted() -> None:
     text = repr(status)
     assert "TOKENONLYSECRET" not in text
     assert "_LeakyString" not in text
+
+
+def test_source_status_health_forged_value_secret_redacted() -> None:
+    # ``health`` renders through ``.value``; a forged object whose ``.value``
+    # returns a *plain builtin str* secret (not a subclass) must never have its
+    # ``.value`` evaluated.  ``_repr_scalar`` would pass an exact builtin str
+    # straight through (``type("TOKENONLYSECRET") is str`` is true), so the
+    # ``.value`` access itself is the leak — the exact ``SourceHealth`` type
+    # guard must run before any attribute access.
+    status = SourceStatus(
+        source_id="orders",
+        connector="parquet",
+        generation=1,
+        schema_fingerprint=schema_fingerprint(_schema()),
+        snapshot=None,
+        health=_ForgedHealth(),  # type: ignore[arg-type]
+    )
+    text = repr(status)
+    assert "TOKENONLYSECRET" not in text
+    assert "_ForgedHealth" not in text
+    assert "health='<redacted>'" in text
 
 
 def test_source_filter_operator_renders_via_safe_helper() -> None:
