@@ -29,10 +29,17 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import suppress
+from urllib.parse import urlparse
 
 import pyarrow as pa
 import pyarrow.csv as pacsv
 import pyarrow.dataset as padataset
+import pyarrow.fs as pafs
+
+try:
+    import boto3
+except ImportError:  # pragma: no cover - exercised only without the s3 extra
+    boto3 = None  # type: ignore[assignment]
 
 from selayer.sources.base import (
     QueryBinding,
@@ -49,6 +56,7 @@ from selayer.sources.config import (
 from selayer.sources.profiles import (
     ArrowObject,
     ArrowProviderResolver,
+    RuntimeProfile,
     RuntimeProfileResolver,
 )
 from selayer.sources.schema import TableSchema, table_schema_to_arrow
@@ -103,11 +111,13 @@ class ArrowDatasetAdapter:
             # is observed by ``inspect_schema`` and any drift (type, extra
             # field, nullability) is caught by ``compare_schemas`` before the
             # source is registered.  DuckDB still gets ARROW_SCAN pushdown over
-            # the physical dataset.
-            resource = padataset.dataset(connector.location, format="parquet")
+            # the physical dataset (local or S3-backed alike).
+            filesystem, path = _resolve_s3_location(connector, profiles, source.name)
+            resource = _parquet_dataset(path, filesystem)
         elif kind == "csv":
             assert isinstance(connector, CsvConfig)
-            resource = _csv_dataset(connector, arrow_schema)
+            filesystem, path = _resolve_s3_location(connector, profiles, source.name)
+            resource = _csv_dataset(connector, arrow_schema, filesystem, path)
         else:  # pragma: no cover - registry only dispatches these kinds
             raise TypeError(f"ArrowDatasetAdapter does not serve connector {kind!r}")
         return SourceHandle(
@@ -183,7 +193,12 @@ def _connector_kind(connector: SourceConnector) -> str:
     return type(connector).__name__
 
 
-def _csv_dataset(connector: CsvConfig, declared_schema: pa.Schema) -> padataset.Dataset:
+def _csv_dataset(
+    connector: CsvConfig,
+    declared_schema: pa.Schema,
+    filesystem: pafs.FileSystem | None,
+    location: str,
+) -> padataset.Dataset:
     parse_options = pacsv.ParseOptions(
         delimiter=connector.delimiter,
         quote_char=connector.quote_char,
@@ -204,7 +219,7 @@ def _csv_dataset(connector: CsvConfig, declared_schema: pa.Schema) -> padataset.
     probe_format = padataset.CsvFileFormat(
         parse_options=parse_options, read_options=read_options
     )
-    physical_schema = padataset.dataset(connector.location, format=probe_format).schema
+    physical_schema = _csv_probe_schema(location, probe_format, filesystem)
     # Reconcile by position: keep the physical inferred types (so type drift
     # and any extra columns remain observable) but adopt the declared
     # nullability for declared positions so inference's ``nullable=True`` does
@@ -214,9 +229,27 @@ def _csv_dataset(connector: CsvConfig, declared_schema: pa.Schema) -> padataset.
     final_format = padataset.CsvFileFormat(
         parse_options=parse_options, read_options=read_options
     )
+    if filesystem is None:
+        return padataset.dataset(
+            location, schema=reconciled_schema, format=final_format
+        )
     return padataset.dataset(
-        connector.location, schema=reconciled_schema, format=final_format
+        location, schema=reconciled_schema, format=final_format, filesystem=filesystem
     )
+
+
+def _csv_probe_schema(
+    location: str,
+    probe_format: padataset.CsvFileFormat,
+    filesystem: pafs.FileSystem | None,
+) -> pa.Schema:
+    """Probe the physical CSV schema at ``location`` through ``filesystem``."""
+
+    if filesystem is None:
+        return padataset.dataset(location, format=probe_format).schema
+    return padataset.dataset(
+        location, format=probe_format, filesystem=filesystem
+    ).schema
 
 
 def _reconcile_csv_schema(
@@ -335,3 +368,197 @@ def _resource_schema(resource: ArrowObject) -> pa.Schema:
     if isinstance(resource, pa.RecordBatchReader):
         return resource.schema
     raise TypeError(f"unsupported Arrow resource: {type(resource).__name__}")
+
+
+# ---------------------------------------------------------------------------
+# S3 transport
+# ---------------------------------------------------------------------------
+
+# Known profile keys for the S3 transport.  Unknown keys are rejected so a
+# typo (e.g. ``acces_key``) cannot silently fall through to the default
+# credential chain and route an explicit secret to the wrong path.  Only key
+# *names* are configuration metadata; secret values are never enumerated in
+# bulk by :meth:`RuntimeProfile.keys`.
+_S3_PROFILE_KEYS: frozenset[str] = frozenset(
+    {
+        "access_key",
+        "secret_key",
+        "session_token",
+        "region",
+        "endpoint_override",
+        "scheme",
+        "profile_name",
+        "role_arn",
+        "external_id",
+        "session_name",
+    }
+)
+
+_VALID_S3_SCHEMES: frozenset[str] = frozenset({"http", "https"})
+
+
+def s3_filesystem(profile: RuntimeProfile) -> pafs.S3FileSystem:
+    """Build a :class:`pyarrow.fs.S3FileSystem` from a runtime profile.
+
+    Three credential paths are supported, resolved in priority order:
+
+    * **role session** — when ``role_arn`` is present, STS assumes the role
+      (via boto3) and returns temporary credentials.
+    * **explicit credentials** — when ``access_key`` and ``secret_key`` are
+      present, they are passed frozen to PyArrow (boto3 is not consulted).
+    * **default chain** — otherwise boto3's standard chain resolves
+      credentials; ``profile_name`` selects a named AWS profile.
+
+    The profile mapping is never forwarded to Arrow wholesale: only frozen,
+    individual values are passed.  Unknown keys, an endpoint carrying URI
+    userinfo, or an unsupported scheme are rejected with a *constant* message
+    raised outside any ``except`` scope, so no secret value can surface in any
+    error surface — ``error.args``, the formatted traceback, ``__cause__``, or
+    ``__context__``.
+    """
+
+    _validate_s3_profile(profile)
+    keys = set(profile.keys())
+
+    scheme = _s3_profile_value(profile, "scheme", "https")
+    endpoint_override = _s3_profile_value(profile, "endpoint_override", None)
+    region = _s3_profile_value(profile, "region", None)
+
+    if "role_arn" in keys:
+        access_key, secret_key, session_token = _s3_role_session_credentials(profile)
+    elif "access_key" in keys and "secret_key" in keys:
+        access_key = profile.value("access_key")
+        secret_key = profile.value("secret_key")
+        session_token = _s3_profile_value(profile, "session_token", None)
+    else:
+        access_key, secret_key, session_token = _s3_default_chain_credentials(profile)
+
+    return pafs.S3FileSystem(
+        access_key=access_key,
+        secret_key=secret_key,
+        session_token=session_token,
+        region=region,
+        endpoint_override=endpoint_override,
+        scheme=scheme,
+    )
+
+
+def _s3_profile_value(profile: RuntimeProfile, name: str, default: object) -> object:
+    """Return a single profile value, or ``default`` when the key is absent."""
+
+    if name in profile:
+        return profile.value(name)
+    return default
+
+
+def _validate_s3_profile(profile: RuntimeProfile) -> None:
+    """Reject unknown keys, unsupported schemes, and userinfo-bearing endpoints.
+
+    Every rejection raises a :class:`ValueError` with a *constant* message and
+    outside any ``except`` scope, so no profile value can surface in any error
+    surface.
+    """
+
+    unknown = set(profile.keys()) - _S3_PROFILE_KEYS
+    if unknown:
+        raise ValueError("unsupported key in S3 profile")
+    scheme = _s3_profile_value(profile, "scheme", None)
+    if scheme is not None and scheme not in _VALID_S3_SCHEMES:
+        raise ValueError("invalid S3 scheme")
+    endpoint = _s3_profile_value(profile, "endpoint_override", None)
+    if endpoint is not None:
+        parsed = urlparse(str(endpoint))
+        if parsed.scheme not in _VALID_S3_SCHEMES:
+            raise ValueError("invalid S3 endpoint")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("S3 endpoint must not contain credentials")
+
+
+def _s3_role_session_credentials(
+    profile: RuntimeProfile,
+) -> tuple[object, object, object]:
+    """Assume an IAM role via STS; return ``(access_key, secret_key, token)``."""
+
+    if boto3 is None:
+        raise ValueError("boto3 is required for S3 role-session credentials")
+    client_kwargs: dict[str, object] = {}
+    region = _s3_profile_value(profile, "region", None)
+    if region is not None:
+        client_kwargs["region_name"] = region
+    client = boto3.client("sts", **client_kwargs)
+    assume_kwargs: dict[str, object] = {"RoleArn": profile.value("role_arn")}
+    external_id = _s3_profile_value(profile, "external_id", None)
+    if external_id is not None:
+        assume_kwargs["ExternalId"] = external_id
+    session_name = _s3_profile_value(profile, "session_name", None)
+    if session_name is not None:
+        assume_kwargs["RoleSessionName"] = session_name
+    response = client.assume_role(**assume_kwargs)
+    credentials = response["Credentials"]
+    return (
+        credentials["AccessKeyId"],
+        credentials["SecretAccessKey"],
+        credentials["SessionToken"],
+    )
+
+
+def _s3_default_chain_credentials(
+    profile: RuntimeProfile,
+) -> tuple[object, object, object]:
+    """Resolve credentials via boto3's default chain; ``(key, secret, token)``."""
+
+    if boto3 is None:
+        raise ValueError("boto3 is required for S3 default-chain credentials")
+    session_kwargs: dict[str, object] = {}
+    profile_name = _s3_profile_value(profile, "profile_name", None)
+    if profile_name is not None:
+        session_kwargs["profile_name"] = profile_name
+    region = _s3_profile_value(profile, "region", None)
+    if region is not None:
+        session_kwargs["region_name"] = region
+    session = boto3.Session(**session_kwargs)
+    credentials = session.get_credentials()
+    if credentials is None:
+        raise ValueError("no S3 credentials resolved from the default chain")
+    frozen = credentials.get_frozen_credentials()
+    return frozen.access_key, frozen.secret_key, frozen.token
+
+
+def _resolve_s3_location(
+    connector: ParquetConfig | CsvConfig,
+    profiles: RuntimeProfileResolver,
+    source_id: str,
+) -> tuple[pafs.FileSystem | None, str]:
+    """Resolve ``(filesystem, path)`` for a file connector.
+
+    When ``credential_profile`` is set the named profile is resolved to an
+    :class:`~pyarrow.fs.S3FileSystem` and the ``s3://`` scheme is stripped per
+    PyArrow's filesystem contract (the filesystem owns the scheme/host).  Local
+    paths (no ``credential_profile``) are returned unchanged with a ``None``
+    filesystem so local pushdown and reload semantics are preserved exactly.
+    """
+
+    credential_profile = connector.credential_profile
+    location = connector.location
+    if credential_profile is None:
+        return None, location
+    profile = profiles.resolve(credential_profile, source_id=source_id)
+    filesystem = s3_filesystem(profile)
+    location = location.removeprefix("s3://")
+    return filesystem, location
+
+
+def _parquet_dataset(
+    path: str, filesystem: pafs.FileSystem | None
+) -> padataset.Dataset:
+    """Build a parquet dataset, attaching a filesystem only when one is set.
+
+    Built *without* a schema override so the physical Parquet schema is
+    observed by :func:`ArrowDatasetAdapter.inspect_schema` and any drift is
+    caught before registration.  DuckDB still gets ARROW_SCAN pushdown over the
+    dataset (local or S3-backed alike).
+    """
+
+    if filesystem is None:
+        return padataset.dataset(path, format="parquet")
+    return padataset.dataset(path, format="parquet", filesystem=filesystem)

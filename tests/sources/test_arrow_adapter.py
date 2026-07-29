@@ -679,3 +679,82 @@ def test_physical_drift_on_reload_keeps_old_registration(
     assert registry.execute('SELECT sum("id") FROM "orders"').fetchone() == (6,)
 
     registry.close()
+
+
+# ---------------------------------------------------------------------------
+# S3 credential_profile filesystem resolution
+# ---------------------------------------------------------------------------
+
+
+def test_parquet_with_credential_profile_uses_s3_filesystem(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """A parquet source with ``credential_profile`` resolves an S3 filesystem.
+
+    The ``s3://`` scheme is stripped per PyArrow's filesystem contract, the
+    named profile is resolved through the resolver, and the dataset is built
+    against the resolved filesystem.  A :class:`pyarrow.fs.SubTreeFileSystem`
+    rooted at ``tmp_path`` stands in for S3 so the test needs no Docker.
+    """
+
+    import pyarrow.fs as pafs
+
+    # Write a parquet file under tmp_path/bucket/ so the SubTreeFileSystem can
+    # read it via the stripped path "bucket/data.parquet".  Fields are written
+    # non-nullable to match the declared ``_orders_schema()`` so the observed
+    # physical schema does not drift on nullability.
+    bucket_dir = tmp_path / "mybucket"
+    bucket_dir.mkdir()
+    table = pa.table(
+        {
+            "id": pa.array([1, 2, 3], pa.int64()),
+            "amount": pa.array([10, 20, 30], pa.int64()),
+        },
+        schema=pa.schema(
+            [
+                pa.field("id", pa.int64(), nullable=False),
+                pa.field("amount", pa.int64(), nullable=False),
+            ]
+        ),
+    )
+    pq.write_table(table, bucket_dir / "data.parquet")
+
+    subtree = pafs.SubTreeFileSystem(str(tmp_path), pafs.LocalFileSystem())
+
+    resolved_profiles: list[str] = []
+
+    def fake_s3_filesystem(_profile: object) -> pafs.FileSystem:
+        resolved_profiles.append("s3_profile")
+        return subtree
+
+    monkeypatch.setattr(
+        "selayer.sources.adapters.arrow.s3_filesystem", fake_s3_filesystem
+    )
+
+    source = ParsedSource(
+        name="orders",
+        connector=ParquetConfig(
+            "s3://mybucket/data.parquet",
+            credential_profile="s3_profile",
+        ),
+        schema=_orders_schema(),
+        grain=("id",),
+    )
+    profiles = MappingProfileResolver(
+        {"s3_profile": {"access_key": "AKIA", "secret_key": "shh"}}
+    )
+    providers = MappingArrowProviderResolver({})
+
+    adapter = ArrowDatasetAdapter()
+    handle = adapter.prepare(source, profiles, providers)
+    observed = adapter.inspect_schema(handle)
+
+    assert observed == _orders_schema()
+    assert resolved_profiles == ["s3_profile"]
+
+    connection = duckdb.connect(":memory:")
+    adapter.register(connection, "orders", handle)
+    assert connection.execute('SELECT sum("amount") FROM "orders"').fetchone() == (60,)
+    adapter.close(handle)
+    connection.close()

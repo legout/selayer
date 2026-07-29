@@ -100,6 +100,25 @@ class RuntimeProfile:
         """Return a single named value for internal adapter use."""
         return self._values[name]
 
+    def keys(self) -> tuple[str, ...]:
+        """Return the profile's key names for adapter-side validation.
+
+        Key names are configuration metadata (not secret values), so they may
+        be enumerated so adapters can reject unknown keys without exposing any
+        value.  The secret values themselves are never exposed in bulk: this
+        method returns only the key names.
+        """
+        return tuple(self._values.keys())
+
+    def __contains__(self, name: object) -> bool:
+        """Return whether a key is present (key existence only, never a value).
+
+        Companion to :meth:`keys`: adapters test ``name in profile`` to decide
+        which credential-resolution path to take.  Only key *existence* is
+        reported — no value is exposed — so this is secret-safe.
+        """
+        return name in self._values
+
     def __repr__(self) -> str:
         # Only the safe profile name renders; the ``_values`` mapping is never
         # exposed (it carries credential values).  The name is routed through a
