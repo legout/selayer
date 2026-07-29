@@ -9,6 +9,7 @@ without requiring ``isinstance`` switches outside this module.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 __all__ = [
@@ -25,12 +26,40 @@ __all__ = [
 ]
 
 
+# URI authority userinfo (``scheme://user:password@host``).  Only the
+# ``userinfo@`` segment is matched so the scheme, host, port, and path — all
+# useful diagnostics — are preserved while embedded credentials are redacted.
+# The negated class stops at the first ``/``, ``?``, ``#``, or ``@`` so a path
+# that legitimately contains ``@`` is never mistaken for userinfo.
+_URI_USERINFO = re.compile(r"(://)[^@/?#]*@")
+
+
+def _sanitize_location(location: str) -> str:
+    """Redact embedded URI userinfo (credentials) from a location string.
+
+    Only the ``userinfo@`` segment of a URI authority is removed; the scheme,
+    host, port, and path are preserved so diagnostics remain useful.  Strings
+    without a ``scheme://user:password@host`` authority (local paths, plain
+    references) are returned unchanged.
+    """
+
+    return _URI_USERINFO.sub(r"\1", location)
+
+
 @dataclass(frozen=True, slots=True)
 class ParquetConfig:
     """A Parquet file-or-directory source."""
 
     location: str
     credential_profile: str | None = None
+
+    def __repr__(self) -> str:
+        # Locations may carry URI userinfo (``s3://key:secret@bucket``);
+        # redact it so credentials never surface in diagnostics.
+        return (
+            f"ParquetConfig(location={_sanitize_location(self.location)!r},"
+            f" credential_profile={self.credential_profile!r})"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +73,17 @@ class CsvConfig:
     escape_char: str | None = None
     has_header: bool = True
 
+    def __repr__(self) -> str:
+        # See ParquetConfig: redact any URI userinfo from the location.
+        return (
+            f"CsvConfig(location={_sanitize_location(self.location)!r},"
+            f" credential_profile={self.credential_profile!r},"
+            f" delimiter={self.delimiter!r},"
+            f" quote_char={self.quote_char!r},"
+            f" escape_char={self.escape_char!r},"
+            f" has_header={self.has_header!r})"
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class DeltaConfig:
@@ -51,6 +91,13 @@ class DeltaConfig:
 
     location: str
     credential_profile: str | None = None
+
+    def __repr__(self) -> str:
+        # See ParquetConfig: redact any URI userinfo from the location.
+        return (
+            f"DeltaConfig(location={_sanitize_location(self.location)!r},"
+            f" credential_profile={self.credential_profile!r})"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +116,13 @@ class SqliteConfig:
     location: str
     relation: str
 
+    def __repr__(self) -> str:
+        # See ParquetConfig: redact any URI userinfo from the location.
+        return (
+            f"SqliteConfig(location={_sanitize_location(self.location)!r},"
+            f" relation={self.relation!r})"
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class DuckDbConfig:
@@ -77,6 +131,14 @@ class DuckDbConfig:
     location: str
     relation: str
     read_only: bool = True
+
+    def __repr__(self) -> str:
+        # See ParquetConfig: redact any URI userinfo from the location.
+        return (
+            f"DuckDbConfig(location={_sanitize_location(self.location)!r},"
+            f" relation={self.relation!r},"
+            f" read_only={self.read_only!r})"
+        )
 
 
 @dataclass(frozen=True, slots=True)

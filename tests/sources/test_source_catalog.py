@@ -659,3 +659,122 @@ def test_parsed_source_is_frozen_and_slotted() -> None:
         parsed.name = "other"  # type: ignore[misc]
     with pytest.raises((AttributeError, TypeError)):
         parsed.extra = "value"  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Regression — credentials never leak through reprs or schema_ref errors
+# ---------------------------------------------------------------------------
+#
+# Binding requirement: credentials and authenticated locations never appear
+# in catalogs, reprs, or exception/error text.  These tests guard against
+# default dataclass reprs echoing a ``location`` whose URI carries embedded
+# userinfo (``scheme://user:password@host``) and against ``_resolve_schema_ref``
+# error messages echoing a supplied reference verbatim.
+
+# A location whose URI authority carries embedded credentials.
+AUTHENTICATED_LOCATION = "s3://AKIATOPSECRET:hunter2@warehouse/orders/"
+# Markers that must never survive into any rendered diagnostic.
+SECRET_MARKERS = ("AKIATOPSECRET", "hunter2")
+
+# A schema reference whose value carries embedded userinfo.
+SECRET_SCHEMA_REF = "https://token:hunter2@host/orders.yaml"
+
+
+@pytest.mark.parametrize(
+    "connector",
+    [
+        ParquetConfig(AUTHENTICATED_LOCATION),
+        ParquetConfig(AUTHENTICATED_LOCATION, "analytics_s3"),
+        CsvConfig(AUTHENTICATED_LOCATION),
+        CsvConfig(AUTHENTICATED_LOCATION, "analytics_s3"),
+        DeltaConfig(AUTHENTICATED_LOCATION),
+        DeltaConfig(AUTHENTICATED_LOCATION, "analytics_s3"),
+        SqliteConfig(AUTHENTICATED_LOCATION, "main.orders"),
+        DuckDbConfig(AUTHENTICATED_LOCATION, "orders"),
+        DuckDbConfig(AUTHENTICATED_LOCATION, "orders", False),
+    ],
+)
+def test_location_connector_reprs_redact_authenticated_userinfo(
+    connector: SourceConnector,
+) -> None:
+    rendered = repr(connector)
+    for marker in SECRET_MARKERS:
+        assert marker not in rendered
+    # Non-secret diagnostics (scheme + host) remain useful.
+    assert "s3://warehouse/orders/" in rendered
+
+
+@pytest.mark.parametrize(
+    "connector",
+    [
+        IcebergConfig("warehouse", ("analytics",), "orders"),
+        PostgresConfig("warehouse_ro", "analytics.customers"),
+        PyArrowConfig("orders_table"),
+    ],
+)
+def test_non_location_connector_reprs_carry_no_credentials(
+    connector: SourceConnector,
+) -> None:
+    # These configs have only validated-identifier fields; their reprs must
+    # never carry credential markers regardless.
+    for marker in SECRET_MARKERS:
+        assert marker not in repr(connector)
+
+
+def test_parsed_source_repr_redacts_authenticated_location() -> None:
+    parsed = ParsedSource(
+        "orders",
+        ParquetConfig(AUTHENTICATED_LOCATION, "analytics_s3"),
+        TableSchema(()),
+        ("id",),
+    )
+    rendered = repr(parsed)
+    for marker in SECRET_MARKERS:
+        assert marker not in rendered
+    assert "s3://warehouse/orders/" in rendered
+
+
+def test_schema_ref_failure_messages_redact_userinfo(tmp_path: Path) -> None:
+    # A schema_ref whose value embeds credentials; it resolves to a path
+    # that is not a file, producing schema_ref_missing.
+    source: dict[str, Any] = {
+        "type": "parquet",
+        "location": "orders/",
+        "schema_ref": SECRET_SCHEMA_REF,
+        "grain": ["id"],
+    }
+    with pytest.raises(SourceDeclarationError) as caught:
+        parse_source_declarations({"x": source}, tmp_path / "catalog.yaml")
+    error = caught.value
+    messages = [issue.message for issue in error.issues]
+
+    # Every representation of the error must redact the embedded secret.
+    for rendered in (str(error), repr(error), repr(error.args), *messages):
+        for marker in SECRET_MARKERS:
+            assert marker not in rendered, rendered
+
+    # The sanitized reference (host, no userinfo) remains a useful diagnostic.
+    assert any("host/orders.yaml" in message for message in messages)
+
+
+def test_schema_ref_yaml_error_message_redacts_userinfo(tmp_path: Path) -> None:
+    # Create the referenced file with invalid YAML so the schema_ref_yaml
+    # branch echoes the (sanitized) reference.
+    ref_path = tmp_path / SECRET_SCHEMA_REF
+    ref_path.parent.mkdir(parents=True, exist_ok=True)
+    ref_path.write_text("fields: [\n", encoding="utf-8")
+    source: dict[str, Any] = {
+        "type": "parquet",
+        "location": "orders/",
+        "schema_ref": SECRET_SCHEMA_REF,
+        "grain": ["id"],
+    }
+    with pytest.raises(SourceDeclarationError) as caught:
+        parse_source_declarations({"x": source}, tmp_path / "catalog.yaml")
+    error = caught.value
+    messages = [issue.message for issue in error.issues]
+
+    for rendered in (str(error), repr(error), repr(error.args), *messages):
+        for marker in SECRET_MARKERS:
+            assert marker not in rendered, rendered
+    assert any("host/orders.yaml" in message for message in messages)

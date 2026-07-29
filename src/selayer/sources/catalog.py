@@ -39,6 +39,7 @@ from selayer.sources.config import (
     PyArrowConfig,
     SourceConnector,
     SqliteConfig,
+    _sanitize_location,
 )
 from selayer.sources.schema import (
     TableSchema,
@@ -302,9 +303,13 @@ def _resolve_schema_ref(
     """Resolve, load, and validate a schema reference file.
 
     All filesystem access occurs only after the containment check passes.
-    Issues are appended to *issues* and prefixed with *base_path*.
+    Issues are appended to *issues* and prefixed with *base_path*.  Supplied
+    references are sanitized before being echoed in messages so embedded URI
+    userinfo can never leak into error text.
     """
 
+    # Sanitize once; used in every message that echoes the supplied reference.
+    safe_ref = _sanitize_location(schema_ref)
     catalog_root = catalog_path.parent.resolve()
     candidate = catalog_path.parent / schema_ref
     try:
@@ -332,7 +337,7 @@ def _resolve_schema_ref(
             SourceDeclarationIssue(
                 "schema_ref_missing",
                 base_path,
-                f"schema_ref file {schema_ref!r} does not exist",
+                f"schema_ref file {safe_ref!r} does not exist",
             )
         )
         return
@@ -343,7 +348,7 @@ def _resolve_schema_ref(
             SourceDeclarationIssue(
                 "schema_ref_missing",
                 base_path,
-                f"schema_ref file {schema_ref!r} cannot be read",
+                f"schema_ref file {safe_ref!r} cannot be read",
             )
         )
         return
@@ -354,7 +359,7 @@ def _resolve_schema_ref(
             SourceDeclarationIssue(
                 "schema_ref_yaml",
                 base_path,
-                f"schema_ref file {schema_ref!r} is not valid YAML",
+                f"schema_ref file {safe_ref!r} is not valid YAML",
             )
         )
         return
