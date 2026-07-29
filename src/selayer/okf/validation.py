@@ -11,7 +11,7 @@ import yaml
 
 from selayer.catalog import SemanticLayer
 
-from .model import OkfConcept, OkfIssue
+from .model import OkfConcept, OkfIssue, Severity
 
 _STATUS = frozenset({"draft", "stable", "deprecated"})
 _COMPUTATION_SECTION = "Computation"
@@ -35,6 +35,16 @@ _LOG_HEADING = re.compile(r"^## (.+?)\s*$")
 def _issue(concept: OkfConcept, field: str, message: str) -> OkfIssue:
     base = f"{concept.relative_path.as_posix()}.frontmatter"
     return OkfIssue(f"{base}.{field}" if field else base, message)
+
+
+def _optional_issue(
+    concept: OkfConcept,
+    field: str,
+    message: str,
+    severity: Severity,
+) -> OkfIssue:
+    issue = _issue(concept, field, message)
+    return OkfIssue(path=issue.path, message=issue.message, severity=severity)
 
 
 def _is_nonempty_string(value: object) -> bool:
@@ -73,23 +83,51 @@ def _validate_event(
     field: str,
     *,
     require_at: bool,
+    severity: Severity,
 ) -> list[OkfIssue]:
     if not isinstance(event, Mapping):
-        return [_issue(concept, field, f"{field.rsplit('.', 1)[-1]} must be a mapping")]
+        return [
+            _optional_issue(
+                concept,
+                field,
+                f"{field.rsplit('.', 1)[-1]} must be a mapping",
+                severity,
+            )
+        ]
     issues: list[OkfIssue] = []
     actor = event.get("by")
     if not _is_nonempty_string(actor):
-        issues.append(_issue(concept, f"{field}.by", "by must be a non-empty string"))
+        issues.append(
+            _optional_issue(
+                concept, f"{field}.by", "by must be a non-empty string", severity
+            )
+        )
     if "at" not in event:
         if require_at:
-            issues.append(_issue(concept, f"{field}.at", "at is required"))
+            issues.append(
+                _optional_issue(concept, f"{field}.at", "at is required", severity)
+            )
     elif not _is_iso_datetime(event["at"]):
-        issues.append(_issue(concept, f"{field}.at", "at must be an ISO 8601 datetime"))
+        issues.append(
+            _optional_issue(
+                concept,
+                f"{field}.at",
+                "at must be an ISO 8601 datetime",
+                severity,
+            )
+        )
     return issues
 
 
-def _validate_generated(concept: OkfConcept, value: object) -> list[OkfIssue]:
-    issues = _validate_event(concept, value, "generated", require_at=False)
+def _validate_generated(
+    concept: OkfConcept,
+    value: object,
+    *,
+    severity: Severity,
+) -> list[OkfIssue]:
+    issues = _validate_event(
+        concept, value, "generated", require_at=False, severity=severity
+    )
     if isinstance(value, Mapping) and "fingerprint" in value:
         fingerprint = value["fingerprint"]
         if (
@@ -97,32 +135,43 @@ def _validate_generated(concept: OkfConcept, value: object) -> list[OkfIssue]:
             or _SHA256_HEX.fullmatch(fingerprint) is None
         ):
             issues.append(
-                _issue(
+                _optional_issue(
                     concept,
                     "generated.fingerprint",
                     "fingerprint must be a 64-character SHA-256 hex digest",
+                    severity,
                 )
             )
     return issues
 
 
-def _validate_verified(concept: OkfConcept, value: object) -> list[OkfIssue]:
+def _validate_verified(
+    concept: OkfConcept,
+    value: object,
+    *,
+    severity: Severity,
+) -> list[OkfIssue]:
     if isinstance(value, Mapping):
         events: tuple[object, ...] = (value,)
         is_sequence = False
     elif isinstance(value, (list, tuple)):
         if not value:
             return [
-                _issue(
+                _optional_issue(
                     concept,
                     "verified",
                     "verified must contain at least one event",
+                    severity,
                 )
             ]
         events = tuple(value)
         is_sequence = True
     else:
-        return [_issue(concept, "verified", "verified must be a mapping or list")]
+        return [
+            _optional_issue(
+                concept, "verified", "verified must be a mapping or list", severity
+            )
+        ]
     return [
         issue
         for index, event in enumerate(events)
@@ -131,25 +180,36 @@ def _validate_verified(concept: OkfConcept, value: object) -> list[OkfIssue]:
             event,
             f"verified[{index}]" if is_sequence else "verified",
             require_at=True,
+            severity=severity,
         )
     ]
 
 
-def _validate_sources(concept: OkfConcept, value: object) -> list[OkfIssue]:
+def _validate_sources(
+    concept: OkfConcept,
+    value: object,
+    *,
+    severity: Severity,
+) -> list[OkfIssue]:
     if not isinstance(value, (list, tuple)):
-        return [_issue(concept, "sources", "sources must be a list")]
+        return [
+            _optional_issue(concept, "sources", "sources must be a list", severity)
+        ]
     issues: list[OkfIssue] = []
     for index, source in enumerate(value):
         field = f"sources[{index}]"
         if not isinstance(source, Mapping):
-            issues.append(_issue(concept, field, "source must be a mapping"))
+            issues.append(
+                _optional_issue(concept, field, "source must be a mapping", severity)
+            )
             continue
         if not _is_nonempty_string(source.get("resource")):
             issues.append(
-                _issue(
+                _optional_issue(
                     concept,
                     f"{field}.resource",
                     "resource must be a non-empty string",
+                    severity,
                 )
             )
     return issues
@@ -201,9 +261,12 @@ def _validate_selayer_id(
 def validate_concept(
     concept: OkfConcept,
     layer: SemanticLayer | None = None,
+    *,
+    strict: bool = True,
 ) -> tuple[OkfIssue, ...]:
     """Validate required and recognized OKF v0.2 frontmatter fields."""
     frontmatter = concept.frontmatter
+    optional_severity: Severity = "error" if strict else "warning"
     issues: list[OkfIssue] = []
     concept_type = frontmatter.get("type")
     if not _is_nonempty_string(concept_type):
@@ -213,124 +276,208 @@ def validate_concept(
         not isinstance(status, str) or status not in _STATUS
     ):
         issues.append(
-            _issue(
+            _optional_issue(
                 concept,
                 "status",
                 "status must be one of: deprecated, draft, stable",
+                optional_severity,
             )
         )
     if "stale_after" in frontmatter and not _is_iso_date(frontmatter["stale_after"]):
         issues.append(
-            _issue(concept, "stale_after", "stale_after must be an ISO 8601 date")
+            _optional_issue(
+                concept,
+                "stale_after",
+                "stale_after must be an ISO 8601 date",
+                optional_severity,
+            )
         )
     if "generated" in frontmatter:
-        issues.extend(_validate_generated(concept, frontmatter["generated"]))
+        issues.extend(
+            _validate_generated(
+                concept, frontmatter["generated"], severity=optional_severity
+            )
+        )
     if "verified" in frontmatter:
-        issues.extend(_validate_verified(concept, frontmatter["verified"]))
+        issues.extend(
+            _validate_verified(
+                concept, frontmatter["verified"], severity=optional_severity
+            )
+        )
     if "sources" in frontmatter:
-        issues.extend(_validate_sources(concept, frontmatter["sources"]))
+        issues.extend(
+            _validate_sources(
+                concept, frontmatter["sources"], severity=optional_severity
+            )
+        )
     if concept_type == "Attested Computation":
         if not _is_nonempty_string(frontmatter.get("runtime")):
             issues.append(
                 _issue(concept, "runtime", "runtime must be a non-empty string")
             )
         if "parameters" in frontmatter:
-            issues.extend(_validate_parameters(concept, frontmatter["parameters"]))
+            issues.extend(
+                _validate_parameters(
+                    concept, frontmatter["parameters"], severity=optional_severity
+                )
+            )
         if "computation" in frontmatter:
-            issues.extend(_validate_computation(concept, frontmatter["computation"]))
+            issues.extend(
+                _validate_computation(
+                    concept, frontmatter["computation"], severity=optional_severity
+                )
+            )
         if _is_nonempty_string(frontmatter.get("computation")) and any(
             section.title == _COMPUTATION_SECTION for section in concept.sections
         ):
             issues.append(
-                _issue(
+                _optional_issue(
                     concept,
                     "computation",
                     "computation path and inline Computation section are "
                     "mutually exclusive; provide exactly one computation source",
+                    optional_severity,
                 )
             )
         if "executor" in frontmatter:
-            issues.extend(_validate_executor(concept, frontmatter["executor"]))
+            issues.extend(
+                _validate_executor(
+                    concept, frontmatter["executor"], severity=optional_severity
+                )
+            )
         if "attester" in frontmatter:
-            issues.extend(_validate_attester(concept, frontmatter["attester"]))
+            issues.extend(
+                _validate_attester(
+                    concept, frontmatter["attester"], severity=optional_severity
+                )
+            )
     if "selayer_id" in frontmatter:
         issues.extend(_validate_selayer_id(concept, frontmatter["selayer_id"], layer))
     return tuple(sorted(issues, key=lambda issue: (issue.path, issue.message)))
 
 
-def _validate_parameters(concept: OkfConcept, value: object) -> list[OkfIssue]:
+def _validate_parameters(
+    concept: OkfConcept,
+    value: object,
+    *,
+    severity: Severity,
+) -> list[OkfIssue]:
     if not isinstance(value, (list, tuple)):
-        return [_issue(concept, "parameters", "parameters must be a list")]
+        return [
+            _optional_issue(
+                concept, "parameters", "parameters must be a list", severity
+            )
+        ]
     issues: list[OkfIssue] = []
     for index, param in enumerate(value):
         field = f"parameters[{index}]"
         if not isinstance(param, Mapping):
-            issues.append(_issue(concept, field, "parameter must be a mapping"))
+            issues.append(
+                _optional_issue(concept, field, "parameter must be a mapping", severity)
+            )
             continue
         if not _is_nonempty_string(param.get("name")):
             issues.append(
-                _issue(concept, f"{field}.name", "name must be a non-empty string")
+                _optional_issue(
+                    concept, f"{field}.name", "name must be a non-empty string", severity
+                )
             )
         if not _is_nonempty_string(param.get("type")):
             issues.append(
-                _issue(concept, f"{field}.type", "type must be a non-empty string")
+                _optional_issue(
+                    concept, f"{field}.type", "type must be a non-empty string", severity
+                )
             )
         if "required" in param and not isinstance(param.get("required"), bool):
             issues.append(
-                _issue(concept, f"{field}.required", "required must be a boolean")
+                _optional_issue(
+                    concept, f"{field}.required", "required must be a boolean", severity
+                )
             )
     return issues
 
 
-def _validate_computation(concept: OkfConcept, value: object) -> list[OkfIssue]:
+def _validate_computation(
+    concept: OkfConcept,
+    value: object,
+    *,
+    severity: Severity,
+) -> list[OkfIssue]:
     if not _is_nonempty_string(value):
         return [
-            _issue(
-                concept, "computation", "computation must be a non-empty string path"
+            _optional_issue(
+                concept,
+                "computation",
+                "computation must be a non-empty string path",
+                severity,
             )
         ]
     return []
 
 
-def _validate_executor(concept: OkfConcept, value: object) -> list[OkfIssue]:
+def _validate_executor(
+    concept: OkfConcept,
+    value: object,
+    *,
+    severity: Severity,
+) -> list[OkfIssue]:
     if not isinstance(value, Mapping):
-        return [_issue(concept, "executor", "executor must be a mapping")]
+        return [_optional_issue(concept, "executor", "executor must be a mapping", severity)]
     issues: list[OkfIssue] = []
     if not _is_nonempty_string(value.get("resource")):
         issues.append(
-            _issue(concept, "executor.resource", "resource must be a non-empty string")
+            _optional_issue(
+                concept,
+                "executor.resource",
+                "resource must be a non-empty string",
+                severity,
+            )
         )
     receipt = value.get("receipt")
     if "receipt" in value:
         if not isinstance(receipt, (list, tuple)):
-            issues.append(_issue(concept, "executor.receipt", "receipt must be a list"))
+            issues.append(
+                _optional_issue(concept, "executor.receipt", "receipt must be a list", severity)
+            )
         elif not receipt:
             issues.append(
-                _issue(
+                _optional_issue(
                     concept,
                     "executor.receipt",
                     "receipt must contain at least one field",
+                    severity,
                 )
             )
         else:
             for index, name in enumerate(receipt):
                 if not _is_nonempty_string(name):
                     issues.append(
-                        _issue(
+                        _optional_issue(
                             concept,
                             f"executor.receipt[{index}]",
                             "receipt field must be a non-empty string",
+                            severity,
                         )
                     )
     return issues
 
 
-def _validate_attester(concept: OkfConcept, value: object) -> list[OkfIssue]:
+def _validate_attester(
+    concept: OkfConcept,
+    value: object,
+    *,
+    severity: Severity,
+) -> list[OkfIssue]:
     if not isinstance(value, Mapping):
-        return [_issue(concept, "attester", "attester must be a mapping")]
+        return [_optional_issue(concept, "attester", "attester must be a mapping", severity)]
     if not _is_nonempty_string(value.get("resource")):
         return [
-            _issue(concept, "attester.resource", "resource must be a non-empty string")
+            _optional_issue(
+                concept,
+                "attester.resource",
+                "resource must be a non-empty string",
+                severity,
+            )
         ]
     return []
 

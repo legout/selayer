@@ -1,15 +1,99 @@
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
 from selayer import SemanticLayer
-from selayer.okf import OkfBundle, OkfValidationError
+from selayer.okf import OkfBundle, OkfConcept, OkfValidationError
+from selayer.okf.validation import validate_concept
 
 
 def _write_concept(root: Path, frontmatter: str, body: str = "") -> Path:
     path = root / "concept.md"
     path.write_text(f"---\n{frontmatter}\n---\n{body}", encoding="utf-8")
     return path
+
+
+def _make_concept(frontmatter: dict[str, object]) -> OkfConcept:
+    return OkfConcept.create(
+        concept_id="concept",
+        relative_path=PurePosixPath("concept.md"),
+        frontmatter=frontmatter,
+    )
+
+
+@pytest.mark.parametrize(
+    "frontmatter",
+    [
+        {"type": "Metric", "status": "bogus"},
+        {"type": "Metric", "stale_after": "not-a-date"},
+        {"type": "Metric", "generated": []},
+        {
+            "type": "Metric",
+            "generated": {"by": "process:build", "fingerprint": "short"},
+        },
+        {"type": "Metric", "verified": "nope"},
+        {"type": "Metric", "sources": "nope"},
+        {"type": "Metric", "sources": [{"id": "policy"}]},
+        {"type": "Attested Computation", "runtime": "python", "parameters": "nope"},
+        {"type": "Attested Computation", "runtime": "python", "computation": ""},
+        {"type": "Attested Computation", "runtime": "python", "executor": "nope"},
+        {"type": "Attested Computation", "runtime": "python", "attester": "nope"},
+    ],
+)
+def test_validate_concept_lenient_downgrades_optional_families_to_warnings(
+    frontmatter: dict[str, object],
+) -> None:
+    issues = validate_concept(_make_concept(frontmatter), None, strict=False)
+
+    assert issues
+    assert all(issue.severity == "warning" for issue in issues)
+    assert list(issues) == sorted(
+        issues, key=lambda issue: (issue.path, issue.message)
+    )
+
+
+@pytest.mark.parametrize(
+    "frontmatter",
+    [
+        {"type": ""},
+        {"type": "Attested Computation"},
+        {"type": "Selayer Metric", "selayer_id": "metric."},
+        {"type": "Selayer Metric", "selayer_id": "bogus"},
+    ],
+)
+def test_validate_concept_keeps_hard_families_fatal_in_lenient_mode(
+    frontmatter: dict[str, object],
+) -> None:
+    issues = validate_concept(_make_concept(frontmatter), None, strict=False)
+
+    assert issues
+    assert all(issue.severity == "error" for issue in issues)
+
+
+def test_strict_default_keeps_optional_families_as_errors() -> None:
+    issues = validate_concept(
+        _make_concept({"type": "Metric", "status": "bogus"}), None
+    )
+
+    assert issues
+    assert all(issue.severity == "error" for issue in issues)
+
+
+def test_lenient_issues_share_paths_and_messages_with_strict_errors() -> None:
+    frontmatter: dict[str, object] = {
+        "type": "Metric",
+        "status": "bogus",
+        "sources": "nope",
+    }
+
+    strict_issues = validate_concept(_make_concept(frontmatter), None)
+    lenient_issues = validate_concept(_make_concept(frontmatter), None, strict=False)
+
+    assert [(i.path, i.message) for i in strict_issues] == [
+        (i.path, i.message) for i in lenient_issues
+    ]
+    assert all(i.severity == "error" for i in strict_issues)
+    assert all(i.severity == "warning" for i in lenient_issues)
 
 
 @pytest.mark.parametrize(
