@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 from dataclasses import dataclass, field
+from typing import Any
 
 import pyarrow as pa
 
@@ -193,29 +194,47 @@ class IcebergAdapter:
 # Catalog configuration
 # ---------------------------------------------------------------------------
 
-# Known profile keys for a PyIceberg catalog configuration.  Unknown keys are
-# rejected so a typo cannot silently route credentials to the wrong path.  Only
-# key *names* are configuration metadata; secret values are never enumerated.
-_CATALOG_CONFIG_KEYS: frozenset[str] = frozenset(
-    {"type", "uri", "warehouse", "region", "endpoint"}
-)
-
 
 def _catalog_config(profile: object) -> dict[str, str]:
     """Extract PyIceberg catalog configuration from a runtime profile.
 
-    Every present value must be an *exact* builtin ``str``
-    (``type(value) is str``, not ``isinstance``) so a hostile ``str`` subclass
-    whose dunders could leak a secret is rejected before any value is forwarded
-    to ``load_catalog``.
+    Forwards *every* profile key whose name and value are both exact builtin
+    ``str`` instances, so auth/S3/token settings (``s3.access-key-id``,
+    ``s3.secret-access-key``, ``s3.session-token``, ``s3.endpoint``, ``region``,
+    ``gcs.*``, ``glue.*``, ...) reach ``load_catalog`` as ``**properties``.
+
+    Secrecy invariants (load-bearing):
+
+    * Key *names* and *values* are both validated with ``type(x) is str``
+      (never ``isinstance``) so a hostile ``str`` subclass whose ``__repr__``/
+      ``__eq__``/``__hash__`` dunders could leak a secret is rejected before
+      any value is forwarded.
+    * Values are never enumerated, echoed in an error, rendered in a repr, or
+      logged: they pass straight from the opaque profile into the returned
+      mapping, which is forwarded to ``load_catalog`` and never repr'd.
+    * A non-string key or value (including a hostile subclass) is *skipped*
+      rather than forwarded, and never surfaces in an exception message.
+    * Unknown profile keys are not rejected: PyIceberg accepts arbitrary
+      ``**properties`` and ignores those it does not recognize, so forwarding
+      all exact-builtin-string pairs keeps ``load_catalog`` inputs compatible
+      with PyIceberg's ``**properties`` contract.
     """
 
     config: dict[str, str] = {}
-    for key in sorted(_CATALOG_CONFIG_KEYS):
-        if key in profile:  # type: ignore[operator]
-            value: object = profile.value(key)  # type: ignore[attr-defined]
-            if type(value) is str:
-                config[key] = value
+    keys = getattr(profile, "keys", None)
+    if not callable(keys):
+        return config
+    key_names: Any = keys()
+    for raw_key in key_names:
+        # Validate the key *name* as an exact builtin ``str``.  Key names are
+        # configuration metadata (not secrets), but a hostile ``str`` subclass
+        # is rejected here so its dunders can never run against a real value.
+        if type(raw_key) is not str:
+            continue
+        value: object = profile.value(raw_key)  # type: ignore[attr-defined]
+        # Validate the value as an exact builtin ``str``; never echo it.
+        if type(value) is str:
+            config[raw_key] = value
     return config
 
 
@@ -241,30 +260,86 @@ def _safe_snapshot_id(table: object) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _normalize_arrow_schema(schema: pa.Schema) -> pa.Schema:
-    """Normalize ``large_string``/``large_binary`` to their standard equivalents.
+def _normalize_arrow_type(dtype: pa.DataType) -> pa.DataType:
+    """Recursively normalize ``large_string``/``large_binary`` Arrow types.
 
-    PyIceberg represents ``string`` columns as ``large_string`` in Arrow for
-    read efficiency.  Normalizing to ``string`` (``utf8``) lets a standard
-    ``utf8`` declaration match the observed schema during ``compare_schemas``.
+    PyIceberg represents ``string``/``binary`` columns as ``large_string``/
+    ``large_binary`` in Arrow for read efficiency.  This recurses through every
+    nested container — ``list``, ``large_list``, ``fixed_size_list``, ``struct``,
+    ``map``, and ``dictionary`` — normalizing leaf string/binary types at any
+    depth while preserving field names, nullability, metadata, list sizes, map
+    key/item field shape, and dictionary index/ordered properties.
     """
 
-    fields: list[pa.Field] = []
-    for arrow_field in schema:
-        field_type = arrow_field.type
-        if field_type == pa.large_string():
-            field_type = pa.string()
-        elif field_type == pa.large_binary():
-            field_type = pa.binary()
-        fields.append(
-            pa.field(
-                arrow_field.name,
-                field_type,
-                nullable=arrow_field.nullable,
-                metadata=arrow_field.metadata,
-            )
+    # Leaf normalization: large_string/large_binary -> string/binary.
+    if dtype == pa.large_string():
+        return pa.string()
+    if dtype == pa.large_binary():
+        return pa.binary()
+
+    # list<T> / large_list<T> / fixed_size_list<T, n>: recurse into the value
+    # field, preserving the list variant and (for fixed-size) the list size.
+    if pa.types.is_list(dtype):
+        return pa.list_(_normalize_arrow_field(dtype.value_field))
+    if pa.types.is_large_list(dtype):
+        return pa.large_list(_normalize_arrow_field(dtype.value_field))
+    if pa.types.is_fixed_size_list(dtype):
+        return pa.list_(_normalize_arrow_field(dtype.value_field), dtype.list_size)
+
+    # struct<...>: recurse into every named child field.
+    if pa.types.is_struct(dtype):
+        return pa.struct([_normalize_arrow_field(field) for field in dtype])
+
+    # map<key, value>: recurse into the key and item fields, preserving
+    # keys_sorted and the key/item field shape.
+    if pa.types.is_map(dtype):
+        return pa.map_(
+            _normalize_arrow_field(dtype.key_field),
+            _normalize_arrow_field(dtype.item_field),
+            keys_sorted=dtype.keys_sorted,
         )
-    return pa.schema(fields)
+
+    # dictionary<index, value, ordered>: recurse into the index and value
+    # types, preserving the ordered flag.  The value type is the leaf most
+    # likely to carry large_string/large_binary.
+    if pa.types.is_dictionary(dtype):
+        return pa.dictionary(
+            _normalize_arrow_type(dtype.index_type),
+            _normalize_arrow_type(dtype.value_type),
+            ordered=dtype.ordered,
+        )
+
+    # Any other (non-nested, non-large) type is already normalized.
+    return dtype
+
+
+def _normalize_arrow_field(arrow_field: pa.Field) -> pa.Field:
+    """Normalize a field's type while preserving name, nullability, metadata."""
+
+    return pa.field(
+        arrow_field.name,
+        _normalize_arrow_type(arrow_field.type),
+        nullable=arrow_field.nullable,
+        metadata=arrow_field.metadata,
+    )
+
+
+def _normalize_arrow_schema(schema: pa.Schema) -> pa.Schema:
+    """Recursively normalize ``large_string``/``large_binary`` in a schema.
+
+    PyIceberg represents ``string``/``binary`` columns as ``large_string``/
+    ``large_binary`` in Arrow for read efficiency, including inside nested
+    types (``list<string>``, ``struct<a: string>``, ``map<string, binary>``,
+    ...).  Normalizing these to ``string``/``binary`` at every depth lets a
+    standard ``utf8``/``binary`` declaration match the observed schema during
+    ``compare_schemas``.  Field names, nullability, metadata, list sizes, map
+    key/item shape, and dictionary properties are all preserved.
+    """
+
+    return pa.schema(
+        [_normalize_arrow_field(arrow_field) for arrow_field in schema],
+        metadata=schema.metadata,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -12,7 +12,7 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 import pytest
@@ -56,6 +56,46 @@ class _RecordingScan:
         self.selected_fields: tuple[str, ...] | None = None
         self.row_filter: str | None = None
         self.reader_count: int = 0
+        self.close_count: int = 0
+
+
+class _TrackedReader:
+    """Wraps a ``RecordBatchReader`` recording every ``close()`` call.
+
+    Every attribute access other than ``close`` is delegated to the underlying
+    reader via ``__getattr__`` so DuckDB's Arrow stream interface is unchanged.
+    A ``close()`` increments the recording's ``close_count`` *before*
+    delegating so the instrumentation survives even if the inner close raises.
+    """
+
+    _inner: Any
+    _recording: _RecordingScan
+
+    def __init__(self, inner: Any, recording: _RecordingScan) -> None:
+        self._inner = inner
+        self._recording = recording
+
+    def close(self) -> None:
+        self._recording.close_count += 1
+        self._inner.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _RecordingScanBuilder:
+    """Wraps a PyIceberg ``TableScan`` so the reader is tracked on creation."""
+
+    def __init__(self, inner: object, recording: _RecordingScan) -> None:
+        self._inner = inner
+        self._recording = recording
+
+    def to_arrow_batch_reader(self) -> _TrackedReader:
+        raw = self._inner.to_arrow_batch_reader()  # type: ignore[attr-defined]
+        return _TrackedReader(raw, self._recording)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
 
 
 class _RecordingTable:
@@ -65,7 +105,7 @@ class _RecordingTable:
         self._inner = inner
         self._recording = recording
 
-    def scan(self, **kwargs: object) -> object:
+    def scan(self, **kwargs: object) -> _RecordingScanBuilder:
         fields = kwargs.get("selected_fields")
         self._recording.selected_fields = (
             tuple(fields) if isinstance(fields, (tuple, list)) else ()
@@ -73,7 +113,10 @@ class _RecordingTable:
         raw_filter = kwargs.get("row_filter")
         self._recording.row_filter = raw_filter if isinstance(raw_filter, str) else None
         self._recording.reader_count += 1
-        return self._inner.scan(**kwargs)  # type: ignore[attr-defined]
+        return _RecordingScanBuilder(
+            self._inner.scan(**kwargs),  # type: ignore[attr-defined]
+            self._recording,
+        )
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._inner, name)
@@ -126,6 +169,7 @@ def _iceberg_layer() -> SemanticLayer:
     }
     dimensions = {
         "category": Dimension("category", "events", "category", "string"),
+        "value": Dimension("value", "events", "value", "integer"),
     }
     facts = {
         "event_value": Fact.from_expression(
@@ -234,6 +278,130 @@ def iceberg_table_fixture(
 
 
 # ---------------------------------------------------------------------------
+# Schema normalization
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_arrow_schema_recurses_into_nested_types() -> None:
+    """Normalization recurses through every nested container type.
+
+    PyIceberg surfaces ``large_string``/``large_binary`` at any depth (a
+    ``string``/``binary`` column is read as its large variant, including inside
+    ``list``/``large_list``/``fixed_size_list``, ``struct``, ``map``, and
+    ``dictionary`` containers).  The adapter normalizes every leaf to
+    ``string``/``binary`` while preserving field names, nullability, metadata,
+    list sizes, map key/item shape, and dictionary ordering — so a standard
+    ``utf8``/``binary`` declaration matches the observed schema.
+    """
+
+    from selayer.sources.adapters.iceberg import _normalize_arrow_schema
+
+    field_metadata = {b"field": b"meta"}
+    schema_metadata = {b"schema": b"meta"}
+
+    raw = pa.schema(
+        [
+            pa.field(
+                "top_str",
+                pa.large_string(),
+                nullable=False,
+                metadata=field_metadata,
+            ),
+            pa.field("top_bin", pa.large_binary(), metadata=field_metadata),
+            pa.field(
+                "list_str",
+                pa.list_(pa.field("item", pa.large_string(), nullable=False)),
+            ),
+            pa.field(
+                "large_list_bin",
+                pa.large_list(pa.field("item", pa.large_binary())),
+            ),
+            pa.field(
+                "fixed_list_bin",
+                pa.list_(pa.field("item", pa.large_binary()), 4),
+            ),
+            pa.field(
+                "struct_nested",
+                pa.struct(
+                    [
+                        pa.field("a", pa.large_string(), metadata=field_metadata),
+                        pa.field("b", pa.large_binary(), nullable=False),
+                    ]
+                ),
+            ),
+            pa.field(
+                "map_nested",
+                pa.map_(
+                    pa.field("key", pa.large_string(), nullable=False),
+                    pa.field("value", pa.large_binary()),
+                ),
+            ),
+            pa.field("dict_str", pa.dictionary(pa.int32(), pa.large_string())),
+            pa.field(
+                "dict_ordered_bin",
+                pa.dictionary(pa.int8(), pa.large_binary(), ordered=True),
+            ),
+        ],
+        metadata=schema_metadata,
+    )
+
+    normalized = _normalize_arrow_schema(raw)
+
+    # Top-level leaves normalized; nullability and metadata preserved.
+    assert normalized.field("top_str").type == pa.string()
+    assert normalized.field("top_str").nullable is False
+    assert normalized.field("top_str").metadata == field_metadata
+    assert normalized.field("top_bin").type == pa.binary()
+    assert normalized.field("top_bin").metadata == field_metadata
+    assert normalized.metadata == schema_metadata
+
+    # list<large_string> -> list<string>; inner nullability preserved.
+    list_type = normalized.field("list_str").type
+    assert pa.types.is_list(list_type)
+    assert list_type.value_type == pa.string()
+    assert list_type.value_field.nullable is False
+
+    # large_list<large_binary> stays a large_list with a normalized value.
+    large_list_type = normalized.field("large_list_bin").type
+    assert pa.types.is_large_list(large_list_type)
+    assert large_list_type.value_type == pa.binary()
+
+    # fixed_size_list<large_binary, 4> keeps the size and normalizes the value.
+    fixed_type = normalized.field("fixed_list_bin").type
+    assert pa.types.is_fixed_size_list(fixed_type)
+    assert fixed_type.list_size == 4
+    assert fixed_type.value_type == pa.binary()
+
+    # struct recurses into every named child, preserving metadata/nullability.
+    struct_type = normalized.field("struct_nested").type
+    assert pa.types.is_struct(struct_type)
+    assert struct_type.field("a").type == pa.string()
+    assert struct_type.field("a").metadata == field_metadata
+    assert struct_type.field("b").type == pa.binary()
+    assert struct_type.field("b").nullable is False
+
+    # map<large_string, large_binary> -> map<string, binary>; key nullability
+    # preserved (PyIceberg requires non-nullable keys).
+    map_type = normalized.field("map_nested").type
+    assert pa.types.is_map(map_type)
+    assert map_type.key_type == pa.string()
+    assert map_type.item_type == pa.binary()
+    assert map_type.key_field.nullable is False
+
+    # dictionary<index, large_string> -> dictionary<index, string>; ordered flag
+    # preserved on both an unordered and an ordered dictionary.
+    dict_type = normalized.field("dict_str").type
+    assert pa.types.is_dictionary(dict_type)
+    assert dict_type.index_type == pa.int32()
+    assert dict_type.value_type == pa.string()
+    assert dict_type.ordered is False
+    dict_ordered_type = normalized.field("dict_ordered_bin").type
+    assert pa.types.is_dictionary(dict_ordered_type)
+    assert dict_ordered_type.value_type == pa.binary()
+    assert dict_ordered_type.ordered is True
+
+
+# ---------------------------------------------------------------------------
 # Main test from the brief
 # ---------------------------------------------------------------------------
 
@@ -303,63 +471,68 @@ def test_iceberg_list_filter_translation(
 def test_iceberg_range_filter_translation(
     iceberg_table_fixture: _IcebergFixture,
 ) -> None:
-    """An inclusive range filter is pushed down as ``>= AND <=`` and matches Arrow.
+    """An inclusive range filter on a numeric dimension is pushed down and matches.
 
-    The range filter is applied to the ``category`` dimension via a range of
-    integer IDs is not possible (category is a string), so we verify range
-    pushdown by inspecting the generated row_filter string directly through a
-    SourceFilter round-trip.
+    The ``value`` integer dimension receives an inclusive range.  PyIceberg gets
+    ``value >= 5 AND value <= 10`` so it scans only the matching rows, while the
+    compiled DuckDB query still evaluates ``value BETWEEN ? AND ?`` as a
+    residual.  The recorded projection carries the grain (``id``), the dimension
+    (``value``), and the fact reference (``value``, de-duplicated); the query
+    result is cross-checked against an independent Arrow calculation over the
+    raw rows rather than against the private formatter alone.
     """
 
-    from selayer.sources.adapters.iceberg import _iceberg_row_filter
-    from selayer.sources.base import SourceFilter
+    fixture = iceberg_table_fixture
+    with QueryEngine(fixture.layer, profiles=fixture.profiles) as engine:
+        result = engine.query(
+            ["total_value"],
+            ["value"],
+            {"value": (5, 10)},
+        )
+    assert fixture.recording.selected_fields == ("id", "value")
+    assert fixture.recording.row_filter == "value >= 5 AND value <= 10"
 
-    filters = (
-        SourceFilter(column="value", operator="ge", value=5),
-        SourceFilter(column="value", operator="le", value=10),
-    )
-    row_filter = _iceberg_row_filter(filters)
-    assert row_filter == "value >= 5 AND value <= 10"
-
-    # Verify against Arrow: values 5 and 6 are in [5, 10], sum = 11
-    values = [4, 6, 5]
-    filtered_values = [v for v in values if 5 <= v <= 10]
-    assert filtered_values == [6, 5]
+    # Independent Arrow calculation over the raw rows.
+    raw_values = [4, 6, 5]
+    expected = sum(v for v in raw_values if 5 <= v <= 10)
+    assert expected == 11
+    assert result["total_value"].sum() == expected
 
 
 def test_unsupported_filter_remains_residual_only(
     iceberg_table_fixture: _IcebergFixture,
 ) -> None:
-    """An unsupported operator (ne) produces no pushdown; DuckDB still filters.
+    """An unsupported filter value produces no pushdown; DuckDB still filters.
 
-    The ``ne`` operator is not in the pushdown set, so ``_iceberg_row_filter``
-    returns ``None`` (no pushdown).  A supported list filter still works
-    correctly through DuckDB's residual evaluation, matching an independent
-    Arrow calculation.
+    A list filter containing a ``None`` value is not a pushdown scalar, so
+    ``requirements_for_plan`` emits no :class:`SourceFilter` and PyIceberg scans
+    every row (``row_filter`` is ``None``).  DuckDB still evaluates
+    ``category IN ('A', NULL)`` as a residual: the three scanned rows are
+    reduced to the two ``'A'`` rows, which an independent Arrow calculation
+    confirms.  This proves the residual path end-to-end through the query
+    engine rather than only through the private formatter.
     """
 
-    from selayer.sources.adapters.iceberg import _iceberg_row_filter
-    from selayer.sources.base import SourceFilter
-
-    # The ne operator is not pushed down.
-    assert (
-        _iceberg_row_filter(
-            (SourceFilter(column="category", operator="ne", value="A"),)
-        )
-        is None
-    )
-
-    # A supported list filter is pushed down and the result matches Arrow.
     fixture = iceberg_table_fixture
     with QueryEngine(fixture.layer, profiles=fixture.profiles) as engine:
         result = engine.query(
             ["total_value"],
             ["category"],
-            {"category": ["A", "B"]},
+            {"category": ["A", None]},
         )
-    assert fixture.recording.row_filter == "category IN ('A', 'B')"
-    # Independent Arrow calculation: A=10, B=5, total=15.
-    assert result["total_value"].sum() == 15
+    # No pushdown: PyIceberg scanned every row.
+    assert fixture.recording.row_filter is None
+
+    # Independent Arrow calculation: the IN ('A', NULL) residual matches only
+    # the 'A' rows (a NULL list member never matches a non-NULL value), so the
+    # residual genuinely filtered the three full-scan rows down to two.
+    raw_categories = ["A", "A", "B"]
+    raw_values = [4, 6, 5]
+    full_scan_sum = sum(raw_values)
+    residual_sum = sum(v for c, v in zip(raw_categories, raw_values) if c == "A")
+    assert full_scan_sum == 15
+    assert residual_sum == 10
+    assert result["total_value"].sum() == residual_sum
 
 
 # ---------------------------------------------------------------------------
@@ -440,22 +613,47 @@ def test_iceberg_status_exposes_snapshot_id_only(
 
 def test_reader_closes_after_success_and_failure(
     iceberg_table_fixture: _IcebergFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Readers are closed after both successful and failed queries."""
+    """Readers close after both successful and failed query execution.
+
+    The reader is registered inside ``registry.bind`` *before* compile/execute,
+    so a deterministic execution failure still drives the binding's ``finally``
+    cleanup.  ``close_count`` increments once per query — for the successful
+    query and for the failed query alike — proving readers never leak on either
+    path.  The failure is injected by compiling malformed SQL (not by querying
+    a closed engine), so it is deterministic and not flaky.
+    """
+
+    import selayer.query as query_mod
+    from selayer.compilation import CompiledQuery
+    from selayer.errors import QueryExecutionError
 
     fixture = iceberg_table_fixture
     with QueryEngine(fixture.layer, profiles=fixture.profiles) as engine:
-        # Successful query — reader is created and cleaned up.
+        # Successful query: a reader is created and then closed in bind's
+        # ``finally`` cleanup.
         engine.query(["total_value"], ["category"], {"category": ["A"]})
         assert fixture.recording.reader_count == 1
+        assert fixture.recording.close_count == 1
 
-        # Another successful query — a new reader is created and cleaned up.
-        engine.query(["total_value"], ["category"], {"category": ["A"]})
+        # Failing query: inject malformed SQL so execution fails after the
+        # reader has already been registered by ``bind``.
+        def failing_compile(_plan: object) -> CompiledQuery:
+            return CompiledQuery(
+                sql="SELECT * FROM __selayer_nonexistent_table__",
+                parameters=(),
+            )
+
+        monkeypatch.setattr(query_mod, "compile_duckdb", failing_compile)
+
+        with pytest.raises(QueryExecutionError):
+            engine.query(["total_value"], ["category"], {"category": ["A"]})
+
+        # A new reader was created for the failing query and closed in the
+        # bind ``finally`` cleanup, so both counters advance to 2.
         assert fixture.recording.reader_count == 2
-
-    # After engine close, querying must fail (registry closed / source gone).
-    with pytest.raises(Exception):  # noqa: B017
-        engine.query(["total_value"], ["category"], {"category": ["A"]})
+        assert fixture.recording.close_count == 2
 
 
 # ---------------------------------------------------------------------------

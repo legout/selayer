@@ -464,16 +464,10 @@ class SourceRegistry:
         prepared: list[tuple[SourceAdapter, SourceHandle, str]] = []
         bindings: list[QueryBinding] = []
         try:
-            grains = {
-                sid: self._sources[sid].grain
-                for sid in _plan_sources(plan)
-                if sid in self._sources
-            }
-            # ``grains`` is a private keyword: the public one-argument form
-            # ``requirements_for_plan(plan)`` collects no grain columns, while
-            # the registry passes each source's declared grain so the scan
-            # projection includes the row-identity columns.
-            requirements = requirements_for_plan(plan, grains=grains)
+            # One-argument form: the plan carries each source's declared grain
+            # (``source_grains``), so ``requirements_for_plan`` seeds
+            # row-identity columns without the registry supplying them.
+            requirements = requirements_for_plan(plan)
             for source_id in _plan_sources(plan):
                 registration = self._registrations.get(source_id)
                 if registration is None:
@@ -691,34 +685,45 @@ def requirements_for_plan(
     """Extract per-source scan requirements from a validated query plan.
 
     The public entry point is the one-argument form
-    ``requirements_for_plan(plan)``: it collects physical columns from planned
-    dimensions, planned filters, fact expression references, and join endpoints
-    — preserving first-seen order with a companion set so a column referenced
-    by multiple mechanisms appears once.
+    ``requirements_for_plan(plan)``: it seeds each source's declared row-identity
+    (grain) columns from ``plan.source_grains`` (connection-free, credential-free
+    metadata populated by :func:`~selayer.planning.planner.plan_query`), then
+    collects physical columns from planned dimensions, planned filters, fact
+    expression references, and join endpoints — preserving first-seen order with
+    a companion set so a column referenced by multiple mechanisms appears once.
 
-    The private keyword-only ``grains`` argument lets a caller (the registry)
-    additionally seed each source's row-identity (grain) columns first; it
-    defaults to empty so the public one-argument call collects no grain.  This
-    keeps the registry's query-time binding — which knows each source's grain —
-    decoupled from plan construction, which does not carry grain metadata.
+    The private keyword-only ``grains`` argument is a fallback for hand-built
+    legacy plans whose ``source_grains`` is empty: when present it takes
+    precedence over ``plan.source_grains`` for the named sources so a caller
+    that knows each source's grain can still supply it.  This keeps the
+    registry's query-time binding decoupled from any plan that does not yet
+    carry declared grain metadata.
 
     Translates source-local scalar, list, and range filters into structured
     :class:`SourceFilter` objects for adapter pushdown.
 
     Metric and measure IDs never appear in the result columns: only physical
     ``source.column`` references extracted from fact expressions, dimensions,
-    filters, joins, and (when supplied) the source grain are collected.
+    filters, joins, and the declared source grain are collected.
     """
 
     plan_sources = _plan_sources(plan)
+    plan_source_grains: Mapping[str, tuple[str, ...]] = plan.source_grains
     collectors: dict[str, _ColumnCollector] = {
         source_id: _ColumnCollector() for source_id in plan_sources
     }
     filters_by_source: dict[str, list[SourceFilter]] = {}
 
-    # 1. Grain columns (first, in grain declaration order).
+    # 1. Grain columns (first, in grain declaration order).  Each source's
+    #    grain comes from the explicit ``grains`` fallback when present,
+    #    otherwise from the plan's declared ``source_grains`` so the
+    #    one-argument public form carries row-identity columns by default.
     for source_id in plan_sources:
-        for column in grains.get(source_id, ()):
+        if source_id in grains:
+            grain_columns = grains[source_id]
+        else:
+            grain_columns = plan_source_grains.get(source_id, ())
+        for column in grain_columns:
             collectors[source_id].add(column)
 
     # 2. Planned dimensions.

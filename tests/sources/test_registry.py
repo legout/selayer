@@ -1114,6 +1114,8 @@ def _requirements_layer() -> SemanticLayer:
 
 
 def _req_grains(layer: SemanticLayer, plan: QueryPlan) -> dict[str, tuple[str, ...]]:
+    """Legacy helper retained only for the explicit-grains fallback test."""
+
     from selayer.sources.registry import _plan_sources
 
     return {
@@ -1193,10 +1195,7 @@ def shared_column_plan() -> QueryPlan:
 def test_requirements_collect_columns_and_local_filters(
     item_margin_plan: QueryPlan,
 ) -> None:
-    layer = _requirements_layer()
-    requirements = requirements_for_plan(
-        item_margin_plan, grains=_req_grains(layer, item_margin_plan)
-    )
+    requirements = requirements_for_plan(item_margin_plan)
 
     assert requirements["order_items"].columns == (
         "order_id",
@@ -1211,12 +1210,10 @@ def test_requirements_collect_columns_and_local_filters(
     assert product_filters[0].operator == "in"
 
 
-def test_fact_reference_plan_columns(item_margin_plan: QueryPlan) -> None:
+def test_fact_reference_plan_columns(fact_reference_plan: QueryPlan) -> None:
     """A fact-reference-only plan collects grain plus fact-expr columns."""
 
-    layer = _requirements_layer()
-    plan = plan_query(layer, QueryRequest(metrics=("item_revenue_total",)))
-    requirements = requirements_for_plan(plan, grains=_req_grains(layer, plan))
+    requirements = requirements_for_plan(fact_reference_plan)
     assert requirements["order_items"].columns == (
         "order_id",
         "product_id",
@@ -1230,10 +1227,7 @@ def test_dimension_plan_columns(
 ) -> None:
     """A dimension plan collects grain plus dimension plus fact columns."""
 
-    layer = _requirements_layer()
-    requirements = requirements_for_plan(
-        dimension_plan, grains=_req_grains(layer, dimension_plan)
-    )
+    requirements = requirements_for_plan(dimension_plan)
     assert requirements["order_items"].columns == (
         "order_id",
         "product_id",
@@ -1247,10 +1241,7 @@ def test_filter_plan_columns_and_filters(
 ) -> None:
     """A filter plan collects grain plus filter column plus fact columns."""
 
-    layer = _requirements_layer()
-    requirements = requirements_for_plan(
-        filter_plan, grains=_req_grains(layer, filter_plan)
-    )
+    requirements = requirements_for_plan(filter_plan)
     assert requirements["order_items"].columns == (
         "order_id",
         "product_id",
@@ -1269,10 +1260,7 @@ def test_join_plan_columns(
 ) -> None:
     """A join plan collects join-endpoint columns from both sources."""
 
-    layer = _requirements_layer()
-    requirements = requirements_for_plan(
-        join_plan, grains=_req_grains(layer, join_plan)
-    )
+    requirements = requirements_for_plan(join_plan)
     assert requirements["order_items"].columns == (
         "order_id",
         "product_id",
@@ -1287,10 +1275,7 @@ def test_shared_column_dedup(
 ) -> None:
     """A column referenced by a dimension and a fact appears only once."""
 
-    layer = _requirements_layer()
-    requirements = requirements_for_plan(
-        shared_column_plan, grains=_req_grains(layer, shared_column_plan)
-    )
+    requirements = requirements_for_plan(shared_column_plan)
     columns = requirements["order_items"].columns
     assert columns.count("quantity") == 1
 
@@ -1301,9 +1286,7 @@ def test_metric_and_measure_ids_never_appear_in_columns(
     """Metric and measure IDs never leak into SourceScanRequirement columns."""
 
     layer = _requirements_layer()
-    requirements = requirements_for_plan(
-        item_margin_plan, grains=_req_grains(layer, item_margin_plan)
-    )
+    requirements = requirements_for_plan(item_margin_plan)
     forbidden = set(layer.metrics) | set(layer.measures)
     forbidden |= {
         "__selayer_measure_total_item_revenue",
@@ -1312,3 +1295,49 @@ def test_metric_and_measure_ids_never_appear_in_columns(
     }
     for req in requirements.values():
         assert not (set(req.columns) & forbidden)
+
+
+def test_one_argument_form_seeds_grain_from_plan_source_grains() -> None:
+    """The one-argument form seeds grain columns from ``plan.source_grains``.
+
+    The brief's required contract: ``requirements_for_plan(plan)`` carries the
+    declared grain columns without a private keyword.  A plan produced by
+    ``plan_query`` populates ``source_grains``; the one-argument call must
+    include those grain columns, and a hand-built plan with empty
+    ``source_grains`` must collect none unless the explicit ``grains=``
+    fallback is supplied.
+    """
+
+    layer = _requirements_layer()
+    plan = plan_query(
+        layer,
+        QueryRequest(
+            metrics=("item_revenue_total",),
+            dimensions=("item_quantity",),
+        ),
+    )
+    # The plan carries connection-free declared grain metadata.
+    assert plan.source_grains["order_items"] == ("order_id", "product_id")
+
+    # One-argument form seeds grain columns from the plan.
+    one_arg = requirements_for_plan(plan)
+    assert "order_id" in one_arg["order_items"].columns
+    assert "product_id" in one_arg["order_items"].columns
+
+    # A hand-built plan with no source_grains collects no grain columns, but
+    # the explicit ``grains=`` fallback still supplies them.
+    hand_built = QueryPlan(
+        plan.anchor_source,
+        plan.joins,
+        plan.dimensions,
+        plan.measures,
+        plan.metrics,
+        plan.filters,
+    )
+    no_grain = requirements_for_plan(hand_built)
+    assert "order_id" not in no_grain["order_items"].columns
+    with_grain = requirements_for_plan(
+        hand_built, grains=_req_grains(layer, hand_built)
+    )
+    assert "order_id" in with_grain["order_items"].columns
+    assert "product_id" in with_grain["order_items"].columns

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from types import MappingProxyType
 
 from selayer.expressions.validation import references
 from selayer.model import Relationship, SemanticLayer
@@ -274,6 +275,22 @@ def plan_query(layer: SemanticLayer, request: QueryRequest) -> QueryPlan:
                 else relationship.source
             )
 
+    # Connection-free, credential-free declared source-grain metadata: the
+    # set of plan-touched sources is exactly the anchor plus every join
+    # endpoint.  Each source's declared grain (column names only) is copied so
+    # ``requirements_for_plan(plan)`` can seed row-identity columns without the
+    # caller having to supply them, while no connector handle, observed schema,
+    # or credential ever reaches the plan.
+    plan_source_ids: set[str] = {anchor}
+    for step in joins:
+        plan_source_ids.add(step.source)
+        plan_source_ids.add(step.target)
+    source_grains = {
+        source_id: layer.data_sources[source_id].grain
+        for source_id in sorted(plan_source_ids)
+        if source_id in layer.data_sources
+    }
+
     return QueryPlan(
         anchor,
         tuple(joins),
@@ -281,6 +298,7 @@ def plan_query(layer: SemanticLayer, request: QueryRequest) -> QueryPlan:
         tuple(measures),
         tuple(metrics),
         tuple(filters),
+        MappingProxyType(source_grains),
     )
 
 
