@@ -40,6 +40,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from selayer.sources.adapters.arrow import ArrowDatasetAdapter
+from selayer.sources.adapters.delta import DeltaAdapter
 from selayer.sources.base import (
     ReloadResult,
     SourceAdapter,
@@ -70,7 +71,10 @@ __all__ = ["SourceRegistry"]
 # registration API is exposed.
 def _builtin_adapters() -> Mapping[str, SourceAdapter]:
     arrow = ArrowDatasetAdapter()
-    return MappingProxyType({"parquet": arrow, "csv": arrow, "pyarrow": arrow})
+    delta = DeltaAdapter()
+    return MappingProxyType(
+        {"parquet": arrow, "csv": arrow, "pyarrow": arrow, "delta": delta}
+    )
 
 
 @dataclass(frozen=True, slots=True)

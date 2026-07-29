@@ -29,7 +29,6 @@ from selayer.sources.base import (
     SourceScanRequirement,
 )
 from selayer.sources.config import (
-    DeltaConfig,
     DuckDbConfig,
     IcebergConfig,
     PostgresConfig,
@@ -941,7 +940,6 @@ def test_execute_blocks_while_query_binding_holds_lock(
 @pytest.mark.parametrize(
     ("connector", "kind"),
     [
-        (DeltaConfig("/data/table", None), "delta"),
         (IcebergConfig("catalog", ("ns",), "table"), "iceberg"),
         (SqliteConfig("/data/db.sqlite", "main.events"), "sqlite"),
         (DuckDbConfig("/data/warehouse.duckdb", "main.events"), "duckdb"),

@@ -9,5 +9,6 @@ registration API is exposed.
 from __future__ import annotations
 
 from selayer.sources.adapters.arrow import ArrowDatasetAdapter
+from selayer.sources.adapters.delta import DeltaAdapter
 
-__all__ = ["ArrowDatasetAdapter"]
+__all__ = ["ArrowDatasetAdapter", "DeltaAdapter"]
