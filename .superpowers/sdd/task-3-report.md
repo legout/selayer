@@ -531,3 +531,191 @@ fix(sources): harden scan repr containers
 
 Files staged: `src/selayer/sources/base.py`,
 `tests/sources/test_adapter_contract.py`.
+
+---
+
+## Follow-up 5: close scalar repr bypass — exact builtin types only
+
+**Status: Complete.** A final re-review found two residual repr leaks in
+`_repr_literal`:
+
+1. **`Enum` members passed through verbatim.** The Follow-up 4 hardening
+   redacted every unknown object type, but it still explicitly returned
+   `Enum` members unchanged (`if isinstance(value, Enum): return value`).
+   An Enum member whose own `__repr__` leaks a secret surfaced in
+   diagnostics.
+2. **`isinstance(value, (int, float))` accepted subclasses.** An
+   `int`/`float` subclass with a custom leaky `__repr__` satisfied the
+   `isinstance` guard and rendered its own string — a subclass scalar
+   bypass identical in shape to the Follow-up 4 unknown-object bypass it
+   was meant to close.
+
+### Root cause
+
+`isinstance` cannot distinguish a benign builtin scalar from a subclass whose
+`__repr__` is hostile. The only way to permit a known-safe scalar while
+rejecting all subclasses is an **exact-type** identity check (`type(value)
+is int`), not an `isinstance` membership test.
+
+### Changes
+
+**`src/selayer/sources/base.py`**
+
+- **`_repr_literal`** no longer passes `Enum` members through; the
+  `isinstance(value, Enum)` branch is removed, so an Enum member whose own
+  `__repr__` leaks a secret is redacted by the final default. (The unused
+  `Enum` import is dropped; `StrEnum` remains for `SourceHealth`.)
+- **Scalar pass-through** switched from `isinstance(value, (int, float))
+  or value is None` to `value is None or type(value) in {int, float, bool}`.
+  Exact-type identity (`type(value)`) defeats any `int`/`float` subclass
+  whose custom `__repr__` would leak. `bool` is included explicitly because
+  `type(True) is bool` (a distinct type from `int`), so it must be covered
+  by the set membership; `isinstance(True, int)` is `True` but the exact-type
+  check would otherwise reject bare booleans.
+- Everything else is unchanged: `str`/`bytes`, `Mapping`/`AbstractSet`, and
+  all other object types are redacted; `tuple`/`list` are projected
+  element-wise (so a tuple containing a leaky Enum/scalar-subclass member is
+  element-redacted through the same exact-type guard).
+
+**`tests/sources/test_adapter_contract.py`**
+
+- 5 new regression tests (2 hostile-Enum, 2 scalar-subclass, 1
+  regression guard for exact scalars).
+
+### Validation gates
+
+| Gate | Result |
+| --- | --- |
+| `pytest -q tests/sources/test_profiles.py tests/sources/test_adapter_contract.py` | **89 passed** |
+| `pytest -q` (full suite) | **1051 passed** |
+| `ruff check src/selayer/sources/base.py tests/sources/test_adapter_contract.py` | **All checks passed!** |
+| `ruff format --check src/selayer/sources/base.py tests/sources/test_adapter_contract.py` | **2 files already formatted** |
+| `pyright src/selayer/sources/base.py tests/sources/test_adapter_contract.py` | **0 errors, 0 warnings, 0 infos** |
+
+### New regression tests
+
+- **Enum member bypass:** `test_source_filter_enum_member_value_is_redacted`
+  (a `_LeakyEnum` whose `__repr__` interpolates `TOKENONLYSECRET` is
+  redacted), `test_source_filter_enum_member_in_tuple_is_redacted`
+  (element-wise projection of a tuple also redacts the Enum member while the
+  safe numeric element still renders).
+- **Scalar-subclass bypass:**
+  `test_source_filter_int_subclass_value_is_redacted`,
+  `test_source_filter_float_subclass_value_is_redacted` (`_LeakyInt` /
+  `_LeakyFloat` with hostile `__repr__` are redacted under the exact-type
+  guard).
+- **Exact-scalar regression guard:**
+  `test_source_filter_exact_scalars_still_render` (bare `int`, `float`,
+  `bool`, and `None` still render unchanged — `bool` covered explicitly
+  since `type(True) is bool`, not `int`).
+
+### Public interfaces preserved
+
+`_repr_literal` is an internal helper; no public constructor, stored field,
+or signature changed. `SourceFilter.value` is still stored verbatim — the
+fix is repr-only, identical in scope to the prior follow-ups. `SourceHealth`
+continues to be a `StrEnum`; it is rendered through other repr paths
+(`SourceStatus.health`), not `_repr_literal`, so its display is unaffected.
+
+### Commit
+
+```
+fix(sources): close scalar repr bypass
+```
+
+Files staged: `src/selayer/sources/base.py`,
+`tests/sources/test_adapter_contract.py`.
+
+---
+
+## Follow-up 6: normalize string contract values — exact builtin str only
+
+**Status: Complete.** The final re-review found that every identifier render
+helper and SourceError storage helper used `isinstance(value, str)`, which a
+hostile `str` subclass satisfies. A `str` subclass with a custom `__repr__`
+(for example one that interpolates `TOKENONLYSECRET`) therefore leaked through
+`_repr_source_name`/`_repr_column` (returned the subclass instance, rendered by
+`_render`'s `!r`), through `SourceFilter.operator` (passed directly to
+`_render`), and through `SourceError` (`_safe_source_id`/`_safe_code` stored the
+subclass, then `__repr__` invoked it). This is the same class of bypass
+Follow-up 5 closed for `int`/`float`/`bool` scalars — now closed for strings.
+
+### Root cause
+
+`isinstance(value, str)` cannot distinguish a benign builtin `str` from a
+subclass whose `__repr__` is hostile. The only safe guard is an exact-type
+identity check (`type(value) is str`).
+
+### Changes
+
+**`src/selayer/sources/base.py`**
+
+- **`_repr_source_name` / `_repr_column`**: `isinstance(value, str)` →
+  `type(value) is str`. A hostile subclass no longer matches, so it is
+  placeholder-ed (`<redacted>`) rather than returned for `_render` to render
+  via its leaky `__repr__`.
+- **`SourceFilter.__post_init__`**: `column` and `operator` checks switched to
+  `type(...) is str`. A hostile subclass column/operator is rejected at
+  construction (`ValueError`) so it can never be stored or rendered.
+- **`SourceScanRequirement.__post_init__`**: column check switched to
+  `type(column) is str`; a hostile subclass column is rejected at construction.
+- Module-level and per-helper docstrings updated to document the exact-builtin-
+  str rationale.
+
+**`src/selayer/sources/errors.py`**
+
+- **`_safe_code` / `_safe_source_id`**: `isinstance(..., str)` → `type(...) is
+  str`. A hostile subclass code/source_id is coerced to `"unknown"` / `"<source>"`
+  (a plain builtin `str`) rather than stored as the subclass and later rendered
+  via its leaky `__repr__`.
+- `_validated_operation_id` was already safe: `str(parsed)` always returns a
+  plain builtin `str`; no change needed (covered by a new regression test).
+
+**`tests/sources/test_adapter_contract.py`**
+
+- 15 new hostile regression tests; 1 regression guard added.
+
+### Validation gates
+
+| Gate | Result |
+| --- | --- |
+| `pytest -q tests/sources/test_profiles.py tests/sources/test_adapter_contract.py` | **103 passed** |
+| `pytest -q` (full suite) | **1065 passed** |
+| `ruff check src/selayer/sources/base.py src/selayer/sources/errors.py tests/sources/test_adapter_contract.py` | **All checks passed!** |
+| `ruff format --check ...` (same scope) | **3 files already formatted** |
+| `pyright ...` (same scope) | **0 errors, 0 warnings, 0 informations** |
+
+### New regression tests
+
+- **SourceFilter rejects hostile subclass column/operator (construction):**
+  `test_source_filter_rejects_str_subclass_column`,
+  `test_source_filter_rejects_str_subclass_operator`.
+- **SourceScanRequirement rejects hostile subclass column (construction):**
+  `test_scan_requirement_rejects_str_subclass_column`.
+- **SourceFilter value hostile subclass redacted:**
+  `test_source_filter_value_str_subclass_is_redacted`.
+- **Identifier hostile subclass redacted in repr:** SourceHandle
+  source_id/connector, SourceStatus source_id, ReloadResult source_id,
+  QueryBinding source_id.
+- **SourceError hostile subclass coerced:** source_id → `<source>`, code →
+  `unknown`, operation_id → plain builtin str (canonical UUIDv4).
+- **Regression guards:** exact-builtin-string identifiers and error fields
+  still render / are retained unchanged.
+
+### Public interfaces preserved
+
+No public constructor, stored field, or signature changed. Sanitization is
+repr-only for identifier fields (SourceHandle/Status/ReloadResult/QueryBinding);
+construction now rejects hostile subclass columns/operators (SourceFilter/
+SourceScanRequirement) and coerces hostile subclass error args (SourceError).
+
+### Commit
+
+```
+fix(sources): normalize string contract values
+```
+
+Files staged: `src/selayer/sources/base.py`,
+`src/selayer/sources/errors.py`,
+`tests/sources/test_adapter_contract.py`,
+`.superpowers/sdd/task-3-report.md`.

@@ -1027,6 +1027,170 @@ def test_source_filter_exact_scalars_still_render() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Follow-up 6: hostile ``str`` subclasses.  A ``str`` subclass passes
+# ``isinstance(value, str)`` yet can carry a custom ``__repr__`` that leaks a
+# secret.  Identifier render helpers (``_repr_source_name``, ``_repr_column``)
+# and SourceError storage helpers (``_safe_source_id``, ``_safe_code``) now
+# accept only *exact* builtin ``str`` (``type(value) is str``), and
+# ``SourceFilter``/``SourceScanRequirement`` columns and operators are rejected
+# at construction unless they are exact builtin ``str``.  A hostile subclass
+# is therefore never rendered via its own ``__repr__``.
+# ---------------------------------------------------------------------------
+
+
+class _LeakyString(str):
+    """A ``str`` subclass whose repr leaks a secret — must never surface."""
+
+    def __repr__(self) -> str:
+        return "_LeakyString(TOKENONLYSECRET)"
+
+
+def test_source_filter_rejects_str_subclass_column() -> None:
+    # ``type(column) is str`` rejects a hostile subclass at construction so it
+    # can never be stored (and later interpolated by an adapter) or rendered.
+    with pytest.raises(ValueError):
+        SourceFilter(column=_LeakyString("id"), operator="eq", value=1)
+
+
+def test_source_filter_rejects_str_subclass_operator() -> None:
+    with pytest.raises(ValueError):
+        SourceFilter(column="id", operator=_LeakyString("eq"), value=1)  # type: ignore[arg-type]
+
+
+def test_scan_requirement_rejects_str_subclass_column() -> None:
+    with pytest.raises(ValueError):
+        SourceScanRequirement(columns=(_LeakyString("id"),), filters=())  # type: ignore[arg-type]
+
+
+def test_source_filter_value_str_subclass_is_redacted() -> None:
+    # The free-form value field redacts every string (including subclasses) to
+    # a fixed placeholder, so a hostile subclass's own ``__repr__`` never runs.
+    flt = SourceFilter(column="id", operator="eq", value=_LeakyString("secret"))
+    text = repr(flt)
+    assert "TOKENONLYSECRET" not in text
+    assert "_LeakyString" not in text
+    assert "<redacted>" in text
+
+
+def test_source_handle_source_id_str_subclass_redacted() -> None:
+    handle = SourceHandle(
+        source_id=_LeakyString("orders"),
+        connector="parquet",
+        resource=_HostileResource("topsecret"),
+        schema=_schema(),
+    )
+    text = repr(handle)
+    assert "TOKENONLYSECRET" not in text
+    assert "_LeakyString" not in text
+
+
+def test_source_handle_connector_str_subclass_redacted() -> None:
+    handle = SourceHandle(
+        source_id="orders",
+        connector=_LeakyString("parquet"),
+        resource=_HostileResource("topsecret"),
+        schema=_schema(),
+    )
+    text = repr(handle)
+    assert "TOKENONLYSECRET" not in text
+    assert "_LeakyString" not in text
+
+
+def test_source_status_source_id_str_subclass_redacted() -> None:
+    status = SourceStatus(
+        source_id=_LeakyString("orders"),
+        connector="parquet",
+        generation=1,
+        schema_fingerprint=schema_fingerprint(_schema()),
+        snapshot=None,
+        health=SourceHealth.READY,
+    )
+    text = repr(status)
+    assert "TOKENONLYSECRET" not in text
+    assert "_LeakyString" not in text
+
+
+def test_reload_result_source_id_str_subclass_redacted() -> None:
+    result = ReloadResult(
+        _LeakyString("orders"),
+        2,
+        3,
+        schema_fingerprint(_schema()),
+        None,
+    )
+    text = repr(result)
+    assert "TOKENONLYSECRET" not in text
+    assert "_LeakyString" not in text
+
+
+def test_query_binding_source_id_str_subclass_redacted() -> None:
+    binding = QueryBinding(
+        source_id=_LeakyString("orders"),
+        stable_name="orders_v1",
+        cleanup=lambda: None,
+    )
+    text = repr(binding)
+    assert "TOKENONLYSECRET" not in text
+    assert "_LeakyString" not in text
+
+
+def test_source_error_str_subclass_source_id_coerced() -> None:
+    err = SourceConnectionError(_LeakyString("orders"), "connect_failed", "detail")
+    assert type(err.source_id) is str
+    assert err.source_id == "<source>"
+    text = repr(err)
+    assert "TOKENONLYSECRET" not in text
+    assert "_LeakyString" not in text
+
+
+def test_source_error_str_subclass_code_coerced() -> None:
+    err = SourceConnectionError("orders", _LeakyString("connect_failed"), "detail")
+    assert type(err.code) is str
+    assert err.code == "unknown"
+    text = repr(err)
+    assert "TOKENONLYSECRET" not in text
+    assert "_LeakyString" not in text
+
+
+def test_source_error_str_subclass_operation_id_normalized() -> None:
+    # A ``str`` subclass operation_id is parsed as a UUID; only the canonical
+    # (plain builtin ``str``) form is stored, so the hostile subclass repr
+    # never runs.
+    valid = _LeakyString("123e4567-e89b-42d3-a456-426614174000")
+    err = SourceConnectionError(
+        "orders", "connect_failed", "detail", operation_id=valid
+    )
+    assert type(err.operation_id) is str
+    text = repr(err)
+    assert "TOKENONLYSECRET" not in text
+    assert "_LeakyString" not in text
+
+
+def test_exact_builtin_string_identifiers_still_render() -> None:
+    # Regression guard: tightening to ``type(value) is str`` must not regress
+    # normal exact-builtin-string identifier fields.
+    handle = SourceHandle(
+        source_id="orders",
+        connector="parquet",
+        resource=_HostileResource("topsecret"),
+        schema=_schema(),
+    )
+    text = repr(handle)
+    assert "orders" in text
+    assert "parquet" in text
+
+
+def test_exact_builtin_string_error_fields_preserved() -> None:
+    # Regression guard: normal exact-builtin-string source_id / code are
+    # retained unchanged.
+    err = SourceConnectionError("orders", "connect_failed", "detail")
+    assert err.source_id == "orders"
+    assert err.code == "connect_failed"
+    assert "orders" in repr(err)
+    assert "connect_failed" in repr(err)
+
+
+# ---------------------------------------------------------------------------
 # SourceAdapter protocol acceptance
 # ---------------------------------------------------------------------------
 

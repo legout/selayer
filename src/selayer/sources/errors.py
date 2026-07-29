@@ -11,8 +11,10 @@ Three guarantees are load-bearing for the secrecy contract:
   ``message`` is intentionally discarded — only a constant generic message
   looked up from ``code`` is stored, so no driver-derived detail can surface.
   ``code`` is validated against a *known-code allowlist* and ``source_id``
-  against the catalog source-name shape, each coerced to a placeholder when it
-  does not match, and an explicit ``operation_id`` is honored only when it
+  against the catalog source-name shape, each coerced to a placeholder when
+  it does not match (and each accepted only as an exact builtin ``str`` — a
+  hostile ``str`` subclass with a leaky ``__repr__`` is coerced to the
+  placeholder), and an explicit ``operation_id`` is honored only when it
   parses as a UUIDv4 (otherwise a fresh one is generated).
 * **No retained driver exceptions.**  Driver exceptions are never stored.
   Errors must be constructed and raised *outside* active ``except`` scopes so
@@ -80,17 +82,29 @@ _SOURCE_NAME_RE = re.compile(r"\A[a-z][a-z0-9_]*\Z")
 
 
 def _safe_code(code: object) -> str:
-    """Return ``code`` only if it is a *known* error code, else ``"unknown"``."""
+    """Return ``code`` only if it is a *known* error code, else ``"unknown"``.
 
-    return code if isinstance(code, str) and code in _KNOWN_CODES else "unknown"
+    Only an *exact* builtin ``str`` is accepted (``type(code) is str``, not
+    ``isinstance``): a hostile ``str`` subclass passes ``isinstance(str)`` yet
+    can carry a custom ``__repr__`` that leaks a secret when rendered, so it is
+    coerced to ``"unknown"`` rather than retained.
+    """
+
+    return code if type(code) is str and code in _KNOWN_CODES else "unknown"
 
 
 def _safe_source_id(source_id: object) -> str:
-    """Return ``source_id`` only if it is a catalog-shaped name, else ``"<source>"``."""
+    """Return ``source_id`` only if it is a catalog-shaped name, else ``"<source>"``.
+
+    Only an *exact* builtin ``str`` is accepted (``type(source_id) is str``,
+    not ``isinstance``): a hostile ``str`` subclass passes ``isinstance(str)``
+    yet can carry a custom ``__repr__`` that leaks a secret when rendered, so
+    it is coerced to ``"<source>"`` rather than retained.
+    """
 
     return (
         source_id
-        if isinstance(source_id, str) and _SOURCE_NAME_RE.match(source_id)
+        if type(source_id) is str and _SOURCE_NAME_RE.match(source_id)
         else "<source>"
     )
 

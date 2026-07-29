@@ -60,8 +60,12 @@ __all__ = [
 # these helpers so that credentials, arbitrary SQL, opaque handles, resources,
 # schemas, and cleanup callbacks can never surface in diagnostics:
 #
-# * identifier fields (``source_id``, ``connector``) must match the catalog
-#   source-name shape (lowercase snake_case) and are placeholder-ed otherwise;
+# * identifier fields (``source_id``, ``connector``) must be an exact builtin
+#   ``str`` that matches the catalog source-name shape (lowercase snake_case);
+#   anything else — including a ``str`` subclass whose own ``__repr__`` could
+#   leak a secret — is placeholder-ed (``isinstance`` cannot distinguish a
+#   benign builtin ``str`` from a hostile subclass, so ``type(value) is str``
+#   is used everywhere a string is rendered);
 # * physical columns must match the SQL-identifier shape and are placeholder-ed
 #   otherwise (this is the SQL-injection surface since adapters interpolate
 #   columns);
@@ -84,9 +88,16 @@ _SQL_IDENT_RE = re.compile(r"\A[a-zA-Z_][a-zA-Z0-9_]*\Z")
 
 
 def _repr_source_name(value: object) -> str:
-    """Render a source_id/connector, placeholder-ing non-conformant values."""
+    """Render a source_id/connector, placeholder-ing non-conformant values.
 
-    if isinstance(value, str) and _SOURCE_NAME_RE.match(value):
+    Only an *exact* builtin ``str`` is accepted (``type(value) is str``, not
+    ``isinstance``): a hostile ``str`` subclass passes ``isinstance(str)`` yet
+    can carry a custom ``__repr__`` that leaks a secret, so it is redacted
+    rather than rendered.  The value is then validated against the catalog
+    source-name shape and placeholder-ed otherwise.
+    """
+
+    if type(value) is str and _SOURCE_NAME_RE.match(value):
         return value
     return "<redacted>"
 
@@ -94,16 +105,19 @@ def _repr_source_name(value: object) -> str:
 def _repr_column(value: object) -> str:
     """Render a physical column, *conservatively* placeholder-ing values.
 
-    Columns are validated against the full SQL-identifier shape (mixed case
-    allowed) at construction, but the repr is stricter: only the catalog
-    source-name shape (lowercase) renders.  A token-shaped secret column such
-    as ``TOKENONLYSECRET`` (uppercase) is a syntactically valid identifier and
-    therefore accepted at construction, yet it is redacted here so it can never
-    surface in diagnostics.  Legitimate lowercase columns (``id``, ``amount``)
-    render unchanged.
+    Only an *exact* builtin ``str`` is accepted (``type(value) is str``, not
+    ``isinstance``): a hostile ``str`` subclass passes ``isinstance(str)`` yet
+    can carry a custom ``__repr__`` that leaks a secret, so it is redacted
+    rather than rendered.  Columns are validated against the full
+    SQL-identifier shape (mixed case allowed) at construction, but the repr is
+    stricter: only the catalog source-name shape (lowercase) renders.  A
+    token-shaped secret column such as ``TOKENONLYSECRET`` (uppercase) is a
+    syntactically valid identifier and therefore accepted at construction, yet
+    it is redacted here so it can never surface in diagnostics.  Legitimate
+    lowercase columns (``id``, ``amount``) render unchanged.
     """
 
-    if isinstance(value, str) and _SOURCE_NAME_RE.match(value):
+    if type(value) is str and _SOURCE_NAME_RE.match(value):
         return value
     return "<redacted>"
 
@@ -213,21 +227,28 @@ class SourceFilter:
     value: object
 
     def __post_init__(self) -> None:
-        # ``column`` must be a string SQL identifier: a non-string or a SQL
-        # fragment (e.g. ``"id; DROP TABLE users--"``) is rejected here so no
-        # arbitrary SQL can ever be stored as a column and later interpolated
-        # by an adapter.  The check runs against an untyped local so the type
+        # ``column`` must be an *exact* builtin ``str`` SQL identifier: a
+        # non-string, a SQL fragment (e.g. ``"id; DROP TABLE users--"``), or a
+        # ``str`` subclass (whose custom ``__repr__`` could leak a secret) is
+        # rejected here so no arbitrary SQL and no hostile subclass can ever
+        # be stored as a column and later interpolated by an adapter.
+        # ``type(column) is str`` is used rather than ``isinstance`` because a
+        # ``str`` subclass passes ``isinstance(str)`` yet may carry a leaky
+        # ``__repr__``.  The check runs against an untyped local so the type
         # checker does not narrow it away as impossible.
         column: object = self.column
-        if not (isinstance(column, str) and _SQL_IDENT_RE.match(column)):
+        if not (type(column) is str and _SQL_IDENT_RE.match(column)):
             raise ValueError("invalid SourceFilter column")
         # The ``Literal`` type is not enforced at runtime, so validate the
         # operator against the closed set here: an out-of-set value (arbitrary
         # SQL such as ``"SELECT * FROM secrets"``) raises immediately.  The
-        # check runs against an untyped local so the type checker does not
-        # narrow it away as impossible.
+        # guard uses ``type(operator) is str`` (not ``isinstance``) so a
+        # ``str`` subclass whose custom ``__repr__`` leaks a secret can never
+        # be stored as an operator (and later rendered).  The check runs
+        # against an untyped local so the type checker does not narrow it away
+        # as impossible.
         operator: object = self.operator
-        if not (isinstance(operator, str) and operator in _FILTER_OPERATORS):
+        if not (type(operator) is str and operator in _FILTER_OPERATORS):
             raise ValueError("invalid SourceFilter operator")
 
     def __repr__(self) -> str:
@@ -260,14 +281,18 @@ class SourceScanRequirement:
         # a local, validate that local, then store it.
         columns = tuple(self.columns)
         filters = tuple(self.filters)
-        # Validate every column is a string SQL identifier: a non-string or a
-        # SQL fragment (e.g. ``"id; DROP TABLE users--"``) is rejected so no
-        # arbitrary SQL can ever be carried as a planned column.  The checks run
-        # against untyped locals so the type checker does not narrow them away
-        # as impossible.
+        # Validate every column is an *exact* builtin ``str`` SQL identifier: a
+        # non-string, a SQL fragment (e.g. ``"id; DROP TABLE users--"``), or a
+        # ``str`` subclass (whose custom ``__repr__`` could leak a secret) is
+        # rejected so no arbitrary SQL and no hostile subclass can ever be
+        # carried as a planned column.  ``type(column) is str`` is used rather
+        # than ``isinstance`` because a ``str`` subclass passes
+        # ``isinstance(str)`` yet may carry a leaky ``__repr__``.  The checks
+        # run against untyped locals so the type checker does not narrow them
+        # away as impossible.
         for raw_column in columns:
             column: object = raw_column
-            if not (isinstance(column, str) and _SQL_IDENT_RE.match(column)):
+            if not (type(column) is str and _SQL_IDENT_RE.match(column)):
                 raise ValueError("invalid SourceScanRequirement column")
         # Validate every filter is an actual SourceFilter: a raw string such as
         # ``"SELECT password FROM users"`` is rejected with a clean TypeError so
