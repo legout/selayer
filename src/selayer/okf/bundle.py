@@ -13,6 +13,7 @@ from urllib.parse import unquote, urlsplit
 
 from selayer.catalog import SemanticLayer
 
+from .compatibility import effective_sources
 from .computation import attested_computation
 from .document import (
     OkfControlledMergeError,
@@ -136,8 +137,13 @@ def freshness(frontmatter: Mapping[str, Any], today: date) -> Freshness:
     return "stale" if today >= stale_after else "current"
 
 
-def _sources(frontmatter: Mapping[str, Any]) -> tuple[str, ...]:
-    return tuple(source["resource"] for source in frontmatter.get("sources", ()))
+def _sources(concept: OkfConcept) -> tuple[str, ...]:
+    sources: list[str] = []
+    for source in effective_sources(concept):
+        resource = source.get("resource")
+        if isinstance(resource, str) and resource:
+            sources.append(resource)
+    return tuple(sources)
 
 
 def _render_context(concept: OkfConcept, sources: tuple[str, ...]) -> str:
@@ -162,7 +168,7 @@ def _render_context(concept: OkfConcept, sources: tuple[str, ...]) -> str:
 
 def _context_item(concept: OkfConcept, today: date) -> ContextItem:
     frontmatter = concept.frontmatter
-    sources = _sources(frontmatter)
+    sources = _sources(concept)
     semantic_id = frontmatter.get("selayer_id")
     return ContextItem(
         concept_id=concept.concept_id,

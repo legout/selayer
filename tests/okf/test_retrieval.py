@@ -589,3 +589,65 @@ def test_lenient_retrieval_does_not_crash_on_malformed_stale_after(
         and issue.severity == "warning"
         for issue in result.diagnostics
     )
+
+
+def test_retrieval_surfaces_legacy_citations_as_sources(tmp_path: Path) -> None:
+    _write_concept(
+        tmp_path,
+        "metrics/margin.md",
+        "type: Selayer Metric\nselayer_id: metric.margin",
+        "\n# Definition\n\nMargin guidance.\n\n"
+        "# Citations\n\n"
+        "- [Margin Policy](https://example.com/policy)\n"
+        "* urn:warehouse:margin\n",
+    )
+
+    item = OkfBundle.load(tmp_path).context_for(
+        ["metric.margin"], include_linked=False
+    ).items[0]
+
+    assert item.sources == (
+        "https://example.com/policy",
+        "urn:warehouse:margin",
+    )
+    assert "## Sources" in item.content
+    assert "- https://example.com/policy" in item.content
+    assert "- urn:warehouse:margin" in item.content
+
+
+def test_retrieval_omits_malformed_frontmatter_sources_in_lenient_mode(
+    tmp_path: Path,
+) -> None:
+    _write_concept(
+        tmp_path,
+        "metrics/margin.md",
+        "type: Selayer Metric\n"
+        "selayer_id: metric.margin\n"
+        "sources:\n"
+        "  - resource: https://example.com/policy\n"
+        "  - broken: entry\n"
+        "  - not-a-mapping",
+    )
+
+    bundle = OkfBundle.load(tmp_path, strict=False)
+    item = bundle.context_for(["metric.margin"], include_linked=False).items[0]
+
+    assert item.sources == ("https://example.com/policy",)
+
+
+def test_retrieval_without_sources_or_citations_has_no_sources_section(
+    tmp_path: Path,
+) -> None:
+    _write_concept(
+        tmp_path,
+        "metrics/margin.md",
+        "type: Selayer Metric\nselayer_id: metric.margin",
+        "\n# Definition\n\nNo citations.\n",
+    )
+
+    item = OkfBundle.load(tmp_path).context_for(
+        ["metric.margin"], include_linked=False
+    ).items[0]
+
+    assert item.sources == ()
+    assert "## Sources" not in item.content
