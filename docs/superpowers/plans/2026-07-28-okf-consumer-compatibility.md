@@ -1031,7 +1031,7 @@ git commit -m "feat(okf): add effective_generated_at compatibility helper"
 Append to `tests/okf/test_compatibility.py`. First extend its imports by replacing the existing import block with:
 
 ```python
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from selayer.okf import OkfBundle, OkfConcept
@@ -1203,7 +1203,9 @@ def test_legacy_timestamp_and_citations_survive_load_write_load(
     assert "timestamp: 2026-01-01" in rewritten
     assert "# Citations" in rewritten
     assert "[Policy](https://example.com/policy)" in rewritten
-    assert effective_generated_at(reloaded.concepts["concept"]) == "2026-01-01"
+    # PyYAML parses unquoted ISO dates as date objects; the helper returns
+    # the stored value unchanged to preserve its non-mutating contract.
+    assert effective_generated_at(reloaded.concepts["concept"]) == date(2026, 1, 1)
     assert [
         source["resource"]
         for source in effective_sources(reloaded.concepts["concept"])
