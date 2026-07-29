@@ -50,6 +50,12 @@ _ACCESS = "AKIA_ACCESS_SENTINEL"
 _SECRET = "SUPER_SECRET_SENTINEL"
 _TOKEN = "TOKEN_SECRET_SENTINEL"
 _USERINFO = "USERINFO_SECRET_SENTINEL"
+# Sentinel carried by the hostile ``str`` subclass's dunders.  If validation
+# invokes any dunder (``__str__``/``__hash__``/``__eq__``/``__repr__``) on a
+# hostile instance before rejecting it by exact builtin type, the dunder
+# raises :class:`RuntimeError` carrying this sentinel, surfacing it in the
+# propagated exception's ``args`` and the formatted traceback.
+_HOSTILE = "HOSTILE_STR_DUNDER_SENTINEL"
 
 
 def _assert_no_secret_leak(error: BaseException, *sentinels: str) -> None:
@@ -77,6 +83,38 @@ def _assert_no_secret_leak(error: BaseException, *sentinels: str) -> None:
             assert sentinel not in surface, (
                 f"secret sentinel {sentinel!r} leaked into error surface"
             )
+
+
+# ---------------------------------------------------------------------------
+# Hostile str subclass
+# ---------------------------------------------------------------------------
+
+
+class _LeakyStr(str):
+    """Hostile ``str`` subclass whose dunders raise carrying ``_HOSTILE``.
+
+    If any validation path invokes ``__str__``, ``__repr__``, ``__hash__``,
+    or ``__eq__`` on an instance *before* rejecting it by exact builtin type,
+    the dunder raises :class:`RuntimeError` carrying ``_HOSTILE``, surfacing
+    the sentinel in the propagated exception's ``args`` and the formatted
+    traceback.  The exact-``str`` type guard in
+    :func:`~selayer.sources.adapters.arrow._validate_s3_profile` rejects the
+    instance before any dunder runs.
+    """
+
+    __slots__ = ()
+
+    def __str__(self) -> str:
+        raise RuntimeError(_HOSTILE)
+
+    def __repr__(self) -> str:
+        raise RuntimeError(_HOSTILE)
+
+    def __hash__(self) -> int:
+        raise RuntimeError(_HOSTILE)
+
+    def __eq__(self, other: object) -> bool:
+        raise RuntimeError(_HOSTILE)
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +312,133 @@ def test_invalid_endpoint_is_rejected() -> None:
     _assert_no_secret_leak(caught.value, _ACCESS, _SECRET, _TOKEN, _USERINFO)
 
 
+def _noop_filesystem(**_kwargs: object) -> object:
+    """A stand-in S3FileSystem that never fails, so a hostile value reaching it
+    would still produce a successful (non-error) result — making a missing
+    rejection observable as ``DID NOT RAISE`` rather than a driver error."""
+
+    return object()
+
+
+def test_invalid_s3_scheme_is_rejected() -> None:
+    """A builtin-but-unsupported scheme is rejected with a constant error."""
+
+    profile = RuntimeProfile(
+        "bad_scheme",
+        {
+            "access_key": _ACCESS,
+            "secret_key": _SECRET,
+            "session_token": _TOKEN,
+            "scheme": "ftp",
+        },
+    )
+    with pytest.raises(Exception) as caught:
+        s3_filesystem(profile)
+    _assert_no_secret_leak(caught.value, _ACCESS, _SECRET, _TOKEN)
+
+
+def test_hostile_str_subclass_scheme_is_rejected(monkeypatch) -> None:
+    """A hostile ``str`` subclass scheme is rejected by type before any hash.
+
+    The membership test ``scheme not in _VALID_S3_SCHEMES`` invokes
+    ``__hash__``; with the value being a hostile subclass whose ``__hash__``
+    raises carrying ``_HOSTILE``, the exact-``str`` guard must reject it first.
+    """
+
+    monkeypatch.setattr(
+        "selayer.sources.adapters.arrow.pafs.S3FileSystem", _noop_filesystem
+    )
+    profile = RuntimeProfile(
+        "hostile_scheme",
+        {
+            "access_key": _ACCESS,
+            "secret_key": _SECRET,
+            "session_token": _TOKEN,
+            "scheme": _LeakyStr("https"),
+        },
+    )
+    with pytest.raises(Exception) as caught:
+        s3_filesystem(profile)
+    _assert_no_secret_leak(caught.value, _ACCESS, _SECRET, _TOKEN, _HOSTILE)
+
+
+def test_hostile_str_subclass_endpoint_is_rejected(monkeypatch) -> None:
+    """A hostile ``str`` subclass endpoint is rejected by type before ``str()``.
+
+    ``urlparse(str(endpoint))`` invokes ``__str__``; with the value being a
+    hostile subclass whose ``__str__`` raises carrying ``_HOSTILE``, the
+    exact-``str`` guard must reject it first.
+    """
+
+    monkeypatch.setattr(
+        "selayer.sources.adapters.arrow.pafs.S3FileSystem", _noop_filesystem
+    )
+    profile = RuntimeProfile(
+        "hostile_endpoint",
+        {
+            "access_key": _ACCESS,
+            "secret_key": _SECRET,
+            "session_token": _TOKEN,
+            "endpoint_override": _LeakyStr("http://127.0.0.1:9000"),
+        },
+    )
+    with pytest.raises(Exception) as caught:
+        s3_filesystem(profile)
+    _assert_no_secret_leak(caught.value, _ACCESS, _SECRET, _TOKEN, _HOSTILE)
+
+
+def test_hostile_str_subclass_credential_is_rejected(monkeypatch) -> None:
+    """A hostile ``str`` subclass credential is rejected before reaching Arrow.
+
+    Without the exact-``str`` guard a hostile ``access_key`` would pass
+    validation and reach the (patched) constructor; the test asserts it is
+    rejected with a constant error instead.
+    """
+
+    monkeypatch.setattr(
+        "selayer.sources.adapters.arrow.pafs.S3FileSystem", _noop_filesystem
+    )
+    profile = RuntimeProfile(
+        "hostile_credential",
+        {
+            "access_key": _LeakyStr(_ACCESS),
+            "secret_key": _SECRET,
+        },
+    )
+    with pytest.raises(Exception) as caught:
+        s3_filesystem(profile)
+    _assert_no_secret_leak(caught.value, _ACCESS, _SECRET, _HOSTILE)
+
+
+def test_s3_filesystem_driver_failure_is_sanitized(monkeypatch) -> None:
+    """A driver failure that echoes credentials is sanitized to a constant error.
+
+    ``pyarrow.fs.S3FileSystem`` receives the access key, secret key, and
+    session token; a failure there may echo them in the driver exception's
+    message/repr.  The call is wrapped so a constant ``ValueError`` is raised
+    *outside* any ``except`` scope (keeping ``__cause__``/``__context__``
+    ``None``), discarding the driver exception entirely.
+    """
+
+    def exploding_filesystem(**_kwargs: object) -> object:
+        raise RuntimeError(f"driver error exposing {_SECRET} and {_TOKEN}")
+
+    monkeypatch.setattr(
+        "selayer.sources.adapters.arrow.pafs.S3FileSystem", exploding_filesystem
+    )
+    profile = RuntimeProfile(
+        "bad_driver",
+        {
+            "access_key": _ACCESS,
+            "secret_key": _SECRET,
+            "session_token": _TOKEN,
+        },
+    )
+    with pytest.raises(Exception) as caught:
+        s3_filesystem(profile)
+    _assert_no_secret_leak(caught.value, _ACCESS, _SECRET, _TOKEN)
+
+
 # ---------------------------------------------------------------------------
 # Step 2: MinIO reload integration test (testcontainers)
 # ---------------------------------------------------------------------------
@@ -319,19 +484,41 @@ def _events_schema_table_two() -> pa.Table:
     )
 
 
+def _docker_available() -> bool:
+    """Return ``True`` when the Docker daemon is reachable.
+
+    The Docker SDK's ``ping`` is probed directly so the MinIO fixture skips
+    *only* when Docker is genuinely unavailable; a healthy daemon followed by
+    a MinIO image/container failure re-raises (and fails CI) rather than being
+    masked as a skip.
+    """
+
+    try:
+        import docker
+    except ImportError:
+        return False
+    try:
+        return bool(docker.from_env().ping())
+    except Exception:  # noqa: BLE001 - any connection/unavailable error = unavailable
+        return False
+
+
 @pytest.fixture
 def minio_source_fixture() -> (
     pytest.fixture  # type: ignore[misc]
 ):
     """Start MinIO via testcontainers, upload a Parquet file, build a layer.
 
-    Yields a :class:`MinioSourceFixture`.  Skipped when Docker or required
-    dependencies (boto3, testcontainers) are unavailable.  CI added in Task 9
-    must run this without skipping.
+    Yields a :class:`MinioSourceFixture`.  Skipped *only* when Docker or a
+    required dependency (boto3, testcontainers) is genuinely unavailable.  When
+    Docker is healthy, a MinIO image/container startup failure re-raises so CI
+    fails rather than silently skipping.
     """
 
     pytest.importorskip("boto3")
     pytest.importorskip("testcontainers")
+    if not _docker_available():
+        pytest.skip("Docker daemon is not available")
     import boto3
 
     try:
@@ -344,12 +531,10 @@ def minio_source_fixture() -> (
         except ImportError:
             pytest.skip("testcontainers[minio] not available")
 
-    try:
-        minio: MinioContainer = MinioContainer()
-        minio.start()
-    except Exception:  # noqa: BLE001
-        pytest.skip("MinIO container could not be started (Docker unavailable)")
-
+    # With Docker confirmed healthy, a MinIO image/container startup failure is
+    # a *real* failure: it re-raises so CI fails rather than silently skipping.
+    minio: MinioContainer = MinioContainer()
+    minio.start()
     try:
         config = minio.get_config()
         endpoint = config["endpoint"]

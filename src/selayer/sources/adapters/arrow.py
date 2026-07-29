@@ -396,6 +396,27 @@ _S3_PROFILE_KEYS: frozenset[str] = frozenset(
 
 _VALID_S3_SCHEMES: frozenset[str] = frozenset({"http", "https"})
 
+# Every S3 profile option is a string.  Requiring an *exact* builtin ``str``
+# (``type(value) is str``, not ``isinstance``) for each present value *before*
+# any membership, hash, or ``urlparse`` operation means a hostile ``str``
+# subclass — whose ``__str__``/``__hash__``/``__eq__`` could raise or leak
+# secret text into a propagated exception — is rejected by type first, so none
+# of its dunders is ever invoked.
+_S3_STRING_OPTIONS: frozenset[str] = frozenset(
+    {
+        "access_key",
+        "secret_key",
+        "session_token",
+        "region",
+        "endpoint_override",
+        "scheme",
+        "profile_name",
+        "role_arn",
+        "external_id",
+        "session_name",
+    }
+)
+
 
 def s3_filesystem(profile: RuntimeProfile) -> pafs.S3FileSystem:
     """Build a :class:`pyarrow.fs.S3FileSystem` from a runtime profile.
@@ -427,47 +448,81 @@ def s3_filesystem(profile: RuntimeProfile) -> pafs.S3FileSystem:
     if "role_arn" in keys:
         access_key, secret_key, session_token = _s3_role_session_credentials(profile)
     elif "access_key" in keys and "secret_key" in keys:
-        access_key = profile.value("access_key")
-        secret_key = profile.value("secret_key")
+        access_key = _s3_profile_value(profile, "access_key", None)
+        secret_key = _s3_profile_value(profile, "secret_key", None)
         session_token = _s3_profile_value(profile, "session_token", None)
     else:
         access_key, secret_key, session_token = _s3_default_chain_credentials(profile)
 
-    return pafs.S3FileSystem(
-        access_key=access_key,
-        secret_key=secret_key,
-        session_token=session_token,
-        region=region,
-        endpoint_override=endpoint_override,
-        scheme=scheme,
-    )
+    # The driver call receives the access key, secret key, and session token; a
+    # failure there may echo them in the driver exception's message/repr.  The
+    # call is wrapped so a constant ``ValueError`` is raised *outside* the
+    # ``except`` scope (keeping ``__cause__``/``__context__`` ``None``),
+    # discarding the driver exception entirely so no sentinel surfaces.
+    filesystem: pafs.S3FileSystem | None = None
+    try:
+        filesystem = pafs.S3FileSystem(
+            access_key=access_key,
+            secret_key=secret_key,
+            session_token=session_token,
+            region=region,
+            endpoint_override=endpoint_override,
+            scheme=scheme,
+        )
+    except Exception:  # noqa: BLE001 - sanitize any failure that may echo credentials
+        filesystem = None
+    if filesystem is None:
+        raise ValueError("S3 filesystem could not be created")
+    return filesystem
 
 
-def _s3_profile_value(profile: RuntimeProfile, name: str, default: object) -> object:
-    """Return a single profile value, or ``default`` when the key is absent."""
+def _s3_profile_value(
+    profile: RuntimeProfile, name: str, default: str | None
+) -> str | None:
+    """Return a validated S3 string option, or ``default`` when absent.
+
+    Call only after :func:`_validate_s3_profile`: every present value is
+    guaranteed to be an exact builtin ``str``.  The ``type(value) is str`` test
+    narrows the ``object`` returned by :meth:`RuntimeProfile.value` to ``str``
+    so downstream PyArrow/boto3/``urlparse`` consumers get a concrete type
+    without further casting.
+    """
 
     if name in profile:
-        return profile.value(name)
+        value: object = profile.value(name)
+        if type(value) is str:
+            return value
+        return default
     return default
 
 
 def _validate_s3_profile(profile: RuntimeProfile) -> None:
-    """Reject unknown keys, unsupported schemes, and userinfo-bearing endpoints.
+    """Reject unknown keys, non-``str`` values, bad schemes, and userinfo endpoints.
 
     Every rejection raises a :class:`ValueError` with a *constant* message and
     outside any ``except`` scope, so no profile value can surface in any error
-    surface.
+    surface (``error.args``, the formatted traceback, ``__cause__``,
+    ``__context__``).
+
+    Each present value is required to be an *exact* builtin ``str``
+    (``type(value) is str``) *before* any membership, hash, or ``urlparse``
+    operation: a hostile ``str`` subclass whose ``__str__``/``__hash__``/
+    ``__eq__`` raises or leaks secret text would otherwise surface that text in
+    a propagated exception.
     """
 
     unknown = set(profile.keys()) - _S3_PROFILE_KEYS
     if unknown:
         raise ValueError("unsupported key in S3 profile")
+    for name in _S3_STRING_OPTIONS:
+        if name in profile and type(profile.value(name)) is not str:
+            raise ValueError("invalid S3 profile value")
     scheme = _s3_profile_value(profile, "scheme", None)
     if scheme is not None and scheme not in _VALID_S3_SCHEMES:
         raise ValueError("invalid S3 scheme")
     endpoint = _s3_profile_value(profile, "endpoint_override", None)
     if endpoint is not None:
-        parsed = urlparse(str(endpoint))
+        parsed = urlparse(endpoint)
         if parsed.scheme not in _VALID_S3_SCHEMES:
             raise ValueError("invalid S3 endpoint")
         if parsed.username is not None or parsed.password is not None:
