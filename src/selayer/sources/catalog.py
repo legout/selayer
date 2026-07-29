@@ -310,6 +310,60 @@ def _collect_duplicate_keys(
 # ---------------------------------------------------------------------------
 
 
+def _escape_error(base_path: str, message: str) -> SourceDeclarationError:
+    return SourceDeclarationError(
+        (SourceDeclarationIssue("schema_ref_escape", base_path, message),)
+    )
+
+
+def _open_contained_schema_ref(
+    schema_ref: str, catalog_path: Path, base_path: str
+) -> str:
+    """Resolve a schema_ref under the catalog root and read it.
+
+    Containment is verified *immediately* before the file is read so a symlink
+    swapped between validation and parsing cannot escape the catalog root.
+    Returns the file text, or raises :class:`SourceDeclarationError` carrying
+    a single issue describing why the reference could not be opened.  The
+    supplied reference is sanitized before being echoed in any message so
+    embedded URI userinfo can never leak.
+    """
+
+    safe_ref = _sanitize_location(schema_ref)
+    catalog_root = catalog_path.parent.resolve()
+    candidate = catalog_path.parent / schema_ref
+    try:
+        resolved = candidate.resolve()
+    except (OSError, RuntimeError):
+        raise _escape_error(base_path, "schema_ref path cannot be resolved safely")
+    if not resolved.is_relative_to(catalog_root):
+        raise _escape_error(
+            base_path, "schema_ref must resolve within the catalog root directory"
+        )
+    if not resolved.is_file():
+        raise SourceDeclarationError(
+            (
+                SourceDeclarationIssue(
+                    "schema_ref_missing",
+                    base_path,
+                    f"schema_ref file {safe_ref!r} does not exist",
+                ),
+            )
+        )
+    try:
+        return resolved.read_text(encoding="utf-8")
+    except OSError:
+        raise SourceDeclarationError(
+            (
+                SourceDeclarationIssue(
+                    "schema_ref_missing",
+                    base_path,
+                    f"schema_ref file {safe_ref!r} cannot be read",
+                ),
+            )
+        )
+
+
 def _resolve_schema_ref(
     schema_ref: str,
     catalog_path: Path,
@@ -318,55 +372,18 @@ def _resolve_schema_ref(
 ) -> None:
     """Resolve, load, and validate a schema reference file.
 
-    All filesystem access occurs only after the containment check passes.
-    Issues are appended to *issues* and prefixed with *base_path*.  Supplied
-    references are sanitized before being echoed in messages so embedded URI
-    userinfo can never leak into error text.
+    All filesystem access occurs through :func:`_open_contained_schema_ref`,
+    which verifies containment immediately before the read.  Issues are
+    appended to *issues* and prefixed with *base_path*.  Supplied references
+    are sanitized before being echoed in messages so embedded URI userinfo
+    can never leak into error text.
     """
 
-    # Sanitize once; used in every message that echoes the supplied reference.
     safe_ref = _sanitize_location(schema_ref)
-    catalog_root = catalog_path.parent.resolve()
-    candidate = catalog_path.parent / schema_ref
     try:
-        resolved = candidate.resolve()
-    except (OSError, RuntimeError):
-        issues.append(
-            SourceDeclarationIssue(
-                "schema_ref_escape",
-                base_path,
-                "schema_ref path cannot be resolved safely",
-            )
-        )
-        return
-    if not resolved.is_relative_to(catalog_root):
-        issues.append(
-            SourceDeclarationIssue(
-                "schema_ref_escape",
-                base_path,
-                "schema_ref must resolve within the catalog root directory",
-            )
-        )
-        return
-    if not resolved.is_file():
-        issues.append(
-            SourceDeclarationIssue(
-                "schema_ref_missing",
-                base_path,
-                f"schema_ref file {safe_ref!r} does not exist",
-            )
-        )
-        return
-    try:
-        text = resolved.read_text(encoding="utf-8")
-    except OSError:
-        issues.append(
-            SourceDeclarationIssue(
-                "schema_ref_missing",
-                base_path,
-                f"schema_ref file {safe_ref!r} cannot be read",
-            )
-        )
+        text = _open_contained_schema_ref(schema_ref, catalog_path, base_path)
+    except SourceDeclarationError as exc:
+        issues.extend(exc.issues)
         return
     try:
         node, data = _compose_and_construct(text)
@@ -479,8 +496,11 @@ def _validate_source(
             )
 
     # --- missing required fields ---
+    # A required field that is absent *or* explicitly null is missing: both
+    # surface as ``field_missing`` at the field's path so a null value is
+    # never silently coerced to the literal string ``'None'`` downstream.
     for field_name in sorted(_REQUIRED_FIELDS[kind]):
-        if field_name not in value:
+        if value.get(field_name) is None:
             issues.append(
                 SourceDeclarationIssue(
                     "field_missing",
@@ -617,10 +637,13 @@ def _validate_connector_fields(
     if kind == "csv":
         _validate_single_char(value, "delimiter", base, issues)
         _validate_single_char(value, "quote_char", base, issues)
-        escape = value.get("escape_char")
-        if escape is not None:
+        # ``escape_char`` is genuinely nullable (defaults to None), so an
+        # explicit null is accepted; only a present non-single-char value is
+        # rejected.
+        if "escape_char" in value:
+            escape = value["escape_char"]
             esc_path = f"{base}.escape_char"
-            if not isinstance(escape, str) or len(escape) != 1:
+            if escape is not None and (not isinstance(escape, str) or len(escape) != 1):
                 issues.append(
                     SourceDeclarationIssue(
                         "escape_char_invalid",
@@ -628,15 +651,16 @@ def _validate_connector_fields(
                         "escape_char must be a single character or null",
                     )
                 )
-        header = value.get("has_header")
-        if header is not None and not isinstance(header, bool):
-            issues.append(
-                SourceDeclarationIssue(
-                    "has_header_invalid",
-                    f"{base}.has_header",
-                    "has_header must be a boolean",
+        if "has_header" in value:
+            header = value["has_header"]
+            if not isinstance(header, bool):
+                issues.append(
+                    SourceDeclarationIssue(
+                        "has_header_invalid",
+                        f"{base}.has_header",
+                        "has_header must be a boolean",
+                    )
                 )
-            )
 
     # Iceberg fields.
     if kind == "iceberg":
@@ -734,9 +758,9 @@ def _validate_connector_fields(
                         break
 
     # read_only (duckdb).
-    if kind == "duckdb":
-        read_only = value.get("read_only")
-        if read_only is not None and not isinstance(read_only, bool):
+    if kind == "duckdb" and "read_only" in value:
+        read_only = value["read_only"]
+        if not isinstance(read_only, bool):
             issues.append(
                 SourceDeclarationIssue(
                     "read_only_invalid",
@@ -780,9 +804,12 @@ def _validate_single_char(
     base: str,
     issues: list[SourceDeclarationIssue],
 ) -> None:
-    raw = value.get(field)
-    if raw is None:
+    # Presence-based so an explicit null (present but None) is rejected as a
+    # type error rather than skipped — preventing the literal string 'None'
+    # from flowing into the built config.
+    if field not in value:
         return
+    raw = value[field]
     path = f"{base}.{field}"
     if not isinstance(raw, str) or len(raw) != 1:
         issues.append(
@@ -884,10 +911,12 @@ def _build_connector(decl: Mapping[object, object], kind: str) -> SourceConnecto
 def _build_schema(decl: Mapping[object, object], catalog_path: Path) -> TableSchema:
     if "schema" in decl:
         return parse_schema_document(decl["schema"])
-    # schema_ref (validation guaranteed exactly one is present)
+    # schema_ref (validation guaranteed exactly one is present).  Containment is
+    # rechecked immediately before the read via ``_open_contained_schema_ref``
+    # so a symlink swapped between validation and this build-time read cannot
+    # escape the catalog root (TOCTOU defence).
     ref = str(decl["schema_ref"])
-    resolved = (catalog_path.parent / ref).resolve()
-    text = resolved.read_text(encoding="utf-8")
+    text = _open_contained_schema_ref(ref, catalog_path, "schema_ref")
     _, data = _compose_and_construct(text)
     return parse_schema_document(data)
 

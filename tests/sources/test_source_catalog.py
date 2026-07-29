@@ -12,6 +12,7 @@ from selayer.sources.catalog import (
     ParsedSource,
     SourceDeclarationError,
     SourceDeclarationIssue,
+    _build_schema,
     parse_source_declarations,
     validate_source_declarations,
 )
@@ -25,6 +26,7 @@ from selayer.sources.config import (
     PyArrowConfig,
     SourceConnector,
     SqliteConfig,
+    _sanitize_location,
     connector_kind,
 )
 from selayer.sources.schema import ScalarType, TableSchema
@@ -808,3 +810,241 @@ def test_schema_ref_yaml_error_message_redacts_userinfo(tmp_path: Path) -> None:
         for marker in SECRET_MARKERS:
             assert marker not in rendered, rendered
     assert any("host/orders.yaml" in message for message in messages)
+
+
+# ---------------------------------------------------------------------------
+# Follow-up P1 — multi-@ userinfo, explicit YAML nulls, schema_ref recheck
+# ---------------------------------------------------------------------------
+#
+# Three Task 2 P1 review findings:
+#
+# 1. The URI sanitizer must redact the *entire* userinfo even when the
+#    embedded secret itself contains one or more ``@`` characters; the prior
+#    regex stopped at the first ``@`` and leaked the secret's suffix.
+# 2. Explicit YAML ``null`` for any required or typed connector field must be
+#    rejected as a deterministic ``SourceDeclarationIssue``/error — never
+#    silently coerced to the literal string ``'None'`` and never reach an
+#    ``assert``.
+# 3. schema_ref containment must be re-verified immediately before every
+#    open/read in the parse-time builder so a symlink swapped between
+#    validation and parsing cannot escape the catalog root.
+
+# A secret whose value itself contains multiple ``@`` characters.  The whole
+# ``userinfo@`` segment (up to and including the LAST ``@`` before the path)
+# must be redacted; no suffix of the secret may survive.
+MULTI_AT_LOCATION = "s3://AKIATOPSECRET:p@ss@word@bucket/orders/"
+# No fragment of the secret — nor any residual ``@`` — may leak.
+MULTI_AT_MARKERS = ("AKIATOPSECRET", "hunter2", "p@ss", "ss", "word")
+# A schema reference whose value embeds a multi-@ secret.
+MULTI_AT_SCHEMA_REF = "https://token:p@ss@word@host/orders.yaml"
+
+
+# --- Finding 1: multi-@ userinfo redaction -------------------------------
+
+
+def test_sanitizer_redacts_entire_userinfo_with_multiple_at_signs() -> None:
+    sanitized = _sanitize_location(MULTI_AT_LOCATION)
+    # The full authority (user:p@ss@word) is stripped, leaving scheme + host.
+    assert sanitized == "s3://bucket/orders/"
+    for marker in MULTI_AT_MARKERS:
+        assert marker not in sanitized, sanitized
+    assert "@" not in sanitized
+
+
+@pytest.mark.parametrize(
+    "connector",
+    [
+        ParquetConfig(MULTI_AT_LOCATION),
+        ParquetConfig(MULTI_AT_LOCATION, "analytics_s3"),
+        CsvConfig(MULTI_AT_LOCATION),
+        CsvConfig(MULTI_AT_LOCATION, "analytics_s3"),
+        DeltaConfig(MULTI_AT_LOCATION),
+        SqliteConfig(MULTI_AT_LOCATION, "main.orders"),
+        DuckDbConfig(MULTI_AT_LOCATION, "orders"),
+    ],
+)
+def test_location_connector_reprs_redact_multi_at_userinfo(
+    connector: SourceConnector,
+) -> None:
+    rendered = repr(connector)
+    for marker in MULTI_AT_MARKERS:
+        assert marker not in rendered, rendered
+    # No residual ``@`` survives: the whole userinfo is gone.
+    assert "@" not in rendered
+    assert "s3://bucket/orders/" in rendered
+
+
+@pytest.mark.parametrize(
+    "connector",
+    [
+        IcebergConfig(
+            "warehouse",
+            ("s3://AKIATOPSECRET:p@ss@word@ns/analytics",),
+            "s3://AKIATOPSECRET:p@ss@word@host/orders",
+        ),
+        PostgresConfig("warehouse_ro", "s3://AKIATOPSECRET:p@ss@word@host/cust"),
+        PyArrowConfig("s3://AKIATOPSECRET:p@ss@word@handle/orders"),
+    ],
+)
+def test_non_location_connector_reprs_redact_multi_at_userinfo(
+    connector: SourceConnector,
+) -> None:
+    rendered = repr(connector)
+    for marker in MULTI_AT_MARKERS:
+        assert marker not in rendered, rendered
+    assert "@" not in rendered
+    assert "s3://" in rendered
+
+
+def test_parsed_source_repr_redacts_multi_at_userinfo() -> None:
+    parsed = ParsedSource(
+        "orders",
+        ParquetConfig(MULTI_AT_LOCATION, "analytics_s3"),
+        TableSchema(()),
+        ("s3://AKIATOPSECRET:p@ss@word@grain/id",),
+    )
+    rendered = repr(parsed)
+    for marker in MULTI_AT_MARKERS:
+        assert marker not in rendered, rendered
+    assert "@" not in rendered
+    assert "s3://bucket/orders/" in rendered
+    assert "grain/id" in rendered
+
+
+def test_schema_ref_multi_at_secret_is_redacted_in_messages(
+    tmp_path: Path,
+) -> None:
+    # A schema_ref embedding a multi-@ secret that resolves to no file.
+    source: dict[str, Any] = {
+        "type": "parquet",
+        "location": "orders/",
+        "schema_ref": MULTI_AT_SCHEMA_REF,
+        "grain": ["id"],
+    }
+    with pytest.raises(SourceDeclarationError) as caught:
+        parse_source_declarations({"x": source}, tmp_path / "catalog.yaml")
+    error = caught.value
+    messages = [issue.message for issue in error.issues]
+    for rendered in (str(error), repr(error), repr(error.args), *messages):
+        for marker in MULTI_AT_MARKERS:
+            assert marker not in rendered, rendered
+    # The sanitized host/path remains a useful diagnostic, with no residual @.
+    assert any("host/orders.yaml" in message for message in messages)
+
+
+# --- Finding 2: explicit YAML nulls are rejected -------------------------
+
+
+@pytest.mark.parametrize(
+    ("kind", "field"),
+    [
+        # Required location-bearing fields.
+        ("parquet", "location"),
+        ("csv", "location"),
+        ("delta", "location"),
+        ("sqlite", "location"),
+        ("duckdb", "location"),
+        # Required relation fields.
+        ("sqlite", "relation"),
+        ("duckdb", "relation"),
+        ("postgres", "relation"),
+        # Required identifier / handle fields.
+        ("iceberg", "catalog_profile"),
+        ("iceberg", "namespace"),
+        ("iceberg", "table"),
+        ("postgres", "connection_profile"),
+        ("pyarrow", "handle"),
+        # Typed CSV framing options (single-char / bool).
+        ("csv", "delimiter"),
+        ("csv", "quote_char"),
+        ("csv", "has_header"),
+        ("duckdb", "read_only"),
+    ],
+)
+def test_explicit_null_required_and_typed_fields_are_rejected(
+    tmp_path: Path, kind: str, field: str
+) -> None:
+    source = {**valid_source_mapping(kind), field: None}
+    field_path = f"data_sources.x.{field}"
+
+    # Validation reports a deterministic issue at the field's own path.
+    issues = validate_source_declarations({"x": source}, tmp_path / "catalog.yaml")
+    assert field_path in {issue.path for issue in issues}
+
+    # Parsing raises a clean SourceDeclarationError — never an AssertionError
+    # and never the literal string 'None'.
+    with pytest.raises(SourceDeclarationError) as caught:
+        parse_source_declarations({"x": source}, tmp_path / "catalog.yaml")
+    assert field_path in {issue.path for issue in caught.value.issues}
+    for issue in caught.value.issues:
+        assert "'None'" not in issue.message
+
+
+def test_csv_explicit_null_escape_char_is_accepted(tmp_path: Path) -> None:
+    # ``escape_char`` is genuinely nullable (defaults to None); explicit null
+    # must remain valid and round-trip as None.
+    source = {**valid_source_mapping("csv"), "escape_char": None}
+    sources = parse_source_declarations({"x": source}, tmp_path / "catalog.yaml")
+    connector = sources["x"].connector
+    assert isinstance(connector, CsvConfig)
+    assert connector.escape_char is None
+
+
+def test_parquet_explicit_null_credential_profile_is_accepted(
+    tmp_path: Path,
+) -> None:
+    # ``credential_profile`` defaults to None; explicit null is valid.
+    source = {**valid_source_mapping("parquet"), "credential_profile": None}
+    sources = parse_source_declarations({"x": source}, tmp_path / "catalog.yaml")
+    connector = sources["x"].connector
+    assert isinstance(connector, ParquetConfig)
+    assert connector.credential_profile is None
+
+
+def test_explicit_null_never_coerced_to_none_string(tmp_path: Path) -> None:
+    # Regression: a null location previously slipped through validation and
+    # became the literal string 'None' in the built connector.  It must now be
+    # a deterministic error at the field path.
+    source = {**valid_source_mapping("parquet"), "location": None}
+    with pytest.raises(SourceDeclarationError) as caught:
+        parse_source_declarations({"x": source}, tmp_path / "catalog.yaml")
+    paths = {issue.path for issue in caught.value.issues}
+    assert "data_sources.x.location" in paths
+
+
+# --- Finding 3: schema_ref containment rechecked before read -------------
+
+
+def test_build_schema_rechecks_containment_before_read(tmp_path: Path) -> None:
+    # A schema_ref that resolves outside the catalog root must be rejected by
+    # the parse-time builder itself — containment is rechecked immediately
+    # before the read so a symlink swapped to escape between validation and
+    # this build-time read is refused (TOCTOU defence).  ``_build_schema`` is
+    # source-agnostic (no name context), so its escape path is the bare field.
+    outside = tmp_path.parent / "escaped.yaml"
+    outside.write_text(str(yaml.safe_dump(INLINE_SCHEMA)), encoding="utf-8")
+    catalog_path = tmp_path / "catalog.yaml"
+
+    with pytest.raises(SourceDeclarationError) as caught:
+        _build_schema({"schema_ref": "../escaped.yaml"}, catalog_path)
+    assert caught.value.issues[0].code == "schema_ref_escape"
+    assert caught.value.issues[0].path == "schema_ref"
+
+
+def test_build_schema_rechecks_symlink_escape_before_read(tmp_path: Path) -> None:
+    # Simulate the TOCTOU swap: a schema_ref that pointed inside the catalog
+    # root at validation time but is re-resolved outside at build time.  The
+    # builder rechecks containment and refuses to read the escaped target.
+    schemas = tmp_path / "schemas"
+    schemas.mkdir()
+    link = schemas / "link.yaml"
+    outside = tmp_path.parent / "outside_target.yaml"
+    outside.write_text(str(yaml.safe_dump(INLINE_SCHEMA)), encoding="utf-8")
+    # Point the symlink outside the root for the build-time resolution.
+    link.symlink_to(outside)
+    catalog_path = tmp_path / "catalog.yaml"
+
+    with pytest.raises(SourceDeclarationError) as caught:
+        _build_schema({"schema_ref": "schemas/link.yaml"}, catalog_path)
+    assert caught.value.issues[0].code == "schema_ref_escape"
+    assert caught.value.issues[0].path == "schema_ref"

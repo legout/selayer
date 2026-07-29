@@ -38,23 +38,27 @@ __all__ = [
 ]
 
 
-# URI authority userinfo (``scheme://user:password@host``).  Only the
-# ``userinfo@`` segment is matched so the scheme, host, port, and path — all
-# useful diagnostics — are preserved while embedded credentials are redacted.
-# The negated class stops at the first ``/``, ``?``, ``#``, or ``@`` so a path
-# that legitimately contains ``@`` is never mistaken for userinfo.
-_URI_USERINFO = re.compile(r"(://)[^@/?#]*@")
+# URI authority userinfo (``scheme://user:password@host``).  The authority is
+# everything up to the first ``/``, ``?``, or ``#``; the greedy ``[^/?#]*``
+# then backtracks to the LAST ``@`` within it, so the *entire* userinfo —
+# including a secret that itself contains ``@`` characters — is matched and
+# redacted while the scheme, host, port, and path are preserved.  An ``@``
+# that appears only in the path/query/fragment is left untouched.
+_URI_USERINFO = re.compile(r"(://)[^/?#]*@")
 
 
 def _sanitize_location(location: str) -> str:
     """Redact embedded URI userinfo (credentials) from a string.
 
     Only the ``userinfo@`` segment of a URI authority is removed; the scheme,
-    host, port, and path are preserved so diagnostics remain useful.  Strings
-    without a ``scheme://user:password@host`` authority (local paths, plain
-    references, validated identifiers) are returned unchanged.  This is the
-    low-level redactor; :func:`_safe` is the field-level entry point used by
-    every config ``__repr__``.
+    host, port, and path are preserved so diagnostics remain useful.  When the
+    embedded secret itself contains ``@`` characters the *entire* userinfo —
+    up to and including the last ``@`` before the path — is redacted, so no
+    suffix of the secret can leak.  Strings without a
+    ``scheme://user:password@host`` authority (local paths, plain references,
+    validated identifiers) are returned unchanged.  This is the low-level
+    redactor; :func:`_safe` is the field-level entry point used by every
+    config ``__repr__``.
     """
 
     return _URI_USERINFO.sub(r"\1", location)
