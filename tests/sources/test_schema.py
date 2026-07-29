@@ -579,6 +579,30 @@ def test_field_metadata_is_immutable_mapping_proxy() -> None:
         metadata["b"] = "2"  # type: ignore[index]
 
 
+def test_table_schema_coerces_list_fields_to_tuple() -> None:
+    # ``fields`` is declared ``tuple[FieldSchema, ...]``; an untyped/dynamic
+    # caller that hands a mutable list must not be able to corrupt the schema.
+    # We model that untrusted input as ``Any`` (the same stance the parser takes
+    # for raw documents) and assert the constructor coerces and decouples it.
+    source: Any = [FieldSchema("id", ScalarType("int64"), False)]
+    schema = TableSchema(source)
+    assert isinstance(schema.fields, tuple)
+    assert schema.fields == (FieldSchema("id", ScalarType("int64"), False),)
+    source.append(FieldSchema("extra", ScalarType("utf8"), False))
+    assert len(schema.fields) == 1
+    assert schema.fields[0].name == "id"
+
+
+def test_struct_type_coerces_list_fields_to_tuple() -> None:
+    source: Any = [FieldSchema("x", ScalarType("int64"), False)]
+    struct = StructType(source)
+    assert isinstance(struct.fields, tuple)
+    assert struct.fields == (FieldSchema("x", ScalarType("int64"), False),)
+    source.append(FieldSchema("y", ScalarType("utf8"), False))
+    assert len(struct.fields) == 1
+    assert struct.fields[0].name == "x"
+
+
 def test_table_schema_field_lookup_raises_key_error_for_missing() -> None:
     schema = TableSchema((FieldSchema("id", ScalarType("int64"), False),))
     assert schema.field("id").name == "id"

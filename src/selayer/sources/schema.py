@@ -231,6 +231,14 @@ class FixedSizeListType:
 class StructType:
     fields: tuple[FieldSchema, ...]
 
+    def __post_init__(self) -> None:
+        # Coerce any iterable (e.g. a mutable list handed by an untyped
+        # caller) to an immutable tuple so the frozen schema cannot be mutated
+        # by later changes to the source collection.  Mirrors the defensive
+        # ``FieldSchema.metadata`` coercion.
+        if not isinstance(self.fields, tuple):
+            object.__setattr__(self, "fields", tuple(self.fields))
+
 
 @dataclass(frozen=True, slots=True)
 class MapType:
@@ -289,6 +297,13 @@ class FieldSchema:
 @dataclass(frozen=True, slots=True)
 class TableSchema:
     fields: tuple[FieldSchema, ...]
+
+    def __post_init__(self) -> None:
+        # Coerce any iterable (e.g. a mutable list handed by an untyped
+        # caller) to an immutable tuple so the frozen schema cannot be mutated
+        # by later changes to the source collection.
+        if not isinstance(self.fields, tuple):
+            object.__setattr__(self, "fields", tuple(self.fields))
 
     def field(self, name: str) -> FieldSchema:
         for item in self.fields:
