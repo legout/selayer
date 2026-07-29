@@ -29,7 +29,7 @@ import re
 from collections.abc import Callable, Mapping
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
-from enum import Enum, StrEnum
+from enum import StrEnum
 from typing import Literal, Protocol, Self, runtime_checkable
 
 from selayer.sources.catalog import ParsedSource
@@ -121,23 +121,29 @@ def _repr_literal(value: object) -> object:
     ``MappingProxyType``, ``UserDict``, or hand-rolled ``Mapping``/``Set`` are
     all covered by the ABC check.  Ordered collections (``tuple``/``list``) are
     projected element-wise so that bare numeric literals remain visible.  The
-    only values that pass through unchanged are non-string scalars (ints,
-    bools, floats, ``None``) and :class:`~enum.Enum` members; every other
-    object type is redacted so an arbitrary handle's own ``__repr__`` can never
-    leak a secret.
+    only values that pass through unchanged are *exact* builtin scalars
+    (``int``, ``float``, ``bool``) and ``None`` — checked with ``type(value)``
+    rather than ``isinstance`` so an ``int``/``float`` subclass whose own
+    ``__repr__`` leaks a secret can never surface; :class:`~enum.Enum` members
+    and every other object type are redacted so an arbitrary handle's own
+    ``__repr__`` can never leak a secret.
     """
 
     if isinstance(value, (str, bytes)):
         return "<redacted>"
     if isinstance(value, (Mapping, AbstractSet)):
         return "<redacted>"
-    if isinstance(value, Enum):
-        return value
     if isinstance(value, tuple):
         return tuple(_repr_literal(item) for item in value)
     if isinstance(value, list):
         return tuple(_repr_literal(item) for item in value)
-    if isinstance(value, (int, float)) or value is None:
+    # Only exact builtin scalar types and None pass through.  ``isinstance`` is
+    # deliberately avoided here: an ``int``/``float`` subclass (whose custom
+    # ``__repr__`` could leak a secret) or an ``Enum`` member would satisfy the
+    # ``isinstance`` check yet surface its own repr in diagnostics.  ``bool`` is
+    # included explicitly because ``type(True) is bool`` (not ``int``), and the
+    # set membership keeps the exact-type guard uniform across all scalars.
+    if value is None or type(value) in {int, float, bool}:
         return value
     return "<redacted>"
 

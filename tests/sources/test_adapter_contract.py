@@ -8,6 +8,7 @@ from collections import UserDict
 from collections.abc import Callable, Mapping
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
+from enum import Enum
 
 import pytest
 
@@ -929,6 +930,100 @@ def test_source_error_token_code_coerced_to_unknown() -> None:
     assert err.message == "a source lifecycle error occurred"
     text = repr(err)
     assert "TOKENONLYCODE" not in text
+
+
+# ---------------------------------------------------------------------------
+# Follow-up 5: scalar repr bypass.  ``_repr_literal`` previously passed Enum
+# members through verbatim and used ``isinstance(value, (int, float))``, which
+# also catches subclasses.  An Enum member whose own ``__repr__`` leaks a
+# secret, or an ``int``/``float`` subclass with a custom ``__repr__``, thus
+# surfaced in diagnostics.  Only *exact* builtin scalars (``int``, ``float``,
+# ``bool``) and ``None`` may now pass through; Enum and all subclasses are
+# redacted to ``<redacted>``.
+# ---------------------------------------------------------------------------
+
+
+class _LeakyEnum(Enum):
+    """An Enum whose repr leaks a secret — must never surface."""
+
+    TOKENONLYSECRET = "supersecret"
+
+    def __repr__(self) -> str:
+        return f"_LeakyEnum(TOKENONLYSECRET={self.value!r})"
+
+
+class _LeakyInt(int):
+    """An ``int`` subclass whose repr leaks a secret."""
+
+    def __repr__(self) -> str:
+        return "_LeakyInt(TOKENONLYSECRET)"
+
+
+class _LeakyFloat(float):
+    """A ``float`` subclass whose repr leaks a secret."""
+
+    def __repr__(self) -> str:
+        return "_LeakyFloat(TOKENONLYSECRET)"
+
+
+def test_source_filter_enum_member_value_is_redacted() -> None:
+    # Previously ``_repr_literal`` returned Enum members unchanged, letting a
+    # member whose own ``__repr__`` leaks a secret (``TOKENONLYSECRET``) surface
+    # verbatim in diagnostics.
+    flt = SourceFilter(column="id", operator="eq", value=_LeakyEnum.TOKENONLYSECRET)
+    text = repr(flt)
+    assert "TOKENONLYSECRET" not in text
+    assert "supersecret" not in text
+    assert "_LeakyEnum" not in text
+    assert "<redacted>" in text
+
+
+def test_source_filter_enum_member_in_tuple_is_redacted() -> None:
+    # The element-wise projection of a tuple must also redact an Enum member.
+    flt = SourceFilter(
+        column="id",
+        operator="in",
+        value=(1, _LeakyEnum.TOKENONLYSECRET),
+    )
+    text = repr(flt)
+    assert "TOKENONLYSECRET" not in text
+    assert "supersecret" not in text
+    assert "<redacted>" in text
+    # The safe numeric element still renders.
+    assert "1" in text
+
+
+def test_source_filter_int_subclass_value_is_redacted() -> None:
+    # ``isinstance(_LeakyInt(1), int)`` is True, so the previous isinstance
+    # guard let the subclass through to its own (leaky) ``__repr__``.
+    flt = SourceFilter(column="id", operator="eq", value=_LeakyInt(1))
+    text = repr(flt)
+    assert "TOKENONLYSECRET" not in text
+    assert "_LeakyInt" not in text
+    assert "<redacted>" in text
+
+
+def test_source_filter_float_subclass_value_is_redacted() -> None:
+    # Likewise ``isinstance(_LeakyFloat(1.0), float)`` is True.
+    flt = SourceFilter(column="id", operator="eq", value=_LeakyFloat(1.0))
+    text = repr(flt)
+    assert "TOKENONLYSECRET" not in text
+    assert "_LeakyFloat" not in text
+    assert "<redacted>" in text
+
+
+def test_source_filter_exact_scalars_still_render() -> None:
+    # Regression guard: tightening to exact-type checks must not regress normal
+    # numeric filter reprs.  ``bool`` is included because ``type(True) is bool``
+    # (a distinct type from ``int``), so it must be covered explicitly.
+    int_value = SourceFilter(column="id", operator="eq", value=42)
+    float_value = SourceFilter(column="amount", operator="gt", value=3.14)
+    bool_value = SourceFilter(column="active", operator="eq", value=True)
+    none_value = SourceFilter(column="id", operator="is_null", value=None)
+    assert "42" in repr(int_value)
+    assert "3.14" in repr(float_value)
+    assert "True" in repr(bool_value)
+    assert "None" in repr(none_value)
 
 
 # ---------------------------------------------------------------------------
