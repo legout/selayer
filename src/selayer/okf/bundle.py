@@ -122,9 +122,17 @@ def trust_tier(frontmatter: Mapping[str, Any]) -> TrustTier:
 
 def freshness(frontmatter: Mapping[str, Any], today: date) -> Freshness:
     value = frontmatter.get("stale_after")
-    if value is None:
+    if isinstance(value, datetime):
         return "unspecified"
-    stale_after = value if isinstance(value, date) else date.fromisoformat(value)
+    if isinstance(value, date):
+        stale_after = value
+    elif isinstance(value, str):
+        try:
+            stale_after = date.fromisoformat(value)
+        except ValueError:
+            return "unspecified"
+    else:
+        return "unspecified"
     return "stale" if today >= stale_after else "current"
 
 

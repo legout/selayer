@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -532,4 +532,60 @@ def test_linked_attested_computation_counts_required_flags_in_budget(
         len(metric_item.content)
         + len(decoder_item.content)
         + _decoder_contract_chars(body)
+    )
+
+
+def test_malformed_stale_after_yields_unspecified_freshness_without_raising() -> None:
+    concept = OkfConcept.create(
+        concept_id="metrics/margin",
+        relative_path=PurePosixPath("metrics/margin.md"),
+        frontmatter={
+            "type": "Selayer Metric",
+            "selayer_id": "metric.margin",
+            "stale_after": "not-a-date",
+        },
+    )
+    bundle = OkfBundle(root=None, concepts={concept.concept_id: concept})
+
+    result = bundle.context_for(["metric.margin"], include_linked=False)
+
+    assert result.items[0].freshness == "unspecified"
+
+
+def test_datetime_stale_after_is_treated_as_unspecified() -> None:
+    concept = OkfConcept.create(
+        concept_id="metrics/margin",
+        relative_path=PurePosixPath("metrics/margin.md"),
+        frontmatter={
+            "type": "Selayer Metric",
+            "selayer_id": "metric.margin",
+            "stale_after": datetime(
+                2026, 7, 27, 10, 0, 0, tzinfo=timezone(timedelta(0))
+            ),
+        },
+    )
+    bundle = OkfBundle(root=None, concepts={concept.concept_id: concept})
+
+    result = bundle.context_for(["metric.margin"], include_linked=False)
+
+    assert result.items[0].freshness == "unspecified"
+
+
+def test_lenient_retrieval_does_not_crash_on_malformed_stale_after(
+    tmp_path: Path,
+) -> None:
+    _write_concept(
+        tmp_path,
+        "metrics/margin.md",
+        "type: Selayer Metric\nselayer_id: metric.margin\nstale_after: not-a-date",
+    )
+
+    bundle = OkfBundle.load(tmp_path, strict=False)
+    result = bundle.context_for(["metric.margin"], include_linked=False)
+
+    assert result.items[0].freshness == "unspecified"
+    assert any(
+        issue.path == "metrics/margin.md.frontmatter.stale_after"
+        and issue.severity == "warning"
+        for issue in result.diagnostics
     )
