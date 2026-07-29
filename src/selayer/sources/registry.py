@@ -458,11 +458,21 @@ class SourceRegistry:
         cannot swap a handle mid-query.  When ``bind_query`` returns ``None``
         the registry falls back to preparing and registering a fresh handle
         from the adapter's provider.
+
+        Every query-time binding failure (a raw PyIceberg/Arrow/registration
+        exception from ``bind_query`` or the fallback prepare/register) is
+        caught here and surfaced as a sanitized
+        :class:`~selayer.sources.errors.SourceConnectionError` (code
+        ``bind_failed``) raised *outside* the active ``except`` scope so no
+        driver-derived detail — authenticated locations, credentials, opaque
+        handles — can ever surface, and ``__cause__``/``__context__`` remain
+        ``None``.
         """
 
         self._lock.acquire()
         prepared: list[tuple[SourceAdapter, SourceHandle, str]] = []
         bindings: list[QueryBinding] = []
+        bind_failed_source: str | None = None
         try:
             # One-argument form: the plan carries each source's declared grain
             # (``source_grains``), so ``requirements_for_plan`` seeds
@@ -478,17 +488,32 @@ class SourceRegistry:
                 adapter = registration.adapter
                 requirement = requirements.get(source_id)
                 binding: QueryBinding | None = None
-                if requirement is not None:
-                    binding = adapter.bind_query(self._connection, handle, requirement)
-                if binding is not None:
-                    bindings.append(binding)
-                    continue
-                # Fall back to prepare + register for provider-backed readers.
-                source = self._sources[source_id]
-                fresh = adapter.prepare(source, self._profiles, self._arrow_providers)
-                adapter.register(self._connection, source_id, fresh)
-                prepared.append((adapter, fresh, source_id))
-            yield
+                try:
+                    if requirement is not None:
+                        binding = adapter.bind_query(
+                            self._connection, handle, requirement
+                        )
+                    if binding is not None:
+                        bindings.append(binding)
+                        continue
+                    # Fall back to prepare + register for provider-backed
+                    # readers.
+                    source = self._sources[source_id]
+                    fresh = adapter.prepare(
+                        source, self._profiles, self._arrow_providers
+                    )
+                    adapter.register(self._connection, source_id, fresh)
+                    prepared.append((adapter, fresh, source_id))
+                except Exception:  # noqa: BLE001
+                    # Catch every raw binding-stage exception (PyIceberg scan
+                    # failure, Arrow reader failure, DuckDB registration
+                    # failure, fallback prepare/register failure) so it cannot
+                    # escape unsanitized.  The sanitized SourceError is raised
+                    # *outside* this except scope below.
+                    bind_failed_source = source_id
+                    break
+            if bind_failed_source is None:
+                yield
         finally:
             for binding in reversed(bindings):
                 binding.cleanup()
@@ -496,6 +521,16 @@ class SourceRegistry:
                 unregister_quietly(self._connection, source_id)
                 close_quietly(adapter, fresh)
             self._lock.release()
+        if bind_failed_source is not None:
+            # Constructed and raised outside the active ``except`` scope so
+            # ``__cause__`` and ``__context__`` remain ``None`` and the constant
+            # message (looked up from the allowlisted ``bind_failed`` code)
+            # never echoes driver text.
+            raise SourceConnectionError(
+                bind_failed_source,
+                "bind_failed",
+                "the source could not be bound for the query",
+            )
 
     @contextmanager
     def execute_lock(self) -> Iterator[None]:

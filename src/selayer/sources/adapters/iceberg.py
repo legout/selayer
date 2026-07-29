@@ -163,7 +163,18 @@ class IcebergAdapter:
 
         reader = table.scan(**scan_kwargs).to_arrow_batch_reader()  # type: ignore[attr-defined]
         stable_name = handle.source_id
-        connection.register(stable_name, reader)  # type: ignore[attr-defined]
+        try:
+            connection.register(stable_name, reader)  # type: ignore[attr-defined]
+        except Exception:
+            # ``register`` may have partially mutated the connection before
+            # failing.  Unregister best-effort and close the just-created reader
+            # so it is never leaked, then re-raise so the registry boundary can
+            # convert the raw exception into a sanitized SourceError.
+            with suppress(Exception):
+                connection.unregister(stable_name)  # type: ignore[attr-defined]
+            with suppress(Exception):
+                reader.close()  # type: ignore[attr-defined]
+            raise
 
         def _cleanup() -> None:
             with suppress(Exception):

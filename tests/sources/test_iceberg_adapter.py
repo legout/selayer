@@ -57,6 +57,7 @@ class _RecordingScan:
         self.row_filter: str | None = None
         self.reader_count: int = 0
         self.close_count: int = 0
+        self.scan_error: BaseException | None = None
 
 
 class _TrackedReader:
@@ -106,6 +107,10 @@ class _RecordingTable:
         self._recording = recording
 
     def scan(self, **kwargs: object) -> _RecordingScanBuilder:
+        if self._recording.scan_error is not None:
+            error = self._recording.scan_error
+            self._recording.scan_error = None
+            raise error
         fields = kwargs.get("selected_fields")
         self._recording.selected_fields = (
             tuple(fields) if isinstance(fields, (tuple, list)) else ()
@@ -134,6 +139,26 @@ class _RecordingCatalog:
         return _RecordingTable(table, self._recording)
 
     def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
+class _FailingRegisterConnection:
+    """Connection wrapper that raises on ``register``, delegating all else.
+
+    Used to inject a register failure *after* the reader has been created by
+    ``table.scan(...).to_arrow_batch_reader()`` so the adapter's bind_query
+    cleanup path is exercised.  Every other attribute access delegates to the
+    inner DuckDB connection.
+    """
+
+    def __init__(self, inner: Any, error: BaseException) -> None:
+        self._inner = inner
+        self._error = error
+
+    def register(self, name: str, obj: object) -> None:
+        raise self._error
+
+    def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
 
@@ -676,3 +701,95 @@ def test_iceberg_never_installs_or_loads_duckdb_extension(
         ).fetchall()
         active = {row[0] for row in rows}
     assert "iceberg" not in active
+
+
+# ---------------------------------------------------------------------------
+# Binding-failure sanitization and reader cleanup (Task 7 review fixes)
+# ---------------------------------------------------------------------------
+
+
+def test_scan_failure_surfaces_sanitized_source_error(
+    iceberg_table_fixture: _IcebergFixture,
+) -> None:
+    """A raw PyIceberg exception from ``table.scan`` is sanitized at the boundary.
+
+    A ``RuntimeError`` carrying a fake credential/location is injected into
+    ``table.scan``.  The registry boundary converts it into a
+    :class:`~selayer.sources.errors.SourceConnectionError` (code
+    ``bind_failed``) whose message and repr never contain the credential, and
+    whose ``__cause__``/``__context__`` are both ``None``.  No reader is
+    created because the scan failed before reader construction.
+    """
+
+    from selayer.sources.errors import SourceConnectionError
+
+    fixture = iceberg_table_fixture
+    credential = "s3://AKIAIOSFODNN7EXAMPLE@warehouse/events"
+    fixture.recording.scan_error = RuntimeError(
+        f"failed to scan iceberg table: {credential}"
+    )
+    with (
+        QueryEngine(fixture.layer, profiles=fixture.profiles) as engine,
+        pytest.raises(SourceConnectionError) as exc_info,
+    ):
+        engine.query(["total_value"], ["category"], {"category": ["A"]})
+
+    error = exc_info.value
+    # The constant message never echoes driver text.
+    assert credential not in str(error)
+    assert credential not in repr(error)
+    assert error.code == "bind_failed"
+    assert error.message == "the source could not be bound for the query"
+    # source_id is sanitized (valid catalog name retained).
+    assert error.source_id == "events"
+    # No retained driver exception.
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    # No reader was created (scan raised before reader construction).
+    assert fixture.recording.reader_count == 0
+    assert fixture.recording.close_count == 0
+
+
+def test_register_failure_closes_reader_and_sanitizes_error(
+    iceberg_table_fixture: _IcebergFixture,
+) -> None:
+    """A failing ``register`` closes the created reader and is sanitized.
+
+    A ``RuntimeError`` carrying a fake credential is injected into
+    ``connection.register`` *after* the reader has been created by
+    ``table.scan(...).to_arrow_batch_reader()``.  The adapter's ``bind_query``
+    cleanup unregisters and closes the reader best-effort before re-raising,
+    so ``close_count`` increments.  The registry boundary then converts the
+    raw exception into a sanitized
+    :class:`~selayer.sources.errors.SourceConnectionError` with no credential
+    and no ``__cause__``/``__context__``.
+    """
+
+    from selayer.sources.errors import SourceConnectionError
+
+    fixture = iceberg_table_fixture
+    credential = "AKIAIOSFODNN7EXAMPLE/s3://secret-warehouse/token"
+    with QueryEngine(fixture.layer, profiles=fixture.profiles) as engine:
+        original = engine._registry._connection  # type: ignore[attr-defined]
+        engine._registry._connection = _FailingRegisterConnection(  # type: ignore[attr-defined]
+            original,
+            RuntimeError(f"connection.register failed: {credential}"),
+        )
+        with pytest.raises(SourceConnectionError) as exc_info:
+            engine.query(["total_value"], ["category"], {"category": ["A"]})
+
+    # The reader was created by the scan and then closed by the adapter's
+    # bind_query cleanup despite the register failure.
+    assert fixture.recording.reader_count == 1
+    assert fixture.recording.close_count == 1
+
+    error = exc_info.value
+    # The constant message never echoes driver text.
+    assert credential not in str(error)
+    assert credential not in repr(error)
+    assert error.code == "bind_failed"
+    assert error.message == "the source could not be bound for the query"
+    assert error.source_id == "events"
+    # No retained driver exception.
+    assert error.__cause__ is None
+    assert error.__context__ is None

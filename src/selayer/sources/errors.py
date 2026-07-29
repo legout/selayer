@@ -59,6 +59,7 @@ _CODE_MESSAGES: dict[str, str] = {
     "missing_profile": "a required runtime profile is not configured",
     "missing_arrow_provider": "a required arrow provider handle is not configured",
     "connect_failed": "the source connection could not be established",
+    "bind_failed": "the source could not be bound for the query",
     "schema_mismatch": "the observed schema does not match the declared schema",
     "reload_failed": "the source could not be reloaded",
     "source_initialization_failed": (
