@@ -98,7 +98,10 @@ def test_source_error_carries_uuidv4_operation_id_and_safe_fields() -> None:
     )
     assert err.source_id == "orders"
     assert err.code == "connect_failed"
-    assert err.message == "could not establish connection"
+    # The caller-supplied message is discarded; only the constant generic
+    # message for the code is retained.
+    assert err.message == "the source connection could not be established"
+    assert "could not establish connection" not in err.message
     parsed = uuid.UUID(err.operation_id)
     assert parsed.version == 4
     assert str(parsed) == err.operation_id
@@ -152,10 +155,86 @@ def test_source_error_repr_is_sanitized_and_constant() -> None:
 
 
 def test_source_error_explicit_operation_id_is_honored() -> None:
+    valid = "123e4567-e89b-42d3-a456-426614174000"
     err = SourceReloadError(
-        "orders", "reload_failed", "reload aborted", operation_id="op-123"
+        "orders", "reload_failed", "reload aborted", operation_id=valid
     )
-    assert err.operation_id == "op-123"
+    assert err.operation_id == valid
+
+
+# ---------------------------------------------------------------------------
+# Hostile regression: SourceError must never expose arbitrary caller/driver
+# text in message, source_id, code, or operation_id.
+# ---------------------------------------------------------------------------
+
+
+def test_source_error_ignores_arbitrary_driver_message() -> None:
+    secret = "password=hunter2;host=internal.db.example"
+    err = SourceConnectionError("orders", "connect_failed", secret)
+    text = repr(err)
+    assert "hunter2" not in text
+    assert "password" not in text
+    assert "internal.db.example" not in text
+    assert secret not in str(err)
+    # Stored message is the constant for the code, never the supplied detail.
+    assert err.message == "the source connection could not be established"
+
+
+def test_source_error_sanitizes_hostile_source_id() -> None:
+    err = SourceSchemaError(
+        "orders; DROP TABLE users--", "schema_mismatch", "leaked detail"
+    )
+    assert err.source_id == "<source>"
+    text = repr(err)
+    assert "DROP TABLE" not in text
+    assert "users" not in text
+
+
+def test_source_error_rejects_arbitrary_code() -> None:
+    err = SourceReloadError("orders", "DROP TABLE users", "detail")
+    assert err.code == "unknown"
+    text = repr(err)
+    assert "DROP TABLE" not in text
+    assert "users" not in text
+
+
+def test_source_error_invalid_operation_id_replaced_with_uuidv4() -> None:
+    err = SourceConnectionError(
+        "orders", "connect_failed", "detail", operation_id="not-a-uuid"
+    )
+    parsed = uuid.UUID(err.operation_id)
+    assert parsed.version == 4
+    assert err.operation_id != "not-a-uuid"
+
+
+def test_source_error_non_v4_operation_id_replaced_with_uuidv4() -> None:
+    # A valid UUID that is NOT v4 must also be replaced.
+    v1 = "123e4567-e89b-12d3-a456-426614174000"
+    err = SourceConnectionError("orders", "connect_failed", "detail", operation_id=v1)
+    parsed = uuid.UUID(err.operation_id)
+    assert parsed.version == 4
+    assert err.operation_id != v1
+
+
+def test_source_error_arbitrary_args_never_leak_in_repr_or_str() -> None:
+    err = SourceReloadError(
+        "src'; --",
+        "Evil Code!",
+        "driver secret token=abcdef DROP TABLE x",
+        operation_id="../../etc/passwd",
+    )
+    for text in (repr(err), str(err)):
+        assert "abcdef" not in text
+        assert "DROP TABLE" not in text
+        assert "passwd" not in text
+        assert "Evil Code" not in text
+        assert "token=" not in text
+
+
+def test_source_error_unknown_code_uses_fallback_message() -> None:
+    err = SourceConnectionError("orders", "some_future_code", "detail")
+    assert err.code == "some_future_code"
+    assert err.message == "a source lifecycle error occurred"
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +414,167 @@ def test_query_binding_repr_excludes_cleanup_and_does_not_invoke_it() -> None:
     assert "orders" in text
     assert "cleanup" not in text
     assert "<function" not in text
+    assert invoked == []
+
+
+# ---------------------------------------------------------------------------
+# Hostile regression: value-object reprs must not leak arbitrary SQL,
+# credential-bearing URI strings, handles, resources, schemas, or cleanup
+# callbacks.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _HostileResource:
+    """A resource whose own repr leaks a secret — must never surface."""
+
+    secret: str
+
+    def __repr__(self) -> str:
+        return f"_HostileResource(secret={self.secret!r})"
+
+
+def test_source_filter_value_credential_uri_is_redacted() -> None:
+    flt = SourceFilter(
+        column="id",
+        operator="eq",
+        value="postgres://user:secret@internal.host:5432/db",
+    )
+    text = repr(flt)
+    # The credential userinfo (user:secret) is redacted; the host/path may
+    # remain (matching the existing config redactor contract).
+    assert "secret" not in text
+    assert "user:" not in text
+    assert "user:secret" not in text
+
+
+def test_source_filter_value_sql_fragment_is_redacted() -> None:
+    flt = SourceFilter(column="id", operator="eq", value="'; DROP TABLE users; --")
+    text = repr(flt)
+    assert "DROP TABLE" not in text
+    assert "users" not in text
+
+
+def test_source_filter_value_keyeq_secret_is_redacted() -> None:
+    flt = SourceFilter(column="id", operator="eq", value="password=hunter2")
+    text = repr(flt)
+    assert "hunter2" not in text
+    assert "password" not in text
+
+
+def test_source_filter_value_tuple_elements_are_redacted() -> None:
+    flt = SourceFilter(
+        column="id",
+        operator="in",
+        value=("postgres://u:p@h/db", "'; DROP TABLE x"),
+    )
+    text = repr(flt)
+    assert "p@h" not in text
+    assert "DROP TABLE" not in text
+
+
+def test_source_filter_column_sql_is_placeholdered() -> None:
+    flt = SourceFilter(column="id; DROP TABLE users--", operator="eq", value=1)
+    text = repr(flt)
+    assert "DROP TABLE" not in text
+    assert "users" not in text
+    assert "<redacted>" in text
+
+
+def test_source_filter_scalar_values_render_normally() -> None:
+    flt = SourceFilter(column="amount", operator="gt", value=0)
+    assert "amount" in repr(flt)
+    assert "gt" in repr(flt)
+    assert "0" in repr(flt)
+
+
+def test_scan_requirement_hostile_columns_are_placeholdered() -> None:
+    req = SourceScanRequirement(
+        columns=("id; DROP TABLE users--", "amount"),
+        filters=(),
+    )
+    text = repr(req)
+    assert "DROP TABLE" not in text
+    assert "users" not in text
+    assert "amount" in text
+    assert "<redacted>" in text
+
+
+def test_source_handle_repr_redacts_credential_snapshot() -> None:
+    handle = SourceHandle(
+        source_id="orders",
+        connector="parquet",
+        resource=_HostileResource("topsecret"),
+        schema=_schema(),
+        snapshot="s3://AKIAKEY:s3cr3t@bucket.internal/path",
+        cleanup=lambda: None,
+    )
+    text = repr(handle)
+    # Resource object, schema, and cleanup never surface.
+    assert "topsecret" not in text
+    assert "_HostileResource" not in text
+    assert "TableSchema" not in text
+    assert "<function" not in text
+    # Credential userinfo in the snapshot is redacted.
+    assert "s3cr3t" not in text
+    assert "AKIAKEY" not in text
+    assert "AKIAKEY:s3cr3t" not in text
+    assert "orders" in text
+
+
+def test_source_status_repr_redacts_credential_snapshot() -> None:
+    handle = SourceHandle(
+        source_id="orders",
+        connector="parquet",
+        resource=_HostileResource("topsecret"),
+        schema=_schema(),
+        snapshot="https://admin:p4ss@internal.host/snap",
+    )
+    status = SourceStatus.from_handle(handle, generation=1)
+    text = repr(status)
+    assert "topsecret" not in text
+    assert "_HostileResource" not in text
+    assert "TableSchema" not in text
+    # Credential userinfo in the snapshot is redacted.
+    assert "p4ss" not in text
+    assert "admin:p4ss" not in text
+
+
+def test_reload_result_repr_redacts_hostile_snapshot() -> None:
+    result = ReloadResult(
+        "orders",
+        2,
+        3,
+        schema_fingerprint(_schema()),
+        "'; DROP TABLE users; --",
+    )
+    text = repr(result)
+    assert "DROP TABLE" not in text
+    assert "users" not in text
+    assert "orders" in text
+
+
+def test_query_binding_repr_redacts_hostile_stable_name() -> None:
+    binding = QueryBinding(
+        source_id="orders",
+        stable_name="orders; DROP TABLE users--",
+        cleanup=lambda: None,
+    )
+    text = repr(binding)
+    assert "DROP TABLE" not in text
+    assert "users" not in text
+    assert "<function" not in text
+    assert "orders" in text
+
+
+def test_query_binding_repr_does_not_invoke_cleanup() -> None:
+    invoked: list[str] = []
+
+    def cleanup() -> None:
+        invoked.append("called")
+
+    binding = QueryBinding(source_id="orders", stable_name="orders_v1", cleanup=cleanup)
+    repr(binding)
     assert invoked == []
 
 

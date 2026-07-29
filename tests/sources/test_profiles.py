@@ -8,10 +8,11 @@ from collections.abc import Callable
 import pyarrow as pa
 import pytest
 
-from selayer.sources.errors import SourceProfileError
+from selayer.sources.errors import SourceDependencyError, SourceProfileError
 from selayer.sources.profiles import (
     ArrowObject,
     ArrowProviderResolver,
+    MappingArrowProviderResolver,
     MappingProfileResolver,
     RuntimeProfile,
     RuntimeProfileResolver,
@@ -126,6 +127,22 @@ def test_resolver_error_repr_is_sanitized() -> None:
     assert "Traceback" not in text
 
 
+def test_missing_profile_error_does_not_interpolate_hostile_name() -> None:
+    """The supplied profile name (hostile) must never surface in the error."""
+    resolver = MappingProfileResolver({})
+    hostile = "admin; DROP TABLE profiles--"
+    with pytest.raises(SourceProfileError) as caught:
+        resolver.resolve(hostile, source_id="orders")
+    err = caught.value
+    text = repr(err)
+    assert "DROP TABLE" not in text
+    assert "profiles" not in text
+    assert hostile not in text
+    assert hostile not in err.message
+    # The stored message is the constant for the code, not interpolated text.
+    assert err.message == "a required runtime profile is not configured"
+
+
 # ---------------------------------------------------------------------------
 # RuntimeProfileResolver protocol acceptance
 # ---------------------------------------------------------------------------
@@ -164,3 +181,66 @@ def test_arrow_provider_resolver_protocol_accepts_fake() -> None:
     provider = resolver.resolve("h", source_id="orders")
     obj = provider()
     assert isinstance(obj, pa.Table)
+
+
+# ---------------------------------------------------------------------------
+# MappingArrowProviderResolver (concrete)
+# ---------------------------------------------------------------------------
+
+
+def test_mapping_arrow_provider_resolver_returns_provider() -> None:
+    table = pa.table({"id": [1, 2]})
+    resolver = MappingArrowProviderResolver({"orders_handle": lambda: table})
+    provider = resolver.resolve("orders_handle", source_id="orders")
+    obj = provider()
+    assert isinstance(obj, pa.Table)
+
+
+def test_mapping_arrow_provider_resolver_satisfies_protocol() -> None:
+    resolver: ArrowProviderResolver = MappingArrowProviderResolver({})
+    assert isinstance(resolver, ArrowProviderResolver)
+
+
+def test_mapping_arrow_provider_resolver_missing_handle_raises_sanitized() -> None:
+    resolver = MappingArrowProviderResolver({})
+    with pytest.raises(SourceDependencyError) as caught:
+        resolver.resolve("missing_handle", source_id="orders")
+    err = caught.value
+    assert err.code == "missing_arrow_provider"
+    assert err.source_id == "orders"
+    assert err.__cause__ is None
+    assert err.__context__ is None
+    assert err.message == "a required arrow provider handle is not configured"
+
+
+def test_mapping_arrow_provider_resolver_missing_does_not_interpolate_handle() -> None:
+    resolver = MappingArrowProviderResolver({})
+    hostile = "admin; DROP TABLE handles--"
+    with pytest.raises(SourceDependencyError) as caught:
+        resolver.resolve(hostile, source_id="orders")
+    err = caught.value
+    text = repr(err)
+    assert "DROP TABLE" not in text
+    assert "handles" not in text
+    assert hostile not in text
+    assert hostile not in err.message
+
+
+def test_mapping_arrow_provider_resolver_missing_has_uuidv4_operation_id() -> None:
+    resolver = MappingArrowProviderResolver({})
+    with pytest.raises(SourceDependencyError) as caught:
+        resolver.resolve("missing_handle", source_id="orders")
+    parsed = uuid.UUID(caught.value.operation_id)
+    assert parsed.version == 4
+
+
+def test_mapping_arrow_provider_resolver_defensively_copies_map() -> None:
+    table = pa.table({"id": [1]})
+    source_map: dict[str, Callable[[], ArrowObject]] = {"h": lambda: table}
+    resolver = MappingArrowProviderResolver(source_map)
+    source_map.clear()
+    source_map["h2"] = lambda: table
+    # Original mapping is unaffected by later mutation.
+    assert isinstance(resolver.resolve("h", source_id="orders")(), pa.Table)
+    with pytest.raises(SourceDependencyError):
+        resolver.resolve("h2", source_id="orders")

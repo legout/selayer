@@ -2,23 +2,28 @@
 
 Every source lifecycle failure surfaces as a :class:`SourceError` subclass
 that carries a UUIDv4 ``operation_id`` (generated at the lifecycle boundary),
-the affected ``source_id``, a stable symbolic ``code``, and a constant
+the affected ``source_id``, a stable symbolic ``code``, and a *constant*
 sanitized ``message``.
 
-Two guarantees are load-bearing for the secrecy contract:
+Three guarantees are load-bearing for the secrecy contract:
 
+* **No arbitrary caller/driver text is ever retained.**  The caller-supplied
+  ``message`` is intentionally discarded — only a constant generic message
+  looked up from ``code`` is stored, so no driver-derived detail can surface.
+  ``source_id`` and ``code`` are validated against safe patterns and coerced to
+  placeholders when they do not match, and an explicit ``operation_id`` is
+  honored only when it parses as a UUIDv4 (otherwise a fresh one is generated).
 * **No retained driver exceptions.**  Driver exceptions are never stored.
   Errors must be constructed and raised *outside* active ``except`` scopes so
-  ``__cause__`` and ``__context__`` remain ``None``; the only stored text is
-  the constant ``message`` — never driver-derived strings that could carry
-  credentials.
-* **Safe reprs.**  The repr renders only ``operation_id``, ``source_id``,
-  ``code``, and the constant ``message`` — all of which are safe identifiers or
-  constant text, never driver material.
+  ``__cause__`` and ``__context__`` remain ``None``.
+* **Safe reprs.**  The repr renders only the validated ``operation_id``,
+  ``source_id``, ``code``, and the constant ``message`` — all of which are safe
+  identifiers or constant text, never driver material.
 """
 
 from __future__ import annotations
 
+import re
 import uuid
 
 __all__ = [
@@ -43,8 +48,86 @@ def new_operation_id() -> str:
     return str(uuid.uuid4())
 
 
+# A safe symbolic error code: lowercase snake_case (matching the catalog's own
+# code vocabulary).  Any other shape is coerced to ``"unknown"`` so arbitrary
+# caller/driver text can never surface as a code.
+_CODE_RE = re.compile(r"\A[a-z][a-z0-9_]*\Z")
+
+# A safe source identifier (the SQL-identifier shape the catalog accepts).
+# Anything else is replaced with ``"<source>"`` so arbitrary text — SQL
+# fragments, credentials, URIs — can never surface as a source id.
+_SOURCE_ID_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
+
+# Constant, generic messages keyed by stable error code.  The caller-supplied
+# ``message`` is *never* retained; only these constant strings are stored, so
+# no driver-derived detail can surface in diagnostics.  Unknown codes fall back
+# to ``_FALLBACK_MESSAGE``.
+_CODE_MESSAGES: dict[str, str] = {
+    "missing_profile": "a required runtime profile is not configured",
+    "missing_arrow_provider": "a required arrow provider handle is not configured",
+    "connect_failed": "the source connection could not be established",
+    "schema_mismatch": "the observed schema does not match the declared schema",
+    "reload_failed": "the source could not be reloaded",
+}
+
+_FALLBACK_MESSAGE = "a source lifecycle error occurred"
+
+
+def _safe_code(code: object) -> str:
+    """Return ``code`` if it is a safe symbolic code, else ``"unknown"``."""
+
+    if isinstance(code, str) and _CODE_RE.match(code):
+        return code
+    return "unknown"
+
+
+def _safe_source_id(source_id: object) -> str:
+    """Return ``source_id`` if it is a safe identifier, else ``"<source>"``."""
+
+    if isinstance(source_id, str) and _SOURCE_ID_RE.match(source_id):
+        return source_id
+    return "<source>"
+
+
+def _validated_operation_id(operation_id: str | None) -> str:
+    """Return a UUIDv4 operation id, validating any caller-supplied value.
+
+    A supplied value is honored only when it parses as a UUIDv4 (normalized to
+    its canonical lowercase form); any other value is replaced with a fresh
+    UUIDv4 so no arbitrary caller/driver text can be stored as the operation id.
+    """
+
+    if operation_id is not None:
+        try:
+            parsed = uuid.UUID(operation_id)
+        except (ValueError, AttributeError, TypeError):
+            parsed = None
+        if parsed is not None and parsed.version == 4:
+            return str(parsed)
+    return new_operation_id()
+
+
+def _message_for_code(code: str) -> str:
+    """Return the constant generic message for ``code`` (fallback if unknown)."""
+
+    return _CODE_MESSAGES.get(code, _FALLBACK_MESSAGE)
+
+
 class SourceError(Exception):
     """Base class for sanitized source lifecycle errors.
+
+    Only safe, derived identifiers are stored:
+
+    * ``operation_id`` — a UUIDv4 (validated if supplied, else generated).
+    * ``source_id`` — a validated identifier, else ``"<source>"``.
+    * ``code`` — a validated snake_case symbolic code, else ``"unknown"``.
+    * ``message`` — a *constant* generic message looked up from ``code``; the
+      caller-supplied message is intentionally ignored so driver-derived detail
+      can never surface.
+
+    Driver exceptions are never retained.  Errors must be constructed and
+    raised outside active ``except`` scopes so ``__cause__`` and ``__context__``
+    remain ``None``.
 
     Attributes:
         operation_id: UUIDv4 identifying the lifecycle operation.
@@ -61,13 +144,14 @@ class SourceError(Exception):
         *,
         operation_id: str | None = None,
     ) -> None:
-        self.operation_id = (
-            operation_id if operation_id is not None else new_operation_id()
-        )
-        self.source_id = source_id
-        self.code = code
-        self.message = message
-        super().__init__(message)
+        self.operation_id = _validated_operation_id(operation_id)
+        self.source_id = _safe_source_id(source_id)
+        self.code = _safe_code(code)
+        # The caller-supplied ``message`` is intentionally discarded: only the
+        # constant generic message for ``code`` is retained, so no
+        # driver-derived detail can ever surface in diagnostics.
+        self.message = _message_for_code(self.code)
+        super().__init__(self.message)
 
     def __repr__(self) -> str:
         return (

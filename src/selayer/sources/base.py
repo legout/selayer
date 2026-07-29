@@ -23,13 +23,14 @@ Secrecy invariants (load-bearing):
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Literal, Protocol, Self, runtime_checkable
 
 from selayer.sources.catalog import ParsedSource
-from selayer.sources.config import _format_repr
+from selayer.sources.config import _sanitize_location
 from selayer.sources.profiles import (
     ArrowProviderResolver,
     RuntimeProfileResolver,
@@ -47,6 +48,66 @@ __all__ = [
     "SourceScanRequirement",
     "SourceStatus",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Repr sanitization
+# ---------------------------------------------------------------------------
+#
+# Every free-form string/tuple that appears in a lifecycle value-object repr
+# is routed through these helpers so that credentials, arbitrary SQL, opaque
+# handles, resources, schemas, and cleanup callbacks can never surface in
+# diagnostics:
+#
+# * identifier fields (``source_id``, ``connector``, ``column``, ``stable_name``)
+#   must match the SQL-identifier shape and are placeholder-ed otherwise — this
+#   is the SQL-injection surface since adapters interpolate identifiers;
+# * free-form fields (``value``, ``snapshot``, ``schema_fingerprint``) are first
+#   URI-userinfo-redacted through the existing config redactor
+#   (:func:`_sanitize_location`), then any result that is not a safe token
+#   (e.g. SQL fragments, ``key=value`` secrets) is replaced with a
+#   ``"<redacted>"`` placeholder.
+#
+# Sanitization is repr-only: the stored values are unchanged so adapters keep
+# using the real identifiers/snapshots/filter literals to drive scans.
+
+_IDENTIFIER_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
+_SAFE_TOKEN_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.\-:/]*\Z")
+
+
+def _repr_id(value: object) -> str:
+    """Render an identifier field, placeholder-ing anything that is not one."""
+
+    if isinstance(value, str) and _IDENTIFIER_RE.match(value):
+        return value
+    return "<redacted>"
+
+
+def _repr_token(value: object) -> object:
+    """Repr-safe projection of a free-form field.
+
+    Strings are URI-userinfo-redacted via the config redactor, then any result
+    that is not a safe token (SQL fragments, ``key=value`` secrets, embedded
+    whitespace/punctuation) is replaced with ``"<redacted>"``.  Tuples and
+    lists are projected element-wise; all other values (ints, bools, enums)
+    pass through unchanged.
+    """
+
+    if isinstance(value, str):
+        redacted = _sanitize_location(value)
+        return redacted if _SAFE_TOKEN_RE.match(redacted) else "<redacted>"
+    if isinstance(value, tuple):
+        return tuple(_repr_token(item) for item in value)
+    if isinstance(value, list):
+        return tuple(_repr_token(item) for item in value)
+    return value
+
+
+def _render(name: str, fields: list[tuple[str, object]]) -> str:
+    """Render a ``Name(field=value, ...)`` repr from pre-sanitized field values."""
+
+    body = ", ".join(f"{field}={value!r}" for field, value in fields)
+    return f"{name}({body})"
 
 
 # ---------------------------------------------------------------------------
@@ -96,12 +157,12 @@ class SourceFilter:
     value: object
 
     def __repr__(self) -> str:
-        return _format_repr(
+        return _render(
             "SourceFilter",
             [
-                ("column", self.column),
+                ("column", _repr_id(self.column)),
                 ("operator", self.operator),
-                ("value", self.value),
+                ("value", _repr_token(self.value)),
             ],
         )
 
@@ -125,9 +186,12 @@ class SourceScanRequirement:
             object.__setattr__(self, "filters", tuple(self.filters))
 
     def __repr__(self) -> str:
-        return _format_repr(
+        return _render(
             "SourceScanRequirement",
-            [("columns", self.columns), ("filters", self.filters)],
+            [
+                ("columns", tuple(_repr_id(column) for column in self.columns)),
+                ("filters", self.filters),
+            ],
         )
 
 
@@ -155,12 +219,12 @@ class SourceHandle:
     cleanup: Callable[[], None] | None = field(default=None, repr=False)
 
     def __repr__(self) -> str:
-        return _format_repr(
+        return _render(
             "SourceHandle",
             [
-                ("source_id", self.source_id),
-                ("connector", self.connector),
-                ("snapshot", self.snapshot),
+                ("source_id", _repr_id(self.source_id)),
+                ("connector", _repr_id(self.connector)),
+                ("snapshot", _repr_token(self.snapshot)),
                 ("query_scoped", self.query_scoped),
             ],
         )
@@ -199,14 +263,14 @@ class SourceStatus:
         )
 
     def __repr__(self) -> str:
-        return _format_repr(
+        return _render(
             "SourceStatus",
             [
-                ("source_id", self.source_id),
-                ("connector", self.connector),
+                ("source_id", _repr_id(self.source_id)),
+                ("connector", _repr_id(self.connector)),
                 ("generation", self.generation),
-                ("schema_fingerprint", self.schema_fingerprint),
-                ("snapshot", self.snapshot),
+                ("schema_fingerprint", _repr_token(self.schema_fingerprint)),
+                ("snapshot", _repr_token(self.snapshot)),
                 ("health", self.health.value),
             ],
         )
@@ -223,14 +287,14 @@ class ReloadResult:
     snapshot: str | None
 
     def __repr__(self) -> str:
-        return _format_repr(
+        return _render(
             "ReloadResult",
             [
-                ("source_id", self.source_id),
+                ("source_id", _repr_id(self.source_id)),
                 ("old_generation", self.old_generation),
                 ("new_generation", self.new_generation),
-                ("schema_fingerprint", self.schema_fingerprint),
-                ("snapshot", self.snapshot),
+                ("schema_fingerprint", _repr_token(self.schema_fingerprint)),
+                ("snapshot", _repr_token(self.snapshot)),
             ],
         )
 
@@ -274,9 +338,12 @@ class QueryBinding:
         self.cleanup()
 
     def __repr__(self) -> str:
-        return _format_repr(
+        return _render(
             "QueryBinding",
-            [("source_id", self.source_id), ("stable_name", self.stable_name)],
+            [
+                ("source_id", _repr_id(self.source_id)),
+                ("stable_name", _repr_id(self.stable_name)),
+            ],
         )
 
 
