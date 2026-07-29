@@ -32,6 +32,7 @@ Lifecycle guarantees:
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -346,6 +347,7 @@ class SourceRegistry:
         source_ids = sorted(self._sources)
         candidates: dict[str, tuple[SourceAdapter, SourceHandle, TableSchema]] = {}
         prepare_failed_source: str | None = None
+        unexpected_failure = False
         try:
             for source_id in source_ids:
                 source = self._sources[source_id]
@@ -354,16 +356,22 @@ class SourceRegistry:
                 prepared_candidate = self._prepare_candidate(adapter, source)
                 if prepared_candidate is None:
                     prepare_failed_source = source_id
-                    raise _PrepareFailed
+                    break
                 candidate, observed = prepared_candidate
                 mismatches = compare_schemas(source.schema, observed)
                 if mismatches:
                     close_quietly(adapter, candidate)
                     prepare_failed_source = source_id
-                    raise _PrepareFailed
+                    break
                 candidates[source_id] = (adapter, candidate, observed)
         except Exception:  # noqa: BLE001
-            # Close every candidate prepared so far.
+            unexpected_failure = True
+
+        # On any prepare-phase failure (prepare/schema-mismatch via ``break`` or
+        # an unexpected exception), close every candidate prepared so far and
+        # raise a sanitized SourceReloadError *outside* the except scope so
+        # ``__cause__``/``__context__`` remain ``None``.
+        if prepare_failed_source is not None or unexpected_failure:
             for adapter, candidate, _observed in candidates.values():
                 close_quietly(adapter, candidate)
             failed_id = (
@@ -590,10 +598,6 @@ class SourceRegistry:
 # ---------------------------------------------------------------------------
 
 
-class _PrepareFailed(Exception):
-    """Internal sentinel raised only to reach the prepare-failure handler."""
-
-
 class _SchemaDrift(Exception):
     """Internal sentinel carrying declared/observed schemas on mismatch."""
 
@@ -677,9 +681,17 @@ class _ColumnCollector:
 
 
 def _is_pushdown_scalar(value: object) -> bool:
-    """Return ``True`` for exact builtin scalar types safe for pushdown."""
+    """Return ``True`` for exact builtin scalar types safe for pushdown.
 
-    return type(value) in {str, int, float, bool}
+    Non-finite floats (``math.nan``, ``math.inf``, ``-math.inf``) are rejected
+    via :func:`math.isfinite` so they never reach PyIceberg's row-filter parser.
+    A non-finite bound produces no :class:`SourceFilter`; DuckDB still evaluates
+    the original bound filter as a residual.
+    """
+
+    if type(value) is float:
+        return math.isfinite(value)
+    return type(value) in {str, int, bool}
 
 
 def _translate_planned_filter(

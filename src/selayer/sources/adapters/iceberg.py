@@ -35,6 +35,7 @@ Design pillars:
 
 from __future__ import annotations
 
+import math
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
@@ -368,10 +369,13 @@ def _iceberg_literal(value: object) -> str | None:
     expression can be generated for that value.  Only *exact* builtin types are
     accepted: ``type(value) is str/int/float/bool`` (not ``isinstance``) so a
     hostile subclass whose dunders could leak a secret is rejected.
+    Non-finite floats (``nan``/``inf``/``-inf``) also return ``None``: PyIceberg's
+    row-filter parser cannot represent them, so the caller skips pushdown for
+    that value and DuckDB evaluates the original bound filter as a residual.
 
     * **strings** are single-quoted with embedded single quotes doubled.
     * **booleans** render as ``TRUE``/``FALSE``.
-    * **integers/floats** render via ``repr``.
+    * **integers/finite floats** render via ``repr``.
     """
 
     if type(value) is str:
@@ -381,7 +385,9 @@ def _iceberg_literal(value: object) -> str | None:
     if type(value) is int:
         return repr(value)
     if type(value) is float:
-        return repr(value)
+        if math.isfinite(value):
+            return repr(value)
+        return None
     return None
 
 

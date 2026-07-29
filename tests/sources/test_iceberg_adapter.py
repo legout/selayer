@@ -524,6 +524,28 @@ def test_iceberg_range_filter_translation(
     assert result["total_value"].sum() == expected
 
 
+def test_nonfinite_float_filters_remain_residual_only(
+    iceberg_table_fixture: _IcebergFixture,
+) -> None:
+    """NaN and infinity stay residual filters instead of invalid pushdown."""
+
+    fixture = iceberg_table_fixture
+    cases = (
+        (float("nan"), 0),
+        ([float("inf")], 0),
+        ((float("-inf"), float("inf")), 15),
+    )
+    with QueryEngine(fixture.layer, profiles=fixture.profiles) as engine:
+        for filter_value, expected in cases:
+            result = engine.query(
+                ["total_value"],
+                ["value"],
+                {"value": filter_value},
+            )
+            assert fixture.recording.row_filter is None
+            assert result["total_value"].sum() == expected
+
+
 def test_unsupported_filter_remains_residual_only(
     iceberg_table_fixture: _IcebergFixture,
 ) -> None:
