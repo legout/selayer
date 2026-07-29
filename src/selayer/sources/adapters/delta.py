@@ -34,8 +34,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import pyarrow.dataset as padataset
+import pyarrow.fs as pafs
 
-from selayer.sources.adapters.arrow import s3_filesystem
+from selayer.sources.adapters.arrow import (
+    _s3_profile_value,
+    _s3_role_session_credentials,
+    _validate_s3_profile,
+    s3_filesystem,
+)
 from selayer.sources.base import (
     QueryBinding,
     SourceHandle,
@@ -61,18 +67,6 @@ except ImportError:
     _DeltaTable = None  # type: ignore[assignment, misc]
 
 __all__ = ["DeltaAdapter"]
-
-
-# Mapping from S3 profile keys to the AWS storage-option names that
-# ``deltalake`` (via the Rust ``object_store`` crate) consumes.  Only key
-# *names* are configuration metadata; secret values are never enumerated.
-_STORAGE_OPTION_MAP: dict[str, str] = {
-    "access_key": "AWS_ACCESS_KEY_ID",
-    "secret_key": "AWS_SECRET_ACCESS_KEY",
-    "session_token": "AWS_SESSION_TOKEN",
-    "region": "AWS_REGION",
-    "endpoint_override": "AWS_ENDPOINT_URL",
-}
 
 
 @dataclass(slots=True)
@@ -126,8 +120,16 @@ class DeltaAdapter:
 
         if credential_profile is not None:
             profile = profiles.resolve(credential_profile, source_id=source.name)
-            filesystem = s3_filesystem(profile)
             storage_options = _delta_storage_options(profile)
+            base_filesystem = s3_filesystem(profile)
+            # Root the filesystem at the table's bucket/prefix.  The wrapped
+            # S3FileSystem owns the ``s3://`` scheme/host, so the root is a
+            # clean ``bucket/prefix`` path and the relative file paths stored
+            # in the Delta log resolve against it.  A local path is returned
+            # unchanged (trailing slash stripped) so local behavior is
+            # preserved exactly.
+            root = _s3_root_path(location)
+            filesystem = pafs.SubTreeFileSystem(root, base_filesystem)
             # The DeltaTable reads the transaction log via its own storage
             # backend; ``storage_options`` carry the resolved credentials.
             # For a local path the options are harmlessly ignored.
@@ -197,20 +199,93 @@ class DeltaAdapter:
 # ---------------------------------------------------------------------------
 
 
-def _delta_storage_options(profile: RuntimeProfile) -> dict[str, str]:
-    """Map S3 profile keys to ``deltalake``/AWS storage-option names.
+def _s3_root_path(location: str) -> str:
+    """Return the SubTreeFileSystem root for a Delta ``location``.
 
-    Only keys present in the profile are mapped; absent keys are omitted so
-    ``deltalake`` falls back to its own credential chain for those.  Secret
-    values are never exposed in bulk — only individual present values are read.
+    The ``s3://`` scheme is stripped (the wrapped :class:`S3FileSystem` owns
+    the scheme/host) and any trailing slash is removed, so the root is a clean
+    ``bucket/prefix`` path that the relative file paths stored in the Delta
+    log resolve against.  Local paths are returned with a trailing slash
+    stripped but otherwise unchanged, so local behavior is preserved exactly.
     """
 
+    path = location.removeprefix("s3://")
+    path = path.removesuffix("/")
+    return path
+
+
+def _delta_storage_options(profile: RuntimeProfile) -> dict[str, str]:
+    """Resolve ``deltalake``/AWS storage options for a Delta S3 profile.
+
+    Mirrors the credential precedence of :func:`~selayer.sources.adapters.arrow.s3_filesystem`
+    so the DeltaTable transaction-log reader uses the same identity as the
+    dataset filesystem:
+
+    * **role session** — when ``role_arn`` is present, STS assumes the role
+      (via boto3) and the temporary credentials become
+      ``AWS_ACCESS_KEY_ID`` / ``AWS_SECRET_ACCESS_KEY`` / ``AWS_SESSION_TOKEN``.
+      If boto3 is unavailable a constant ``ValueError`` is raised outside any
+      ``except`` scope.
+    * **explicit credentials** — when ``access_key`` and ``secret_key`` are
+      present they are forwarded directly (plus an optional ``session_token``).
+    * **named/default profile** — ``AWS_PROFILE`` is set so Delta's Rust
+      ``object_store`` resolves the profile itself rather than receiving
+      long-lived credentials.
+
+    Region and endpoint are always propagated when present
+    (``AWS_REGION`` / ``AWS_ENDPOINT_URL``).  Every value is read through an
+    exact-builtin-``str`` guard, and every failure raises a *constant* message
+    outside any ``except`` scope so no credential can leak via ``error.args``,
+    the traceback, ``__cause__``, or ``__context__``.
+    """
+
+    _validate_s3_profile(profile)
+    keys = set(profile.keys())
     opts: dict[str, str] = {}
-    for profile_key, env_key in _STORAGE_OPTION_MAP.items():
-        if profile_key in profile:
-            value = profile.value(profile_key)
-            # Only an exact builtin ``str`` is accepted so a hostile subclass
-            # cannot leak its ``__repr__`` through the storage options.
-            if type(value) is str:
-                opts[env_key] = value
+
+    region = _s3_profile_value(profile, "region", None)
+    endpoint = _s3_profile_value(profile, "endpoint_override", None)
+    if region is not None:
+        opts["AWS_REGION"] = region
+    if endpoint is not None:
+        opts["AWS_ENDPOINT_URL"] = endpoint
+
+    if "role_arn" in keys:
+        access_key, secret_key, session_token = _s3_role_session_credentials(profile)
+        _add_str_storage_opt(opts, "AWS_ACCESS_KEY_ID", access_key)
+        _add_str_storage_opt(opts, "AWS_SECRET_ACCESS_KEY", secret_key)
+        _add_str_storage_opt(opts, "AWS_SESSION_TOKEN", session_token)
+    elif "access_key" in keys and "secret_key" in keys:
+        _add_str_storage_opt(
+            opts, "AWS_ACCESS_KEY_ID", _s3_profile_value(profile, "access_key", None)
+        )
+        _add_str_storage_opt(
+            opts,
+            "AWS_SECRET_ACCESS_KEY",
+            _s3_profile_value(profile, "secret_key", None),
+        )
+        _add_str_storage_opt(
+            opts,
+            "AWS_SESSION_TOKEN",
+            _s3_profile_value(profile, "session_token", None),
+        )
+    else:
+        # Named/default profile: Delta's Rust ``object_store`` consumes
+        # ``AWS_PROFILE`` directly (alongside the propagated region/endpoint)
+        # rather than receiving resolved long-lived credentials.
+        profile_name = _s3_profile_value(profile, "profile_name", None)
+        if profile_name is not None:
+            opts["AWS_PROFILE"] = profile_name
     return opts
+
+
+def _add_str_storage_opt(opts: dict[str, str], env_key: str, value: object) -> None:
+    """Add ``env_key`` only when ``value`` is an exact builtin ``str``.
+
+    A hostile ``str`` subclass whose dunders could leak a secret is rejected
+    by the exact-type guard (``type(value) is str``); ``None`` and non-string
+    values are skipped so Delta falls back to its own chain for those.
+    """
+
+    if type(value) is str:
+        opts[env_key] = value

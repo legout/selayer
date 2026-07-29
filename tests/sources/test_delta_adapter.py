@@ -7,19 +7,22 @@ deterministic Delta tables in ``tmp_path`` so every test is self-contained.
 
 from __future__ import annotations
 
+import types
 from collections.abc import Callable
 from pathlib import Path
 
 import duckdb
 import pyarrow as pa
 import pyarrow.dataset as padataset
+import pyarrow.fs as pafs
 import pytest
 from deltalake import write_deltalake
-from selayer.sources.adapters.delta import DeltaAdapter
 
 from selayer.catalog import SemanticLayer
 from selayer.model import DataSource, Fact, Measure, Metric
 from selayer.query import QueryEngine
+from selayer.sources.adapters.delta import DeltaAdapter
+from selayer.sources.base import SourceHandle
 from selayer.sources.catalog import ParsedSource
 from selayer.sources.config import DeltaConfig
 from selayer.sources.errors import SourceDependencyError, SourceSchemaError
@@ -27,6 +30,7 @@ from selayer.sources.profiles import (
     ArrowProviderResolver,
     MappingArrowProviderResolver,
     MappingProfileResolver,
+    RuntimeProfile,
     RuntimeProfileResolver,
 )
 from selayer.sources.registry import SourceRegistry
@@ -351,25 +355,41 @@ def test_delta_s3_profile_builds_filesystem(
 ) -> None:
     """A delta source with ``credential_profile`` resolves an S3 filesystem.
 
-    The filesystem is passed to ``DeltaTable.to_pyarrow_dataset``.  A
-    :class:`pyarrow.fs.SubTreeFileSystem` rooted at the table directory stands
-    in for S3 so the test needs no Docker — the relative file paths in the
-    Delta log resolve through the subtree root.
+    The adapter *wraps* the resolved filesystem in a
+    :class:`pyarrow.fs.SubTreeFileSystem` rooted at the table directory before
+    passing it to ``DeltaTable.to_pyarrow_dataset``, so the relative file paths
+    in the Delta log resolve through the subtree root.  A
+    :class:`pyarrow.fs.LocalFileSystem` stands in for the S3FileSystem so the
+    test needs no Docker.
     """
-
-    import pyarrow.fs as pafs
 
     location = tmp_path / "events.delta"
     write_deltalake(location, _events_table({"id": [1], "value": [10]}))
 
     resolved_profiles: list[str] = []
+    # The fake S3FileSystem is a *plain* LocalFileSystem — the adapter must
+    # add the SubTreeFileSystem rooting itself, not the test.
+    recording_fs = pafs.LocalFileSystem()
 
     def fake_s3_filesystem(_profile: object) -> pafs.FileSystem:
         resolved_profiles.append("s3_profile")
-        return pafs.SubTreeFileSystem(str(location), pafs.LocalFileSystem())
+        return recording_fs
 
     monkeypatch.setattr(
         "selayer.sources.adapters.delta.s3_filesystem", fake_s3_filesystem
+    )
+
+    # Record the SubTreeFileSystem the adapter constructs so the rooting and
+    # base filesystem are asserted, not merely that no exception was raised.
+    subtree_calls: list[tuple[str, pafs.FileSystem]] = []
+    real_subtree = pafs.SubTreeFileSystem
+
+    def recording_subtree(base_path: str, base_fs: pafs.FileSystem) -> pafs.FileSystem:
+        subtree_calls.append((base_path, base_fs))
+        return real_subtree(base_path, base_fs)
+
+    monkeypatch.setattr(
+        "selayer.sources.adapters.delta.pafs.SubTreeFileSystem", recording_subtree
     )
 
     source = ParsedSource(
@@ -386,12 +406,195 @@ def test_delta_s3_profile_builds_filesystem(
     handle = adapter.prepare(source, profiles, MappingArrowProviderResolver({}))
 
     assert resolved_profiles == ["s3_profile"]
+    # The adapter rooted exactly one SubTreeFileSystem at the table directory,
+    # wrapping the resolved S3 filesystem as its base.
+    assert len(subtree_calls) == 1
+    base_path, base_fs = subtree_calls[0]
+    assert base_path == str(location)
+    assert base_fs is recording_fs
 
     connection = duckdb.connect(":memory:")
     adapter.register(connection, "events", handle)
     assert connection.execute('SELECT sum("value") FROM "events"').fetchone() == (10,)
     adapter.close(handle)
     connection.close()
+
+
+# ---------------------------------------------------------------------------
+# SubTreeFileSystem root path derivation (s3:// stripping)
+# ---------------------------------------------------------------------------
+
+
+def test_delta_s3_root_path_strips_scheme_and_trailing_slash() -> None:
+    """``_s3_root_path`` strips ``s3://`` and any trailing slash.
+
+    The wrapped S3FileSystem owns the ``s3://`` scheme/host, so the
+    SubTreeFileSystem root is a clean ``bucket/prefix`` path.  Local paths are
+    returned unchanged (trailing slash stripped) so local behavior is exact.
+    """
+
+    from selayer.sources.adapters.delta import _s3_root_path
+
+    assert _s3_root_path("s3://my-bucket/data/events/") == "my-bucket/data/events"
+    assert _s3_root_path("s3://my-bucket/data/events") == "my-bucket/data/events"
+    # A local path has no scheme to strip; only a trailing slash is removed.
+    assert _s3_root_path("/local/path/events.delta") == "/local/path/events.delta"
+    assert _s3_root_path("/local/path/events.delta/") == "/local/path/events.delta"
+
+
+# ---------------------------------------------------------------------------
+# Storage options credential modes
+# ---------------------------------------------------------------------------
+
+
+def test_delta_storage_options_explicit_credentials() -> None:
+    """Explicit access/secret/session are forwarded plus region/endpoint."""
+
+    from selayer.sources.adapters.delta import _delta_storage_options
+
+    profile = RuntimeProfile(
+        "s3",
+        {
+            "access_key": "AKIA_EXPLICIT",
+            "secret_key": "SECRET_EXPLICIT",
+            "session_token": "TOKEN_EXPLICIT",
+            "region": "us-east-1",
+            "endpoint_override": "http://minio:9000",
+        },
+    )
+    assert _delta_storage_options(profile) == {
+        "AWS_ACCESS_KEY_ID": "AKIA_EXPLICIT",
+        "AWS_SECRET_ACCESS_KEY": "SECRET_EXPLICIT",
+        "AWS_SESSION_TOKEN": "TOKEN_EXPLICIT",
+        "AWS_REGION": "us-east-1",
+        "AWS_ENDPOINT_URL": "http://minio:9000",
+    }
+
+
+def test_delta_storage_options_profile_name_uses_aws_profile() -> None:
+    """A named/default profile emits ``AWS_PROFILE`` (not resolved creds)."""
+
+    from selayer.sources.adapters.delta import _delta_storage_options
+
+    profile = RuntimeProfile(
+        "s3",
+        {"profile_name": "dev", "region": "us-west-2"},
+    )
+    assert _delta_storage_options(profile) == {
+        "AWS_PROFILE": "dev",
+        "AWS_REGION": "us-west-2",
+    }
+
+
+def test_delta_storage_options_default_chain_propagates_region_only() -> None:
+    """No credentials and no profile name propagate region/endpoint only."""
+
+    from selayer.sources.adapters.delta import _delta_storage_options
+
+    profile = RuntimeProfile("s3", {"region": "eu-central-1"})
+    assert _delta_storage_options(profile) == {"AWS_REGION": "eu-central-1"}
+
+
+def test_delta_storage_options_role_arn(monkeypatch) -> None:
+    """``role_arn`` assumes the role via STS and forwards temporary creds."""
+
+    pytest.importorskip("boto3")
+    from selayer.sources.adapters import arrow as arrow_mod
+    from selayer.sources.adapters.delta import _delta_storage_options
+
+    class _STS:
+        def assume_role(self, **kwargs: object) -> dict[str, object]:
+            assert kwargs["RoleArn"] == "arn:aws:iam::1:role/selayer"
+            assert kwargs["RoleSessionName"] == "selayer-session"
+            return {
+                "Credentials": {
+                    "AccessKeyId": "ROLE_AK",
+                    "SecretAccessKey": "ROLE_SK",
+                    "SessionToken": "ROLE_TOK",
+                }
+            }
+
+    class _Client:
+        def __init__(self, service_name: str, **_kwargs: object) -> None:
+            assert service_name == "sts"
+            self._sts = _STS()
+
+        def assume_role(self, **kwargs: object) -> dict[str, object]:
+            return self._sts.assume_role(**kwargs)
+
+    fake_boto3 = types.SimpleNamespace(client=_Client)
+    monkeypatch.setattr(arrow_mod, "boto3", fake_boto3)
+
+    profile = RuntimeProfile(
+        "s3",
+        {
+            "role_arn": "arn:aws:iam::1:role/selayer",
+            "session_name": "selayer-session",
+            "region": "eu-west-1",
+        },
+    )
+    assert _delta_storage_options(profile) == {
+        "AWS_ACCESS_KEY_ID": "ROLE_AK",
+        "AWS_SECRET_ACCESS_KEY": "ROLE_SK",
+        "AWS_SESSION_TOKEN": "ROLE_TOK",
+        "AWS_REGION": "eu-west-1",
+    }
+
+
+def test_delta_storage_options_role_arn_without_boto3_is_sanitized(
+    monkeypatch,
+) -> None:
+    """``role_arn`` without boto3 raises a constant error with no leak."""
+
+    from selayer.sources.adapters import arrow as arrow_mod
+    from selayer.sources.adapters.delta import _delta_storage_options
+
+    monkeypatch.setattr(arrow_mod, "boto3", None)
+
+    role_secret = "arn:aws:iam::1:role/SECRETROLE"
+    profile = RuntimeProfile(
+        "s3",
+        {"role_arn": role_secret, "region": "eu-west-1"},
+    )
+    with pytest.raises(ValueError) as caught:
+        _delta_storage_options(profile)
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert "SECRETROLE" not in repr(caught.value)
+    assert "SECRETROLE" not in repr(caught.value.args)
+
+
+def test_delta_storage_options_hostile_subclass_is_rejected() -> None:
+    """A hostile ``str`` subclass credential is rejected before any dunder."""
+
+    from selayer.sources.adapters import arrow as arrow_mod
+    from selayer.sources.adapters.delta import _delta_storage_options
+
+    hostile = "HOSTILE_STR_DUNDER_SENTINEL"
+
+    class _LeakyStr(str):
+        __slots__ = ()
+
+        def __repr__(self) -> str:
+            raise RuntimeError(hostile)
+
+        def __hash__(self) -> int:
+            raise RuntimeError(hostile)
+
+        def __eq__(self, other: object) -> bool:
+            raise RuntimeError(hostile)
+
+    profile = RuntimeProfile(
+        "s3",
+        {"access_key": _LeakyStr("AKIA"), "secret_key": "shh"},
+    )
+    with pytest.raises(ValueError) as caught:
+        _delta_storage_options(profile)
+
+    assert hostile not in repr(caught.value)
+    # The sentinel must not be imported into the arrow module namespace.
+    assert not hasattr(arrow_mod, "_LeakyStr")
 
 
 # ---------------------------------------------------------------------------
@@ -437,15 +640,52 @@ def test_delta_status_contains_integer_version_only(
 
 
 def test_delta_handles_close_after_reload_and_engine_close(
+    monkeypatch,
     tmp_path: Path,
     delta_layer_factory: Callable[[str | Path], SemanticLayer],
 ) -> None:
+    """Reload and engine close clear both old and current Delta resources.
+
+    Spy objects wrap ``DeltaAdapter.prepare``/``close`` to capture every
+    handle, proving that the *old* DeltaTable and Dataset resources are
+    cleared after a reload and the *current* ones are cleared after the engine
+    closes — not merely that no exception is raised.
+    """
+
+    prepared: list[SourceHandle] = []
+    closed: list[SourceHandle] = []
+    real_prepare = DeltaAdapter.prepare
+    real_close = DeltaAdapter.close
+
+    def recording_prepare(
+        self: DeltaAdapter,
+        source: ParsedSource,
+        profiles: RuntimeProfileResolver,
+        providers: ArrowProviderResolver,
+    ) -> SourceHandle:
+        handle = real_prepare(self, source, profiles, providers)
+        prepared.append(handle)
+        return handle
+
+    def recording_close(self: DeltaAdapter, handle: SourceHandle) -> None:
+        closed.append(handle)
+        real_close(self, handle)
+
+    monkeypatch.setattr(DeltaAdapter, "prepare", recording_prepare)
+    monkeypatch.setattr(DeltaAdapter, "close", recording_close)
+
     location = tmp_path / "events.delta"
     write_deltalake(location, _events_table({"id": [1], "value": [10]}))
     layer = delta_layer_factory(location)
 
     engine = QueryEngine(layer)
     assert engine.query(["total_value"])["total_value"].item() == 10
+
+    # The first handle carries populated DeltaTable and Dataset resources.
+    assert len(prepared) == 1
+    first = prepared[0]
+    assert first.resource.table is not None  # type: ignore[attr-defined]
+    assert first.resource.dataset is not None  # type: ignore[attr-defined]
 
     write_deltalake(
         location,
@@ -455,6 +695,18 @@ def test_delta_handles_close_after_reload_and_engine_close(
     engine.reload_source("events")
     assert engine.query(["total_value"])["total_value"].item() == 30
 
-    # Closing the engine closes every handle (old + new) and the connection
-    # without raising.
+    # Two handles have been prepared (old + current); the OLD handle's
+    # DeltaTable and Dataset were cleared by the reload swap.
+    assert len(prepared) == 2
+    current = prepared[1]
+    assert current.resource.table is not None  # type: ignore[attr-defined]
+    assert current.resource.dataset is not None  # type: ignore[attr-defined]
+    assert first in closed
+    assert first.resource.table is None  # type: ignore[attr-defined]
+    assert first.resource.dataset is None  # type: ignore[attr-defined]
+
+    # Closing the engine clears the CURRENT handle's resources too.
     engine.close()
+    assert current in closed
+    assert current.resource.table is None  # type: ignore[attr-defined]
+    assert current.resource.dataset is None  # type: ignore[attr-defined]
