@@ -21,28 +21,51 @@ data_sources:
     grain: [id]
     schema:
       fields:
-        - {name: id, type: utf8, nullable: false}
-        - {name: created_at, type: {timestamp: {unit: us}}, nullable: false}
+        - {name: id, type: utf8, nullable: true}
+        - {name: customer_id, type: utf8, nullable: true}
+        - name: created_at
+          type:
+            timestamp: {unit: ns}
+          nullable: true
+        - {name: status, type: utf8, nullable: true}
+        - {name: payment_method, type: utf8, nullable: true}
+        - {name: shipping_cost, type: float64, nullable: true}
+        - {name: discount_code, type: utf8, nullable: true}
+        - {name: discount_amount, type: float64, nullable: true}
+        - {name: reason, type: utf8, nullable: true}
+        - {name: is_first_purchase, type: boolean, nullable: true}
+        - {name: amount, type: float64, nullable: true}
+        - {name: total_amount, type: float64, nullable: true}
   order_items:
     type: parquet
     location: data/order_items.parquet
     grain: [order_id, product_id]
     schema:
       fields:
-        - {name: order_id, type: utf8, nullable: false}
-        - {name: product_id, type: utf8, nullable: false}
-        - {name: quantity, type: int64, nullable: false}
-        - {name: total, type: float64, nullable: false}
+        - {name: order_id, type: utf8, nullable: true}
+        - {name: product_id, type: utf8, nullable: true}
+        - {name: quantity, type: int64, nullable: true}
+        - {name: price, type: float64, nullable: true}
+        - {name: total, type: float64, nullable: true}
   products:
     type: parquet
     location: data/products.parquet
     grain: [id]
     schema:
       fields:
-        - {name: id, type: utf8, nullable: false}
-        - {name: category, type: utf8, nullable: false}
-        - {name: cost, type: float64, nullable: false}
-        - {name: in_stock, type: int64, nullable: false}
+        - {name: id, type: utf8, nullable: true}
+        - {name: name, type: utf8, nullable: true}
+        - {name: category, type: utf8, nullable: true}
+        - {name: subcategory, type: utf8, nullable: true}
+        - {name: base_price, type: float64, nullable: true}
+        - {name: cost, type: float64, nullable: true}
+        - {name: in_stock, type: int64, nullable: true}
+        - {name: supplier_id, type: int64, nullable: true}
+        - name: created_at
+          type:
+            timestamp: {unit: ns}
+          nullable: true
+        - {name: is_active, type: boolean, nullable: true}
 dimensions:
   product_category:
     source: products

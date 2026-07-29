@@ -7,7 +7,7 @@ import duckdb
 import polars as pl
 
 from selayer.catalog import SemanticLayer
-from selayer.compilation import compile_duckdb
+from selayer.compilation import CompiledQuery, compile_duckdb
 from selayer.errors import QueryExecutionError
 from selayer.planning import QueryPlan, QueryRequest, plan_query
 from selayer.sources.base import ReloadResult, SourceStatus
@@ -116,15 +116,21 @@ class QueryEngine:
     ) -> pl.DataFrame:
         """Execute a semantic query and return its result as Polars."""
         plan = self.plan(metrics, dimensions, filters)
-        compiled = compile_duckdb(plan)
         query_id = str(uuid4())
         execution_error: QueryExecutionError | None = None
         result: pl.DataFrame | None = None
+        compiled: CompiledQuery | None = None
         try:
             with self._registry.bind(plan):
+                # Compile inside the binding so the query-scoped sources are
+                # registered before compilation and the registry lock is held
+                # across both compile and execute.
+                compiled = compile_duckdb(plan)
                 result = self._registry.execute(compiled.sql, compiled.parameters).pl()
         except duckdb.Error as error:
-            if compiled.parameters:
+            if compiled is None:
+                message = f"query execution failed: {error}"
+            elif compiled.parameters:
                 category = _duckdb_diagnostic_category(error)
                 message = (
                     f"query execution failed: parameterized query failed ({category})"

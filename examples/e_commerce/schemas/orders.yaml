@@ -1,13 +1,16 @@
 fields:
-  - {name: id, type: utf8, nullable: false}
+  - {name: id, type: utf8, nullable: true}
   - {name: customer_id, type: utf8, nullable: true}
   - name: created_at
     type:
-      timestamp: {unit: ns, timezone: UTC}
+      timestamp: {unit: ns}
     nullable: true
   - {name: status, type: utf8, nullable: true}
   - {name: payment_method, type: utf8, nullable: true}
   - {name: shipping_cost, type: float64, nullable: true}
+  - {name: discount_code, type: utf8, nullable: true}
   - {name: discount_amount, type: float64, nullable: true}
+  - {name: reason, type: utf8, nullable: true}
+  - {name: is_first_purchase, type: boolean, nullable: true}
   - {name: amount, type: float64, nullable: true}
   - {name: total_amount, type: float64, nullable: true}

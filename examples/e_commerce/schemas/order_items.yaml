@@ -1,5 +1,6 @@
 fields:
-  - {name: order_id, type: utf8, nullable: false}
-  - {name: product_id, type: utf8, nullable: false}
-  - {name: quantity, type: int64, nullable: false}
-  - {name: total, type: float64, nullable: false}
+  - {name: order_id, type: utf8, nullable: true}
+  - {name: product_id, type: utf8, nullable: true}
+  - {name: quantity, type: int64, nullable: true}
+  - {name: price, type: float64, nullable: true}
+  - {name: total, type: float64, nullable: true}

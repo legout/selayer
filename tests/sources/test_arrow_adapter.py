@@ -8,6 +8,8 @@ is self-contained.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import duckdb
@@ -19,9 +21,15 @@ from selayer.catalog import SemanticLayer
 from selayer.model import DataSource, Fact, Measure, Metric
 from selayer.query import QueryEngine
 from selayer.sources.adapters.arrow import ArrowDatasetAdapter
+from selayer.sources.base import QueryBinding, SourceHandle, SourceScanRequirement
 from selayer.sources.catalog import ParsedSource
-from selayer.sources.config import CsvConfig, ParquetConfig, PyArrowConfig
-from selayer.sources.errors import SourceConnectionError
+from selayer.sources.config import (
+    CsvConfig,
+    ParquetConfig,
+    PyArrowConfig,
+    SourceConnector,
+)
+from selayer.sources.errors import SourceConnectionError, SourceSchemaError
 from selayer.sources.profiles import (
     ArrowObject,
     ArrowProviderResolver,
@@ -29,6 +37,7 @@ from selayer.sources.profiles import (
     MappingProfileResolver,
     RuntimeProfileResolver,
 )
+from selayer.sources.registry import SourceRegistry
 from selayer.sources.schema import (
     FieldSchema,
     ScalarType,
@@ -365,3 +374,308 @@ def test_compare_schemas_detects_extra_observed_field() -> None:
     )
     mismatches = compare_schemas(declared, observed)
     assert any(mismatch.code == "extra_observed_field" for mismatch in mismatches)
+
+
+# ---------------------------------------------------------------------------
+# Physical schema drift regressions (registry gate: compare before register)
+# ---------------------------------------------------------------------------
+#
+# The registry validates a candidate's *observed* physical schema against the
+# declared schema with ``compare_schemas`` *before* committing any DuckDB
+# registration — both at initial creation and on every reload.  These tests
+# prove, for parquet and csv and for both physical-type and extra-column drift:
+#
+# * the drift is detected *before* registration (a register-spy records zero
+#   ``register`` calls at initialization; on reload the candidate is never
+#   swapped in);
+# * after a failed *reload*, the previously registered data and generation
+#   remain queryable (no half-swap);
+# * every drift error is sanitized — ``__cause__``/``__context__`` are ``None``
+#   and the constant message echoes neither the observed schema, the location
+#   (whose path carries a ``secret`` token), nor any driver text.
+#
+# ``compare_schemas`` is *not* weakened: the fixtures simply write data whose
+# physical schema genuinely drifts from the declaration.
+
+
+class _RegisterSpy:
+    """Adapter wrapper recording every ``register`` call.
+
+    Delegates every lifecycle method to a real
+    :class:`~selayer.sources.adapters.arrow.ArrowDatasetAdapter` while appending
+    each registered ``stable_name`` to :attr:`register_calls`, so a drift test
+    can prove ``register`` was never reached for a rejected candidate.
+    """
+
+    def __init__(self, inner: ArrowDatasetAdapter) -> None:
+        self._inner = inner
+        self.register_calls: list[str] = []
+
+    def prepare(
+        self,
+        source: ParsedSource,
+        profiles: RuntimeProfileResolver,
+        arrow_providers: ArrowProviderResolver,
+    ) -> SourceHandle:
+        return self._inner.prepare(source, profiles, arrow_providers)
+
+    def inspect_schema(self, handle: SourceHandle) -> TableSchema:
+        return self._inner.inspect_schema(handle)
+
+    def register(
+        self, connection: object, stable_name: str, handle: SourceHandle
+    ) -> None:
+        self.register_calls.append(stable_name)
+        self._inner.register(connection, stable_name, handle)
+
+    def bind_query(
+        self, handle: SourceHandle, requirement: SourceScanRequirement
+    ) -> QueryBinding | None:
+        return self._inner.bind_query(handle, requirement)
+
+    def close(self, handle: SourceHandle) -> None:
+        self._inner.close(handle)
+
+
+@dataclass(frozen=True)
+class _DriftCase:
+    """One physical-drift scenario (connector kind x drift kind)."""
+
+    label: str
+    declared: TableSchema
+    write_valid: Callable[[Path], None]
+    write_drifted: Callable[[Path], None]
+    connector: Callable[[str], SourceConnector]
+    mismatch_code: str
+
+
+def _parquet_connector(location: str) -> SourceConnector:
+    return ParquetConfig(location)
+
+
+def _csv_connector(location: str) -> SourceConnector:
+    return CsvConfig(location)
+
+
+def _write_parquet(path: Path, columns: dict[str, object], schema: pa.Schema) -> None:
+    pq.write_table(
+        pa.Table.from_arrays(
+            [pa.array(columns[field.name], field.type) for field in schema],
+            schema=schema,
+        ),
+        path,
+    )
+
+
+def _pq_valid_single(path: Path) -> None:
+    _write_parquet(
+        path,
+        {"id": [1, 2, 3]},
+        pa.schema([pa.field("id", pa.int64(), nullable=False)]),
+    )
+
+
+def _pq_valid_typed(path: Path) -> None:
+    _write_parquet(
+        path,
+        {"id": [1, 2, 3], "amount": [1.0, 2.0, 3.0]},
+        pa.schema(
+            [
+                pa.field("id", pa.int64(), nullable=False),
+                pa.field("amount", pa.float64(), nullable=False),
+            ]
+        ),
+    )
+
+
+def _pq_drifted_with_int_amount(path: Path) -> None:
+    # ``id`` values are unchanged ([1, 2, 3]); an extra/drifting ``amount``
+    # column is int64, which is either an extra field or a type drift
+    # depending on the declared schema.
+    _write_parquet(
+        path,
+        {"id": [1, 2, 3], "amount": [5, 15, 3]},
+        pa.schema(
+            [
+                pa.field("id", pa.int64(), nullable=False),
+                pa.field("amount", pa.int64(), nullable=False),
+            ]
+        ),
+    )
+
+
+def _csv_valid_single(path: Path) -> None:
+    path.write_text("id\n1\n2\n3\n", encoding="utf-8")
+
+
+def _csv_valid_typed(path: Path) -> None:
+    # ``amount`` holds floats so CSV inference reads it back as float64.
+    path.write_text("id,amount\n1,1.0\n2,2.0\n3,3.0\n", encoding="utf-8")
+
+
+def _csv_drifted_with_int_amount(path: Path) -> None:
+    # ``id`` values are unchanged ([1, 2, 3]); ``amount`` is integer-only so CSV
+    # inference reads it back as int64 (an extra field or a float64->int64
+    # type drift depending on the declared schema).
+    path.write_text("id,amount\n1,5\n2,15\n3,3\n", encoding="utf-8")
+
+
+_DRIFT_CASES: tuple[_DriftCase, ...] = (
+    _DriftCase(
+        label="parquet-extra-column",
+        declared=TableSchema((FieldSchema("id", ScalarType("int64"), False),)),
+        write_valid=_pq_valid_single,
+        write_drifted=_pq_drifted_with_int_amount,
+        connector=_parquet_connector,
+        mismatch_code="extra_observed_field",
+    ),
+    _DriftCase(
+        label="parquet-physical-type",
+        declared=TableSchema(
+            (
+                FieldSchema("id", ScalarType("int64"), False),
+                FieldSchema("amount", ScalarType("float64"), False),
+            )
+        ),
+        write_valid=_pq_valid_typed,
+        write_drifted=_pq_drifted_with_int_amount,
+        connector=_parquet_connector,
+        mismatch_code="field_type",
+    ),
+    _DriftCase(
+        label="csv-extra-column",
+        declared=TableSchema((FieldSchema("id", ScalarType("int64"), True),)),
+        write_valid=_csv_valid_single,
+        write_drifted=_csv_drifted_with_int_amount,
+        connector=_csv_connector,
+        mismatch_code="extra_observed_field",
+    ),
+    _DriftCase(
+        label="csv-physical-type",
+        declared=TableSchema(
+            (
+                FieldSchema("id", ScalarType("int64"), True),
+                FieldSchema("amount", ScalarType("float64"), True),
+            )
+        ),
+        write_valid=_csv_valid_typed,
+        write_drifted=_csv_drifted_with_int_amount,
+        connector=_csv_connector,
+        mismatch_code="field_type",
+    ),
+)
+
+
+def _orders_layer(connector: SourceConnector, schema: TableSchema) -> SemanticLayer:
+    return SemanticLayer(
+        1,
+        "drift",
+        "",
+        "",
+        {
+            "orders": DataSource(
+                name="orders",
+                connector=connector,
+                schema=schema,
+                grain=("id",),
+            )
+        },
+        {},
+        {},
+        {},
+        {},
+        {},
+    )
+
+
+@pytest.mark.parametrize("case", _DRIFT_CASES, ids=[c.label for c in _DRIFT_CASES])
+def test_physical_drift_prevents_initialization(
+    case: _DriftCase,
+    tmp_path: Path,
+    profiles: RuntimeProfileResolver,
+    providers: ArrowProviderResolver,
+) -> None:
+    # The drifted file path deliberately carries a ``secret`` token so the
+    # sanitized-error assertions are meaningful: the connector ``location``
+    # would leak if the drift error ever echoed it.
+    path = tmp_path / "orders_secret"
+    case.write_drifted(path)
+    connector = case.connector(str(path))
+    declared = case.declared
+
+    # 1. The adapter gate detects the drift on the prepared candidate before
+    #    any registration could occur.
+    adapter = ArrowDatasetAdapter()
+    handle = adapter.prepare(
+        ParsedSource(
+            name="orders", connector=connector, schema=declared, grain=("id",)
+        ),
+        profiles,
+        providers,
+    )
+    observed = adapter.inspect_schema(handle)
+    mismatches = compare_schemas(declared, observed)
+    assert any(mismatch.code == case.mismatch_code for mismatch in mismatches)
+    adapter.close(handle)
+
+    # 2. A register-spy proves ``register`` is never called for the drifted
+    #    candidate, and the registry surfaces a sanitized initialization error.
+    spy = _RegisterSpy(ArrowDatasetAdapter())
+    connection = duckdb.connect(":memory:")
+    with pytest.raises(SourceConnectionError) as caught:
+        SourceRegistry.create(
+            _orders_layer(connector, declared),
+            connection,
+            profiles,
+            providers,
+            adapters={"parquet": spy, "csv": spy, "pyarrow": spy},
+        )
+
+    assert caught.value.code == "source_initialization_failed"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert "secret" not in str(caught.value)
+    # No registration was committed before the mismatch was detected.
+    assert spy.register_calls == []
+
+
+@pytest.mark.parametrize("case", _DRIFT_CASES, ids=[c.label for c in _DRIFT_CASES])
+def test_physical_drift_on_reload_keeps_old_registration(
+    case: _DriftCase,
+    tmp_path: Path,
+    profiles: RuntimeProfileResolver,
+    providers: ArrowProviderResolver,
+) -> None:
+    path = tmp_path / "orders_secret"
+    case.write_valid(path)
+    connector = case.connector(str(path))
+    declared = case.declared
+
+    connection = duckdb.connect(":memory:")
+    registry = SourceRegistry.create(
+        _orders_layer(connector, declared), connection, profiles, providers
+    )
+    # The source is live at generation 1 and its ``id`` values sum to 6.
+    assert registry.status("orders").generation == 1
+    assert registry.execute('SELECT sum("id") FROM "orders"').fetchone() == (6,)
+
+    # Overwrite the file with a drifted physical schema.  The ``id`` values are
+    # unchanged ([1, 2, 3]); only the drifted column differs, so the *old*
+    # registered dataset still reads the original ``id`` projection after the
+    # rejected reload.
+    case.write_drifted(path)
+
+    with pytest.raises(SourceSchemaError) as caught:
+        registry.reload_source("orders")
+
+    assert caught.value.code == "schema_mismatch"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert "secret" not in str(caught.value)
+
+    # The failed reload did not swap the registration: the generation is
+    # unchanged and the previously registered data is still queryable.
+    assert registry.status("orders").generation == 1
+    assert registry.execute('SELECT sum("id") FROM "orders"').fetchone() == (6,)
+
+    registry.close()

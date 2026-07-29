@@ -99,9 +99,12 @@ class ArrowDatasetAdapter:
             return _handle_for_arrow_object(source, resource, provider)
         if kind == "parquet":
             assert isinstance(connector, ParquetConfig)
-            resource = padataset.dataset(
-                connector.location, schema=arrow_schema, format="parquet"
-            )
+            # Build *without* a schema override so the physical Parquet schema
+            # is observed by ``inspect_schema`` and any drift (type, extra
+            # field, nullability) is caught by ``compare_schemas`` before the
+            # source is registered.  DuckDB still gets ARROW_SCAN pushdown over
+            # the physical dataset.
+            resource = padataset.dataset(connector.location, format="parquet")
         elif kind == "csv":
             assert isinstance(connector, CsvConfig)
             resource = _csv_dataset(connector, arrow_schema)
@@ -121,9 +124,11 @@ class ArrowDatasetAdapter:
     def inspect_schema(self, handle: SourceHandle) -> TableSchema:
         resource = handle.resource
         arrow_schema = _resource_schema(resource)
-        # The declared schema was used to build the resource, so the observed
-        # Arrow schema round-trips through the logical model; comparing the two
-        # logical schemas catches any drift introduced by a provider.
+        # The resource carries the *observed* Arrow schema: the physical
+        # Parquet schema, the reconciled CSV schema (physical types with
+        # declared nullability), or the provider object's schema.  Converting
+        # it back to the logical model lets the registry compare it against
+        # the declaration and reject any drift before registration.
         from selayer.sources.schema import table_schema_from_arrow
 
         return table_schema_from_arrow(arrow_schema)
@@ -178,25 +183,68 @@ def _connector_kind(connector: SourceConnector) -> str:
     return type(connector).__name__
 
 
-def _csv_dataset(connector: CsvConfig, arrow_schema: pa.Schema) -> padataset.Dataset:
+def _csv_dataset(connector: CsvConfig, declared_schema: pa.Schema) -> padataset.Dataset:
     parse_options = pacsv.ParseOptions(
         delimiter=connector.delimiter,
         quote_char=connector.quote_char,
         escape_char=connector.escape_char,
     )
-    read_options = pacsv.ReadOptions(autogenerate_column_names=False)
+    # Probe the *physical* CSV schema without a declared type override so the
+    # file's own inferred types are observed.  CSV type inference marks every
+    # column ``nullable=True`` regardless of the data, so the probe alone would
+    # produce false mismatches against declared non-nullable fields.  For a
+    # header-less file there is no header row to read names from, so the
+    # declared field names are used positionally.
     if not connector.has_header:
-        # When there is no header, columns are positional; the declared schema
-        # names them.  PyArrow still needs to know there is no header row.
         read_options = pacsv.ReadOptions(
-            column_names=list(arrow_schema.names), autogenerate_column_names=False
+            column_names=list(declared_schema.names), autogenerate_column_names=False
         )
-    format_options = padataset.CsvFileFormat(
+    else:
+        read_options = pacsv.ReadOptions(autogenerate_column_names=False)
+    probe_format = padataset.CsvFileFormat(
+        parse_options=parse_options, read_options=read_options
+    )
+    physical_schema = padataset.dataset(connector.location, format=probe_format).schema
+    # Reconcile by position: keep the physical inferred types (so type drift
+    # and any extra columns remain observable) but adopt the declared
+    # nullability for declared positions so inference's ``nullable=True`` does
+    # not create a false mismatch.  Columns beyond the declaration keep their
+    # physical nullability so an extra field still surfaces as drift.
+    reconciled_schema = _reconcile_csv_schema(physical_schema, declared_schema)
+    final_format = padataset.CsvFileFormat(
         parse_options=parse_options, read_options=read_options
     )
     return padataset.dataset(
-        connector.location, schema=arrow_schema, format=format_options
+        connector.location, schema=reconciled_schema, format=final_format
     )
+
+
+def _reconcile_csv_schema(
+    physical_schema: pa.Schema, declared_schema: pa.Schema
+) -> pa.Schema:
+    """Adopt declared nullability by position while keeping physical types.
+
+    The physical types (and any extra fields beyond the declaration) are
+    preserved so genuine type drift and extra columns stay observable for
+    :func:`~selayer.sources.schema.compare_schemas`; only the nullability of
+    the declared positions is taken from the declaration, neutralizing CSV
+    inference's unconditional ``nullable=True``.
+    """
+
+    fields: list[pa.Field] = []
+    for index, physical_field in enumerate(physical_schema):
+        if index < len(declared_schema):
+            declared_field = declared_schema.field(index)
+            fields.append(
+                pa.field(
+                    physical_field.name,
+                    physical_field.type,
+                    nullable=declared_field.nullable,
+                )
+            )
+        else:
+            fields.append(physical_field)
+    return pa.schema(fields)
 
 
 def _handle_for_arrow_object(

@@ -1,4 +1,14 @@
 fields:
-  - {name: id, type: utf8, nullable: false}
+  - {name: id, type: utf8, nullable: true}
+  - {name: email, type: utf8, nullable: true}
+  - {name: name, type: utf8, nullable: true}
   - {name: segment, type: utf8, nullable: true}
+  - {name: acquisition_channel, type: utf8, nullable: true}
+  - name: registration_date
+    type:
+      timestamp: {unit: ns}
+    nullable: true
   - {name: country, type: utf8, nullable: true}
+  - {name: city, type: utf8, nullable: true}
+  - {name: is_active, type: boolean, nullable: true}
+  - {name: lifetime_value, type: float64, nullable: true}
