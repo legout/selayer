@@ -39,6 +39,7 @@ from selayer.sources.config import (
     PyArrowConfig,
     SourceConnector,
     SqliteConfig,
+    _format_repr,
     _sanitize_location,
 )
 from selayer.sources.schema import (
@@ -84,6 +85,21 @@ class ParsedSource:
     connector: SourceConnector
     schema: TableSchema
     grain: tuple[str, ...]
+
+    def __repr__(self) -> str:
+        # ``grain`` is a tuple of non-empty strings that could carry embedded
+        # URI userinfo; route it (and ``name``) through the centralized
+        # sanitizer.  ``connector`` renders via its own safe repr and
+        # ``schema`` carries no connector credentials.
+        return _format_repr(
+            "ParsedSource",
+            [
+                ("name", self.name),
+                ("connector", self.connector),
+                ("schema", self.schema),
+                ("grain", self.grain),
+            ],
+        )
 
 
 # ---------------------------------------------------------------------------

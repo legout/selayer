@@ -5,6 +5,18 @@ structural equality.  The :data:`SourceConnector` union is closed: every
 adapter receives one of these concrete configs, never an arbitrary option
 mapping.  :func:`connector_kind` returns the YAML discriminator for a config
 without requiring ``isinstance`` switches outside this module.
+
+**Secret-safe reprs.**  Every connector config — and
+:class:`~selayer.sources.catalog.ParsedSource` — defines an explicit
+``__repr__`` that routes *every* string-bearing field through the centralized
+:func:`_safe` sanitizer (backed by :func:`_sanitize_location`).  The binding
+requirement is that credentials and authenticated locations never appear in
+reprs, catalogs, or error text; several string fields (``location``,
+``table``, ``namespace``, ``handle``, ``grain``) are validated only as
+non-empty strings and so could carry embedded URI userinfo, so the sanitizer
+is applied defensively to all of them.  For credential-free values the
+formatted repr is byte-identical to the default dataclass ``__repr__``, and
+dataclass equality / required fields are unchanged.
 """
 
 from __future__ import annotations
@@ -35,15 +47,55 @@ _URI_USERINFO = re.compile(r"(://)[^@/?#]*@")
 
 
 def _sanitize_location(location: str) -> str:
-    """Redact embedded URI userinfo (credentials) from a location string.
+    """Redact embedded URI userinfo (credentials) from a string.
 
     Only the ``userinfo@`` segment of a URI authority is removed; the scheme,
     host, port, and path are preserved so diagnostics remain useful.  Strings
     without a ``scheme://user:password@host`` authority (local paths, plain
-    references) are returned unchanged.
+    references, validated identifiers) are returned unchanged.  This is the
+    low-level redactor; :func:`_safe` is the field-level entry point used by
+    every config ``__repr__``.
     """
 
     return _URI_USERINFO.sub(r"\1", location)
+
+
+def _safe(value: object) -> object:
+    """Return a repr-safe projection of a field value.
+
+    The single sanitizer every connector ``__repr__`` routes string-bearing
+    fields through:
+
+    * **strings** are userinfo-redacted via :func:`_sanitize_location`;
+    * **tuples** (e.g. ``namespace``, ``grain``) are projected element-wise so
+      credentials nested inside a sequence are redacted too;
+    * every other value (``None``, ``bool``, and nested objects such as a
+      connector or schema) passes through unchanged so its own ``__repr__`` is
+      used.
+
+    For credential-free values the result is byte-identical to the default
+    ``repr``, so dataclass equality semantics and rendered diagnostics are
+    unchanged for well-formed inputs.
+    """
+
+    if isinstance(value, str):
+        return _sanitize_location(value)
+    if isinstance(value, tuple):
+        return tuple(_safe(item) for item in value)
+    return value
+
+
+def _format_repr(name: str, fields: list[tuple[str, object]]) -> str:
+    """Render a ``Name(field=value, ...)`` repr with all values sanitized.
+
+    Each value is routed through :func:`_safe` before being formatted with
+    ``!r``, so the rendered output is byte-identical to the default dataclass
+    ``__repr__`` for credential-free inputs while guaranteeing no embedded URI
+    userinfo can leak for any string-bearing field.
+    """
+
+    body = ", ".join(f"{field}={_safe(value)!r}" for field, value in fields)
+    return f"{name}({body})"
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,11 +106,14 @@ class ParquetConfig:
     credential_profile: str | None = None
 
     def __repr__(self) -> str:
-        # Locations may carry URI userinfo (``s3://key:secret@bucket``);
-        # redact it so credentials never surface in diagnostics.
-        return (
-            f"ParquetConfig(location={_sanitize_location(self.location)!r},"
-            f" credential_profile={self.credential_profile!r})"
+        # Every string-bearing field is routed through the centralized
+        # sanitizer so embedded URI userinfo can never surface in diagnostics.
+        return _format_repr(
+            "ParquetConfig",
+            [
+                ("location", self.location),
+                ("credential_profile", self.credential_profile),
+            ],
         )
 
 
@@ -74,14 +129,16 @@ class CsvConfig:
     has_header: bool = True
 
     def __repr__(self) -> str:
-        # See ParquetConfig: redact any URI userinfo from the location.
-        return (
-            f"CsvConfig(location={_sanitize_location(self.location)!r},"
-            f" credential_profile={self.credential_profile!r},"
-            f" delimiter={self.delimiter!r},"
-            f" quote_char={self.quote_char!r},"
-            f" escape_char={self.escape_char!r},"
-            f" has_header={self.has_header!r})"
+        return _format_repr(
+            "CsvConfig",
+            [
+                ("location", self.location),
+                ("credential_profile", self.credential_profile),
+                ("delimiter", self.delimiter),
+                ("quote_char", self.quote_char),
+                ("escape_char", self.escape_char),
+                ("has_header", self.has_header),
+            ],
         )
 
 
@@ -93,10 +150,12 @@ class DeltaConfig:
     credential_profile: str | None = None
 
     def __repr__(self) -> str:
-        # See ParquetConfig: redact any URI userinfo from the location.
-        return (
-            f"DeltaConfig(location={_sanitize_location(self.location)!r},"
-            f" credential_profile={self.credential_profile!r})"
+        return _format_repr(
+            "DeltaConfig",
+            [
+                ("location", self.location),
+                ("credential_profile", self.credential_profile),
+            ],
         )
 
 
@@ -108,6 +167,18 @@ class IcebergConfig:
     namespace: tuple[str, ...]
     table: str
 
+    def __repr__(self) -> str:
+        # ``namespace`` and ``table`` are validated only as non-empty strings,
+        # so they could carry URI userinfo; both are sanitized here.
+        return _format_repr(
+            "IcebergConfig",
+            [
+                ("catalog_profile", self.catalog_profile),
+                ("namespace", self.namespace),
+                ("table", self.table),
+            ],
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class SqliteConfig:
@@ -117,10 +188,9 @@ class SqliteConfig:
     relation: str
 
     def __repr__(self) -> str:
-        # See ParquetConfig: redact any URI userinfo from the location.
-        return (
-            f"SqliteConfig(location={_sanitize_location(self.location)!r},"
-            f" relation={self.relation!r})"
+        return _format_repr(
+            "SqliteConfig",
+            [("location", self.location), ("relation", self.relation)],
         )
 
 
@@ -133,11 +203,13 @@ class DuckDbConfig:
     read_only: bool = True
 
     def __repr__(self) -> str:
-        # See ParquetConfig: redact any URI userinfo from the location.
-        return (
-            f"DuckDbConfig(location={_sanitize_location(self.location)!r},"
-            f" relation={self.relation!r},"
-            f" read_only={self.read_only!r})"
+        return _format_repr(
+            "DuckDbConfig",
+            [
+                ("location", self.location),
+                ("relation", self.relation),
+                ("read_only", self.read_only),
+            ],
         )
 
 
@@ -148,12 +220,28 @@ class PostgresConfig:
     connection_profile: str
     relation: str
 
+    def __repr__(self) -> str:
+        # ``relation`` is validated as a SQL identifier, but the sanitizer is
+        # applied defensively so credentials can never surface regardless.
+        return _format_repr(
+            "PostgresConfig",
+            [
+                ("connection_profile", self.connection_profile),
+                ("relation", self.relation),
+            ],
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class PyArrowConfig:
     """An in-memory PyArrow table registered under a named handle."""
 
     handle: str
+
+    def __repr__(self) -> str:
+        # ``handle`` is validated only as a non-empty string; sanitize it so
+        # embedded URI userinfo can never surface in diagnostics.
+        return _format_repr("PyArrowConfig", [("handle", self.handle)])
 
 
 type SourceConnector = (

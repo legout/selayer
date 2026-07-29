@@ -707,18 +707,30 @@ def test_location_connector_reprs_redact_authenticated_userinfo(
 @pytest.mark.parametrize(
     "connector",
     [
-        IcebergConfig("warehouse", ("analytics",), "orders"),
-        PostgresConfig("warehouse_ro", "analytics.customers"),
-        PyArrowConfig("orders_table"),
+        # These identifier-only connectors carry free-form string fields
+        # (table, namespace, handle, relation) that are validated only as
+        # non-empty strings, so they could embed URI userinfo if validation
+        # rules ever relax.  Prove every field is redacted regardless.
+        IcebergConfig(
+            "warehouse",
+            ("s3://AKIATOPSECRET:hunter2@ns/analytics",),
+            "s3://AKIATOPSECRET:hunter2@host/orders",
+        ),
+        PostgresConfig("warehouse_ro", "s3://AKIATOPSECRET:hunter2@host/customers"),
+        PyArrowConfig("s3://AKIATOPSECRET:hunter2@handle/orders"),
     ],
 )
-def test_non_location_connector_reprs_carry_no_credentials(
+def test_non_location_connector_reprs_redact_credential_bearing_fields(
     connector: SourceConnector,
 ) -> None:
-    # These configs have only validated-identifier fields; their reprs must
-    # never carry credential markers regardless.
+    rendered = repr(connector)
     for marker in SECRET_MARKERS:
-        assert marker not in repr(connector)
+        assert marker not in rendered, rendered
+    # The ``userinfo@`` authority is fully stripped from every string field,
+    # so no residual ``@`` survives in the repr.
+    assert "@" not in rendered
+    # Scheme/host diagnostics remain useful (not over-redacted).
+    assert "s3://" in rendered
 
 
 def test_parsed_source_repr_redacts_authenticated_location() -> None:
@@ -732,6 +744,24 @@ def test_parsed_source_repr_redacts_authenticated_location() -> None:
     for marker in SECRET_MARKERS:
         assert marker not in rendered
     assert "s3://warehouse/orders/" in rendered
+
+
+def test_parsed_source_repr_redacts_grain_credentials() -> None:
+    # ``grain`` is a tuple of non-empty strings that could carry embedded URI
+    # userinfo; prove the ParsedSource repr sanitizes it (and not just the
+    # delegated connector repr).
+    parsed = ParsedSource(
+        "orders",
+        ParquetConfig("s3://warehouse/orders/", "analytics_s3"),
+        TableSchema(()),
+        ("s3://AKIATOPSECRET:hunter2@grain/id",),
+    )
+    rendered = repr(parsed)
+    for marker in SECRET_MARKERS:
+        assert marker not in rendered, rendered
+    assert "@" not in rendered
+    # The sanitized grain value remains a useful diagnostic.
+    assert "grain/id" in rendered
 
 
 def test_schema_ref_failure_messages_redact_userinfo(tmp_path: Path) -> None:
