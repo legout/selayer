@@ -91,9 +91,18 @@ def _repr_source_name(value: object) -> str:
 
 
 def _repr_column(value: object) -> str:
-    """Render a physical column, placeholder-ing non-conformant values."""
+    """Render a physical column, *conservatively* placeholder-ing values.
 
-    if isinstance(value, str) and _SQL_IDENT_RE.match(value):
+    Columns are validated against the full SQL-identifier shape (mixed case
+    allowed) at construction, but the repr is stricter: only the catalog
+    source-name shape (lowercase) renders.  A token-shaped secret column such
+    as ``TOKENONLYSECRET`` (uppercase) is a syntactically valid identifier and
+    therefore accepted at construction, yet it is redacted here so it can never
+    surface in diagnostics.  Legitimate lowercase columns (``id``, ``amount``)
+    render unchanged.
+    """
+
+    if isinstance(value, str) and _SOURCE_NAME_RE.match(value):
         return value
     return "<redacted>"
 
@@ -101,14 +110,20 @@ def _repr_column(value: object) -> str:
 def _repr_literal(value: object) -> object:
     """Repr-safe projection of a free-form literal/handle field.
 
-    Strings are *always* redacted to ``"<redacted>"``: a free-form string may
-    carry a secret token (``TOKENONLYSECRET``), a SQL fragment, or a
-    credential-bearing URI, and no token-shaped regex can reliably separate a
-    safe string from a secret.  Tuples/lists are projected element-wise; all
-    other values (ints, bools, floats, enums, ``None``) pass through unchanged.
+    Every string and byte string is redacted to a fixed ``"<redacted>"``
+    placeholder: a free-form string may carry a secret token
+    (``TOKENONLYSECRET``), a SQL fragment, or a credential-bearing URI, and no
+    token-shaped regex can reliably separate a safe string from a secret.
+    Mappings (``dict``) and unordered collections (``set``/``frozenset``) are
+    redacted wholesale — their keys and members may each be a secret — while
+    ordered collections (``tuple``/``list``) are projected element-wise so that
+    bare numeric literals remain visible.  Non-string scalars (ints, bools,
+    floats, enums, ``None``) pass through unchanged.
     """
 
-    if isinstance(value, str):
+    if isinstance(value, (str, bytes)):
+        return "<redacted>"
+    if isinstance(value, (dict, set, frozenset)):
         return "<redacted>"
     if isinstance(value, tuple):
         return tuple(_repr_literal(item) for item in value)
@@ -182,6 +197,14 @@ class SourceFilter:
     value: object
 
     def __post_init__(self) -> None:
+        # ``column`` must be a string SQL identifier: a non-string or a SQL
+        # fragment (e.g. ``"id; DROP TABLE users--"``) is rejected here so no
+        # arbitrary SQL can ever be stored as a column and later interpolated
+        # by an adapter.  The check runs against an untyped local so the type
+        # checker does not narrow it away as impossible.
+        column: object = self.column
+        if not (isinstance(column, str) and _SQL_IDENT_RE.match(column)):
+            raise ValueError("invalid SourceFilter column")
         # The ``Literal`` type is not enforced at runtime, so validate the
         # operator against the closed set here: an out-of-set value (arbitrary
         # SQL such as ``"SELECT * FROM secrets"``) raises immediately.  The
@@ -213,6 +236,23 @@ class SourceScanRequirement:
     filters: tuple[SourceFilter, ...] = ()
 
     def __post_init__(self) -> None:
+        # Validate every column is a string SQL identifier before coercing: a
+        # non-string or a SQL fragment (e.g. ``"id; DROP TABLE users--"``) is
+        # rejected so no arbitrary SQL can ever be carried as a planned column.
+        # The checks run against untyped locals so the type checker does not
+        # narrow them away as impossible.
+        for raw_column in self.columns:
+            column: object = raw_column
+            if not (isinstance(column, str) and _SQL_IDENT_RE.match(column)):
+                raise ValueError("invalid SourceScanRequirement column")
+        # Validate every filter is an actual SourceFilter: a raw string such as
+        # ``"SELECT password FROM users"`` is rejected with a clean TypeError so
+        # arbitrary SQL can never be stored as a planned filter.
+        for raw_filter in self.filters:
+            if not isinstance(raw_filter, SourceFilter):
+                raise TypeError(
+                    "SourceScanRequirement filters must be SourceFilter instances"
+                )
         # Coerce any iterable (e.g. a mutable list) to an immutable tuple so
         # the frozen requirement cannot be mutated by later caller changes.
         if not isinstance(self.columns, tuple):

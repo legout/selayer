@@ -476,11 +476,25 @@ def test_source_filter_value_tuple_elements_are_redacted() -> None:
     assert "DROP TABLE" not in text
 
 
-def test_source_filter_column_sql_is_placeholdered() -> None:
-    flt = SourceFilter(column="id; DROP TABLE users--", operator="eq", value=1)
+def test_source_filter_rejects_hostile_column() -> None:
+    # A SQL fragment is not a string identifier; it is rejected at construction
+    # so no arbitrary SQL can ever be stored as a column (and later interpolated).
+    with pytest.raises(ValueError):
+        SourceFilter(column="id; DROP TABLE users--", operator="eq", value=1)
+
+
+def test_source_filter_rejects_non_string_column() -> None:
+    with pytest.raises(ValueError):
+        SourceFilter(column=123, operator="eq", value=1)  # type: ignore[arg-type]
+
+
+def test_source_filter_token_shaped_column_is_redacted() -> None:
+    # TOKENONLYSECRET is a syntactically valid identifier, so it is accepted at
+    # construction; the repr conservatively redacts it so a token-shaped secret
+    # column can never surface in diagnostics.
+    flt = SourceFilter(column="TOKENONLYSECRET", operator="eq", value=1)
     text = repr(flt)
-    assert "DROP TABLE" not in text
-    assert "users" not in text
+    assert "TOKENONLYSECRET" not in text
     assert "<redacted>" in text
 
 
@@ -491,16 +505,32 @@ def test_source_filter_scalar_values_render_normally() -> None:
     assert "0" in repr(flt)
 
 
-def test_scan_requirement_hostile_columns_are_placeholdered() -> None:
-    req = SourceScanRequirement(
-        columns=("id; DROP TABLE users--", "amount"),
-        filters=(),
-    )
+def test_scan_requirement_rejects_hostile_column() -> None:
+    # Every column must be a string identifier; a SQL fragment is rejected at
+    # construction rather than merely redacted in the repr.
+    with pytest.raises(ValueError):
+        SourceScanRequirement(
+            columns=("id; DROP TABLE users--", "amount"),
+            filters=(),
+        )
+
+
+def test_scan_requirement_token_shaped_column_is_redacted() -> None:
+    req = SourceScanRequirement(columns=("TOKENONLYSECRET", "amount"), filters=())
     text = repr(req)
-    assert "DROP TABLE" not in text
-    assert "users" not in text
+    assert "TOKENONLYSECRET" not in text
     assert "amount" in text
     assert "<redacted>" in text
+
+
+def test_scan_requirement_rejects_raw_string_filter() -> None:
+    # A raw SQL string is not a SourceFilter; it is rejected with a clean
+    # TypeError so arbitrary SQL can never be stored as a planned filter.
+    with pytest.raises(TypeError):
+        SourceScanRequirement(
+            columns=("id",),
+            filters=("SELECT password FROM users",),  # type: ignore[list-item]
+        )
 
 
 def test_source_handle_repr_redacts_credential_snapshot() -> None:
@@ -610,6 +640,48 @@ def test_source_filter_value_token_in_collection_is_redacted() -> None:
     text = repr(flt)
     assert "TOKENONLYSECRET" not in text
     assert "PLAINVALUE" not in text
+
+
+def test_source_filter_dict_value_is_redacted() -> None:
+    # A mapping value may carry secrets in keys or values; the whole mapping is
+    # redacted to a fixed placeholder so neither can surface in the repr.
+    flt = SourceFilter(
+        column="id",
+        operator="eq",
+        value={"token": "TOKENONLYSECRET", "password": "hunter2"},
+    )
+    text = repr(flt)
+    assert "TOKENONLYSECRET" not in text
+    assert "hunter2" not in text
+    assert "password" not in text
+    assert "token" not in text
+    assert "{" not in text
+    assert "<redacted>" in text
+
+
+def test_source_filter_set_value_is_redacted() -> None:
+    # A set value may carry secret members; the whole set is redacted so no
+    # member can surface in the repr.
+    flt = SourceFilter(column="id", operator="in", value={"TOKENONLYSECRET", "x"})
+    text = repr(flt)
+    assert "TOKENONLYSECRET" not in text
+    assert "{" not in text
+    assert "<redacted>" in text
+
+
+def test_source_filter_numeric_tuple_value_renders_safely() -> None:
+    # Numeric literals are safe: a tuple of numeric literals renders without
+    # leaking, and a tuple mixing a string secret with a numeric still redacts
+    # the string element.
+    numeric = SourceFilter(column="id", operator="in", value=(1, 2, 3))
+    secret_numeric = SourceFilter(
+        column="id", operator="in", value=(1, "TOKENONLYSECRET")
+    )
+    numeric_text = repr(numeric)
+    secret_text = repr(secret_numeric)
+    assert "TOKENONLYSECRET" not in secret_text
+    assert "<redacted>" in secret_text
+    assert "1" in numeric_text
 
 
 def test_source_filter_rejects_arbitrary_sql_operator() -> None:

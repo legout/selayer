@@ -354,3 +354,94 @@ token-regex approach entirely for free-form fields.
 behavioural change is that an invalid `SourceFilter` operator now raises
 `ValueError` at construction (documenting the closed-set constraint the
 `Literal` alias already implied).
+
+---
+
+## Follow-up 3: final filter-contract fix — structured scan requirements
+
+**Status: Complete.** The final re-review found that the Follow-up 2 repr
+sanitizers redacted hostile values but still *stored* them: a SQL fragment
+(`"id; DROP TABLE users--"`) was accepted as a `SourceFilter.column` / scan
+requirement column and only placeholder-ed in the repr, and a raw string was
+accepted as a scan-requirement filter. A token-shaped uppercase secret
+(`TOKENONLYSECRET`) was likewise accepted as a column and merely redacted.
+This final fix enforces the structured contract at **construction time** so
+no arbitrary SQL can ever be carried as a planned column or filter, and
+tightens the column repr to the catalog source-name shape.
+
+### Changes
+
+**`src/selayer/sources/base.py`**
+
+- **`SourceFilter.__post_init__`** now validates `column` is a string SQL
+  identifier (via `_SQL_IDENT_RE`) at construction; a non-string or a SQL
+  fragment (`"id; DROP TABLE users--"`) raises `ValueError("invalid
+  SourceFilter column")`. The check runs against an untyped local so the
+type checker does not narrow it away as impossible.
+- **`SourceScanRequirement.__post_init__`** now validates every column is a
+  string SQL identifier (raises `ValueError`) and every filter is an actual
+  `SourceFilter` instance (a raw SQL string raises a clean `TypeError`), so
+  arbitrary SQL can never be stored as a planned column or filter.
+- **`_repr_source_name`** switched from the SQL-identifier regex to the
+  stricter catalog source-name regex (`_SOURCE_NAME_RE`, lowercase
+  `[a-z][a-z0-9_]*`). A token-shaped uppercase secret column such as
+  `TOKENONLYSECRET` is a syntactically valid identifier and therefore
+  accepted at construction, yet it is redacted in the repr so it can never
+  surface in diagnostics. Legitimate lowercase columns (`id`, `amount`)
+  render unchanged.
+- **`_repr_literal`** now also redacts `bytes`, `dict`, `set`, and
+  `frozenset` wholesale (their members may each be a secret); ordered
+  collections (`tuple`/`list`) are still projected element-wise so bare
+  numeric literals stay visible.
+
+**`tests/sources/test_adapter_contract.py`**
+
+- 6 new hostile regression tests; 2 existing tests rewritten from
+  "placeholdered" to "rejected".
+
+### Validation gates
+
+| Gate | Result |
+| --- | --- |
+| `pytest -q tests/sources/test_profiles.py tests/sources/test_adapter_contract.py` | **75 passed** |
+| `pytest -q` (full suite) | **1037 passed** |
+| `ruff check src/selayer/sources tests/sources` | **All checks passed!** |
+| `ruff format --check src/selayer/sources tests/sources` | **12 files already formatted** |
+| `pyright src/selayer/sources tests/sources` | **0 errors, 0 warnings, 0 infos** |
+
+### New / updated hostile regression tests
+
+- **`SourceFilter` rejects hostile / non-string column (construction):**
+  `test_source_filter_rejects_hostile_column`,
+  `test_source_filter_rejects_non_string_column`.
+- **`SourceFilter` token-shaped column redacted in repr:**
+  `test_source_filter_token_shaped_column_is_redacted` (replaces the old
+  `_column_sql_is_placeholdered`).
+- **`SourceScanRequirement` rejects hostile column (construction):**
+  `test_scan_requirement_rejects_hostile_column` (replaces the old
+  `_hostile_columns_are_placeholdered`).
+- **`SourceScanRequirement` token-shaped column redacted in repr:**
+  `test_scan_requirement_token_shaped_column_is_redacted`.
+- **`SourceScanRequirement` rejects raw-string filter (construction):**
+  `test_scan_requirement_rejects_raw_string_filter`.
+- **Collection-value repr hardening:**
+  `test_source_filter_dict_value_is_redacted`,
+  `test_source_filter_set_value_is_redacted`,
+  `test_source_filter_numeric_tuple_value_renders_safely`.
+
+### Public interfaces preserved
+
+`SourceFilter` and `SourceScanRequirement` constructors and stored fields are
+unchanged. The only behavioural change is that an invalid column or
+non-`SourceFilter` filter now raises at construction (`ValueError` /
+`TypeError`), documenting the structured-input contract the types already
+implied. All other lifecycle objects are untouched.
+
+### Commit
+
+```
+fix(sources): enforce structured scan requirements
+```
+
+Files staged: `src/selayer/sources/base.py`,
+`tests/sources/test_adapter_contract.py`.
