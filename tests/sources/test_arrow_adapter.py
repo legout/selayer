@@ -21,7 +21,11 @@ from selayer.catalog import SemanticLayer
 from selayer.model import DataSource, Fact, Measure, Metric
 from selayer.query import QueryEngine
 from selayer.sources.adapters.arrow import ArrowDatasetAdapter
-from selayer.sources.base import QueryBinding, SourceHandle, SourceScanRequirement
+from selayer.sources.base import (
+    QueryBinding,
+    SourceHandle,
+    SourceScanRequirement,
+)
 from selayer.sources.catalog import ParsedSource
 from selayer.sources.config import (
     CsvConfig,
@@ -429,9 +433,12 @@ class _RegisterSpy:
         self._inner.register(connection, stable_name, handle)
 
     def bind_query(
-        self, handle: SourceHandle, requirement: SourceScanRequirement
+        self,
+        connection: object,
+        handle: SourceHandle,
+        requirement: SourceScanRequirement,
     ) -> QueryBinding | None:
-        return self._inner.bind_query(handle, requirement)
+        return self._inner.bind_query(connection, handle, requirement)
 
     def close(self, handle: SourceHandle) -> None:
         self._inner.close(handle)

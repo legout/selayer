@@ -22,6 +22,9 @@ build-backend = "hatchling.build"
 [project.optional-dependencies]
 s3 = ["boto3>=1.40,<2"]
 delta = ["deltalake>=1.6.2,<2"]
+iceberg = [
+    "pyiceberg[pyarrow,sql-sqlite]>=0.11.1,<0.12",
+]
 
 [dependency-groups]
 dev = [

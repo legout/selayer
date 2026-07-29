@@ -1419,7 +1419,10 @@ class _RecordingAdapter:
         self.registered.append(stable_name)
 
     def bind_query(
-        self, handle: SourceHandle, requirement: SourceScanRequirement
+        self,
+        connection: object,
+        handle: SourceHandle,
+        requirement: SourceScanRequirement,
     ) -> QueryBinding | None:
         return QueryBinding(
             source_id=handle.source_id,
@@ -1449,7 +1452,9 @@ def test_fake_adapter_methods_are_usable() -> None:
     adapter.register(object(), "orders_v1", handle)
     assert adapter.registered == ["orders_v1"]
     binding = adapter.bind_query(
-        handle, SourceScanRequirement(columns=("id",), filters=())
+        object(),
+        handle,
+        SourceScanRequirement(columns=("id",), filters=()),
     )
     assert binding is not None
     adapter.close(handle)

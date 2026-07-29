@@ -554,12 +554,17 @@ class SourceAdapter(Protocol):
         ...
 
     def bind_query(
-        self, handle: SourceHandle, requirement: SourceScanRequirement
+        self,
+        connection: object,
+        handle: SourceHandle,
+        requirement: SourceScanRequirement,
     ) -> QueryBinding | None:
         """Bind a scan requirement to the source, returning a cleanup record.
 
-        Returning ``None`` signals the adapter cannot push the requirement
-        down and the caller must fall back to a full scan.
+        ``connection`` is the execution-engine connection the adapter uses to
+        register any query-scoped reader it creates.  Returning ``None`` signals
+        the adapter cannot push the requirement down and the caller must fall
+        back to preparing and registering a fresh handle.
         """
         ...
 

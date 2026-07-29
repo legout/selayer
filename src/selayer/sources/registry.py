@@ -39,12 +39,17 @@ from threading import RLock
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
+from selayer.expressions.validation import references
 from selayer.sources.adapters.arrow import ArrowDatasetAdapter
 from selayer.sources.adapters.delta import DeltaAdapter
+from selayer.sources.adapters.iceberg import IcebergAdapter
 from selayer.sources.base import (
+    QueryBinding,
     ReloadResult,
     SourceAdapter,
+    SourceFilter,
     SourceHandle,
+    SourceScanRequirement,
     SourceStatus,
 )
 from selayer.sources.catalog import ParsedSource
@@ -67,14 +72,32 @@ if TYPE_CHECKING:
 __all__ = ["SourceRegistry"]
 
 
+# Conditional iceberg adapter: pyiceberg is an optional extra.  The adapter is
+# only registered when the import succeeds so catalogs without the extra see a
+# sanitized ``unsupported_connector`` error for iceberg sources rather than an
+# import-time crash.
+try:
+    import pyiceberg  # noqa: F401
+
+    _ICEBERG_AVAILABLE = True
+except ImportError:
+    _ICEBERG_AVAILABLE = False
+
+
 # Closed built-in adapter mapping keyed by connector kind.  No public plugin
 # registration API is exposed.
 def _builtin_adapters() -> Mapping[str, SourceAdapter]:
     arrow = ArrowDatasetAdapter()
     delta = DeltaAdapter()
-    return MappingProxyType(
-        {"parquet": arrow, "csv": arrow, "pyarrow": arrow, "delta": delta}
-    )
+    mapping: dict[str, SourceAdapter] = {
+        "parquet": arrow,
+        "csv": arrow,
+        "pyarrow": arrow,
+        "delta": delta,
+    }
+    if _ICEBERG_AVAILABLE:
+        mapping["iceberg"] = IcebergAdapter()
+    return MappingProxyType(mapping)
 
 
 @dataclass(frozen=True, slots=True)
@@ -429,15 +452,28 @@ class SourceRegistry:
     def bind(self, plan: QueryPlan) -> Iterator[None]:
         """Hold the registry lock for one query and bind query-scoped sources.
 
-        Persistent sources need no per-query binding.  Query-scoped (reader)
-        sources are recreated from their provider and re-registered once per
-        query so the reload lock cannot swap a handle mid-query and the
-        single-pass reader is fresh for every execution.
+        Persistent sources need no per-query binding.  Query-scoped sources are
+        bound once per query via ``adapter.bind_query`` (which creates a
+        fresh reader, registers it, and returns a cleanup) so the reload lock
+        cannot swap a handle mid-query.  When ``bind_query`` returns ``None``
+        the registry falls back to preparing and registering a fresh handle
+        from the adapter's provider.
         """
 
         self._lock.acquire()
-        scoped: list[tuple[SourceAdapter, SourceHandle, str]] = []
+        prepared: list[tuple[SourceAdapter, SourceHandle, str]] = []
+        bindings: list[QueryBinding] = []
         try:
+            grains = {
+                sid: self._sources[sid].grain
+                for sid in _plan_sources(plan)
+                if sid in self._sources
+            }
+            # ``grains`` is a private keyword: the public one-argument form
+            # ``requirements_for_plan(plan)`` collects no grain columns, while
+            # the registry passes each source's declared grain so the scan
+            # projection includes the row-identity columns.
+            requirements = requirements_for_plan(plan, grains=grains)
             for source_id in _plan_sources(plan):
                 registration = self._registrations.get(source_id)
                 if registration is None:
@@ -445,14 +481,24 @@ class SourceRegistry:
                 handle = registration.handle
                 if not handle.query_scoped:
                     continue
-                source = self._sources[source_id]
                 adapter = registration.adapter
+                requirement = requirements.get(source_id)
+                binding: QueryBinding | None = None
+                if requirement is not None:
+                    binding = adapter.bind_query(self._connection, handle, requirement)
+                if binding is not None:
+                    bindings.append(binding)
+                    continue
+                # Fall back to prepare + register for provider-backed readers.
+                source = self._sources[source_id]
                 fresh = adapter.prepare(source, self._profiles, self._arrow_providers)
                 adapter.register(self._connection, source_id, fresh)
-                scoped.append((adapter, fresh, source_id))
+                prepared.append((adapter, fresh, source_id))
             yield
         finally:
-            for adapter, fresh, source_id in reversed(scoped):
+            for binding in reversed(bindings):
+                binding.cleanup()
+            for adapter, fresh, source_id in reversed(prepared):
                 unregister_quietly(self._connection, source_id)
                 close_quietly(adapter, fresh)
             self._lock.release()
@@ -575,3 +621,142 @@ def _plan_sources(plan: QueryPlan) -> tuple[str, ...]:
         sources.add(step.source)
         sources.add(step.target)
     return tuple(sorted(sources))
+
+
+# ---------------------------------------------------------------------------
+# Source-scan requirement extraction
+# ---------------------------------------------------------------------------
+
+
+class _ColumnCollector:
+    """First-seen-order column accumulator with de-duplication."""
+
+    __slots__ = ("_columns", "_seen")
+
+    def __init__(self) -> None:
+        self._columns: list[str] = []
+        self._seen: set[str] = set()
+
+    def add(self, column: str) -> None:
+        if column not in self._seen:
+            self._seen.add(column)
+            self._columns.append(column)
+
+    @property
+    def columns(self) -> tuple[str, ...]:
+        return tuple(self._columns)
+
+
+def _is_pushdown_scalar(value: object) -> bool:
+    """Return ``True`` for exact builtin scalar types safe for pushdown."""
+
+    return type(value) in {str, int, float, bool}
+
+
+def _translate_planned_filter(
+    column: str,
+    value: object,
+) -> list[SourceFilter]:
+    """Translate a planned filter value into zero or more SourceFilters.
+
+    Only scalar equality (``eq``), list membership (``in``), and inclusive range
+    (``ge``/``le``) filters with supported literal types are translated.
+    Unsupported value types produce no SourceFilter; the compiled DuckDB SQL
+    still evaluates every filter as a residual.
+    """
+
+    from selayer.planning.types import ListFilter, RangeFilter, ScalarFilter
+
+    if isinstance(value, ScalarFilter):
+        if _is_pushdown_scalar(value.value):
+            return [SourceFilter(column=column, operator="eq", value=value.value)]
+    elif isinstance(value, ListFilter):
+        if value.values and all(_is_pushdown_scalar(v) for v in value.values):
+            return [SourceFilter(column=column, operator="in", value=value.values)]
+    elif isinstance(value, RangeFilter):
+        result: list[SourceFilter] = []
+        if _is_pushdown_scalar(value.start):
+            result.append(SourceFilter(column=column, operator="ge", value=value.start))
+        if _is_pushdown_scalar(value.end):
+            result.append(SourceFilter(column=column, operator="le", value=value.end))
+        return result
+    return []
+
+
+def requirements_for_plan(
+    plan: QueryPlan,
+    *,
+    grains: Mapping[str, tuple[str, ...]] = MappingProxyType({}),
+) -> Mapping[str, SourceScanRequirement]:
+    """Extract per-source scan requirements from a validated query plan.
+
+    The public entry point is the one-argument form
+    ``requirements_for_plan(plan)``: it collects physical columns from planned
+    dimensions, planned filters, fact expression references, and join endpoints
+    — preserving first-seen order with a companion set so a column referenced
+    by multiple mechanisms appears once.
+
+    The private keyword-only ``grains`` argument lets a caller (the registry)
+    additionally seed each source's row-identity (grain) columns first; it
+    defaults to empty so the public one-argument call collects no grain.  This
+    keeps the registry's query-time binding — which knows each source's grain —
+    decoupled from plan construction, which does not carry grain metadata.
+
+    Translates source-local scalar, list, and range filters into structured
+    :class:`SourceFilter` objects for adapter pushdown.
+
+    Metric and measure IDs never appear in the result columns: only physical
+    ``source.column`` references extracted from fact expressions, dimensions,
+    filters, joins, and (when supplied) the source grain are collected.
+    """
+
+    plan_sources = _plan_sources(plan)
+    collectors: dict[str, _ColumnCollector] = {
+        source_id: _ColumnCollector() for source_id in plan_sources
+    }
+    filters_by_source: dict[str, list[SourceFilter]] = {}
+
+    # 1. Grain columns (first, in grain declaration order).
+    for source_id in plan_sources:
+        for column in grains.get(source_id, ()):
+            collectors[source_id].add(column)
+
+    # 2. Planned dimensions.
+    for item in plan.dimensions:
+        source = item.dimension.source
+        if source in collectors:
+            collectors[source].add(item.dimension.column)
+
+    # 3. Planned filters (columns + SourceFilter translation).
+    for item in plan.filters:
+        source = item.dimension.source
+        column = item.dimension.column
+        if source in collectors:
+            collectors[source].add(column)
+            filters_by_source.setdefault(source, []).extend(
+                _translate_planned_filter(column, item.value)
+            )
+
+    # 4. Fact expression references (measure order, then left-to-right).
+    for measure in plan.measures:
+        for ref in references(measure.expression):
+            parts = ref.parts
+            if len(parts) == 2:
+                source, column = parts[0], parts[1]
+                if source in collectors:
+                    collectors[source].add(column)
+
+    # 5. Join endpoints.
+    for step in plan.joins:
+        if step.source in collectors:
+            collectors[step.source].add(step.source_column)
+        if step.target in collectors:
+            collectors[step.target].add(step.target_column)
+
+    result: dict[str, SourceScanRequirement] = {}
+    for source_id in plan_sources:
+        result[source_id] = SourceScanRequirement(
+            columns=collectors[source_id].columns,
+            filters=tuple(filters_by_source.get(source_id, ())),
+        )
+    return MappingProxyType(result)

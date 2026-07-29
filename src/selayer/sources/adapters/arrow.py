@@ -153,20 +153,17 @@ class ArrowDatasetAdapter:
     # -- query binding -----------------------------------------------------
 
     def bind_query(
-        self, handle: SourceHandle, requirement: SourceScanRequirement
+        self,
+        connection: object,
+        handle: SourceHandle,
+        requirement: SourceScanRequirement,
     ) -> QueryBinding | None:
         # Persistent datasets (parquet/csv and provider-backed datasets/scanners/
         # tables) are registered once and benefit from automatic DuckDB Arrow
-        # pushdown; they need no per-query binding.  Only query-scoped readers
-        # are recreated per query, and that path is driven by the registry which
-        # re-invokes the stored provider directly.
-        if not handle.query_scoped or handle.cleanup is None:
-            return None
-        return QueryBinding(
-            source_id=handle.source_id,
-            stable_name=handle.source_id,
-            cleanup=handle.cleanup,
-        )
+        # pushdown; they need no per-query binding.  Query-scoped readers are
+        # recreated per query by the registry via ``prepare`` + ``register``, so
+        # this method always returns ``None`` to signal that fallback.
+        return None
 
     # -- close -------------------------------------------------------------
 

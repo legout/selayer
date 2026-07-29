@@ -13,15 +13,31 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import duckdb
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pytest
 
-from selayer.model import DataSource
-from selayer.planning import QueryPlan
+from selayer.model import (
+    DataSource,
+    Dimension,
+    Fact,
+    Measure,
+    Metric,
+    Relationship,
+)
+from selayer.planning import (
+    ListFilter,
+    QueryPlan,
+    QueryRequest,
+    ScalarFilter,
+    plan_query,
+)
+
+if TYPE_CHECKING:
+    from selayer.catalog import SemanticLayer
 from selayer.sources.base import (
     QueryBinding,
     ReloadResult,
@@ -31,6 +47,7 @@ from selayer.sources.base import (
 from selayer.sources.config import (
     DuckDbConfig,
     IcebergConfig,
+    ParquetConfig,
     PostgresConfig,
     PyArrowConfig,
     SqliteConfig,
@@ -46,7 +63,7 @@ from selayer.sources.profiles import (
     MappingProfileResolver,
     RuntimeProfileResolver,
 )
-from selayer.sources.registry import SourceRegistry
+from selayer.sources.registry import SourceRegistry, requirements_for_plan
 from selayer.sources.schema import (
     FieldSchema,
     ScalarType,
@@ -226,7 +243,10 @@ class _FakeAdapter:
             self._provider.register_order.append(stable_name)
 
     def bind_query(
-        self, handle: SourceHandle, requirement: SourceScanRequirement
+        self,
+        connection: object,
+        handle: SourceHandle,
+        requirement: SourceScanRequirement,
     ) -> QueryBinding | None:
         if not handle.query_scoped:
             return None
@@ -408,7 +428,10 @@ class _InitRecordingAdapter:
         connection.register(stable_name, handle.resource)  # type: ignore[attr-defined]
 
     def bind_query(
-        self, handle: SourceHandle, requirement: SourceScanRequirement
+        self,
+        connection: object,
+        handle: SourceHandle,
+        requirement: SourceScanRequirement,
     ) -> QueryBinding | None:
         return None
 
@@ -744,7 +767,10 @@ class _SharedCounterAdapter:
         connection.register(stable_name, handle.resource)  # type: ignore[attr-defined]
 
     def bind_query(
-        self, handle: SourceHandle, requirement: SourceScanRequirement
+        self,
+        connection: object,
+        handle: SourceHandle,
+        requirement: SourceScanRequirement,
     ) -> QueryBinding | None:
         return None
 
@@ -985,3 +1011,304 @@ def test_unsupported_connector_fails_sanitized(
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
     assert connection.closed
+
+
+# ---------------------------------------------------------------------------
+# Source-scan requirement extraction
+# ---------------------------------------------------------------------------
+
+
+def _req_schema(name: str, type_name: str, nullable: bool = True) -> FieldSchema:
+    return FieldSchema(name, ScalarType(type_name), nullable)
+
+
+def _requirements_layer() -> SemanticLayer:
+    """A semantic layer for source-requirement extraction tests."""
+
+    from selayer.catalog import SemanticLayer as _SL
+
+    items = TableSchema(
+        (
+            _req_schema("order_id", "utf8", False),
+            _req_schema("product_id", "utf8", False),
+            _req_schema("quantity", "int64"),
+            _req_schema("total", "float64"),
+        )
+    )
+    products = TableSchema(
+        (
+            _req_schema("id", "utf8", False),
+            _req_schema("category", "utf8"),
+            _req_schema("cost", "float64"),
+        )
+    )
+    data_sources = {
+        "order_items": DataSource(
+            "order_items",
+            ParquetConfig("data/order_items.parquet"),
+            items,
+            ("order_id", "product_id"),
+        ),
+        "products": DataSource(
+            "products",
+            ParquetConfig("data/products.parquet"),
+            products,
+            ("id",),
+        ),
+    }
+    dimensions = {
+        "product_category": Dimension(
+            "product_category", "products", "category", "string"
+        ),
+        "item_quantity": Dimension(
+            "item_quantity", "order_items", "quantity", "integer"
+        ),
+    }
+    facts = {
+        "item_revenue": Fact.from_expression(
+            "item_revenue", "order_items", "order_items.total", "float"
+        ),
+        "item_cost": Fact.from_expression(
+            "item_cost",
+            "order_items",
+            "order_items.quantity * products.cost",
+            "float",
+        ),
+    }
+    measures = {
+        "total_item_revenue": Measure("total_item_revenue", "item_revenue", "sum"),
+        "total_item_cost": Measure("total_item_cost", "item_cost", "sum"),
+    }
+    metrics = {
+        "item_margin": Metric.from_expression(
+            "item_margin",
+            "(total_item_revenue - total_item_cost)",
+            ["total_item_cost", "total_item_revenue"],
+        ),
+        "item_revenue_total": Metric.from_expression(
+            "item_revenue_total", "total_item_revenue", ["total_item_revenue"]
+        ),
+    }
+    relationships = {
+        "product_order_items": Relationship(
+            "product_order_items",
+            "products",
+            "order_items",
+            "one_to_many",
+            "id",
+            "product_id",
+        ),
+    }
+    return _SL(
+        1,
+        "test",
+        "",
+        "",
+        data_sources,
+        dimensions,
+        facts,
+        measures,
+        metrics,
+        relationships,
+    )
+
+
+def _req_grains(layer: SemanticLayer, plan: QueryPlan) -> dict[str, tuple[str, ...]]:
+    from selayer.sources.registry import _plan_sources
+
+    return {
+        sid: layer.data_sources[sid].grain
+        for sid in _plan_sources(plan)
+        if sid in layer.data_sources
+    }
+
+
+@pytest.fixture
+def item_margin_plan() -> QueryPlan:
+    layer = _requirements_layer()
+    return plan_query(
+        layer,
+        QueryRequest(
+            metrics=("item_margin",),
+            dimensions=("product_category",),
+            filters={"product_category": ListFilter(("A",))},
+        ),
+    )
+
+
+@pytest.fixture
+def fact_reference_plan() -> QueryPlan:
+    layer = _requirements_layer()
+    return plan_query(layer, QueryRequest(metrics=("item_revenue_total",)))
+
+
+@pytest.fixture
+def dimension_plan() -> QueryPlan:
+    layer = _requirements_layer()
+    return plan_query(
+        layer,
+        QueryRequest(
+            metrics=("item_revenue_total",),
+            dimensions=("item_quantity",),
+        ),
+    )
+
+
+@pytest.fixture
+def filter_plan() -> QueryPlan:
+    layer = _requirements_layer()
+    return plan_query(
+        layer,
+        QueryRequest(
+            metrics=("item_revenue_total",),
+            filters={"item_quantity": ScalarFilter(5)},
+        ),
+    )
+
+
+@pytest.fixture
+def join_plan() -> QueryPlan:
+    layer = _requirements_layer()
+    return plan_query(
+        layer,
+        QueryRequest(
+            metrics=("item_margin",),
+            dimensions=("product_category",),
+        ),
+    )
+
+
+@pytest.fixture
+def shared_column_plan() -> QueryPlan:
+    layer = _requirements_layer()
+    return plan_query(
+        layer,
+        QueryRequest(
+            metrics=("item_margin",),
+            dimensions=("item_quantity",),
+        ),
+    )
+
+
+def test_requirements_collect_columns_and_local_filters(
+    item_margin_plan: QueryPlan,
+) -> None:
+    layer = _requirements_layer()
+    requirements = requirements_for_plan(
+        item_margin_plan, grains=_req_grains(layer, item_margin_plan)
+    )
+
+    assert requirements["order_items"].columns == (
+        "order_id",
+        "product_id",
+        "quantity",
+        "total",
+    )
+    assert requirements["products"].columns == ("id", "category", "cost")
+    product_filters = requirements["products"].filters
+    assert len(product_filters) == 1
+    assert product_filters[0].column == "category"
+    assert product_filters[0].operator == "in"
+
+
+def test_fact_reference_plan_columns(item_margin_plan: QueryPlan) -> None:
+    """A fact-reference-only plan collects grain plus fact-expr columns."""
+
+    layer = _requirements_layer()
+    plan = plan_query(layer, QueryRequest(metrics=("item_revenue_total",)))
+    requirements = requirements_for_plan(plan, grains=_req_grains(layer, plan))
+    assert requirements["order_items"].columns == (
+        "order_id",
+        "product_id",
+        "total",
+    )
+    assert all(not req.filters for req in requirements.values())
+
+
+def test_dimension_plan_columns(
+    dimension_plan: QueryPlan,
+) -> None:
+    """A dimension plan collects grain plus dimension plus fact columns."""
+
+    layer = _requirements_layer()
+    requirements = requirements_for_plan(
+        dimension_plan, grains=_req_grains(layer, dimension_plan)
+    )
+    assert requirements["order_items"].columns == (
+        "order_id",
+        "product_id",
+        "quantity",
+        "total",
+    )
+
+
+def test_filter_plan_columns_and_filters(
+    filter_plan: QueryPlan,
+) -> None:
+    """A filter plan collects grain plus filter column plus fact columns."""
+
+    layer = _requirements_layer()
+    requirements = requirements_for_plan(
+        filter_plan, grains=_req_grains(layer, filter_plan)
+    )
+    assert requirements["order_items"].columns == (
+        "order_id",
+        "product_id",
+        "quantity",
+        "total",
+    )
+    item_filters = requirements["order_items"].filters
+    assert len(item_filters) == 1
+    assert item_filters[0].column == "quantity"
+    assert item_filters[0].operator == "eq"
+    assert item_filters[0].value == 5
+
+
+def test_join_plan_columns(
+    join_plan: QueryPlan,
+) -> None:
+    """A join plan collects join-endpoint columns from both sources."""
+
+    layer = _requirements_layer()
+    requirements = requirements_for_plan(
+        join_plan, grains=_req_grains(layer, join_plan)
+    )
+    assert requirements["order_items"].columns == (
+        "order_id",
+        "product_id",
+        "quantity",
+        "total",
+    )
+    assert requirements["products"].columns == ("id", "category", "cost")
+
+
+def test_shared_column_dedup(
+    shared_column_plan: QueryPlan,
+) -> None:
+    """A column referenced by a dimension and a fact appears only once."""
+
+    layer = _requirements_layer()
+    requirements = requirements_for_plan(
+        shared_column_plan, grains=_req_grains(layer, shared_column_plan)
+    )
+    columns = requirements["order_items"].columns
+    assert columns.count("quantity") == 1
+
+
+def test_metric_and_measure_ids_never_appear_in_columns(
+    item_margin_plan: QueryPlan,
+) -> None:
+    """Metric and measure IDs never leak into SourceScanRequirement columns."""
+
+    layer = _requirements_layer()
+    requirements = requirements_for_plan(
+        item_margin_plan, grains=_req_grains(layer, item_margin_plan)
+    )
+    forbidden = set(layer.metrics) | set(layer.measures)
+    forbidden |= {
+        "__selayer_measure_total_item_revenue",
+        "__selayer_measure_total_item_cost",
+        "__selayer_dimension_product_category",
+    }
+    for req in requirements.values():
+        assert not (set(req.columns) & forbidden)

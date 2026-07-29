@@ -175,7 +175,10 @@ class DeltaAdapter:
     # -- query binding -----------------------------------------------------
 
     def bind_query(
-        self, handle: SourceHandle, requirement: SourceScanRequirement
+        self,
+        connection: object,
+        handle: SourceHandle,
+        requirement: SourceScanRequirement,
     ) -> QueryBinding | None:
         # Persistent Delta Datasets are registered once and benefit from
         # automatic DuckDB Arrow pushdown; they need no per-query binding.

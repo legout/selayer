@@ -10,5 +10,6 @@ from __future__ import annotations
 
 from selayer.sources.adapters.arrow import ArrowDatasetAdapter
 from selayer.sources.adapters.delta import DeltaAdapter
+from selayer.sources.adapters.iceberg import IcebergAdapter
 
-__all__ = ["ArrowDatasetAdapter", "DeltaAdapter"]
+__all__ = ["ArrowDatasetAdapter", "DeltaAdapter", "IcebergAdapter"]

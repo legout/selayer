@@ -68,6 +68,9 @@ _CODE_MESSAGES: dict[str, str] = {
         "the connector type is not supported by any registered adapter"
     ),
     "missing_delta_dependency": ("the deltalake package is required for delta sources"),
+    "missing_iceberg_dependency": (
+        "the pyiceberg package is required for iceberg sources"
+    ),
 }
 
 # Known source error codes — an allowlist, *not* a permissive regex.  Only a
