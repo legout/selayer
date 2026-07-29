@@ -555,6 +555,7 @@ class OkfBundle:
         path: str | Path,
         *,
         layer: SemanticLayer | None = None,
+        strict: bool = True,
     ) -> OkfBundle:
         root = Path(path)
         if not root.exists():
@@ -577,7 +578,7 @@ class OkfBundle:
                 issues.append(OkfIssue(relative, str(error)))
                 continue
             concepts[concept.concept_id] = concept
-            issues.extend(validate_concept(concept, layer))
+            issues.extend(validate_concept(concept, layer, strict=strict))
         issues.extend(validate_duplicate_bindings(concepts))
         issues.extend(validate_links(root, concepts))
         ordered = tuple(sorted(issues, key=lambda issue: (issue.path, issue.message)))

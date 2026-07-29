@@ -617,3 +617,66 @@ def test_full_attested_computation_contract_is_valid(tmp_path: Path) -> None:
         "  resource: references/attesters/revenue.py\n",
     )
     assert OkfBundle.load(tmp_path).concepts["concept"]
+
+
+def test_lenient_load_downgrades_optional_errors_to_warnings(tmp_path: Path) -> None:
+    _write_concept(tmp_path, "type: Metric\nstatus: unknown")
+
+    bundle = OkfBundle.load(tmp_path, strict=False)
+
+    assert [(issue.path, issue.severity) for issue in bundle.diagnostics] == [
+        ("concept.md.frontmatter.status", "warning")
+    ]
+    assert bundle.concepts["concept"]
+
+
+@pytest.mark.parametrize(
+    "frontmatter",
+    [
+        "type: ''",
+        "type: Attested Computation",
+        "type: Selayer Metric\nselayer_id: metric.",
+    ],
+)
+def test_hard_failures_remain_fatal_in_lenient_mode(
+    tmp_path: Path, frontmatter: str
+) -> None:
+    _write_concept(tmp_path, frontmatter)
+
+    with pytest.raises(OkfValidationError) as caught:
+        OkfBundle.load(tmp_path, strict=False)
+
+    assert caught.value.issues
+    assert all(issue.severity == "error" for issue in caught.value.issues)
+
+
+def test_strict_load_default_remains_fatal_for_optional_errors(tmp_path: Path) -> None:
+    _write_concept(tmp_path, "type: Metric\nstatus: unknown")
+
+    with pytest.raises(OkfValidationError) as caught:
+        OkfBundle.load(tmp_path)
+
+    assert caught.value.issues[0].severity == "error"
+
+
+def test_malformed_yaml_remains_fatal_in_lenient_mode(tmp_path: Path) -> None:
+    (tmp_path / "bad.md").write_text(
+        "---\ntype: [unterminated\n---\n", encoding="utf-8"
+    )
+
+    with pytest.raises(OkfValidationError):
+        OkfBundle.load(tmp_path, strict=False)
+
+
+def test_duplicate_bindings_remain_fatal_in_lenient_mode(
+    tmp_path: Path, valid_catalog_path: Path
+) -> None:
+    layer = SemanticLayer.load(valid_catalog_path)
+    for name in ("a.md", "b.md"):
+        (tmp_path / name).write_text(
+            "---\ntype: Selayer Metric\nselayer_id: metric.gross_margin\n---\n",
+            encoding="utf-8",
+        )
+
+    with pytest.raises(OkfValidationError):
+        OkfBundle.load(tmp_path, layer=layer, strict=False)
