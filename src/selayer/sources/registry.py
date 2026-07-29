@@ -155,6 +155,7 @@ class SourceRegistry:
         prepared: list[tuple[str, SourceAdapter, SourceHandle]] = []
         failed_source_id: str | None = None
         init_failed = False
+        unsupported_id: str | None = None
         try:
             for source_id in sorted(layer.data_sources):
                 failed_source_id = source_id
@@ -162,14 +163,21 @@ class SourceRegistry:
                 parsed = _parsed_source_from_data_source(data_source)
                 sources[source_id] = parsed
                 kind = connector_kind(data_source.connector)
+                # Unsupported connector kinds (not mapped by any built-in or
+                # injected adapter) must fail deterministically with a sanitized
+                # error *before* a bare ``KeyError`` can escape the lookup.
+                if kind not in adapter_map:
+                    unsupported_id = source_id
+                    raise _UnsupportedConnector(source_id)
                 adapter = adapter_map[kind]
                 handle = adapter.prepare(parsed, profiles, arrow_providers)
+                # Track the handle immediately so cleanup closes it even if
+                # ``inspect_schema`` raises after a successful prepare.
+                prepared.append((source_id, adapter, handle))
                 observed = adapter.inspect_schema(handle)
                 mismatches = compare_schemas(data_source.schema, observed)
                 if mismatches:
-                    adapter.close(handle)
                     raise _SchemaDrift(data_source.schema, observed)
-                prepared.append((source_id, adapter, handle))
         except Exception:  # noqa: BLE001
             init_failed = True
 
@@ -180,6 +188,14 @@ class SourceRegistry:
             for _source_id, adapter, handle in prepared:
                 close_quietly(adapter, handle)
             connection.close()
+            # An unmapped connector kind surfaces a dedicated, sanitized error
+            # (never the bare ``KeyError`` from the adapter lookup).
+            if unsupported_id is not None:
+                raise SourceConnectionError(
+                    unsupported_id,
+                    "unsupported_connector",
+                    "connector type is not supported",
+                )
             if failed_source_id is not None:
                 raise SourceConnectionError(
                     failed_source_id,
@@ -223,13 +239,22 @@ class SourceRegistry:
     # -- lifecycle: reload -------------------------------------------------
 
     def reload_source(self, source_id: str) -> ReloadResult:
-        """Atomically reload one source, publishing a new generation."""
+        """Atomically reload one source, publishing a new generation.
+
+        Candidate preparation and schema verification happen *before* the
+        critical section.  Snapshotting the old registration/generation, the
+        ``register`` commit, the registry publication, and the generation
+        increment all occur inside one ``RLock`` critical section so concurrent
+        ``reload_source`` calls serialize and produce strictly increasing
+        generations (``1 -> 2 -> 3``).  The old/candidate handles are closed
+        *outside* the lock only after the commit has succeeded or rolled back.
+        """
+
         self._ensure_open(source_id)
         if source_id not in self._registrations:
             raise SourceReloadError(source_id, "reload_failed", "unknown source")
         source = self._sources[source_id]
-        registration = self._registrations[source_id]
-        adapter = registration.adapter
+        adapter = self._registrations[source_id].adapter
 
         prepared_candidate = self._prepare_candidate(adapter, source)
         if prepared_candidate is None:
@@ -241,38 +266,55 @@ class SourceRegistry:
             close_quietly(adapter, candidate)
             raise SourceSchemaError(source_id, "schema_mismatch", "schema mismatch")
 
-        old_handle = registration.handle
-        old_generation = registration.generation
+        # One critical section: snapshot old registration/generation, commit
+        # the candidate registration, and publish the incremented generation.
+        # A concurrent reload_source blocks here and observes the new
+        # generation when it acquires the lock, guaranteeing 1 -> 2 -> 3.
         commit_failed = False
+        old_handle: SourceHandle | None = None
+        old_generation = 0
         with self._lock:
+            old_registration = self._registrations[source_id]
+            old_handle = old_registration.handle
+            old_generation = old_registration.generation
             try:
                 adapter.register(self._connection, source_id, candidate)
             except Exception:  # noqa: BLE001
                 commit_failed = True
-                # Restore the previous handle before releasing the lock.
+                # register may have mutated the connection before raising, so
+                # restore the previous handle before releasing the lock.
                 restore_quietly(adapter, self._connection, source_id, old_handle)
+            else:
+                self._registrations[source_id] = _Registration(
+                    adapter, candidate, old_generation + 1
+                )
         if commit_failed:
             close_quietly(adapter, candidate)
             raise SourceReloadError(source_id, "reload_failed", "reload failed")
 
-        new_generation = old_generation + 1
-        with self._lock:
-            self._registrations[source_id] = _Registration(
-                adapter, candidate, new_generation
-            )
         # The old handle is no longer referenced by DuckDB; release it outside
-        # the lock.
+        # the lock after the commit succeeded.
         close_quietly(adapter, old_handle)
         return ReloadResult(
             source_id=source_id,
             old_generation=old_generation,
-            new_generation=new_generation,
+            new_generation=old_generation + 1,
             schema_fingerprint=schema_fingerprint(observed),
             snapshot=candidate.snapshot,
         )
 
     def reload_all(self) -> tuple[ReloadResult, ...]:
-        """Atomically reload every source in sorted source-ID order."""
+        """Atomically reload every source in sorted source-ID order.
+
+        Candidates are prepared and verified before the critical section.
+        Inside one ``RLock`` section the stable registrations are swapped in
+        sorted source-ID order and the generations are published.  If any
+        ``register`` raises — even after mutating the connection — the failing
+        source's old handle is restored too (not only the already-swapped
+        entries), every old registration is restored in reverse order, no
+        generation changes, and the old query results are unchanged.
+        """
+
         self._ensure_open("<source>")
         source_ids = sorted(self._sources)
         candidates: dict[str, tuple[SourceAdapter, SourceHandle, TableSchema]] = {}
@@ -306,45 +348,53 @@ class SourceRegistry:
 
         swapped: list[tuple[str, SourceAdapter, SourceHandle, int]] = []
         commit_failed = False
+        results: list[ReloadResult] = []
+        # One critical section: swap every registration and publish every
+        # generation.  A register failure rolls back the failing source's old
+        # handle *and* every already-swapped entry in reverse order, leaving
+        # all old registrations, query results, and generations unchanged.
         with self._lock:
             for source_id in source_ids:
                 adapter, candidate, _observed = candidates[source_id]
                 old = self._registrations[source_id]
                 try:
                     adapter.register(self._connection, source_id, candidate)
-                    swapped.append((source_id, adapter, old.handle, old.generation))
                 except Exception:  # noqa: BLE001
                     commit_failed = True
+                    # register may have mutated the connection before raising,
+                    # so restore the failing source's old handle too — not only
+                    # the previously swapped entries.
+                    restore_quietly(adapter, self._connection, source_id, old.handle)
                     break
+                swapped.append((source_id, adapter, old.handle, old.generation))
             if commit_failed:
                 # Restore each already-swapped old handle in reverse order.
                 for source_id, adapter, old_handle, _gen in reversed(swapped):
                     restore_quietly(adapter, self._connection, source_id, old_handle)
+            else:
+                # Publish every generation change only after every swap
+                # succeeded, within the same critical section.
+                for source_id in source_ids:
+                    adapter, candidate, observed = candidates[source_id]
+                    old_generation = self._registrations[source_id].generation
+                    self._registrations[source_id] = _Registration(
+                        adapter, candidate, old_generation + 1
+                    )
+                    results.append(
+                        ReloadResult(
+                            source_id=source_id,
+                            old_generation=old_generation,
+                            new_generation=old_generation + 1,
+                            schema_fingerprint=schema_fingerprint(observed),
+                            snapshot=candidate.snapshot,
+                        )
+                    )
         if commit_failed:
             for adapter, candidate, _observed in candidates.values():
                 close_quietly(adapter, candidate)
             raise SourceReloadError("<source>", "reload_failed", "reload failed")
 
-        # Publish generation changes only after every swap succeeded.
-        results: list[ReloadResult] = []
-        with self._lock:
-            for source_id in source_ids:
-                adapter, candidate, observed = candidates[source_id]
-                old_generation = self._registrations[source_id].generation
-                new_generation = old_generation + 1
-                self._registrations[source_id] = _Registration(
-                    adapter, candidate, new_generation
-                )
-                results.append(
-                    ReloadResult(
-                        source_id=source_id,
-                        old_generation=old_generation,
-                        new_generation=new_generation,
-                        schema_fingerprint=schema_fingerprint(observed),
-                        snapshot=candidate.snapshot,
-                    )
-                )
-        # Close old handles outside the lock.
+        # Close old handles outside the lock after the commit succeeded.
         for source_id, adapter, old_handle, _gen in swapped:
             close_quietly(adapter, old_handle)
         return tuple(results)
@@ -411,9 +461,15 @@ class SourceRegistry:
             yield
 
     def execute(self, sql: str, parameters: tuple[object, ...] = ()) -> Any:
-        """Execute SQL on the registry connection (call within :meth:`bind`)."""
+        """Execute SQL on the registry connection under the registry lock.
 
-        return self._connection.execute(sql, parameters)
+        The lock is acquired here directly so registry-aware execution can
+        never bypass locking.  Because the lock is an ``RLock``, nested
+        acquisition from within :meth:`bind` is permitted (reentrant).
+        """
+
+        with self._lock:
+            return self._connection.execute(sql, parameters)
 
     # -- internals ---------------------------------------------------------
 
@@ -433,12 +489,19 @@ class SourceRegistry:
         Failures are signaled rather than raised so the caller can construct the
         sanitized :class:`~selayer.sources.errors.SourceError` outside the
         ``except`` scope, preserving the ``__cause__``/``__context__`` invariant.
+        If ``prepare`` succeeds but ``inspect_schema`` raises, the prepared
+        handle is closed so it is never leaked.
         """
 
+        candidate: SourceHandle | None = None
         try:
             candidate = adapter.prepare(source, self._profiles, self._arrow_providers)
             observed = adapter.inspect_schema(candidate)
         except Exception:  # noqa: BLE001
+            # inspect_schema may have raised after a successful prepare; close
+            # the prepared handle so it is never leaked.
+            if candidate is not None:
+                close_quietly(adapter, candidate)
             return None
         return candidate, observed
 
@@ -458,6 +521,13 @@ class _SchemaDrift(Exception):
     def __init__(self, declared: TableSchema, observed: TableSchema) -> None:
         self.declared = declared
         self.observed = observed
+
+
+class _UnsupportedConnector(Exception):
+    """Internal sentinel for a connector kind with no registered adapter."""
+
+    def __init__(self, source_id: str) -> None:
+        self.source_id = source_id
 
 
 def close_quietly(adapter: SourceAdapter, handle: SourceHandle) -> None:

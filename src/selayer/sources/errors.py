@@ -64,6 +64,9 @@ _CODE_MESSAGES: dict[str, str] = {
     "source_initialization_failed": (
         "a data source could not be initialized during registry creation"
     ),
+    "unsupported_connector": (
+        "the connector type is not supported by any registered adapter"
+    ),
 }
 
 # Known source error codes — an allowlist, *not* a permissive regex.  Only a
