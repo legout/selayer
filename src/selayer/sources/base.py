@@ -7,14 +7,16 @@ object is frozen and slotted.
 Secrecy invariants (load-bearing):
 
 * **No credentials, handles, or schemas in reprs.**  ``SourceHandle.resource``,
-  ``schema``, and ``cleanup`` are excluded from the repr; ``SourceStatus`` and
-  ``ReloadResult`` carry only IDs, connector kind, generation, a stable
-  fingerprint, a safe snapshot/version, and health — never the resource object
-  or schema.  Snapshots are routed through the centralized URI-userinfo
-  sanitizer so embedded credentials can never surface.
+  ``schema``, and ``cleanup`` are excluded from the repr; free-form strings
+  (filter ``value``, ``snapshot``, ``stable_name``, ``schema_fingerprint``)
+  are *always* redacted to a fixed placeholder so a token-shaped secret
+  (``TOKENONLYSECRET``), a SQL fragment, or a credential-bearing URI can never
+  surface — no permissive token regex is trusted.  ``source_id`` and
+  ``connector`` render only when they match the catalog source-name shape.
 * **No raw SQL.**  :class:`SourceScanRequirement` carries ordered physical
   columns and structured :class:`SourceFilter` objects with a closed set of
-  symbolic operators — never SQL text.
+  symbolic operators — never SQL text.  An operator outside the closed
+  :data:`SourceFilterOperator` set is rejected at construction.
 * **Cleanup callbacks are repr-hidden.**  ``SourceHandle.cleanup`` and
   ``QueryBinding.cleanup`` never appear in diagnostics.
 * **Context cleanup.**  :class:`QueryBinding` is a context manager that
@@ -30,7 +32,6 @@ from enum import StrEnum
 from typing import Literal, Protocol, Self, runtime_checkable
 
 from selayer.sources.catalog import ParsedSource
-from selayer.sources.config import _sanitize_location
 from selayer.sources.profiles import (
     ArrowProviderResolver,
     RuntimeProfileResolver,
@@ -54,52 +55,65 @@ __all__ = [
 # Repr sanitization
 # ---------------------------------------------------------------------------
 #
-# Every free-form string/tuple that appears in a lifecycle value-object repr
-# is routed through these helpers so that credentials, arbitrary SQL, opaque
-# handles, resources, schemas, and cleanup callbacks can never surface in
-# diagnostics:
+# Every string that appears in a lifecycle value-object repr is routed through
+# these helpers so that credentials, arbitrary SQL, opaque handles, resources,
+# schemas, and cleanup callbacks can never surface in diagnostics:
 #
-# * identifier fields (``source_id``, ``connector``, ``column``, ``stable_name``)
-#   must match the SQL-identifier shape and are placeholder-ed otherwise — this
-#   is the SQL-injection surface since adapters interpolate identifiers;
-# * free-form fields (``value``, ``snapshot``, ``schema_fingerprint``) are first
-#   URI-userinfo-redacted through the existing config redactor
-#   (:func:`_sanitize_location`), then any result that is not a safe token
-#   (e.g. SQL fragments, ``key=value`` secrets) is replaced with a
-#   ``"<redacted>"`` placeholder.
+# * identifier fields (``source_id``, ``connector``) must match the catalog
+#   source-name shape (lowercase snake_case) and are placeholder-ed otherwise;
+# * physical columns must match the SQL-identifier shape and are placeholder-ed
+#   otherwise (this is the SQL-injection surface since adapters interpolate
+#   columns);
+# * free-form fields (filter ``value``, ``snapshot``, ``stable_name``,
+#   ``schema_fingerprint``) are *always* redacted to a fixed placeholder — no
+#   permissive "safe token" regex can reliably tell a credential/SQL fragment
+#   from a benign string (``TOKENONLYSECRET`` is token-shaped yet secret), so
+#   strings are redacted by default and only non-string scalars (ints, bools,
+#   floats, ``None``) pass through.
 #
 # Sanitization is repr-only: the stored values are unchanged so adapters keep
 # using the real identifiers/snapshots/filter literals to drive scans.
 
-_IDENTIFIER_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
-_SAFE_TOKEN_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.\-:/]*\Z")
+# The exact shape the catalog enforces for declared source names.  Only a
+# catalog-shaped name renders; anything else (uppercase secret tokens, SQL
+# fragments, credential URIs) is placeholder-ed.
+_SOURCE_NAME_RE = re.compile(r"\A[a-z][a-z0-9_]*\Z")
+# Physical SQL identifiers (columns) may legitimately be mixed case.
+_SQL_IDENT_RE = re.compile(r"\A[a-zA-Z_][a-zA-Z0-9_]*\Z")
 
 
-def _repr_id(value: object) -> str:
-    """Render an identifier field, placeholder-ing anything that is not one."""
+def _repr_source_name(value: object) -> str:
+    """Render a source_id/connector, placeholder-ing non-conformant values."""
 
-    if isinstance(value, str) and _IDENTIFIER_RE.match(value):
+    if isinstance(value, str) and _SOURCE_NAME_RE.match(value):
         return value
     return "<redacted>"
 
 
-def _repr_token(value: object) -> object:
-    """Repr-safe projection of a free-form field.
+def _repr_column(value: object) -> str:
+    """Render a physical column, placeholder-ing non-conformant values."""
 
-    Strings are URI-userinfo-redacted via the config redactor, then any result
-    that is not a safe token (SQL fragments, ``key=value`` secrets, embedded
-    whitespace/punctuation) is replaced with ``"<redacted>"``.  Tuples and
-    lists are projected element-wise; all other values (ints, bools, enums)
-    pass through unchanged.
+    if isinstance(value, str) and _SQL_IDENT_RE.match(value):
+        return value
+    return "<redacted>"
+
+
+def _repr_literal(value: object) -> object:
+    """Repr-safe projection of a free-form literal/handle field.
+
+    Strings are *always* redacted to ``"<redacted>"``: a free-form string may
+    carry a secret token (``TOKENONLYSECRET``), a SQL fragment, or a
+    credential-bearing URI, and no token-shaped regex can reliably separate a
+    safe string from a secret.  Tuples/lists are projected element-wise; all
+    other values (ints, bools, floats, enums, ``None``) pass through unchanged.
     """
 
     if isinstance(value, str):
-        redacted = _sanitize_location(value)
-        return redacted if _SAFE_TOKEN_RE.match(redacted) else "<redacted>"
+        return "<redacted>"
     if isinstance(value, tuple):
-        return tuple(_repr_token(item) for item in value)
+        return tuple(_repr_literal(item) for item in value)
     if isinstance(value, list):
-        return tuple(_repr_token(item) for item in value)
+        return tuple(_repr_literal(item) for item in value)
     return value
 
 
@@ -144,25 +158,46 @@ type SourceFilterOperator = Literal[
 ]
 
 
+# The closed set of valid filter operators, mirrored as a runtime frozenset so
+# that an out-of-set operator can be rejected at construction (the ``Literal``
+# alias is not enforced at runtime).  This is the single guard against an
+# arbitrary SQL string being stored as an operator and later rendered.
+_FILTER_OPERATORS: frozenset[str] = frozenset(
+    {"eq", "ne", "lt", "le", "gt", "ge", "in", "is_null", "is_not_null"}
+)
+
+
 @dataclass(frozen=True, slots=True)
 class SourceFilter:
     """Structured source-local scan filter.
 
     ``operator`` is a closed symbolic token and ``value`` is a literal (or
-    collection literal for ``in``).  No field may carry SQL text.
+    collection literal for ``in``).  No field may carry SQL text.  An operator
+    outside the closed :data:`SourceFilterOperator` set is rejected at
+    construction so no arbitrary SQL can ever be stored or rendered.
     """
 
     column: str
     operator: SourceFilterOperator
     value: object
 
+    def __post_init__(self) -> None:
+        # The ``Literal`` type is not enforced at runtime, so validate the
+        # operator against the closed set here: an out-of-set value (arbitrary
+        # SQL such as ``"SELECT * FROM secrets"``) raises immediately.  The
+        # check runs against an untyped local so the type checker does not
+        # narrow it away as impossible.
+        operator: object = self.operator
+        if not (isinstance(operator, str) and operator in _FILTER_OPERATORS):
+            raise ValueError("invalid SourceFilter operator")
+
     def __repr__(self) -> str:
         return _render(
             "SourceFilter",
             [
-                ("column", _repr_id(self.column)),
+                ("column", _repr_column(self.column)),
                 ("operator", self.operator),
-                ("value", _repr_token(self.value)),
+                ("value", _repr_literal(self.value)),
             ],
         )
 
@@ -189,7 +224,7 @@ class SourceScanRequirement:
         return _render(
             "SourceScanRequirement",
             [
-                ("columns", tuple(_repr_id(column) for column in self.columns)),
+                ("columns", tuple(_repr_column(column) for column in self.columns)),
                 ("filters", self.filters),
             ],
         )
@@ -222,9 +257,9 @@ class SourceHandle:
         return _render(
             "SourceHandle",
             [
-                ("source_id", _repr_id(self.source_id)),
-                ("connector", _repr_id(self.connector)),
-                ("snapshot", _repr_token(self.snapshot)),
+                ("source_id", _repr_source_name(self.source_id)),
+                ("connector", _repr_source_name(self.connector)),
+                ("snapshot", _repr_literal(self.snapshot)),
                 ("query_scoped", self.query_scoped),
             ],
         )
@@ -266,11 +301,11 @@ class SourceStatus:
         return _render(
             "SourceStatus",
             [
-                ("source_id", _repr_id(self.source_id)),
-                ("connector", _repr_id(self.connector)),
+                ("source_id", _repr_source_name(self.source_id)),
+                ("connector", _repr_source_name(self.connector)),
                 ("generation", self.generation),
-                ("schema_fingerprint", _repr_token(self.schema_fingerprint)),
-                ("snapshot", _repr_token(self.snapshot)),
+                ("schema_fingerprint", _repr_literal(self.schema_fingerprint)),
+                ("snapshot", _repr_literal(self.snapshot)),
                 ("health", self.health.value),
             ],
         )
@@ -290,11 +325,11 @@ class ReloadResult:
         return _render(
             "ReloadResult",
             [
-                ("source_id", _repr_id(self.source_id)),
+                ("source_id", _repr_source_name(self.source_id)),
                 ("old_generation", self.old_generation),
                 ("new_generation", self.new_generation),
-                ("schema_fingerprint", _repr_token(self.schema_fingerprint)),
-                ("snapshot", _repr_token(self.snapshot)),
+                ("schema_fingerprint", _repr_literal(self.schema_fingerprint)),
+                ("snapshot", _repr_literal(self.snapshot)),
             ],
         )
 
@@ -341,8 +376,8 @@ class QueryBinding:
         return _render(
             "QueryBinding",
             [
-                ("source_id", _repr_id(self.source_id)),
-                ("stable_name", _repr_id(self.stable_name)),
+                ("source_id", _repr_source_name(self.source_id)),
+                ("stable_name", _repr_literal(self.stable_name)),
             ],
         )
 

@@ -231,10 +231,13 @@ def test_source_error_arbitrary_args_never_leak_in_repr_or_str() -> None:
         assert "token=" not in text
 
 
-def test_source_error_unknown_code_uses_fallback_message() -> None:
+def test_source_error_unknown_code_is_coerced_to_unknown() -> None:
+    # Only known codes are retained; anything else is coerced to ``"unknown"``
+    # so an arbitrary caller/driver code can never surface.
     err = SourceConnectionError("orders", "some_future_code", "detail")
-    assert err.code == "some_future_code"
+    assert err.code == "unknown"
     assert err.message == "a source lifecycle error occurred"
+    assert "some_future_code" not in repr(err)
 
 
 # ---------------------------------------------------------------------------
@@ -576,6 +579,117 @@ def test_query_binding_repr_does_not_invoke_cleanup() -> None:
     binding = QueryBinding(source_id="orders", stable_name="orders_v1", cleanup=cleanup)
     repr(binding)
     assert invoked == []
+
+
+# ---------------------------------------------------------------------------
+# Hostile regression: token-shaped secrets.  ``TOKENONLYSECRET`` is a string
+# that matches a permissive "safe token" regex yet is a secret.  It must never
+# surface in any repr surface; filter values, snapshots, and stable names are
+# redacted by default, and arbitrary SQL operators are rejected at
+# construction.  SourceError must render token-shaped source ids / codes as
+# safe placeholders rather than trusting a permissive regex.
+# ---------------------------------------------------------------------------
+
+
+def test_source_filter_value_token_secret_is_redacted() -> None:
+    # A bare token-shaped secret has no URI userinfo, so a userinfo redactor
+    # and a token-shaped regex both let it through verbatim — the value must
+    # be redacted by default.
+    flt = SourceFilter(column="id", operator="eq", value="TOKENONLYSECRET")
+    text = repr(flt)
+    assert "TOKENONLYSECRET" not in text
+    assert "<redacted>" in text
+
+
+def test_source_filter_value_token_in_collection_is_redacted() -> None:
+    flt = SourceFilter(
+        column="id",
+        operator="in",
+        value=("TOKENONLYSECRET", "PLAINVALUE"),
+    )
+    text = repr(flt)
+    assert "TOKENONLYSECRET" not in text
+    assert "PLAINVALUE" not in text
+
+
+def test_source_filter_rejects_arbitrary_sql_operator() -> None:
+    # The ``Literal`` operator type is enforced at construction: arbitrary SQL
+    # cannot be stored as an operator (and therefore never rendered).  The
+    # ``type: ignore`` is static only — ``__post_init__`` rejects it at runtime.
+    with pytest.raises(ValueError):
+        SourceFilter(
+            column="id",
+            operator="SELECT * FROM secrets",  # type: ignore[arg-type]
+            value=1,
+        )
+
+
+def test_source_handle_snapshot_token_secret_is_redacted() -> None:
+    handle = SourceHandle(
+        source_id="orders",
+        connector="parquet",
+        resource=_HostileResource("topsecret"),
+        schema=_schema(),
+        snapshot="TOKENONLYSECRET",
+        cleanup=lambda: None,
+    )
+    text = repr(handle)
+    assert "TOKENONLYSECRET" not in text
+    assert "topsecret" not in text
+
+
+def test_source_status_snapshot_token_secret_is_redacted() -> None:
+    handle = SourceHandle(
+        source_id="orders",
+        connector="parquet",
+        resource=_HostileResource("topsecret"),
+        schema=_schema(),
+        snapshot="TOKENONLYSECRET",
+    )
+    status = SourceStatus.from_handle(handle, generation=1)
+    text = repr(status)
+    assert "TOKENONLYSECRET" not in text
+    assert "topsecret" not in text
+
+
+def test_reload_result_snapshot_token_secret_is_redacted() -> None:
+    result = ReloadResult(
+        "orders",
+        2,
+        3,
+        schema_fingerprint(_schema()),
+        "TOKENONLYSECRET",
+    )
+    text = repr(result)
+    assert "TOKENONLYSECRET" not in text
+
+
+def test_query_binding_stable_name_token_secret_is_redacted() -> None:
+    binding = QueryBinding(
+        source_id="orders",
+        stable_name="TOKENONLYSECRET",
+        cleanup=lambda: None,
+    )
+    text = repr(binding)
+    assert "TOKENONLYSECRET" not in text
+    assert "orders" in text
+
+
+def test_source_error_token_source_id_rendered_as_source() -> None:
+    # A token-shaped source id matches a permissive identifier regex yet is a
+    # secret; it must render as ``<source>`` and never be retained in repr.
+    err = SourceConnectionError("TOKENONLYSECRET", "connect_failed", "detail")
+    assert err.source_id == "<source>"
+    text = repr(err)
+    assert "TOKENONLYSECRET" not in text
+
+
+def test_source_error_token_code_coerced_to_unknown() -> None:
+    err = SourceConnectionError("orders", "TOKENONLYCODE", "detail")
+    assert err.code == "unknown"
+    assert err.message == "a source lifecycle error occurred"
+    text = repr(err)
+    assert "TOKENONLYCODE" not in text
 
 
 # ---------------------------------------------------------------------------

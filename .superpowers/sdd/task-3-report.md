@@ -261,3 +261,96 @@ unchanged (the `message` param is kept for interface compatibility but its
 value is discarded). All dataclass fields/signatures unchanged. Two existing
 tests updated to assert the new constant message and UUIDv4-honored operation
 id.
+
+---
+
+## Follow-up 2: remaining reviewer P1 — token-shaped secret leaks
+
+**Status: Complete.** A re-review found that the repr sanitizers still relied
+on a permissive "safe token" regex (`_SAFE_TOKEN_RE`), which let any
+token-shaped string through. `TOKENONLYSECRET` matched that regex (and the
+identifier regex used for `stable_name`/`source_id`), so it leaked verbatim in
+`SourceFilter.value`, `SourceHandle`/`SourceStatus`/`ReloadResult.snapshot`,
+`QueryBinding.stable_name`, and arbitrary SQL rendered as a `SourceFilter`
+operator (the `Literal` alias is not enforced at runtime).
+
+### Root cause
+
+No permissive token-shaped regex can separate a benign string from a secret
+(`TOKENONLYSECRET` is token-shaped yet secret). The fix abandons the
+token-regex approach entirely for free-form fields.
+
+### Changes
+
+**`src/selayer/sources/base.py`**
+
+- Replaced `_repr_token` / `_SAFE_TOKEN_RE` (the permissive "safe token"
+  regex) with `_repr_literal`, which **redacts every string to a fixed
+  `<redacted>` placeholder by default** — only non-string scalars (ints,
+  bools, floats, `None`) pass through. Collections are projected element-wise.
+  Applied to `SourceFilter.value`, all `snapshot` fields, `stable_name`, and
+  `schema_fingerprint`.
+- Split `_repr_id` into `_repr_source_name` (catalog source-name shape
+  `[a-z][a-z0-9_]*` — the exact shape the catalog enforces, so only
+  catalog-valid names render; `TOKENONLYSECRET` is rejected) for
+  `source_id`/`connector`, and `_repr_column` (SQL-identifier shape) for
+  physical columns.
+- **`SourceFilter.operator` is now validated at construction** against the
+  closed `_FILTER_OPERATORS` set; an out-of-set value raises a clean
+  `ValueError("invalid SourceFilter operator")` (no hostile text in the
+  message), so arbitrary SQL can never be stored or rendered.
+- Removed the now-unused `_sanitize_location` import.
+
+**`src/selayer/sources/errors.py`**
+
+- `_safe_code` changed from a permissive `[a-z][a-z0-9_]*` regex to a
+  **known-code allowlist** (`_KNOWN_CODES`); anything not in the set is
+  coerced to `"unknown"` (`some_future_code`, `TOKENONLYCODE` → `unknown`).
+- `_safe_source_id` regex tightened to the catalog source-name shape
+  `[a-z][a-z0-9_]*`; token-shaped ids (`TOKENONLYSECRET`) render as
+  `<source>`. `.source_id` and known `.code` properties preserved for the
+  tests that read them (`orders`/`missing_profile`).
+- `message`/args/cause/context guarantees unchanged (constant per-code
+  message; raised outside `except` so `__cause__`/`__context__` are `None`).
+
+**`tests/sources/test_adapter_contract.py`**
+
+- 9 new hostile regression tests; 1 existing test updated.
+
+### Validation gates
+
+| Gate | Result |
+| --- | --- |
+| `pytest -q tests/sources/test_profiles.py tests/sources/test_adapter_contract.py` | **68 passed** |
+| `pytest -q` (full suite) | **1030 passed** |
+| `ruff check src/selayer/sources tests/sources` | **All checks passed!** |
+| `ruff format --check src/selayer/sources tests/sources` | **12 files already formatted** |
+| `pyright src/selayer/sources tests/sources` | **0 errors, 0 warnings, 0 infos** |
+
+### New / updated hostile regression tests
+
+- **`TOKENONLYSECRET` in filter value / collection:**
+  `test_source_filter_value_token_secret_is_redacted`,
+  `test_source_filter_value_token_in_collection_is_redacted`.
+- **Arbitrary SQL operator:**
+  `test_source_filter_rejects_arbitrary_sql_operator` (asserts `ValueError`).
+- **`TOKENONLYSECRET` in snapshots:**
+  `test_source_handle_snapshot_token_secret_is_redacted`,
+  `test_source_status_snapshot_token_secret_is_redacted`,
+  `test_reload_result_snapshot_token_secret_is_redacted`.
+- **`TOKENONLYSECRET` in stable name:**
+  `test_query_binding_stable_name_token_secret_is_redacted`.
+- **Untrusted error ids:** `test_source_error_token_source_id_rendered_as_source`
+  (`source_id` → `<source>`), `test_source_error_token_code_coerced_to_unknown`.
+- **Updated:** `test_source_error_unknown_code_is_coerced_to_unknown` (was
+  `…_unknown_code_uses_fallback_message`; now asserts `.code == "unknown"`
+  under the allowlist).
+
+### Public interfaces preserved
+
+`SourceFilter`, `SourceHandle`, `SourceStatus`, `ReloadResult`,
+`QueryBinding`, and `SourceError` constructors and stored fields are unchanged
+— sanitization is repr-only. `SourceError(...)` signature unchanged. The only
+behavioural change is that an invalid `SourceFilter` operator now raises
+`ValueError` at construction (documenting the closed-set constraint the
+`Literal` alias already implied).

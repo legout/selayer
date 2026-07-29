@@ -10,9 +10,10 @@ Three guarantees are load-bearing for the secrecy contract:
 * **No arbitrary caller/driver text is ever retained.**  The caller-supplied
   ``message`` is intentionally discarded — only a constant generic message
   looked up from ``code`` is stored, so no driver-derived detail can surface.
-  ``source_id`` and ``code`` are validated against safe patterns and coerced to
-  placeholders when they do not match, and an explicit ``operation_id`` is
-  honored only when it parses as a UUIDv4 (otherwise a fresh one is generated).
+  ``code`` is validated against a *known-code allowlist* and ``source_id``
+  against the catalog source-name shape, each coerced to a placeholder when it
+  does not match, and an explicit ``operation_id`` is honored only when it
+  parses as a UUIDv4 (otherwise a fresh one is generated).
 * **No retained driver exceptions.**  Driver exceptions are never stored.
   Errors must be constructed and raised *outside* active ``except`` scopes so
   ``__cause__`` and ``__context__`` remain ``None``.
@@ -48,16 +49,6 @@ def new_operation_id() -> str:
     return str(uuid.uuid4())
 
 
-# A safe symbolic error code: lowercase snake_case (matching the catalog's own
-# code vocabulary).  Any other shape is coerced to ``"unknown"`` so arbitrary
-# caller/driver text can never surface as a code.
-_CODE_RE = re.compile(r"\A[a-z][a-z0-9_]*\Z")
-
-# A safe source identifier (the SQL-identifier shape the catalog accepts).
-# Anything else is replaced with ``"<source>"`` so arbitrary text — SQL
-# fragments, credentials, URIs — can never surface as a source id.
-_SOURCE_ID_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
-
 # Constant, generic messages keyed by stable error code.  The caller-supplied
 # ``message`` is *never* retained; only these constant strings are stored, so
 # no driver-derived detail can surface in diagnostics.  Unknown codes fall back
@@ -70,23 +61,38 @@ _CODE_MESSAGES: dict[str, str] = {
     "reload_failed": "the source could not be reloaded",
 }
 
+# Known source error codes — an allowlist, *not* a permissive regex.  Only a
+# code in this set is retained; anything else (e.g. ``TOKENONLYCODE`` or a SQL
+# fragment) is coerced to ``"unknown"`` so arbitrary caller/driver text can
+# never surface as a code.
+_KNOWN_CODES: frozenset[str] = frozenset(_CODE_MESSAGES)
+
 _FALLBACK_MESSAGE = "a source lifecycle error occurred"
+
+# Source-name identifier shape — the *exact* convention the catalog enforces
+# for declared source names (lowercase snake_case).  Only a ``source_id`` that
+# matches this specific validated shape is retained/rendered; anything else
+# (uppercase secret tokens like ``TOKENONLYSECRET``, SQL fragments, credential
+# URIs) is replaced with ``"<source>"``.  This is not a permissive catch-all
+# regex: it is the project's own source-name validation, so only
+# catalog-shaped identifiers surface in diagnostics.
+_SOURCE_NAME_RE = re.compile(r"\A[a-z][a-z0-9_]*\Z")
 
 
 def _safe_code(code: object) -> str:
-    """Return ``code`` if it is a safe symbolic code, else ``"unknown"``."""
+    """Return ``code`` only if it is a *known* error code, else ``"unknown"``."""
 
-    if isinstance(code, str) and _CODE_RE.match(code):
-        return code
-    return "unknown"
+    return code if isinstance(code, str) and code in _KNOWN_CODES else "unknown"
 
 
 def _safe_source_id(source_id: object) -> str:
-    """Return ``source_id`` if it is a safe identifier, else ``"<source>"``."""
+    """Return ``source_id`` only if it is a catalog-shaped name, else ``"<source>"``."""
 
-    if isinstance(source_id, str) and _SOURCE_ID_RE.match(source_id):
-        return source_id
-    return "<source>"
+    return (
+        source_id
+        if isinstance(source_id, str) and _SOURCE_NAME_RE.match(source_id)
+        else "<source>"
+    )
 
 
 def _validated_operation_id(operation_id: str | None) -> str:
@@ -119,8 +125,8 @@ class SourceError(Exception):
     Only safe, derived identifiers are stored:
 
     * ``operation_id`` — a UUIDv4 (validated if supplied, else generated).
-    * ``source_id`` — a validated identifier, else ``"<source>"``.
-    * ``code`` — a validated snake_case symbolic code, else ``"unknown"``.
+    * ``source_id`` — a catalog-shaped name, else ``"<source>"``.
+    * ``code`` — a known error code, else ``"unknown"``.
     * ``message`` — a *constant* generic message looked up from ``code``; the
       caller-supplied message is intentionally ignored so driver-derived detail
       can never surface.
