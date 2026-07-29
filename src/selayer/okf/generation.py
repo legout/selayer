@@ -8,6 +8,8 @@ from types import MappingProxyType
 from selayer.catalog import SemanticLayer, SemanticObject
 from selayer.expressions import format_expression
 from selayer.model import DataSource, Dimension, Fact, Measure, Metric, Relationship
+from selayer.sources.config import connector_kind
+from selayer.sources.schema import schema_fingerprint
 
 from .document import generated_fingerprint
 from .model import OkfConcept, OkfSection
@@ -49,14 +51,25 @@ def generated_directories() -> tuple[str, ...]:
     return tuple(_KIND_DIRECTORIES.values())
 
 
+def _field_summary(schema: object) -> str:
+    """Render an ordered, name/type summary of a declared table schema."""
+
+    fields = getattr(schema, "fields", ())
+    entries = []
+    for field in fields:
+        entries.append(f"`{field.name}`")
+    return ", ".join(entries)
+
+
 def catalog_definition(semantic_id: str, value: SemanticObject) -> str:
     """Render the complete executable catalog definition without reading data."""
     lines = [f"Semantic ID: `{semantic_id}`"]
     if isinstance(value, DataSource):
         lines.extend(
             (
-                f"Physical type: `{value.type}`",
-                f"Path: `{value.path}`",
+                f"Connector: `{connector_kind(value.connector)}`",
+                f"Schema fingerprint: `{schema_fingerprint(value.schema)}`",
+                f"Fields: {_field_summary(value.schema)}",
                 f"Grain: {', '.join(f'`{column}`' for column in value.grain)}",
             )
         )

@@ -17,6 +17,10 @@ from selayer import (
     QueryExecutionError,
     SemanticLayer,
 )
+from selayer.sources.config import PyArrowConfig
+from selayer.sources.errors import SourceConnectionError
+from selayer.sources.profiles import MappingArrowProviderResolver
+from selayer.sources.schema import FieldSchema, ScalarType, TableSchema
 
 
 def test_query_engine_exposes_resolved_plan(valid_catalog_path: Path) -> None:
@@ -113,7 +117,7 @@ def test_diagnostic_category_requires_an_anchored_token(
             raise duckdb.ConversionException(diagnostic)
 
     connection = FailingConnection()
-    monkeypatch.setattr(engine, "conn", connection)
+    monkeypatch.setattr(engine._registry, "_connection", connection)
     with pytest.raises(QueryExecutionError) as caught:
         engine.query(["gross_margin"], filters={"stock": "secret"})
     error = caught.value
@@ -211,7 +215,7 @@ def test_parameterized_errors_reach_execution_with_immutable_parameters_and_sani
             raise duckdb.ConversionException(raw_diagnostic)
 
     connection = FailingConnection()
-    monkeypatch.setattr(engine, "conn", connection)
+    monkeypatch.setattr(engine._registry, "_connection", connection)
     custom = _UnprintableParameter()
     cases: tuple[tuple[object, tuple[object, ...], tuple[str, ...]], ...] = (
         (
@@ -309,7 +313,7 @@ def test_parameterized_errors_never_format_values_or_driver_messages(
             raise duckdb.ConversionException(raw_diagnostic)
 
     connection = FailingConnection()
-    monkeypatch.setattr(engine, "conn", connection)
+    monkeypatch.setattr(engine._registry, "_connection", connection)
     custom = _UnprintableParameter()
     secret_values: tuple[tuple[object, tuple[str, ...]], ...] = (
         ("<redacted>", ("<redacted>",)),
@@ -381,7 +385,7 @@ def test_parameterized_errors_use_generic_category_for_unknown_driver_error(
             raise duckdb.Error(raw_diagnostic)
 
     connection = FailingConnection()
-    monkeypatch.setattr(engine, "conn", connection)
+    monkeypatch.setattr(engine._registry, "_connection", connection)
     with pytest.raises(QueryExecutionError) as caught:
         engine.query(["gross_margin"], filters={"stock": "secret"})
     error = caught.value
@@ -414,6 +418,8 @@ def test_query_execution_errors_have_distinct_uuid_ids(
 def test_source_loading_error_is_sanitized_and_closes_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A failing pyarrow provider surfaces a sanitized, closed connection error."""
+
     class TrackingConnection:
         closed = False
 
@@ -427,40 +433,100 @@ def test_source_loading_error_is_sanitized_and_closes_connection(
     monkeypatch.setattr("selayer.query.duckdb.connect", lambda *_args: connection)
     credential_path = "https://user:password@private.example/data.parquet"
 
-    def fail_loader(_source_type: str, _path: str) -> object:
+    def failing_provider() -> object:
         raise OSError(f"cannot read {credential_path}")
 
-    monkeypatch.setattr(QueryEngine, "_load_source", staticmethod(fail_loader))
+    providers = MappingArrowProviderResolver({"events": failing_provider})
     layer = SemanticLayer(
         1,
         "test",
         "",
         "",
-        {"source": DataSource("source", "parquet", credential_path, ("id",))},
+        {
+            "events": DataSource(
+                name="events",
+                connector=PyArrowConfig("events"),
+                schema=TableSchema((FieldSchema("id", ScalarType("int64"), False),)),
+                grain=("id",),
+            )
+        },
         {},
         {},
         {},
         {},
         {},
     )
-    with pytest.raises(QueryExecutionError) as caught:
-        QueryEngine(layer)
+    with pytest.raises(SourceConnectionError) as caught:
+        QueryEngine(layer, arrow_providers=providers)
     error = caught.value
     assert connection.closed
     assert credential_path not in str(error)
     assert credential_path not in error.message
+    assert credential_path not in repr(error)
     assert error.__cause__ is None
     assert error.__context__ is None
-    assert UUID(error.query_id).version == 4
+    assert error.code == "source_initialization_failed"
+    assert error.source_id == "events"
 
 
 def test_query_engine_context_manager_closes_connection(
     valid_catalog_path: Path,
 ) -> None:
     with QueryEngine(SemanticLayer.load(valid_catalog_path)) as engine:
-        connection = engine.conn
+        connection = engine._registry._connection
     with pytest.raises(duckdb.Error):
         connection.execute("SELECT 1")
+
+
+def test_query_engine_delegates_source_reload(
+    valid_layer: SemanticLayer,
+    arrow_providers: MappingArrowProviderResolver,
+) -> None:
+    """The engine delegates reload_source and reports the generation change."""
+    with QueryEngine(valid_layer, arrow_providers=arrow_providers) as engine:
+        before = engine.source_status("order_items")
+        result = engine.reload_source("order_items")
+        after = engine.source_status("order_items")
+
+    assert result.old_generation == before.generation
+    assert result.new_generation == after.generation
+    assert after.generation == before.generation + 1
+
+
+def test_reload_all_is_exposed_as_immutable_results(
+    valid_layer: SemanticLayer,
+    arrow_providers: MappingArrowProviderResolver,
+) -> None:
+    """reload_all returns immutable results for every source in sorted order."""
+    with QueryEngine(valid_layer, arrow_providers=arrow_providers) as engine:
+        results = engine.reload_all()
+
+    assert tuple(item.source_id for item in results) == tuple(
+        sorted(valid_layer.data_sources)
+    )
+    for item in results:
+        assert item.new_generation == 2
+
+
+def test_query_engine_never_uses_eager_polars_source_reads(
+    valid_layer: SemanticLayer,
+    arrow_providers: MappingArrowProviderResolver,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful query proves neither eager Polars reader is invoked."""
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("query engine must not eagerly read sources via Polars")
+
+    import polars as pl
+
+    monkeypatch.setattr(pl, "read_parquet", fail)
+    monkeypatch.setattr(pl, "read_csv", fail)
+
+    with QueryEngine(valid_layer, arrow_providers=arrow_providers) as engine:
+        result = engine.query(["gross_margin"], ["product_category"])
+
+    assert "gross_margin" in result.columns
 
 
 def test_public_exports_exclude_compiler_internals() -> None:

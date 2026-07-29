@@ -85,14 +85,16 @@ def test_projection_contains_every_semantic_object(
         "sources/orders",
         "sources/products",
     )
-    assert (
-        "Physical type: `parquet`"
-        in bundle.concepts["sources/order_items"].sections[0].content
-    )
-    assert (
-        "Grain: `order_id`, `product_id`"
-        in bundle.concepts["sources/order_items"].sections[0].content
-    )
+    source_content = bundle.concepts["sources/order_items"].sections[0].content
+    assert "Connector: `parquet`" in source_content
+    assert "Schema fingerprint: `" in source_content
+    assert "Fields: `order_id`, `product_id`, `quantity`, `total`" in source_content
+    assert "Grain: `order_id`, `product_id`" in source_content
+    # The old ``path``/``location``/profile shape is gone from the rendered
+    # catalog definition — only the connector category, field summary,
+    # fingerprint, and grain remain.
+    assert "location" not in source_content
+    assert "profile" not in source_content
     assert (
         "Column: `category`"
         in bundle.concepts["dimensions/product_category"].sections[0].content

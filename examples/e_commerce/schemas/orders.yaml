@@ -1,0 +1,13 @@
+fields:
+  - {name: id, type: utf8, nullable: false}
+  - {name: customer_id, type: utf8, nullable: true}
+  - name: created_at
+    type:
+      timestamp: {unit: ns, timezone: UTC}
+    nullable: true
+  - {name: status, type: utf8, nullable: true}
+  - {name: payment_method, type: utf8, nullable: true}
+  - {name: shipping_cost, type: float64, nullable: true}
+  - {name: discount_amount, type: float64, nullable: true}
+  - {name: amount, type: float64, nullable: true}
+  - {name: total_amount, type: float64, nullable: true}

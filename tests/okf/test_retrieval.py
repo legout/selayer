@@ -403,9 +403,7 @@ def test_attested_computation_structured_contract_is_bounded() -> None:
             "type": "Attested Computation",
             "selayer_id": "computation.decoder",
             "runtime": oversized,
-            "parameters": [
-                {"name": oversized, "type": oversized, "required": True}
-            ],
+            "parameters": [{"name": oversized, "type": oversized, "required": True}],
             "computation": oversized,
             "executor": {"resource": oversized, "receipt": [oversized]},
             "attester": {"resource": oversized},

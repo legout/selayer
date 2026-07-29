@@ -1,6 +1,15 @@
-"""Public execution errors."""
+"""Public execution and source lifecycle errors."""
 
 from __future__ import annotations
+
+from selayer.sources.errors import (
+    SourceConnectionError,
+    SourceDependencyError,
+    SourceError,
+    SourceProfileError,
+    SourceReloadError,
+    SourceSchemaError,
+)
 
 
 class QueryExecutionError(RuntimeError):
@@ -12,4 +21,12 @@ class QueryExecutionError(RuntimeError):
         super().__init__(f"query {query_id}: {message}")
 
 
-__all__ = ["QueryExecutionError"]
+__all__ = [
+    "QueryExecutionError",
+    "SourceConnectionError",
+    "SourceDependencyError",
+    "SourceError",
+    "SourceProfileError",
+    "SourceReloadError",
+    "SourceSchemaError",
+]

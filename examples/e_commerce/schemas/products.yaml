@@ -1,0 +1,5 @@
+fields:
+  - {name: id, type: utf8, nullable: false}
+  - {name: category, type: utf8, nullable: true}
+  - {name: subcategory, type: utf8, nullable: true}
+  - {name: cost, type: float64, nullable: true}

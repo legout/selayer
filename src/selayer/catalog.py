@@ -51,6 +51,19 @@ from selayer.model import (
     SemanticLayer,
     SemanticObject,
 )
+from selayer.sources.catalog import (
+    ParsedSource,
+    parse_source_declarations,
+    validate_source_declarations,
+)
+from selayer.sources.schema import (
+    DecimalType,
+    FieldSchema,
+    LogicalType,
+    ScalarType,
+    TableSchema,
+    TimestampType,
+)
 
 _IDENTIFIER = re.compile(r"[a-z][a-z0-9_]*")
 _AGGREGATIONS: frozenset[str] = frozenset(
@@ -59,6 +72,46 @@ _AGGREGATIONS: frozenset[str] = frozenset(
 _CARDINALITIES: frozenset[str] = frozenset(
     get_args(getattr(Cardinality, "__value__", Cardinality))
 )
+
+# Semantic data_type -> set of compatible logical type "kinds".  A dimension
+# or fact declares a coarse semantic ``data_type`` (e.g. ``decimal``); this
+# table decides whether a column's declared logical type satisfies it.  The
+# comparison is by membership only — values are never coerced or cast.
+_INT_SCALARS = frozenset(
+    {"int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64"}
+)
+_FLOAT_SCALARS = frozenset({"float16", "float32", "float64"})
+_DATA_TYPE_COMPAT: Mapping[str, frozenset[str]] = {
+    "string": frozenset({"utf8", "large_utf8"}),
+    "integer": _INT_SCALARS,
+    "decimal": frozenset({"decimal"}) | _FLOAT_SCALARS,
+    "float": _FLOAT_SCALARS,
+    "double": frozenset({"float64"}),
+    "boolean": frozenset({"boolean"}),
+    "timestamp": frozenset({"timestamp"}),
+    "date": frozenset({"date32", "date64"}),
+}
+
+
+def _logical_type_kind(logical: LogicalType) -> str:
+    """Return the kind discriminator a logical type satisfies."""
+
+    if isinstance(logical, ScalarType):
+        return logical.name
+    if isinstance(logical, DecimalType):
+        return "decimal"
+    if isinstance(logical, TimestampType):
+        return "timestamp"
+    return type(logical).__name__
+
+
+def _data_type_compatible(data_type: str, logical: LogicalType) -> bool:
+    """Return whether a semantic data_type accepts a column's logical type."""
+
+    compatible = _DATA_TYPE_COMPAT.get(data_type)
+    if compatible is None:
+        return False
+    return _logical_type_kind(logical) in compatible
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,31 +273,53 @@ def _validate_top_level(data: Mapping[str, Any], collector: _Collector) -> None:
             collector.add(section, f"{section} must be a mapping")
 
 
-def _validate_data_sources(sources: Mapping[str, Any], collector: _Collector) -> None:
-    for key, raw in sources.items():
+def _validate_data_sources(
+    sources: Mapping[str, Any],
+    catalog_path: Path,
+    collector: _Collector,
+) -> dict[str, ParsedSource]:
+    """Validate data source declarations and return parsed sources.
+
+    Connector and schema declaration validation is delegated to
+    :func:`selayer.sources.catalog.validate_source_declarations`; its issues are
+    converted into :class:`CatalogIssue` values.  When sources are clean they are
+    parsed into :class:`ParsedSource` objects so downstream cross-validation can
+    check grain columns, dimension columns, and references against the declared
+    schema.  An empty mapping is returned when any source declaration is invalid
+    so dependent checks are skipped deterministically.
+    """
+
+    for key in sources:
         base = f"data_sources.{key}"
         _validate_identifier_key(key, base, "data source", collector)
-        if not isinstance(raw, Mapping):
-            collector.add(base, "data source must be a mapping")
-            continue
-        _require(raw, "type", base, collector)
-        _require(raw, "path", base, collector)
-        _check_optional_string(raw, "type", base, collector)
-        _check_optional_string(raw, "path", base, collector)
-        grain = raw.get("grain")
-        grain_path = f"{base}.grain"
-        if grain is None:
-            collector.add(grain_path, "grain is required")
-        elif not isinstance(grain, list):
-            collector.add(grain_path, "grain must be a list of column names")
-        elif not grain:
-            collector.add(grain_path, "grain must be non-empty")
-        elif not all(isinstance(column, str) for column in grain):
-            collector.add(grain_path, "grain entries must be strings")
+    source_issues = validate_source_declarations(sources, catalog_path)
+    for issue in source_issues:
+        collector.add(issue.path, issue.message)
+    if source_issues:
+        # Source declarations are invalid; dependent schema checks would
+        # operate on an unparseable model, so return an empty mapping.
+        return {}
+    try:
+        parsed = parse_source_declarations(sources, catalog_path)
+    except Exception:  # noqa: BLE001 - parse only runs after validation
+        return {}
+    # Grain columns must exist in the declared schema.
+    for name, source in parsed.items():
+        schema_columns = {field.name for field in source.schema.fields}
+        for column in source.grain:
+            if column not in schema_columns:
+                collector.add(
+                    f"data_sources.{name}.grain",
+                    f"grain column {column!r} is not declared in the source schema",
+                )
+    return dict(parsed)
 
 
 def _validate_dimensions(
-    dimensions: Mapping[str, Any], known_sources: frozenset[str], collector: _Collector
+    dimensions: Mapping[str, Any],
+    known_sources: frozenset[str],
+    source_schemas: Mapping[str, TableSchema],
+    collector: _Collector,
 ) -> None:
     for key, raw in dimensions.items():
         base = f"dimensions.{key}"
@@ -258,14 +333,23 @@ def _validate_dimensions(
         for field in ("source", "column", "data_type"):
             _check_optional_string(raw, field, base, collector)
         _check_optional_string(raw, "description", base, collector)
-        _check_known_source(
-            raw.get("source"), known_sources, f"{base}.source", collector
-        )
+        source = raw.get("source")
+        _check_known_source(source, known_sources, f"{base}.source", collector)
+        if isinstance(source, str) and source in source_schemas:
+            _check_column_and_type(
+                source_schemas,
+                source,
+                str(raw.get("column")),
+                str(raw.get("data_type")),
+                base,
+                collector,
+            )
 
 
 def _validate_facts(
     facts: Mapping[str, Any],
     known_sources: frozenset[str],
+    source_schemas: Mapping[str, TableSchema],
     collector: _Collector,
     parsed: dict[str, Expression],
 ) -> None:
@@ -281,10 +365,9 @@ def _validate_facts(
         for field in ("source", "data_type", "expression"):
             _check_optional_string(raw, field, base, collector)
         _check_optional_string(raw, "description", base, collector)
-        _check_known_source(
-            raw.get("source"), known_sources, f"{base}.source", collector
-        )
-        _parse_and_validate_row(
+        source = raw.get("source")
+        _check_known_source(source, known_sources, f"{base}.source", collector)
+        expression = _parse_and_validate_row(
             raw.get("expression"),
             known_sources,
             f"{base}.expression",
@@ -292,6 +375,35 @@ def _validate_facts(
             parsed,
             key,
         )
+        # Every source.column reference must resolve to a declared column.
+        if expression is not None:
+            for reference in references(expression):
+                if len(reference.parts) != 2:
+                    continue
+                ref_source, ref_column = reference.parts
+                if ref_source in source_schemas:
+                    _check_column_exists(
+                        source_schemas,
+                        ref_source,
+                        ref_column,
+                        f"{base}.expression",
+                        collector,
+                    )
+            # For a simple single-column fact, the declared data_type must be
+            # compatible with the referenced column's logical type.  Arithmetic
+            # and function expressions have no single source column, so they are
+            # not type-checked here.
+            ref_columns = [r for r in references(expression) if len(r.parts) == 2]
+            if len(ref_columns) == 1 and ref_columns[0].parts[0] in source_schemas:
+                ref_source, ref_column = ref_columns[0].parts
+                _check_column_type(
+                    source_schemas,
+                    ref_source,
+                    ref_column,
+                    str(raw.get("data_type")),
+                    f"{base}.data_type",
+                    collector,
+                )
 
 
 def _validate_measures(
@@ -360,6 +472,7 @@ def _validate_metrics(
 def _validate_relationships(
     relationships: Mapping[str, Any],
     known_sources: frozenset[str],
+    source_schemas: Mapping[str, TableSchema],
     collector: _Collector,
 ) -> None:
     for key, raw in relationships.items():
@@ -375,15 +488,29 @@ def _validate_relationships(
         _require(raw, "target_column", base, collector)
         for field in ("source", "target", "type", "source_column", "target_column"):
             _check_optional_string(raw, field, base, collector)
-        _check_known_source(
-            raw.get("source"), known_sources, f"{base}.source", collector
-        )
-        _check_known_source(
-            raw.get("target"), known_sources, f"{base}.target", collector
-        )
+        source = raw.get("source")
+        target = raw.get("target")
+        _check_known_source(source, known_sources, f"{base}.source", collector)
+        _check_known_source(target, known_sources, f"{base}.target", collector)
         cardinality = raw.get("type")
         if isinstance(cardinality, str) and cardinality not in _CARDINALITIES:
             collector.add(f"{base}.type", f"unsupported cardinality '{cardinality}'")
+        if isinstance(source, str) and source in source_schemas:
+            _check_column_exists(
+                source_schemas,
+                source,
+                str(raw.get("source_column")),
+                f"{base}.source_column",
+                collector,
+            )
+        if isinstance(target, str) and target in source_schemas:
+            _check_column_exists(
+                source_schemas,
+                target,
+                str(raw.get("target_column")),
+                f"{base}.target_column",
+                collector,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +534,66 @@ def _declared_measures(declared: object) -> frozenset[str]:
     return frozenset()
 
 
+def _schema_field(
+    source_schemas: Mapping[str, TableSchema], source_id: str, column: str
+) -> FieldSchema | None:
+    schema = source_schemas.get(source_id)
+    if schema is None:
+        return None
+    for field in schema.fields:
+        if field.name == column:
+            return field
+    return None
+
+
+def _check_column_exists(
+    source_schemas: Mapping[str, TableSchema],
+    source_id: str,
+    column: str,
+    path: str,
+    collector: _Collector,
+) -> None:
+    if _schema_field(source_schemas, source_id, column) is None:
+        collector.add(
+            path,
+            f"column {column!r} is not declared in source {source_id!r} schema",
+        )
+
+
+def _check_column_type(
+    source_schemas: Mapping[str, TableSchema],
+    source_id: str,
+    column: str,
+    data_type: str,
+    path: str,
+    collector: _Collector,
+) -> None:
+    field = _schema_field(source_schemas, source_id, column)
+    if field is None:
+        return
+    if not _data_type_compatible(data_type, field.type):
+        collector.add(
+            path,
+            f"data_type {data_type!r} is not compatible with column {column!r} type",
+        )
+
+
+def _check_column_and_type(
+    source_schemas: Mapping[str, TableSchema],
+    source_id: str,
+    column: str,
+    data_type: str,
+    base: str,
+    collector: _Collector,
+) -> None:
+    """Check a dimension's column exists and its type matches the data_type."""
+
+    _check_column_exists(source_schemas, source_id, column, f"{base}.column", collector)
+    _check_column_type(
+        source_schemas, source_id, column, data_type, f"{base}.data_type", collector
+    )
+
+
 def _parse_and_validate_row(
     expression_text: object,
     known_sources: frozenset[str],
@@ -414,19 +601,20 @@ def _parse_and_validate_row(
     collector: _Collector,
     parsed: dict[str, Expression],
     key: str,
-) -> None:
+) -> Expression | None:
     if not isinstance(expression_text, str):
         if expression_text is not None:
             collector.add(path, "expression must be a string")
-        return
+        return None
     try:
         expression = parse_expression(expression_text)
     except ExpressionSyntaxError as error:
         collector.add(path, f"invalid expression: {error.message}")
-        return
+        return None
     parsed[key] = expression
     for message in validate_row_expression(expression, known_sources):
         collector.add(path, message)
+    return expression
 
 
 def _parse_and_validate_metric(
@@ -586,10 +774,10 @@ def _validate_metric_grains(
 
 def _build_layer(
     data: Mapping[str, Any],
+    parsed_sources: Mapping[str, ParsedSource],
     fact_expressions: Mapping[str, Expression],
     metric_expressions: Mapping[str, Expression],
 ) -> SemanticLayer:
-    sources = _collection(data, "data_sources")
     dimensions = _collection(data, "dimensions")
     facts = _collection(data, "facts")
     measures = _collection(data, "measures")
@@ -604,12 +792,12 @@ def _build_layer(
         data_sources=MappingProxyType(
             {
                 key: DataSource(
-                    name=key,
-                    type=raw["type"],
-                    path=raw["path"],
-                    grain=tuple(raw["grain"]),
+                    name=parsed.name,
+                    connector=parsed.connector,
+                    schema=parsed.schema,
+                    grain=parsed.grain,
                 )
-                for key, raw in sources.items()
+                for key, parsed in parsed_sources.items()
             }
         ),
         dimensions=MappingProxyType(
@@ -718,12 +906,16 @@ def load(path: str | Path) -> SemanticLayer:
     fact_expressions: dict[str, Expression] = {}
     metric_expressions: dict[str, Expression] = {}
 
-    _validate_data_sources(sources, collector)
-    _validate_dimensions(dimensions, known_sources, collector)
-    _validate_facts(facts, known_sources, collector, fact_expressions)
+    parsed_sources = _validate_data_sources(sources, Path(path), collector)
+    source_schemas: dict[str, TableSchema] = {
+        name: parsed.schema for name, parsed in parsed_sources.items()
+    }
+
+    _validate_dimensions(dimensions, known_sources, source_schemas, collector)
+    _validate_facts(facts, known_sources, source_schemas, collector, fact_expressions)
     _validate_measures(measures, known_facts, collector)
     _validate_metrics(metrics, known_measures, collector, metric_expressions)
-    _validate_relationships(relationships, known_sources, collector)
+    _validate_relationships(relationships, known_sources, source_schemas, collector)
     _validate_metric_grains(metrics, measures, facts, sources, collector)
     _validate_fact_expression_reachability(
         facts,
@@ -735,7 +927,7 @@ def load(path: str | Path) -> SemanticLayer:
     )
 
     collector.raise_if_any()
-    return _build_layer(catalog, fact_expressions, metric_expressions)
+    return _build_layer(catalog, parsed_sources, fact_expressions, metric_expressions)
 
 
 __all__ = [

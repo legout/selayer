@@ -66,8 +66,16 @@ def root(tmp_path: Path) -> Path:
             )
         ),
     )
+    repo = Path(__file__).parents[2]
     for name in ("orders", "order_items", "products", "customers"):
-        catalog["data_sources"][name]["path"] = str(data / f"{name}.parquet")
+        source = catalog["data_sources"][name]
+        source["location"] = str(data / f"{name}.parquet")
+        # The relocated catalog cannot resolve schema_ref relative to tmp_path,
+        # so inline the referenced schema document from the repository.
+        schema_ref = cast(str, source.pop("schema_ref"))
+        source["schema"] = yaml.safe_load(
+            (repo / schema_ref).read_text(encoding="utf-8")
+        )
     catalog_path = tmp_path / "ecommerce_semantic_layer.yaml"
     catalog_text = cast(str, yaml.safe_dump(catalog, sort_keys=False))
     catalog_path.write_text(catalog_text, encoding="utf-8")
@@ -115,8 +123,22 @@ def test_cross_kind_local_names_execute_with_distinct_internal_aliases(
                     "data_sources": {
                         "events": {
                             "type": "csv",
-                            "path": str(data_path),
+                            "location": str(data_path),
                             "grain": ["total", "value"],
+                            "schema": {
+                                "fields": [
+                                    {
+                                        "name": "total",
+                                        "type": "int64",
+                                        "nullable": False,
+                                    },
+                                    {
+                                        "name": "value",
+                                        "type": "int64",
+                                        "nullable": False,
+                                    },
+                                ]
+                            },
                         }
                     },
                     "dimensions": {

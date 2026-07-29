@@ -6,6 +6,9 @@ from pathlib import Path
 
 import pytest
 
+from selayer import SemanticLayer
+from selayer.sources.profiles import MappingArrowProviderResolver
+
 VALID_CATALOG_YAML = """\
 version: 1
 name: ecommerce
@@ -14,16 +17,32 @@ description: Semantic model for the example store
 data_sources:
   orders:
     type: parquet
-    path: data/orders.parquet
+    location: data/orders.parquet
     grain: [id]
+    schema:
+      fields:
+        - {name: id, type: utf8, nullable: false}
+        - {name: created_at, type: {timestamp: {unit: us}}, nullable: false}
   order_items:
     type: parquet
-    path: data/order_items.parquet
+    location: data/order_items.parquet
     grain: [order_id, product_id]
+    schema:
+      fields:
+        - {name: order_id, type: utf8, nullable: false}
+        - {name: product_id, type: utf8, nullable: false}
+        - {name: quantity, type: int64, nullable: false}
+        - {name: total, type: float64, nullable: false}
   products:
     type: parquet
-    path: data/products.parquet
+    location: data/products.parquet
     grain: [id]
+    schema:
+      fields:
+        - {name: id, type: utf8, nullable: false}
+        - {name: category, type: utf8, nullable: false}
+        - {name: cost, type: float64, nullable: false}
+        - {name: in_stock, type: int64, nullable: false}
 dimensions:
   product_category:
     source: products
@@ -83,3 +102,15 @@ def valid_catalog_path(tmp_path: Path) -> Path:
     path = tmp_path / "layer.yaml"
     path.write_text(VALID_CATALOG_YAML, encoding="utf-8")
     return path
+
+
+@pytest.fixture
+def valid_layer(valid_catalog_path: Path) -> SemanticLayer:
+    """A loaded valid semantic layer backed by the example parquet fixtures."""
+    return SemanticLayer.load(valid_catalog_path)
+
+
+@pytest.fixture
+def arrow_providers() -> MappingArrowProviderResolver:
+    """An empty arrow-provider resolver for catalogs without pyarrow sources."""
+    return MappingArrowProviderResolver({})

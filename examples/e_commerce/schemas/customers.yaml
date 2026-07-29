@@ -1,0 +1,4 @@
+fields:
+  - {name: id, type: utf8, nullable: false}
+  - {name: segment, type: utf8, nullable: true}
+  - {name: country, type: utf8, nullable: true}

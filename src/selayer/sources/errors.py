@@ -61,6 +61,9 @@ _CODE_MESSAGES: dict[str, str] = {
     "connect_failed": "the source connection could not be established",
     "schema_mismatch": "the observed schema does not match the declared schema",
     "reload_failed": "the source could not be reloaded",
+    "source_initialization_failed": (
+        "a data source could not be initialized during registry creation"
+    ),
 }
 
 # Known source error codes — an allowlist, *not* a permissive regex.  Only a

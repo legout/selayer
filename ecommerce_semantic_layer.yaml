@@ -6,19 +6,23 @@ description: Grain-aware semantic model for the example store
 data_sources:
   orders:
     type: parquet
-    path: data/orders.parquet
+    location: data/orders.parquet
+    schema_ref: examples/e_commerce/schemas/orders.yaml
     grain: [id]
   order_items:
     type: parquet
-    path: data/order_items.parquet
+    location: data/order_items.parquet
+    schema_ref: examples/e_commerce/schemas/order_items.yaml
     grain: [order_id, product_id]
   customers:
     type: parquet
-    path: data/customers.parquet
+    location: data/customers.parquet
+    schema_ref: examples/e_commerce/schemas/customers.yaml
     grain: [id]
   products:
     type: parquet
-    path: data/products.parquet
+    location: data/products.parquet
+    schema_ref: examples/e_commerce/schemas/products.yaml
     grain: [id]
 
 dimensions:

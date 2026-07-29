@@ -47,9 +47,7 @@ def test_validate_concept_lenient_downgrades_optional_families_to_warnings(
 
     assert issues
     assert all(issue.severity == "warning" for issue in issues)
-    assert list(issues) == sorted(
-        issues, key=lambda issue: (issue.path, issue.message)
-    )
+    assert list(issues) == sorted(issues, key=lambda issue: (issue.path, issue.message))
 
 
 @pytest.mark.parametrize(
