@@ -288,12 +288,14 @@ def test_unknown_s3_profile_key_is_rejected() -> None:
         {
             "access_key": _ACCESS,
             "secret_key": _SECRET,
+            "session_token": _TOKEN,
+            "endpoint_override": f"http://user:{_USERINFO}@127.0.0.1:9000",
             "rogue_key": "should be rejected",
         },
     )
     with pytest.raises(Exception) as caught:
         s3_filesystem(profile)
-    _assert_no_secret_leak(caught.value, _ACCESS, _SECRET)
+    _assert_no_secret_leak(caught.value, _ACCESS, _SECRET, _TOKEN, _USERINFO)
 
 
 def test_invalid_endpoint_is_rejected() -> None:
@@ -329,12 +331,13 @@ def test_invalid_s3_scheme_is_rejected() -> None:
             "access_key": _ACCESS,
             "secret_key": _SECRET,
             "session_token": _TOKEN,
+            "endpoint_override": f"http://user:{_USERINFO}@127.0.0.1:9000",
             "scheme": "ftp",
         },
     )
     with pytest.raises(Exception) as caught:
         s3_filesystem(profile)
-    _assert_no_secret_leak(caught.value, _ACCESS, _SECRET, _TOKEN)
+    _assert_no_secret_leak(caught.value, _ACCESS, _SECRET, _TOKEN, _USERINFO)
 
 
 def test_hostile_str_subclass_scheme_is_rejected(monkeypatch) -> None:
@@ -509,30 +512,26 @@ def minio_source_fixture() -> (
 ):
     """Start MinIO via testcontainers, upload a Parquet file, build a layer.
 
-    Yields a :class:`MinioSourceFixture`.  Skipped *only* when Docker or a
-    required dependency (boto3, testcontainers) is genuinely unavailable.  When
-    Docker is healthy, a MinIO image/container startup failure re-raises so CI
-    fails rather than silently skipping.
+    Yields a :class:`MinioSourceFixture`.
+
+    boto3, testcontainers, and the MinIO module are declared test dependencies
+    (the ``s3`` optional extra and the ``testcontainers[minio]`` dev
+    dependency), so a missing import is a hard failure (``ImportError``), never
+    a skip.  The fixture skips *only* when an explicit Docker daemon
+    availability probe reports Docker unavailable.  With Docker healthy, a
+    MinIO image/container startup or API failure re-raises so CI fails rather
+    than silently skipping.
     """
 
-    pytest.importorskip("boto3")
-    pytest.importorskip("testcontainers")
+    # Declared test dependencies — a missing import fails the test (never a
+    # skip).  The Docker daemon availability probe below is the *only* skip
+    # gate; with Docker healthy, any MinIO startup/API/image failure re-raises.
+    import boto3
+    from testcontainers.community.minio import MinioContainer
+
     if not _docker_available():
         pytest.skip("Docker daemon is not available")
-    import boto3
 
-    try:
-        from testcontainers.community.minio import MinioContainer
-    except ImportError:
-        try:
-            from testcontainers.minio import (  # type: ignore[no-redef]
-                MinioContainer,
-            )
-        except ImportError:
-            pytest.skip("testcontainers[minio] not available")
-
-    # With Docker confirmed healthy, a MinIO image/container startup failure is
-    # a *real* failure: it re-raises so CI fails rather than silently skipping.
     minio: MinioContainer = MinioContainer()
     minio.start()
     try:
