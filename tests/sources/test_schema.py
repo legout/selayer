@@ -696,3 +696,143 @@ def test_fingerprint_is_independent_of_metadata_insertion_order() -> None:
 
 def test_logical_type_union_alias_is_exported() -> None:
     assert LogicalType is not None
+
+
+# ---------------------------------------------------------------------------
+# Reviewer follow-up: deterministic top-level / heterogeneous-key validation
+# and safe Arrow metadata decoding.
+# ---------------------------------------------------------------------------
+
+
+def test_top_level_unknown_key_is_rejected() -> None:
+    raw = {
+        "fields": [{"name": "id", "type": "int64", "nullable": False}],
+        "bogus": 1,
+    }
+    issues = validate_schema_document(raw)
+    assert len(issues) == 1
+    assert issues[0].code == "unknown_key"
+    assert issues[0].path == "schema.bogus"
+    assert issues[0].message == "unknown key 'bogus'"
+    with pytest.raises(SchemaDefinitionError) as caught:
+        parse_schema_document(raw)
+    assert caught.value.issues == issues
+
+
+def test_top_level_unknown_key_reported_alongside_missing_fields() -> None:
+    raw = {"bogus": 1}
+    issues = validate_schema_document(raw)
+    assert issues == tuple(
+        sorted(issues, key=lambda issue: (issue.path, issue.message))
+    )
+    codes = {issue.code for issue in issues}
+    assert codes == {"unknown_key", "missing_fields"}
+    with pytest.raises(SchemaDefinitionError):
+        parse_schema_document(raw)
+
+
+def test_top_level_heterogeneous_unknown_keys_do_not_leak_type_error() -> None:
+    # ``sorted()`` over a {str, int} key set would raise TypeError; the document
+    # must instead surface a deterministic SchemaIssue.
+    raw: dict[Any, Any] = {
+        1: "a",
+        "fields": [{"name": "id", "type": "int64", "nullable": False}],
+        "zeta": 2,
+    }
+    issues = validate_schema_document(raw)
+    assert isinstance(issues, tuple)
+    assert issues == tuple(
+        sorted(issues, key=lambda issue: (issue.path, issue.message))
+    )
+    assert any(issue.code == "unknown_key" for issue in issues)
+    with pytest.raises(SchemaDefinitionError):
+        parse_schema_document(raw)
+
+
+def test_field_heterogeneous_unknown_keys_do_not_leak_type_error() -> None:
+    raw: dict[str, Any] = {
+        "fields": [
+            {
+                "name": "id",
+                "type": "int64",
+                "nullable": False,
+                "bogus": 1,
+                7: 2,
+            }
+        ]
+    }
+    issues = validate_schema_document(raw)
+    assert isinstance(issues, tuple)
+    assert issues[0].code == "unknown_key"
+    with pytest.raises(SchemaDefinitionError):
+        parse_schema_document(raw)
+
+
+def test_type_body_heterogeneous_unknown_keys_do_not_leak_type_error() -> None:
+    raw: dict[str, Any] = {
+        "fields": [
+            {
+                "name": "amount",
+                "type": {"decimal": {"precision": 5, "scale": 0, "bogus": 1, 9: 2}},
+                "nullable": False,
+            }
+        ]
+    }
+    issues = validate_schema_document(raw)
+    assert isinstance(issues, tuple)
+    assert issues[0].code == "decimal_unknown_key"
+    with pytest.raises(SchemaDefinitionError):
+        parse_schema_document(raw)
+
+
+def _schema_with_malformed_value_metadata() -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field(
+                "value",
+                pa.int64(),
+                nullable=False,
+                metadata={b"good": b"\xff\xff\xff\xff"},
+            )
+        ]
+    )
+
+
+def test_table_schema_from_arrow_rejects_malformed_top_level_metadata() -> None:
+    arrow_schema = _schema_with_malformed_value_metadata()
+    with pytest.raises(SchemaDefinitionError) as caught:
+        table_schema_from_arrow(arrow_schema)
+    issue = caught.value.issues[0]
+    assert issue.code == "arrow_metadata_invalid"
+    assert issue.path == "fields[0].metadata.good"
+
+
+def test_table_schema_from_arrow_rejects_malformed_metadata_key() -> None:
+    arrow_schema = pa.schema(
+        [
+            pa.field(
+                "value",
+                pa.int64(),
+                nullable=False,
+                metadata={b"\xff\xff\xff\xff": b"v"},
+            )
+        ]
+    )
+    with pytest.raises(SchemaDefinitionError) as caught:
+        table_schema_from_arrow(arrow_schema)
+    issue = caught.value.issues[0]
+    assert issue.code == "arrow_metadata_invalid"
+    assert issue.path == "fields[0].metadata"
+
+
+def test_table_schema_from_arrow_rejects_malformed_nested_metadata() -> None:
+    element = pa.field(
+        "element",
+        pa.int64(),
+        nullable=False,
+        metadata={b"k": b"\xff\xff\xff\xff"},
+    )
+    arrow_schema = pa.schema([pa.field("value", pa.list_(element), nullable=False)])
+    with pytest.raises(SchemaDefinitionError) as caught:
+        table_schema_from_arrow(arrow_schema)
+    assert any(issue.code == "arrow_metadata_invalid" for issue in caught.value.issues)

@@ -125,6 +125,32 @@ def _get(mapping: Mapping[str, object], key: str) -> tuple[object, bool]:
     return None, False
 
 
+def _sorted_unknown_keys(
+    raw: Mapping[str, object], allowed: Container[str]
+) -> list[str]:
+    """Return unknown mapping keys deterministically ordered by ``str``.
+
+    Schema documents are untrusted mappings and may carry heterogeneous key
+    types (e.g. ``{str, int}``).  ``sorted()`` over such a set raises
+    ``TypeError`` because ``str`` and ``int`` are not mutually orderable, which
+    would leak out of validation.  We never compare raw keys directly: each key
+    is projected through ``str()`` first, then ordered and de-duplicated, so the
+    result is total and deterministic regardless of the input key types.
+    """
+
+    seen: set[str] = set()
+    unknown: list[str] = []
+    for key in raw:
+        if key in allowed:
+            continue
+        text = str(key)
+        if text not in seen:
+            seen.add(text)
+            unknown.append(text)
+    unknown.sort()
+    return unknown
+
+
 # ---------------------------------------------------------------------------
 # Logical type model (frozen, slotted, structural equality)
 # ---------------------------------------------------------------------------
@@ -304,6 +330,8 @@ class SchemaDefinitionError(ValueError):
 # Document validation and parsing
 # ---------------------------------------------------------------------------
 
+# Allowed keys for the top-level table document.
+_TABLE_KEYS = frozenset({"fields"})
 # Allowed keys for a named field mapping.
 _FIELD_KEYS = frozenset({"name", "type", "nullable", "metadata", "field_id"})
 # Allowed keys for an unnamed entry (list element / map key / map value).
@@ -336,17 +364,29 @@ def parse_schema_document(raw: object) -> TableSchema:
 def _validate_table(raw: object, path: str) -> list[SchemaIssue]:
     if not isinstance(raw, Mapping):
         return [_issue("schema_not_mapping", path, "schema must be a mapping")]
+    issues: list[SchemaIssue] = []
+    unknown = _sorted_unknown_keys(raw, _TABLE_KEYS)
+    if unknown:
+        issues.append(
+            _issue(
+                "unknown_key",
+                f"{path}.{unknown[0]}",
+                f"unknown key {unknown[0]!r}",
+            )
+        )
     fields_path = f"{path}.fields"
     fields_raw, present = _get(raw, "fields")
     if not present:
-        return [_issue("missing_fields", fields_path, "fields is required")]
+        issues.append(_issue("missing_fields", fields_path, "fields is required"))
+        return issues
     if not isinstance(fields_raw, list):
-        return [
+        issues.append(
             _issue("fields_not_list", fields_path, "fields must be a list of mappings")
-        ]
+        )
+        return issues
     if not fields_raw:
-        return [_issue("empty_fields", fields_path, "fields must be non-empty")]
-    issues: list[SchemaIssue] = []
+        issues.append(_issue("empty_fields", fields_path, "fields must be non-empty"))
+        return issues
     seen: set[str] = set()
     for index, field_raw in enumerate(fields_raw):
         field_path = f"{fields_path}[{index}]"
@@ -389,7 +429,7 @@ def _validate_keys_and_entry(
     require_name: bool,
 ) -> list[SchemaIssue]:
     issues: list[SchemaIssue] = []
-    unknown = sorted(set(raw.keys()) - allowed)
+    unknown = _sorted_unknown_keys(raw, allowed)
     if unknown:
         issues.append(
             _issue(
@@ -511,7 +551,7 @@ def _reject_unknown_keys(
     discriminator: str,
     allowed: Container[str],
 ) -> list[SchemaIssue]:
-    unknown = sorted(key for key in body if key not in allowed)
+    unknown = _sorted_unknown_keys(body, allowed)
     if unknown:
         return [
             _issue(
@@ -1154,18 +1194,43 @@ def _field_metadata_to_arrow(
     }
 
 
-def _arrow_metadata_to_field(metadata: object) -> Mapping[str, str]:
+def _decode_arrow_metadata_entry(raw: object, path: str) -> str:
+    """Decode an Arrow metadata key/value, surfacing invalid UTF-8 safely.
+
+    Arrow field metadata is a ``dict[bytes, bytes]``.  A non-UTF-8 entry would
+    otherwise leak as ``UnicodeDecodeError``; instead it is reported as a
+    deterministic ``SchemaDefinitionError`` with code ``arrow_metadata_invalid``
+    and the supplied ``path`` (which points at ``…metadata`` for a key failure
+    or ``…metadata.<key>`` for a value failure).
+    """
+
+    try:
+        if isinstance(raw, bytes):
+            return raw.decode("utf-8")
+        return str(raw)
+    except UnicodeDecodeError:
+        raise SchemaDefinitionError(
+            (
+                _issue(
+                    "arrow_metadata_invalid",
+                    path,
+                    "Arrow field metadata is not valid UTF-8",
+                ),
+            )
+        ) from None
+
+
+def _arrow_metadata_to_field(metadata: object, path: str) -> Mapping[str, str]:
     if not metadata:
         return MappingProxyType({})
     assert isinstance(metadata, Mapping)
-    return MappingProxyType(
-        {
-            (key.decode("utf-8") if isinstance(key, bytes) else str(key)): (
-                value.decode("utf-8") if isinstance(value, bytes) else str(value)
-            )
-            for key, value in metadata.items()
-        }
-    )
+    metadata_path = f"{path}.metadata"
+    decoded: dict[str, str] = {}
+    for key, value in metadata.items():
+        key_text = _decode_arrow_metadata_entry(key, metadata_path)
+        value_text = _decode_arrow_metadata_entry(value, f"{metadata_path}.{key_text}")
+        decoded[key_text] = value_text
+    return MappingProxyType(decoded)
 
 
 def _sanitize(error: BaseException) -> str:
@@ -1329,9 +1394,11 @@ def table_schema_from_arrow(schema: pa.Schema) -> TableSchema:
                     arrow_field.name,
                     logical,
                     bool(arrow_field.nullable),
-                    _arrow_metadata_to_field(arrow_field.metadata),
+                    _arrow_metadata_to_field(arrow_field.metadata, field_path),
                 )
             )
+        except SchemaDefinitionError:
+            raise
         except (TypeError, ValueError) as error:  # pragma: no cover - defensive
             issues.append(
                 _issue(
@@ -1456,7 +1523,7 @@ def _arrow_field_to_field(arrow_field: pa.Field, path: str) -> FieldSchema:
         arrow_field.name,
         logical,
         bool(arrow_field.nullable),
-        _arrow_metadata_to_field(arrow_field.metadata),
+        _arrow_metadata_to_field(arrow_field.metadata, path),
     )
 
 
