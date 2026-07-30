@@ -236,6 +236,7 @@ def test_pyarrow_provider_is_invoked_again_on_reload() -> None:
 
 def test_record_batch_reader_is_bound_once_per_query() -> None:
     invoke_count = 0
+    readers: list[pa.RecordBatchReader] = []
 
     def reader_provider() -> ArrowObject:
         nonlocal invoke_count
@@ -246,7 +247,7 @@ def test_record_batch_reader_is_bound_once_per_query() -> None:
                 pa.field("value", pa.int64(), nullable=False),
             ]
         )
-        return pa.RecordBatchReader.from_batches(
+        reader = pa.RecordBatchReader.from_batches(
             schema,
             [
                 pa.RecordBatch.from_arrays(
@@ -255,6 +256,8 @@ def test_record_batch_reader_is_bound_once_per_query() -> None:
                 )
             ],
         )
+        readers.append(reader)
+        return reader
 
     providers = MappingArrowProviderResolver({"events": reader_provider})
     layer = SemanticLayer(
@@ -281,6 +284,10 @@ def test_record_batch_reader_is_bound_once_per_query() -> None:
         {},
     )
     engine = QueryEngine(layer, arrow_providers=providers)
+    assert engine._registry._registrations["events"].handle.resource is None
+
+    engine._registry.reload_source("events")
+    assert engine._registry._registrations["events"].handle.resource is None
 
     first = engine.query(["total"])
     first_count = invoke_count

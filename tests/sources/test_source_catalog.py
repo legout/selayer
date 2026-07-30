@@ -356,6 +356,7 @@ def test_rejects_remote_location_without_credential_profile(
         ("delta", "s3://access:secret@bucket/events"),
         ("sqlite", "file://access:secret@example.invalid/events.sqlite"),
         ("duckdb", "file://access:secret@example.invalid/events.duckdb"),
+        ("parquet", "s3://access:secret@[bad/data.parquet"),
     ],
 )
 def test_rejects_authenticated_location(

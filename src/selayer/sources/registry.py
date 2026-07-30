@@ -35,7 +35,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import RLock
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -256,6 +256,7 @@ class SourceRegistry:
         try:
             for source_id, adapter, handle in prepared:
                 failed_source_id = source_id
+                registration_handle = handle
                 if handle.query_scoped:
                     # A PyArrow RecordBatchReader is one-shot and is used only
                     # for schema inspection; query binding recreates it. Iceberg
@@ -263,9 +264,12 @@ class SourceRegistry:
                     # binding, while its register method is intentionally a no-op.
                     if handle.connector == "pyarrow":
                         close_quietly(adapter, handle)
+                        registration_handle = replace(handle, resource=None)
                 else:
                     adapter.register(connection, source_id, handle)
-                registrations[source_id] = _Registration(adapter, handle, 1)
+                registrations[source_id] = _Registration(
+                    adapter, registration_handle, 1
+                )
         except Exception as error:  # noqa: BLE001
             init_failed = True
             dependency_code = _dependency_code(error)
@@ -361,14 +365,19 @@ class SourceRegistry:
                 old_registration = self._registrations[source_id]
                 old_handle = old_registration.handle
                 old_generation = old_registration.generation
+                registration_candidate = candidate
+                if candidate.query_scoped and candidate.connector == "pyarrow":
+                    # Retain only the provider and declared schema metadata;
+                    # the inspected one-shot reader is closed after unlock.
+                    cleanup.append((adapter, candidate))
+                    registration_candidate = replace(candidate, resource=None)
                 commit_failed = False
                 commit_dependency_code: str | None = None
                 try:
-                    if candidate.query_scoped:
-                        if candidate.connector == "pyarrow":
-                            cleanup.append((adapter, candidate))
-                    else:
-                        adapter.register(self._connection, source_id, candidate)
+                    if not registration_candidate.query_scoped:
+                        adapter.register(
+                            self._connection, source_id, registration_candidate
+                        )
                 except Exception as error:  # noqa: BLE001
                     commit_failed = True
                     commit_dependency_code = _dependency_code(error)
@@ -377,7 +386,7 @@ class SourceRegistry:
                     restore_quietly(adapter, self._connection, source_id, old_handle)
                 else:
                     self._registrations[source_id] = _Registration(
-                        adapter, candidate, old_generation + 1
+                        adapter, registration_candidate, old_generation + 1
                     )
                 if commit_failed:
                     cleanup.append((adapter, candidate))
@@ -397,7 +406,7 @@ class SourceRegistry:
                     old_generation=old_generation,
                     new_generation=old_generation + 1,
                     schema_fingerprint=schema_fingerprint(observed),
-                    snapshot=candidate.snapshot,
+                    snapshot=registration_candidate.snapshot,
                 )
             except BaseException as exc:  # noqa: BLE001
                 pending_error = exc
@@ -471,7 +480,17 @@ class SourceRegistry:
                             cleanup.append((adapter, candidate))
                             prepare_failed_source = source_id
                             break
-                        candidates[source_id] = (adapter, candidate, observed)
+                        registration_candidate = candidate
+                        if candidate.query_scoped and candidate.connector == "pyarrow":
+                            # Store only provider/schema metadata; the
+                            # inspected reader is closed after unlocking.
+                            cleanup.append((adapter, candidate))
+                            registration_candidate = replace(candidate, resource=None)
+                        candidates[source_id] = (
+                            adapter,
+                            registration_candidate,
+                            observed,
+                        )
                 except SourceDependencyError as dep_error:
                     dependency_code = _dependency_code(dep_error)
                 except Exception:  # noqa: BLE001
@@ -533,10 +552,7 @@ class SourceRegistry:
                     adapter, candidate, _observed = candidates[source_id]
                     old = self._registrations[source_id]
                     try:
-                        if candidate.query_scoped:
-                            if candidate.connector == "pyarrow":
-                                cleanup.append((adapter, candidate))
-                        else:
+                        if not candidate.query_scoped:
                             adapter.register(self._connection, source_id, candidate)
                     except Exception as error:  # noqa: BLE001
                         commit_failed = True

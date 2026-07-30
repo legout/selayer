@@ -235,7 +235,9 @@ def _has_location_userinfo(location: str) -> bool:
     try:
         parsed = urlsplit(location)
     except ValueError:
-        return False
+        # Authority parse failures are rejected as invalid locations rather
+        # than treated as proof that credentials are absent.
+        return True
     return parsed.username is not None or parsed.password is not None
 
 
