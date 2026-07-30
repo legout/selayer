@@ -6,8 +6,11 @@ from pathlib import Path
 import pytest
 
 from selayer import SemanticLayer
-from selayer.model import Dimension
+from selayer.model import DataSource, Dimension
 from selayer.okf import OkfBundle
+from selayer.okf.generation import catalog_definition
+from selayer.sources.config import ParquetConfig
+from selayer.sources.schema import FieldSchema, ScalarType, TableSchema
 
 
 @pytest.fixture
@@ -179,6 +182,32 @@ def test_generated_source_context_contains_bounded_schema_summary(
     assert "location" not in content
 
 
+def test_wide_source_schema_summary_has_a_deterministic_bound() -> None:
+    """Large declared schemas are summarized without unbounded OKF output."""
+
+    schema = TableSchema(
+        tuple(
+            FieldSchema(f"field_{index}", ScalarType("utf8"), True)
+            for index in range(200)
+        )
+    )
+    source = DataSource(
+        "wide_events",
+        ParquetConfig("s3://SECRET/location.parquet"),
+        schema,
+        ("field_0",),
+    )
+    content = catalog_definition("source.wide_events", source)
+
+    assert len(content) < 6_000
+    assert "Schema fingerprint:" in content
+    assert "Grain: field_0" in content
+    assert "field_0: utf8 (nullable)" in content
+    assert "field_199" not in content
+    assert "fields omitted; see catalog for full schema" in content
+    assert "s3://SECRET" not in content
+
+
 def test_curated_okf_schema_text_cannot_change_catalog_execution(
     tmp_path: Path,
     ecommerce_layer: SemanticLayer,
@@ -219,7 +248,6 @@ def test_curated_okf_schema_text_cannot_change_catalog_execution(
     # The catalog execution authority is unchanged by the curated edit: the
     # type and grain derive solely from ``DataSource.schema``/``grain``, never
     # from OKF text.  ``quantity`` is a scalar ``int64`` in the catalog.
-    from selayer.sources.schema import ScalarType
 
     quantity_type = (
         ecommerce_layer.data_sources["order_items"].schema.field("quantity").type

@@ -43,7 +43,10 @@ from selayer.sources.config import (
     PyArrowConfig,
     SqliteConfig,
 )
-from selayer.sources.errors import SourceError, SourceReloadError
+from selayer.sources.errors import (
+    SourceError,
+    SourceReloadError,
+)
 from selayer.sources.profiles import (
     ArrowProviderResolver,
     MappingArrowProviderResolver,
@@ -397,6 +400,52 @@ def test_close_waits_for_active_reload(mixed_registry_fixture: _MixedFixture) ->
     assert reload_finished.is_set()
     assert close_finished.is_set()
     assert generation_after_reload == [2]
+
+
+def test_close_waits_for_reload_candidate_preparation(
+    mixed_registry_fixture: _MixedFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Close waits for preparation and cannot orphan an in-flight candidate."""
+
+    fixture = mixed_registry_fixture
+    registry = fixture.registry
+    preparation_started = threading.Event()
+    release_preparation = threading.Event()
+    close_finished = threading.Event()
+    reload_errors: list[BaseException] = []
+    original_prepare = SourceRegistry._prepare_candidate
+
+    def blocked_prepare(registry, adapter, source):
+        preparation_started.set()
+        assert release_preparation.wait(timeout=5)
+        return original_prepare(registry, adapter, source)
+
+    monkeypatch.setattr(SourceRegistry, "_prepare_candidate", blocked_prepare)
+
+    def reloader() -> None:
+        try:
+            registry.reload_source("arrow_events")
+        except BaseException as error:  # noqa: BLE001
+            reload_errors.append(error)
+
+    def closer() -> None:
+        registry.close()
+        close_finished.set()
+
+    reload_thread = threading.Thread(target=reloader)
+    close_thread = threading.Thread(target=closer)
+    reload_thread.start()
+    assert preparation_started.wait(timeout=5)
+    close_thread.start()
+    assert not close_finished.wait(timeout=0.2)
+    release_preparation.set()
+    reload_thread.join(timeout=10)
+    close_thread.join(timeout=10)
+
+    assert reload_errors == []
+    assert close_finished.is_set()
+    assert registry._closed is True
 
 
 def _create_iceberg_table(tmp_path: Path) -> tuple[object, Path, Path]:

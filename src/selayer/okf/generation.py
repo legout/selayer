@@ -108,25 +108,69 @@ def _logical_type_label(logical: LogicalType) -> str:
     return "unknown"
 
 
+# The field summary is advisory text surfaced in an OKF concept's Catalog
+# Definition section.  It is bounded so a wide schema (hundreds of columns)
+# cannot bloat the concept beyond a predictable, manageable size.  Two
+# independent budgets are applied: a maximum field count and a maximum total
+# character length (including the omission marker).  When either budget is
+# exceeded the remaining fields are replaced by a deterministic omission
+# marker that names the count, so the advisory text stays predictable while the
+# catalog :class:`TableSchema` (and its fingerprint) remain the authoritative
+# record.
+_MAX_FIELD_COUNT = 64
+_MAX_FIELD_SUMMARY_CHARS = 4_096
+
+
+def _omission_marker(count: int) -> str:
+    """Render the deterministic omission marker for ``count`` hidden fields."""
+
+    suffix = "s" if count != 1 else ""
+    return f"- \u2026 ({count} field{suffix} omitted; see catalog for full schema)"
+
+
+def _summary_length(lines: list[str], omitted: int) -> int:
+    """Return the rendered length of ``lines`` plus the omission marker."""
+
+    length = sum(len(line) for line in lines) + max(len(lines) - 1, 0)
+    if omitted > 0:
+        length += 1 + len(_omission_marker(omitted))
+    return length
+
+
 def _field_summary(schema: TableSchema) -> str:
-    """Render an ordered, catalog-authoritative field type/nullability summary.
+    """Render a bounded, catalog-authoritative field type/nullability summary.
 
     Each declared field is rendered as ``name: <type> (required|nullable)``.
-    The type label and nullability derive *only* from the declared
+    The summary is *bounded*: at most :data:`_MAX_FIELD_COUNT` fields and
+    :data:`_MAX_FIELD_SUMMARY_CHARS` characters are rendered.  When either
+    budget is exceeded the remaining fields are replaced by a deterministic
+    omission marker so the advisory text stays predictable.  The type label
+    and nullability derive *only* from the declared
     :class:`~selayer.sources.schema.FieldSchema`; no location, profile name,
     connector option, observed handle schema, or credential material is ever
-    surfaced.  This is the bounded advisory summary the OKF concept publishes;
-    the catalog :class:`TableSchema` (and its fingerprint) remain the
-    execution authority.
+    surfaced.  The catalog :class:`TableSchema` (and its fingerprint) remain
+    the execution authority.
     """
 
-    entries = []
-    for field in schema.fields:
-        requirement = "required" if not field.nullable else "nullable"
-        entries.append(
-            f"- {field.name}: {_logical_type_label(field.type)} ({requirement})"
-        )
-    return "\n".join(entries)
+    total = len(schema.fields)
+    lines = [
+        f"- {field.name}: {_logical_type_label(field.type)}"
+        f" ({'required' if not field.nullable else 'nullable'})"
+        for field in schema.fields[:_MAX_FIELD_COUNT]
+    ]
+    omitted = total - len(lines)
+
+    # If the rendered text (including the omission marker) exceeds the
+    # character budget, trim lines from the end until it fits.  Each
+    # iteration recomputes ``omitted`` so the marker always reports the
+    # correct count.
+    while lines and _summary_length(lines, omitted) > _MAX_FIELD_SUMMARY_CHARS:
+        lines.pop()
+        omitted = total - len(lines)
+
+    if omitted > 0:
+        lines.append(_omission_marker(omitted))
+    return "\n".join(lines)
 
 
 def catalog_definition(semantic_id: str, value: SemanticObject) -> str:
