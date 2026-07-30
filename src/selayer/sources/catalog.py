@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import TypeGuard
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -226,6 +227,16 @@ def _is_remote_location(location: str) -> bool:
         return False
     scheme = location[:scheme_sep].lower()
     return scheme in _REMOTE_SCHEMES
+
+
+def _has_location_userinfo(location: str) -> bool:
+    """Detect URI authority userinfo without retaining or rendering it."""
+
+    try:
+        parsed = urlsplit(location)
+    except ValueError:
+        return False
+    return parsed.username is not None or parsed.password is not None
 
 
 def _sorted_unknown_keys(
@@ -606,6 +617,14 @@ def _validate_connector_fields(
                         "location_invalid",
                         loc_path,
                         "location must be non-empty",
+                    )
+                )
+            elif _has_location_userinfo(location):
+                issues.append(
+                    SourceDeclarationIssue(
+                        "location_invalid",
+                        loc_path,
+                        "location must not contain authenticated userinfo",
                     )
                 )
             elif kind in ("parquet", "csv", "delta") and _is_remote_location(location):

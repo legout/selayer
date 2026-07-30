@@ -572,13 +572,34 @@ def test_next_package_is_absent() -> None:
     assert not (Path(selayer.__file__).parent / "_next").exists()
 
 
-def test_query_execution_error_contains_duckdb_message_and_sql_without_parameters(
+def test_unparameterized_driver_error_hides_authenticated_location(
+    valid_catalog_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "s3://access:password@example.invalid/data"
+    engine = QueryEngine(SemanticLayer.load(valid_catalog_path))
+
+    class FailingConnection:
+        def execute(self, _sql: str, _parameters: tuple[object, ...]) -> object:
+            raise duckdb.Error(f"Catalog Error: failed to scan {secret}")
+
+    monkeypatch.setattr(engine._registry, "_connection", FailingConnection())
+    with pytest.raises(QueryExecutionError) as caught:
+        engine.query(["gross_margin"])
+
+    assert secret not in caught.value.message
+    assert "Catalog Error" in caught.value.message
+    assert "SQL:" not in caught.value.message
+
+
+def test_query_execution_error_sanitizes_unparameterized_driver_details(
     valid_catalog_path: Path,
 ) -> None:
     engine = QueryEngine(SemanticLayer.load(valid_catalog_path))
     engine.close()
     with pytest.raises(QueryExecutionError) as caught:
         engine.query(["gross_margin"])
-    assert "Connection already closed" in caught.value.message
-    assert 'SQL: WITH "aggregated"' in caught.value.message
+    assert caught.value.message == "query execution failed: DuckDB Error"
+    assert "Connection already closed" not in caught.value.message
+    assert "SQL:" not in caught.value.message
     assert caught.value.query_id in str(caught.value)

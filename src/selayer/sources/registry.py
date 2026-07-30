@@ -73,12 +73,10 @@ from selayer.sources.profiles import (
 from selayer.sources.schema import TableSchema, compare_schemas, schema_fingerprint
 
 
-def _is_extension_failure(error: BaseException) -> bool:
-    """Recognize the one dependency code callers may classify safely."""
+def _dependency_code(error: BaseException) -> str | None:
+    """Return a sanitized known dependency code, if present."""
 
-    return isinstance(error, SourceDependencyError) and (
-        error.code == "extension_unavailable"
-    )
+    return error.code if isinstance(error, SourceDependencyError) else None
 
 
 if TYPE_CHECKING:
@@ -86,18 +84,6 @@ if TYPE_CHECKING:
     from selayer.planning import QueryPlan
 
 __all__ = ["SourceRegistry"]
-
-
-# Conditional iceberg adapter: pyiceberg is an optional extra.  The adapter is
-# only registered when the import succeeds so catalogs without the extra see a
-# sanitized ``unsupported_connector`` error for iceberg sources rather than an
-# import-time crash.
-try:
-    import pyiceberg  # noqa: F401
-
-    _ICEBERG_AVAILABLE = True
-except ImportError:
-    _ICEBERG_AVAILABLE = False
 
 
 # Closed built-in adapter mapping keyed by connector kind.  No public plugin
@@ -116,9 +102,8 @@ def _builtin_adapters() -> Mapping[str, SourceAdapter]:
         "sqlite": sqlite,
         "duckdb": duckdb_adapter,
         "postgres": postgres,
+        "iceberg": IcebergAdapter(),
     }
-    if _ICEBERG_AVAILABLE:
-        mapping["iceberg"] = IcebergAdapter()
     return MappingProxyType(mapping)
 
 
@@ -204,7 +189,7 @@ class SourceRegistry:
         prepared: list[tuple[str, SourceAdapter, SourceHandle]] = []
         failed_source_id: str | None = None
         init_failed = False
-        extension_failed = False
+        dependency_code: str | None = None
         unsupported_id: str | None = None
         try:
             for source_id in sorted(layer.data_sources):
@@ -230,7 +215,7 @@ class SourceRegistry:
                     raise _SchemaDrift(data_source.schema, observed)
         except Exception as error:  # noqa: BLE001
             init_failed = True
-            extension_failed = _is_extension_failure(error)
+            dependency_code = _dependency_code(error)
 
         if init_failed:
             # Close every handle prepared so far, then the connection.  Errors
@@ -247,11 +232,11 @@ class SourceRegistry:
                     "unsupported_connector",
                     "connector type is not supported",
                 )
-            if extension_failed:
+            if dependency_code is not None:
                 raise SourceDependencyError(
                     failed_source_id or "<source>",
-                    "extension_unavailable",
-                    "a required DuckDB extension is not available",
+                    dependency_code,
+                    "a source dependency is unavailable",
                 )
             if failed_source_id is not None:
                 raise SourceConnectionError(
@@ -267,24 +252,32 @@ class SourceRegistry:
 
         # Commit: register every prepared handle.  Registration failure here
         # is a hard initialization failure, so tear everything down.
-        extension_failed = False
+        dependency_code = None
         try:
             for source_id, adapter, handle in prepared:
                 failed_source_id = source_id
-                adapter.register(connection, source_id, handle)
+                if handle.query_scoped:
+                    # A PyArrow RecordBatchReader is one-shot and is used only
+                    # for schema inspection; query binding recreates it. Iceberg
+                    # keeps its persistent table metadata handle for scan-time
+                    # binding, while its register method is intentionally a no-op.
+                    if handle.connector == "pyarrow":
+                        close_quietly(adapter, handle)
+                else:
+                    adapter.register(connection, source_id, handle)
                 registrations[source_id] = _Registration(adapter, handle, 1)
         except Exception as error:  # noqa: BLE001
             init_failed = True
-            extension_failed = _is_extension_failure(error)
+            dependency_code = _dependency_code(error)
         if init_failed:
             for _source_id, adapter, handle in prepared:
                 close_quietly(adapter, handle)
             connection.close()
-            if extension_failed:
+            if dependency_code is not None:
                 raise SourceDependencyError(
                     failed_source_id or "<source>",
-                    "extension_unavailable",
-                    "a required DuckDB extension is not available",
+                    dependency_code,
+                    "a source dependency is unavailable",
                 )
             raise SourceConnectionError(
                 failed_source_id or "<source>",
@@ -342,11 +335,11 @@ class SourceRegistry:
                 if preparation_failure is not None:
                     if preparation_failure.candidate is not None:
                         cleanup.append((adapter, preparation_failure.candidate))
-                    if preparation_failure.extension_failure:
+                    if preparation_failure.dependency_code is not None:
                         raise SourceDependencyError(
                             source_id,
-                            "extension_unavailable",
-                            "a required DuckDB extension is not available",
+                            preparation_failure.dependency_code,
+                            "a source dependency is unavailable",
                         )
                     raise SourceReloadError(source_id, "reload_failed", "reload failed")
                 if prepared_candidate is None:
@@ -369,12 +362,16 @@ class SourceRegistry:
                 old_handle = old_registration.handle
                 old_generation = old_registration.generation
                 commit_failed = False
-                commit_extension_failed = False
+                commit_dependency_code: str | None = None
                 try:
-                    adapter.register(self._connection, source_id, candidate)
+                    if candidate.query_scoped:
+                        if candidate.connector == "pyarrow":
+                            cleanup.append((adapter, candidate))
+                    else:
+                        adapter.register(self._connection, source_id, candidate)
                 except Exception as error:  # noqa: BLE001
                     commit_failed = True
-                    commit_extension_failed = _is_extension_failure(error)
+                    commit_dependency_code = _dependency_code(error)
                     # register may have mutated the connection before raising,
                     # so restore the previous handle before proceeding.
                     restore_quietly(adapter, self._connection, source_id, old_handle)
@@ -384,17 +381,11 @@ class SourceRegistry:
                     )
                 if commit_failed:
                     cleanup.append((adapter, candidate))
-                    if commit_extension_failed:
-                        # The commit raised a sanitized dependency error (e.g.
-                        # a missing extension surfaced from
-                        # ``_ensure_extension``).  Raise a fresh one outside
-                        # the except scope so the stable
-                        # ``extension_unavailable`` code — not the generic
-                        # ``reload_failed`` — reaches the caller.
+                    if commit_dependency_code is not None:
                         raise SourceDependencyError(
                             source_id,
-                            "extension_unavailable",
-                            "a required DuckDB extension is not available",
+                            commit_dependency_code,
+                            "a source dependency is unavailable",
                         )
                     raise SourceReloadError(source_id, "reload_failed", "reload failed")
 
@@ -453,7 +444,7 @@ class SourceRegistry:
                     str, tuple[SourceAdapter, SourceHandle, TableSchema]
                 ] = {}
                 prepare_failed_source: str | None = None
-                dependency_failure = False
+                dependency_code: str | None = None
                 unexpected_failure = False
                 preparation_failure: _CandidatePreparationFailed | None = None
                 try:
@@ -482,18 +473,18 @@ class SourceRegistry:
                             break
                         candidates[source_id] = (adapter, candidate, observed)
                 except SourceDependencyError as dep_error:
-                    dependency_failure = _is_extension_failure(dep_error)
+                    dependency_code = _dependency_code(dep_error)
                 except Exception:  # noqa: BLE001
                     unexpected_failure = True
 
                 if preparation_failure is not None:
                     for adapter, candidate, _observed in candidates.values():
                         cleanup.append((adapter, candidate))
-                    if preparation_failure.extension_failure:
+                    if preparation_failure.dependency_code is not None:
                         raise SourceDependencyError(
                             prepare_failed_source or "<source>",
-                            "extension_unavailable",
-                            "a required DuckDB extension is not available",
+                            preparation_failure.dependency_code,
+                            "a source dependency is unavailable",
                         )
                     raise SourceReloadError(
                         prepare_failed_source or "<source>",
@@ -508,7 +499,7 @@ class SourceRegistry:
                 # ``__cause__``/``__context__`` remain ``None``.
                 if (
                     prepare_failed_source is not None
-                    or dependency_failure
+                    or dependency_code is not None
                     or unexpected_failure
                 ):
                     for adapter, candidate, _observed in candidates.values():
@@ -518,11 +509,11 @@ class SourceRegistry:
                         if prepare_failed_source is not None
                         else "<source>"
                     )
-                    if dependency_failure:
+                    if dependency_code is not None:
                         raise SourceDependencyError(
                             failed_id,
-                            "extension_unavailable",
-                            "a required DuckDB extension is not available",
+                            dependency_code,
+                            "a source dependency is unavailable",
                         )
                     raise SourceReloadError(
                         failed_id, "reload_all_failed", "reload failed"
@@ -530,7 +521,7 @@ class SourceRegistry:
 
                 swapped: list[tuple[str, SourceAdapter, SourceHandle, int]] = []
                 commit_failed = False
-                commit_extension_failed = False
+                commit_dependency_code: str | None = None
                 commit_failed_source: str | None = None
                 results: list[ReloadResult] = []
                 # Swap every registration and publish every generation under
@@ -542,11 +533,15 @@ class SourceRegistry:
                     adapter, candidate, _observed = candidates[source_id]
                     old = self._registrations[source_id]
                     try:
-                        adapter.register(self._connection, source_id, candidate)
+                        if candidate.query_scoped:
+                            if candidate.connector == "pyarrow":
+                                cleanup.append((adapter, candidate))
+                        else:
+                            adapter.register(self._connection, source_id, candidate)
                     except Exception as error:  # noqa: BLE001
                         commit_failed = True
                         commit_failed_source = source_id
-                        commit_extension_failed = _is_extension_failure(error)
+                        commit_dependency_code = _dependency_code(error)
                         # register may have mutated the connection before
                         # raising, so restore the failing source's old handle
                         # too — not only the previously swapped entries.
@@ -587,17 +582,11 @@ class SourceRegistry:
                         if commit_failed_source is not None
                         else "<source>"
                     )
-                    if commit_extension_failed:
-                        # The commit raised a sanitized dependency error (e.g.
-                        # a missing extension surfaced from
-                        # ``_ensure_extension``).  Raise a fresh one outside
-                        # the except scope so the stable
-                        # ``extension_unavailable`` code — not the generic
-                        # ``reload_failed`` — reaches the caller.
+                    if commit_dependency_code is not None:
                         raise SourceDependencyError(
                             failed_id,
-                            "extension_unavailable",
-                            "a required DuckDB extension is not available",
+                            commit_dependency_code,
+                            "a source dependency is unavailable",
                         )
                     raise SourceReloadError(
                         "<source>", "reload_all_failed", "reload failed"
@@ -626,11 +615,16 @@ class SourceRegistry:
     # -- lifecycle: status / close ----------------------------------------
 
     def status(self, source_id: str) -> SourceStatus:
-        self._ensure_open(source_id)
-        if source_id not in self._registrations:
-            raise SourceConnectionError(source_id, "connect_failed", "unknown source")
-        registration = self._registrations[source_id]
-        return SourceStatus.from_handle(registration.handle, registration.generation)
+        with self._lock:
+            self._ensure_open(source_id)
+            if source_id not in self._registrations:
+                raise SourceConnectionError(
+                    source_id, "connect_failed", "unknown source"
+                )
+            registration = self._registrations[source_id]
+            return SourceStatus.from_handle(
+                registration.handle, registration.generation
+            )
 
     def close(self) -> None:
         """Idempotently close every handle and the connection."""
@@ -774,9 +768,9 @@ class SourceRegistry:
             candidate = adapter.prepare(source, self._profiles, self._arrow_providers)
             observed = adapter.inspect_schema(candidate)
         except SourceDependencyError as error:
-            raise _CandidatePreparationFailed(candidate, _is_extension_failure(error))
+            raise _CandidatePreparationFailed(candidate, _dependency_code(error))
         except Exception:  # noqa: BLE001
-            raise _CandidatePreparationFailed(candidate, False)
+            raise _CandidatePreparationFailed(candidate, None)
         return candidate, observed
 
 
@@ -790,7 +784,7 @@ class _CandidatePreparationFailed(Exception):
     """Internal failure carrying candidate ownership to the caller."""
 
     candidate: SourceHandle | None
-    extension_failure: bool
+    dependency_code: str | None
 
 
 class _SchemaDrift(Exception):

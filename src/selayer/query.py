@@ -40,6 +40,16 @@ def _duckdb_diagnostic_category(error: duckdb.Error) -> str:
     return "DuckDB Error"
 
 
+def _query_error_message(category: str, compiled: CompiledQuery | None) -> str:
+    """Render a safe category-only query error message."""
+
+    if compiled is not None:
+        parameters = compiled.parameters
+        if parameters:
+            return f"query execution failed: parameterized query failed ({category})"
+    return f"query execution failed: {category}"
+
+
 class QueryEngine:
     """Orchestrate catalog loading, planning, compilation, and execution.
 
@@ -128,17 +138,12 @@ class QueryEngine:
                 compiled = compile_duckdb(plan)
                 result = self._registry.execute(compiled.sql, compiled.parameters).pl()
         except duckdb.Error as error:
-            if compiled is None:
-                message = f"query execution failed: {error}"
-            elif compiled.parameters:
-                category = _duckdb_diagnostic_category(error)
-                message = (
-                    f"query execution failed: parameterized query failed ({category})"
-                )
-            else:
-                # With no caller-provided values, the generated SQL and the
-                # DuckDB diagnostic are useful debugging information.
-                message = f"query execution failed: {error}; SQL: {compiled.sql}"
+            # Driver diagnostics and generated SQL can contain source
+            # locations, endpoints, or authenticated URIs.  Expose only the
+            # allowlisted DuckDB category for every query, including queries
+            # with no caller parameters.
+            category = _duckdb_diagnostic_category(error)
+            message = _query_error_message(category, compiled)
             execution_error = QueryExecutionError(query_id, message)
         if execution_error is not None:
             raise execution_error

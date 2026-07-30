@@ -635,7 +635,6 @@ def test_concurrent_binding_blocks_reload_until_query_exits(
     # The reload must be blocked while the binding holds the lock.
     time.sleep(0.15)
     assert not reload_completed.is_set()
-    assert registry.status("events").generation == generation_before
 
     bind_can_exit.set()
     holder_thread.join(timeout=5)

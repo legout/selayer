@@ -348,6 +348,28 @@ def test_rejects_remote_location_without_credential_profile(
     assert "data_sources.x.location" in {issue.path for issue in issues}
 
 
+@pytest.mark.parametrize(
+    ("kind", "location"),
+    [
+        ("parquet", "s3://access:secret@bucket/path.parquet"),
+        ("csv", "https://access:secret@example.invalid/data.csv"),
+        ("delta", "s3://access:secret@bucket/events"),
+        ("sqlite", "file://access:secret@example.invalid/events.sqlite"),
+        ("duckdb", "file://access:secret@example.invalid/events.duckdb"),
+    ],
+)
+def test_rejects_authenticated_location(
+    tmp_path: Path, kind: str, location: str
+) -> None:
+    source = {**valid_source_mapping(kind), "location": location}
+    issues = validate_source_declarations({"x": source}, tmp_path / "catalog.yaml")
+    location_issues = [
+        issue for issue in issues if issue.path == "data_sources.x.location"
+    ]
+    assert any(issue.code == "location_invalid" for issue in location_issues)
+    assert all("secret" not in issue.message for issue in location_issues)
+
+
 def test_remote_location_with_credential_profile_is_accepted(
     tmp_path: Path,
 ) -> None:
