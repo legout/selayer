@@ -178,7 +178,10 @@ def database_layer_factory() -> Callable[[Path, Path], SemanticLayer]:
 
 
 def _duckdb_layer(
-    path: str | Path, relation: str = "facts", source_name: str = "facts"
+    path: str | Path,
+    relation: str = "facts",
+    source_name: str = "facts",
+    source_key: str | None = None,
 ) -> SemanticLayer:
     """A single-source SemanticLayer over a DuckDB file relation."""
 
@@ -188,7 +191,7 @@ def _duckdb_layer(
         "",
         "",
         {
-            source_name: DataSource(
+            source_key or source_name: DataSource(
                 source_name,
                 DuckDbConfig(str(path), relation),
                 _facts_schema(),
@@ -371,6 +374,25 @@ def test_invalid_relation_segment_is_catalog_error(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Missing extension dependency error
 # ---------------------------------------------------------------------------
+
+
+def test_programmatic_source_name_cannot_inject_view_sql(tmp_path: Path) -> None:
+    """Programmatic source IDs are revalidated before stable-view SQL."""
+
+    path = tmp_path / "facts.duckdb"
+    with duckdb.connect(str(path)) as connection:
+        connection.execute('create table facts (id bigint, "value" bigint)')
+        connection.execute("insert into facts values (1, 10)")
+
+    malicious = 'facts"; CREATE TABLE injected AS SELECT 1; --'
+    with pytest.raises(SourceConnectionError) as caught:
+        QueryEngine(_duckdb_layer(path, source_name="facts", source_key=malicious))
+
+    assert caught.value.code == "source_initialization_failed"
+    assert "injected" not in str(caught.value)
+    assert "CREATE TABLE" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 def test_missing_extension_is_dependency_error(

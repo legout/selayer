@@ -421,17 +421,44 @@ def _introspect_relation(
     return table_schema_from_arrow(arrow_schema)
 
 
+# The stable view name must be a catalog-shaped source name: an exact builtin
+# ``str`` matching the lowercase identifier ``[a-z][a-z0-9_]*``.  This mirrors
+# the catalog parser's source-name validation (and the ``_SOURCE_NAME_RE``
+# allowlist in :mod:`selayer.sources.errors`).  A programmatically constructed
+# SemanticLayer bypasses the catalog parser, so the name is re-validated before
+# it is interpolated into the double-quoted CREATE VIEW statement.
+_STABLE_NAME_RE = re.compile(r"\A[a-z][a-z0-9_]*\Z")
+
+
+def _validate_stable_name(stable_name: object) -> None:
+    """Reject a stable view name that is not a catalog-shaped source name.
+
+    ``type(stable_name) is str`` (rather than ``isinstance``) rejects a hostile
+    ``str`` subclass whose dunders could leak a secret.  The regex then rejects
+    any identifier that is not a lowercase source name — e.g. a SQL fragment
+    containing quotes, semicolons, or comments supplied by a programmatic
+    SemanticLayer that bypassed the catalog parser.  The constant message never
+    echoes the rejected name.
+    """
+
+    if type(stable_name) is not str or not _STABLE_NAME_RE.match(stable_name):
+        raise ValueError("invalid stable name")
+
+
 def _create_stable_view(
     connection: Any, stable_name: str, alias: str, quoted_relation: str
 ) -> None:
     """Create/replace a stable view over the attached relation.
 
     ``CREATE OR REPLACE VIEW`` is the atomic commit point: once it succeeds the
-    stable name resolves to the new alias.  ``stable_name`` is a catalog-shaped
-    source name (lowercase identifier); it is quoted for consistency.  The
-    relation reference is ``alias."seg"[."seg"]``.
+    stable name resolves to the new alias.  ``stable_name`` is validated against
+    the catalog source-name shape before it is interpolated into the
+    double-quoted statement; a fragment containing quotes or semicolons is
+    rejected with a constant message so the text can never surface or be
+    injected.  The relation reference is ``alias."seg"[."seg"]``.
     """
 
+    _validate_stable_name(stable_name)
     relation_ref = f"{alias}.{quoted_relation}"
     connection.execute(
         f'CREATE OR REPLACE VIEW "{stable_name}" AS SELECT * FROM {relation_ref}'
@@ -601,6 +628,11 @@ class _DatabaseAdapterBase:
     ) -> None:
         resource = handle.resource
         assert isinstance(resource, _DatabaseResource)
+        # Validate the stable name before any SQL so a programmatic source-map
+        # key containing quotes or semicolons is rejected before ATTACH and
+        # CREATE VIEW.  The registry boundary converts the ValueError into a
+        # sanitized SourceConnectionError.
+        _validate_stable_name(stable_name)
         # Attach the source on the shared registry connection under a fresh
         # alias, then create the stable view.  If either step fails, detach the
         # fresh alias before re-raising so no dangling attachment remains; the
