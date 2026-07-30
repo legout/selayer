@@ -62,6 +62,7 @@ from selayer.sources.catalog import ParsedSource
 from selayer.sources.config import connector_kind
 from selayer.sources.errors import (
     SourceConnectionError,
+    SourceDependencyError,
     SourceReloadError,
     SourceSchemaError,
 )
@@ -70,6 +71,15 @@ from selayer.sources.profiles import (
     RuntimeProfileResolver,
 )
 from selayer.sources.schema import TableSchema, compare_schemas, schema_fingerprint
+
+
+def _is_extension_failure(error: BaseException) -> bool:
+    """Recognize the one dependency code callers may classify safely."""
+
+    return isinstance(error, SourceDependencyError) and (
+        error.code == "extension_unavailable"
+    )
+
 
 if TYPE_CHECKING:
     from selayer.model import SemanticLayer
@@ -194,6 +204,7 @@ class SourceRegistry:
         prepared: list[tuple[str, SourceAdapter, SourceHandle]] = []
         failed_source_id: str | None = None
         init_failed = False
+        extension_failed = False
         unsupported_id: str | None = None
         try:
             for source_id in sorted(layer.data_sources):
@@ -217,8 +228,9 @@ class SourceRegistry:
                 mismatches = compare_schemas(data_source.schema, observed)
                 if mismatches:
                     raise _SchemaDrift(data_source.schema, observed)
-        except Exception:  # noqa: BLE001
+        except Exception as error:  # noqa: BLE001
             init_failed = True
+            extension_failed = _is_extension_failure(error)
 
         if init_failed:
             # Close every handle prepared so far, then the connection.  Errors
@@ -235,6 +247,12 @@ class SourceRegistry:
                     "unsupported_connector",
                     "connector type is not supported",
                 )
+            if extension_failed:
+                raise SourceDependencyError(
+                    failed_source_id or "<source>",
+                    "extension_unavailable",
+                    "a required DuckDB extension is not available",
+                )
             if failed_source_id is not None:
                 raise SourceConnectionError(
                     failed_source_id,
@@ -249,17 +267,25 @@ class SourceRegistry:
 
         # Commit: register every prepared handle.  Registration failure here
         # is a hard initialization failure, so tear everything down.
+        extension_failed = False
         try:
             for source_id, adapter, handle in prepared:
                 failed_source_id = source_id
                 adapter.register(connection, source_id, handle)
                 registrations[source_id] = _Registration(adapter, handle, 1)
-        except Exception:  # noqa: BLE001
+        except Exception as error:  # noqa: BLE001
             init_failed = True
+            extension_failed = _is_extension_failure(error)
         if init_failed:
             for _source_id, adapter, handle in prepared:
                 close_quietly(adapter, handle)
             connection.close()
+            if extension_failed:
+                raise SourceDependencyError(
+                    failed_source_id or "<source>",
+                    "extension_unavailable",
+                    "a required DuckDB extension is not available",
+                )
             raise SourceConnectionError(
                 failed_source_id or "<source>",
                 "source_initialization_failed",
@@ -358,13 +384,18 @@ class SourceRegistry:
         source_ids = sorted(self._sources)
         candidates: dict[str, tuple[SourceAdapter, SourceHandle, TableSchema]] = {}
         prepare_failed_source: str | None = None
+        dependency_failure = False
         unexpected_failure = False
         try:
             for source_id in source_ids:
                 source = self._sources[source_id]
                 registration = self._registrations[source_id]
                 adapter = registration.adapter
-                prepared_candidate = self._prepare_candidate(adapter, source)
+                try:
+                    prepared_candidate = self._prepare_candidate(adapter, source)
+                except SourceDependencyError:
+                    prepare_failed_source = source_id
+                    raise
                 if prepared_candidate is None:
                     prepare_failed_source = source_id
                     break
@@ -375,6 +406,8 @@ class SourceRegistry:
                     prepare_failed_source = source_id
                     break
                 candidates[source_id] = (adapter, candidate, observed)
+        except SourceDependencyError as error:
+            dependency_failure = _is_extension_failure(error)
         except Exception:  # noqa: BLE001
             unexpected_failure = True
 
@@ -382,7 +415,11 @@ class SourceRegistry:
         # an unexpected exception), close every candidate prepared so far and
         # raise a sanitized SourceReloadError *outside* the except scope so
         # ``__cause__``/``__context__`` remain ``None``.
-        if prepare_failed_source is not None or unexpected_failure:
+        if (
+            prepare_failed_source is not None
+            or dependency_failure
+            or unexpected_failure
+        ):
             for adapter, candidate, _observed in candidates.values():
                 close_quietly(adapter, candidate)
             failed_id = (
@@ -390,6 +427,12 @@ class SourceRegistry:
                 if prepare_failed_source is not None
                 else "<source>"
             )
+            if dependency_failure:
+                raise SourceDependencyError(
+                    failed_id,
+                    "extension_unavailable",
+                    "a required DuckDB extension is not available",
+                )
             raise SourceReloadError(failed_id, "reload_failed", "reload failed")
 
         swapped: list[tuple[str, SourceAdapter, SourceHandle, int]] = []
@@ -595,6 +638,10 @@ class SourceRegistry:
         try:
             candidate = adapter.prepare(source, self._profiles, self._arrow_providers)
             observed = adapter.inspect_schema(candidate)
+        except SourceDependencyError:
+            if candidate is not None:
+                close_quietly(adapter, candidate)
+            raise
         except Exception:  # noqa: BLE001
             # inspect_schema may have raised after a successful prepare; close
             # the prepared handle so it is never leaked.

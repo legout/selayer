@@ -257,12 +257,18 @@ def _validate_postgres_profile(profile: RuntimeProfile) -> None:
     could leak a secret is rejected.
     """
 
-    unknown = set(profile.keys()) - _POSTGRES_PROFILE_KEYS
+    allowed_keys = _POSTGRES_PROFILE_KEYS | {_EXTENSION_INSTALL_KEY}
+    unknown = set(profile.keys()) - allowed_keys
     if unknown:
         raise ValueError("unsupported key in postgres profile")
     for name in _POSTGRES_PROFILE_KEYS:
         if name in profile and type(profile.value(name)) is not str:
             raise ValueError("invalid postgres profile value")
+    if (
+        _EXTENSION_INSTALL_KEY in profile
+        and type(profile.value(_EXTENSION_INSTALL_KEY)) is not bool
+    ):
+        raise ValueError("invalid postgres profile value")
 
 
 def _escape_dsn_value(value: str) -> str:

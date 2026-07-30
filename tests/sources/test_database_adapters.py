@@ -373,7 +373,11 @@ def test_invalid_relation_segment_is_catalog_error(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_missing_extension_is_dependency_error(monkeypatch, tmp_path: Path) -> None:
+def test_missing_extension_is_dependency_error(
+    monkeypatch,
+    tmp_path: Path,
+    database_layer_factory: Callable[[Path, Path], SemanticLayer],
+) -> None:
     """A missing DuckDB extension surfaces as a sanitized dependency error.
 
     The ``sqlite_scanner`` extension is force-simulated as unavailable by
@@ -406,10 +410,50 @@ def test_missing_extension_is_dependency_error(monkeypatch, tmp_path: Path) -> N
     assert caught.value.__context__ is None
     _assert_no_secret_leak(caught.value, "SECRET_loc")
 
+    # The public engine preserves the dependency classification rather than
+    # collapsing it into generic source initialization failure.
+    duckdb_path = tmp_path / "facts.duckdb"
+    with duckdb.connect(str(duckdb_path)) as connection:
+        connection.execute('create table facts (id bigint, "value" bigint)')
+    with pytest.raises(SourceDependencyError) as engine_caught:
+        QueryEngine(database_layer_factory(sqlite_path, duckdb_path))
+    assert engine_caught.value.code == "extension_unavailable"
+    assert engine_caught.value.__cause__ is None
+    assert engine_caught.value.__context__ is None
+
 
 # ---------------------------------------------------------------------------
 # Offline policy never installs extension
 # ---------------------------------------------------------------------------
+
+
+def test_postgres_extension_install_permission_is_explicit() -> None:
+    """The non-secret boolean permission is accepted but never enters the DSN."""
+
+    allowed = MappingProfileResolver(
+        {
+            "warehouse": {
+                "host": "db",
+                "dbname": "analytics",
+                "allow_extension_install": True,
+            }
+        }
+    ).resolve("warehouse", source_id="facts")
+    dbmod._validate_postgres_profile(allowed)
+    assert dbmod._extension_allowed(allowed) is True
+    assert "allow_extension_install" not in dbmod._build_postgres_dsn(allowed)
+
+    denied = MappingProfileResolver(
+        {
+            "warehouse": {
+                "host": "db",
+                "dbname": "analytics",
+                "allow_extension_install": "true",
+            }
+        }
+    ).resolve("warehouse", source_id="facts")
+    with pytest.raises(ValueError, match="invalid postgres profile value"):
+        dbmod._validate_postgres_profile(denied)
 
 
 def test_offline_policy_never_installs_extension(monkeypatch, tmp_path: Path) -> None:
