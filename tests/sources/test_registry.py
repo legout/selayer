@@ -194,6 +194,7 @@ class _FakeAdapter:
         self.raise_on_inspect: bool = False
         self.register_delay: float = 0.0
         self.register_exception: BaseException | None = None
+        self.close_lock_probe: object | None = None
 
     def prepare(
         self,
@@ -264,6 +265,8 @@ class _FakeAdapter:
 
     def close(self, handle: SourceHandle) -> None:
         self._provider.closed_handles.append(handle.source_id)
+        if callable(self.close_lock_probe):
+            self.close_lock_probe()
 
 
 def _empty_profiles() -> RuntimeProfileResolver:
@@ -949,6 +952,32 @@ def test_reload_all_preserves_extension_dependency_error() -> None:
 # ---------------------------------------------------------------------------
 # Fix 3a: inspect_schema failure during reload closes the prepared candidate
 # ---------------------------------------------------------------------------
+
+
+def test_reload_inspect_failure_closes_candidate_after_unlock(
+    registry_fixture: _RegistryFixture,
+) -> None:
+    """A candidate from inspect failure closes after the lifecycle lock exits."""
+
+    registry = registry_fixture.registry
+    adapter = cast("_FakeAdapter", registry._registrations["events"].adapter)
+    lock_available: list[bool] = []
+
+    def probe_lock() -> None:
+        acquired = registry._lock.acquire(blocking=False)
+        lock_available.append(acquired)
+        if acquired:
+            registry._lock.release()
+
+    adapter.close_lock_probe = probe_lock
+    adapter.raise_on_inspect = True
+
+    with pytest.raises(SourceReloadError) as caught:
+        registry.reload_source("events")
+
+    assert lock_available == [True]
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 def test_reload_inspect_failure_closes_prepared_candidate(

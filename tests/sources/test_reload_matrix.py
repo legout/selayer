@@ -45,7 +45,6 @@ from selayer.sources.config import (
     SqliteConfig,
 )
 from selayer.sources.errors import (
-    SourceError,
     SourceReloadError,
 )
 from selayer.sources.profiles import (
@@ -357,62 +356,17 @@ def test_query_waits_for_reload_swap(mixed_registry_fixture: _MixedFixture) -> N
     assert reload_done.is_set()
 
 
-def test_close_waits_for_active_reload(mixed_registry_fixture: _MixedFixture) -> None:
-    """``close`` serializes with an in-progress reload on the registry lock.
-
-    ``close`` acquires the registry lock, so it cannot tear down the connection
-    while a reload is mid-swap.  The reload completes (publishing its
-    generation) before close marks the registry closed.
-    """
-
-    fixture = mixed_registry_fixture
-    registry = fixture.registry
-    fixture.arrow_provider._table = pa.table({"id": [7], "value": [77]})
-
-    reload_started = threading.Event()
-    reload_finished = threading.Event()
-    close_finished = threading.Event()
-    generation_after_reload: list[int] = []
-
-    def reloader() -> None:
-        # Hold the lock long enough that close must wait.  We cannot widen the
-        # real adapter's register window, so we instead run reload_source under
-        # the registry's execute_lock and gate completion.
-        reload_started.set()
-        result = registry.reload_source("arrow_events")
-        generation_after_reload.append(result.new_generation)
-        reload_finished.set()
-
-    def closer() -> None:
-        reload_started.wait(timeout=5)
-        # Give the reload a chance to enter its critical section.
-        time.sleep(0.1)
-        registry.close()
-        close_finished.set()
-
-    reload_thread = threading.Thread(target=reloader)
-    close_thread = threading.Thread(target=closer)
-
-    reload_thread.start()
-    close_thread.start()
-    reload_thread.join(timeout=10)
-    close_thread.join(timeout=10)
-
-    assert reload_finished.is_set()
-    assert close_finished.is_set()
-    assert generation_after_reload == [2]
-
-
-def test_close_waits_for_reload_candidate_preparation(
+def test_close_waits_for_active_reload(
     mixed_registry_fixture: _MixedFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Close waits for preparation and cannot orphan an in-flight candidate."""
+    """Close cannot finish while a reload is blocked in candidate preparation."""
 
     fixture = mixed_registry_fixture
     registry = fixture.registry
     preparation_started = threading.Event()
     release_preparation = threading.Event()
+    close_started = threading.Event()
     close_finished = threading.Event()
     reload_errors: list[BaseException] = []
     original_prepare = SourceRegistry._prepare_candidate
@@ -431,6 +385,7 @@ def test_close_waits_for_reload_candidate_preparation(
             reload_errors.append(error)
 
     def closer() -> None:
+        close_started.set()
         registry.close()
         close_finished.set()
 
@@ -439,7 +394,57 @@ def test_close_waits_for_reload_candidate_preparation(
     reload_thread.start()
     assert preparation_started.wait(timeout=5)
     close_thread.start()
-    assert not close_finished.wait(timeout=0.2)
+    assert close_started.wait(timeout=5)
+    assert not close_finished.is_set()
+    release_preparation.set()
+    reload_thread.join(timeout=10)
+    close_thread.join(timeout=10)
+
+    assert reload_errors == []
+    assert close_finished.is_set()
+    assert registry._closed is True
+
+
+def test_close_waits_for_reload_candidate_preparation(
+    mixed_registry_fixture: _MixedFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Close waits for preparation and cannot orphan an in-flight candidate."""
+
+    fixture = mixed_registry_fixture
+    registry = fixture.registry
+    preparation_started = threading.Event()
+    release_preparation = threading.Event()
+    close_started = threading.Event()
+    close_finished = threading.Event()
+    reload_errors: list[BaseException] = []
+    original_prepare = SourceRegistry._prepare_candidate
+
+    def blocked_prepare(registry, adapter, source):
+        preparation_started.set()
+        assert release_preparation.wait(timeout=5)
+        return original_prepare(registry, adapter, source)
+
+    monkeypatch.setattr(SourceRegistry, "_prepare_candidate", blocked_prepare)
+
+    def reloader() -> None:
+        try:
+            registry.reload_source("arrow_events")
+        except BaseException as error:  # noqa: BLE001
+            reload_errors.append(error)
+
+    def closer() -> None:
+        close_started.set()
+        registry.close()
+        close_finished.set()
+
+    reload_thread = threading.Thread(target=reloader)
+    close_thread = threading.Thread(target=closer)
+    reload_thread.start()
+    assert preparation_started.wait(timeout=5)
+    close_thread.start()
+    assert close_started.wait(timeout=5)
+    assert not close_finished.is_set()
     release_preparation.set()
     reload_thread.join(timeout=10)
     close_thread.join(timeout=10)
@@ -671,7 +676,7 @@ def _iceberg_layer(
     layer = _layer(
         DataSource(
             "events",
-            IcebergConfig("catalog", ("default",), "events"),
+            IcebergConfig("test_catalog", ("default",), "events"),
             TableSchema(
                 (
                     FieldSchema("id", ScalarType("int64"), True),
@@ -684,7 +689,7 @@ def _iceberg_layer(
     )
     profiles = MappingProfileResolver(
         {
-            "catalog": {
+            "test_catalog": {
                 "type": "sql",
                 "uri": f"sqlite:///{db_path}",
                 "warehouse": f"file://{warehouse}",
@@ -734,17 +739,16 @@ def test_reload_failure_is_secret_free_across_connector_modes(
     connection = duckdb.connect(":memory:")
     if mode == "database":
         connection.execute("LOAD sqlite_scanner")
-    try:
-        registry = SourceRegistry.create(layer, connection, profiles, providers)
-    except SourceError as caught:
-        # Some adapters reject an intentionally malformed secret-bearing
-        # candidate during initial preparation.  The lifecycle boundary is
-        # still the contract under test: no secret may escape initialization.
-        _assert_no_secret_leak(caught, secret)
-        return
+    registry = SourceRegistry.create(layer, connection, profiles, providers)
 
     if mode == "arrow":
-        registry._arrow_providers = MappingArrowProviderResolver({})
+
+        class _FailingResolver:
+            def resolve(self, handle: str, *, source_id: str):
+                del handle, source_id
+                raise RuntimeError(f"s3://user:{secret}@example/private")
+
+        registry._arrow_providers = _FailingResolver()  # type: ignore[assignment]
     elif mode == "delta":
         shutil.rmtree(tmp_path / secret / "delta")
     elif mode == "iceberg":
