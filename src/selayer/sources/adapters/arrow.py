@@ -59,22 +59,13 @@ from selayer.sources.profiles import (
     RuntimeProfile,
     RuntimeProfileResolver,
 )
-from selayer.sources.schema import TableSchema, table_schema_to_arrow
+from selayer.sources.schema import (
+    TableSchema,
+    table_schema_from_arrow,
+    table_schema_to_arrow,
+)
 
 __all__ = ["ArrowDatasetAdapter"]
-
-
-def _reader_cleanup(connection: object, stable_name: str) -> Callable[[], None]:
-    """Return an idempotent cleanup that deregisters a query-scoped view."""
-
-    def _cleanup() -> None:
-        with suppress(Exception):
-            # DuckDB's unregister removes the replacement-scan binding; any
-            # failure is suppressed because cleanup must never mask the query
-            # result or raise out of a context-manager exit.
-            connection.unregister(stable_name)  # type: ignore[attr-defined]
-
-    return _cleanup
 
 
 class ArrowDatasetAdapter:
@@ -139,8 +130,6 @@ class ArrowDatasetAdapter:
         # declared nullability), or the provider object's schema.  Converting
         # it back to the logical model lets the registry compare it against
         # the declaration and reject any drift before registration.
-        from selayer.sources.schema import table_schema_from_arrow
-
         return table_schema_from_arrow(arrow_schema)
 
     # -- registration ------------------------------------------------------
@@ -301,7 +290,7 @@ def _handle_for_arrow_object(
             # The provider is stashed on the handle so the registry can recreate
             # the reader per query without re-resolving the resolver.  It is
             # repr-hidden by ``SourceHandle``.
-            cleanup=_reader_recreator(provider),
+            cleanup=_persisted_provider(provider),
         )
     return SourceHandle(
         source_id=source.name,
@@ -341,18 +330,6 @@ def _read_provider(handle: SourceHandle) -> Callable[[], ArrowObject] | None:
     if cleanup is None:
         return None
     return getattr(cleanup, "provider", None)
-
-
-def _reader_recreator(
-    provider: Callable[[], ArrowObject],
-) -> Callable[[], None]:
-    """Stash a reader provider for query-scoped recreation on the handle."""
-
-    def _noop() -> None:
-        return None
-
-    _noop.provider = provider  # type: ignore[attr-defined]
-    return _noop
 
 
 def _resource_schema(resource: ArrowObject) -> pa.Schema:

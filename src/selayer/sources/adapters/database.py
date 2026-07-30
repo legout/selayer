@@ -153,12 +153,7 @@ def _extension_allowed(profile: RuntimeProfile | None) -> bool:
     if _EXTENSION_INSTALL_KEY not in profile:
         return False
     value: object = profile.value(_EXTENSION_INSTALL_KEY)
-    # ``type(value) is bool`` (not ``isinstance``) rejects a hostile subclass;
-    # ``bool(value)`` then yields the real truthiness.  ``bool(value) is True``
-    # would be flagged as an identity-with-literal, and a bare ``is True`` is
-    # rejected by the exact-type guard already, so the truthiness test is the
-    # only remaining step.
-    return type(value) is bool and bool(value)
+    return type(value) is bool and value
 
 
 def _ensure_extension(

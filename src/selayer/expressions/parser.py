@@ -442,13 +442,7 @@ class Parser:
 
     def parse_primary(self) -> Expression:
         token = self._peek()
-        if token.kind == "number":
-            self._advance()
-            return Literal(value=cast(Scalar, token.value))
-        if token.kind == "string":
-            self._advance()
-            return Literal(value=cast(Scalar, token.value))
-        if token.kind == "boolean":
+        if token.kind in ("number", "string", "boolean"):
             self._advance()
             return Literal(value=cast(Scalar, token.value))
         if token.kind == "null":

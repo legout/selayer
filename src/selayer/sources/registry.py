@@ -769,12 +769,13 @@ class SourceRegistry:
         self,
         adapter: SourceAdapter,
         source: ParsedSource,
-    ) -> tuple[SourceHandle, TableSchema] | None:
-        """Prepare and inspect a candidate, returning ``None`` on failure.
+    ) -> tuple[SourceHandle, TableSchema]:
+        """Prepare and inspect a candidate, raising on failure.
 
-        Failures are signaled rather than raised so the caller can construct the
-        sanitized :class:`~selayer.sources.errors.SourceError` outside the
-        ``except`` scope, preserving the ``__cause__``/``__context__`` invariant.
+        Failures are raised as :class:`_CandidatePreparationFailed` so the
+        caller can construct the sanitized
+        :class:`~selayer.sources.errors.SourceError` outside the ``except``
+        scope, preserving the ``__cause__``/``__context__`` invariant.
         If ``prepare`` succeeds but ``inspect_schema`` raises, the prepared
         handle is closed so it is never leaked.
         """

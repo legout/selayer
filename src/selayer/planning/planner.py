@@ -211,12 +211,7 @@ def plan_query(layer: SemanticLayer, request: QueryRequest) -> QueryPlan:
     filters: list[PlannedFilter] = []
     for dimension_id in sorted(request.filters):
         raw_value = request.filters[dimension_id]
-        dimension = layer.dimensions.get(dimension_id)
-        if dimension is None:
-            raise QueryPlanningError(
-                "unknown_filter_dimension",
-                f"filter dimension '{dimension_id}' is not known",
-            )
+        dimension = layer.dimensions[dimension_id]
         filters.append(PlannedFilter(dimension_id, dimension, raw_value))
         require_source(dimension.source)
     for planned in measures:
