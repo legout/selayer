@@ -42,6 +42,11 @@ from typing import TYPE_CHECKING, Any
 
 from selayer.expressions.validation import references
 from selayer.sources.adapters.arrow import ArrowDatasetAdapter
+from selayer.sources.adapters.database import (
+    DuckDbAdapter,
+    PostgresAdapter,
+    SqliteAdapter,
+)
 from selayer.sources.adapters.delta import DeltaAdapter
 from selayer.sources.adapters.iceberg import IcebergAdapter
 from selayer.sources.base import (
@@ -90,11 +95,17 @@ except ImportError:
 def _builtin_adapters() -> Mapping[str, SourceAdapter]:
     arrow = ArrowDatasetAdapter()
     delta = DeltaAdapter()
+    duckdb_adapter = DuckDbAdapter()
+    sqlite = SqliteAdapter()
+    postgres = PostgresAdapter()
     mapping: dict[str, SourceAdapter] = {
         "parquet": arrow,
         "csv": arrow,
         "pyarrow": arrow,
         "delta": delta,
+        "sqlite": sqlite,
+        "duckdb": duckdb_adapter,
+        "postgres": postgres,
     }
     if _ICEBERG_AVAILABLE:
         mapping["iceberg"] = IcebergAdapter()

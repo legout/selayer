@@ -72,6 +72,9 @@ _CODE_MESSAGES: dict[str, str] = {
     "missing_iceberg_dependency": (
         "the pyiceberg package is required for iceberg sources"
     ),
+    "extension_unavailable": (
+        "a required DuckDB extension is not available and may not be installed"
+    ),
 }
 
 # Known source error codes — an allowlist, *not* a permissive regex.  Only a

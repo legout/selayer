@@ -25,6 +25,7 @@ delta = ["deltalake>=1.6.2,<2"]
 iceberg = [
     "pyiceberg[pyarrow,sql-sqlite]>=0.11.1,<0.12",
 ]
+postgres = ["psycopg[binary]>=3.3.4,<4"]
 
 [dependency-groups]
 dev = [
@@ -36,7 +37,7 @@ dev = [
   "pytest>=9.1.1",
   "ruff>=0.16.0",
   "s3fs>=2026.6.0",
-  "testcontainers[minio]>=4.15,<5",
+  "testcontainers[minio,postgres]>=4.15,<5",
 ]
 
 [tool.hatch.build.targets.wheel]

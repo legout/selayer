@@ -9,7 +9,19 @@ registration API is exposed.
 from __future__ import annotations
 
 from selayer.sources.adapters.arrow import ArrowDatasetAdapter
+from selayer.sources.adapters.database import (
+    DuckDbAdapter,
+    PostgresAdapter,
+    SqliteAdapter,
+)
 from selayer.sources.adapters.delta import DeltaAdapter
 from selayer.sources.adapters.iceberg import IcebergAdapter
 
-__all__ = ["ArrowDatasetAdapter", "DeltaAdapter", "IcebergAdapter"]
+__all__ = [
+    "ArrowDatasetAdapter",
+    "DeltaAdapter",
+    "DuckDbAdapter",
+    "IcebergAdapter",
+    "PostgresAdapter",
+    "SqliteAdapter",
+]
