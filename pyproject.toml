@@ -19,6 +19,20 @@ selayer-okf = "selayer.okf.cli:run"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[project.optional-dependencies]
+s3 = ["boto3>=1.40,<2"]
+delta = ["deltalake>=1.6.2,<2"]
+iceberg = [
+    "pyiceberg[pyarrow,sql-sqlite]>=0.11.1,<0.12",
+]
+postgres = ["psycopg[binary]>=3.3.4,<4"]
+all = [
+  "boto3>=1.40,<2",
+  "deltalake>=1.6.2,<2",
+  "psycopg[binary]>=3.3.4,<4",
+  "pyiceberg[pyarrow,sql-sqlite]>=0.11.1,<0.12",
+]
+
 [dependency-groups]
 dev = [
   "deltalake>=1.6.2",
@@ -29,6 +43,7 @@ dev = [
   "pytest>=9.1.1",
   "ruff>=0.16.0",
   "s3fs>=2026.6.0",
+  "testcontainers[minio,postgres]>=4.15,<5",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -38,10 +53,17 @@ packages = ["src/selayer"]
 venvPath = "."
 venv = ".venv"
 pythonVersion = "3.13"
-extraPaths = ["src", ".venv/lib/python3.13/site-packages"]
+extraPaths = [
+  "src",
+  "tests/sources",
+  ".venv/lib/python3.13/site-packages",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "integration: tests requiring an external service such as Docker or MinIO",
+]
 
 [tool.ruff]
 extend-exclude = ["legacy"]

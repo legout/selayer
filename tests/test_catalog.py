@@ -26,6 +26,19 @@ from selayer import (
     Relationship,
     SemanticLayer,
 )
+from selayer.sources.config import ParquetConfig
+from selayer.sources.schema import FieldSchema, ScalarType, TableSchema
+
+
+def _source(name: str = "orders") -> DataSource:
+    """Build a minimal valid ``DataSource`` for direct-construction tests."""
+
+    return DataSource(
+        name=name,
+        connector=ParquetConfig("x"),
+        schema=TableSchema((FieldSchema("id", ScalarType("utf8"), False),)),
+        grain=("id",),
+    )
 
 
 def _write(tmp_path: Path, text: str, name: str = "layer.yaml") -> Path:
@@ -73,7 +86,7 @@ def test_catalog_loads_complete_valid_catalog(
 
 
 def test_direct_layer_construction_copies_mappings() -> None:
-    sources = {"orders": DataSource("orders", "parquet", "x", ("id",))}
+    sources = {"orders": _source()}
     layer = SemanticLayer(1, "ecommerce", "", "", sources, {}, {}, {}, {}, {})
     sources["new"] = sources["orders"]
     assert "new" not in layer.data_sources
@@ -92,9 +105,7 @@ def test_catalog_collections_are_immutable(
     assert isinstance(layer.dimensions, MappingProxyType)
     assert isinstance(layer.relationships, MappingProxyType)
     with pytest.raises(TypeError):
-        layer.data_sources["extra"] = DataSource(  # type: ignore[index]
-            name="extra", type="parquet", path="x", grain=("id",)
-        )
+        layer.data_sources["extra"] = _source("extra")  # type: ignore[index]
 
 
 def test_direct_layer_copies_all_collection_mappings() -> None:
@@ -120,7 +131,7 @@ def test_catalog_model_objects_are_frozen(
 ) -> None:
     layer = SemanticLayer.load(valid_catalog_path)
     with pytest.raises((AttributeError, TypeError)):
-        layer.data_sources["orders"].path = "tampered"  # type: ignore[misc]
+        layer.data_sources["orders"].connector = ParquetConfig("tampered")  # type: ignore[misc]
 
 
 def test_fact_and_metric_expression_factories_parse_and_preserve_ast() -> None:
@@ -325,16 +336,15 @@ def test_catalog_rejects_unhashable_field_types_without_typeerror(
 def test_catalog_rejects_wrong_field_types_without_typeerror(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
-        "version: 1\nname: ecommerce\ndata_sources:\n  orders:\n    type: [parquet]\n    path: 1\n    grain: [id, 2]\n",
+        "version: 1\nname: ecommerce\ndata_sources:\n"
+        "  orders:\n    type: parquet\n    location: x\n    grain: [id, 2]\n"
+        "    schema:\n      fields: not-a-list\n",
     )
     with pytest.raises(CatalogValidationError) as caught:
         SemanticLayer.load(path)
     paths = {issue.path for issue in caught.value.issues}
-    assert {
-        "data_sources.orders.type",
-        "data_sources.orders.path",
-        "data_sources.orders.grain",
-    } <= paths
+    assert "data_sources.orders.grain" in paths
+    assert "data_sources.orders.schema.fields" in paths
 
 
 def test_catalog_data_source_missing_type(tmp_path: Path) -> None:
@@ -350,17 +360,22 @@ def test_catalog_data_source_missing_type(tmp_path: Path) -> None:
     )
 
 
-def test_catalog_data_source_missing_path(tmp_path: Path) -> None:
+def test_catalog_old_type_path_shape_is_rejected(tmp_path: Path) -> None:
+    # The pre-v1 ``type/path/grain`` shape is no longer loadable: ``path`` is an
+    # unknown field and every connector now requires a location and a schema.
     path = _write(
         tmp_path,
         "version: 1\nname: ecommerce\ndata_sources:\n"
-        "  orders:\n    type: parquet\n    grain: [id]\n",
+        "  orders:\n    type: parquet\n    path: x\n    grain: [id]\n",
     )
     with pytest.raises(CatalogValidationError) as caught:
         SemanticLayer.load(path)
-    assert any(
-        issue.path == "data_sources.orders.path" for issue in caught.value.issues
-    )
+    paths = {issue.path for issue in caught.value.issues}
+    assert {
+        "data_sources.orders.path",
+        "data_sources.orders.location",
+        "data_sources.orders.schema",
+    } <= paths
 
 
 def test_catalog_data_source_missing_grain(tmp_path: Path) -> None:
@@ -686,9 +701,21 @@ def _fact_reachability_catalog(
 ) -> str:
     return (
         "version: 1\nname: generic\ndata_sources:\n"
-        "  anchor:\n    type: parquet\n    path: anchor\n    grain: [id]\n"
-        "  middle:\n    type: parquet\n    path: middle\n    grain: [id]\n"
-        "  leaf:\n    type: parquet\n    path: leaf\n    grain: [id]\n"
+        "  anchor:\n    type: parquet\n    location: anchor\n    grain: [id]\n"
+        "    schema:\n"
+        "      fields:\n"
+        "        - {name: id, type: utf8, nullable: false}\n"
+        "        - {name: value, type: float64, nullable: true}\n"
+        "  middle:\n    type: parquet\n    location: middle\n    grain: [id]\n"
+        "    schema:\n"
+        "      fields:\n"
+        "        - {name: id, type: utf8, nullable: false}\n"
+        "        - {name: value, type: float64, nullable: true}\n"
+        "  leaf:\n    type: parquet\n    location: leaf\n    grain: [id]\n"
+        "    schema:\n"
+        "      fields:\n"
+        "        - {name: id, type: utf8, nullable: false}\n"
+        "        - {name: value, type: float64, nullable: true}\n"
         "facts:\n"
         f"  value:\n    source: anchor\n    expression: {referenced_source}.value\n    data_type: decimal\n"
         f"relationships:\n{relationship}"
@@ -890,8 +917,10 @@ def test_catalog_accepts_many_to_many_type(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
         "version: 1\nname: ecommerce\ndata_sources:\n"
-        "  orders:\n    type: parquet\n    path: x\n    grain: [id]\n"
-        "  carts:\n    type: parquet\n    path: y\n    grain: [id]\n"
+        "  orders:\n    type: parquet\n    location: x\n    grain: [id]\n"
+        "    schema:\n      fields:\n        - {name: id, type: utf8, nullable: false}\n"
+        "  carts:\n    type: parquet\n    location: y\n    grain: [id]\n"
+        "    schema:\n      fields:\n        - {name: id, type: utf8, nullable: false}\n"
         "relationships:\n  rel:\n    source: orders\n    target: carts\n"
         "    type: many_to_many\n    source_column: id\n    target_column: id\n",
     )

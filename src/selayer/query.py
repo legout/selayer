@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from contextlib import suppress
 from typing import Self
 from uuid import uuid4
 
@@ -8,9 +7,17 @@ import duckdb
 import polars as pl
 
 from selayer.catalog import SemanticLayer
-from selayer.compilation import compile_duckdb
+from selayer.compilation import CompiledQuery, compile_duckdb
 from selayer.errors import QueryExecutionError
 from selayer.planning import QueryPlan, QueryRequest, plan_query
+from selayer.sources.base import ReloadResult, SourceStatus
+from selayer.sources.profiles import (
+    ArrowProviderResolver,
+    MappingArrowProviderResolver,
+    MappingProfileResolver,
+    RuntimeProfileResolver,
+)
+from selayer.sources.registry import SourceRegistry
 
 _DUCKDB_DIAGNOSTIC_CATEGORIES = (
     "Conversion Error",
@@ -33,41 +40,69 @@ def _duckdb_diagnostic_category(error: duckdb.Error) -> str:
     return "DuckDB Error"
 
 
+def _query_error_message(category: str, compiled: CompiledQuery | None) -> str:
+    """Render a safe category-only query error message."""
+
+    if compiled is not None:
+        parameters = compiled.parameters
+        if parameters:
+            return f"query execution failed: parameterized query failed ({category})"
+    return f"query execution failed: {category}"
+
+
 class QueryEngine:
-    """Orchestrate catalog loading, planning, compilation, and execution."""
+    """Orchestrate catalog loading, planning, compilation, and execution.
 
-    def __init__(self, semantic_layer: SemanticLayer) -> None:
+    Sources are loaded through a :class:`~selayer.sources.registry.SourceRegistry`
+    that owns the DuckDB connection; there is no eager Polars source reading.
+    Queries obtain a plan, enter ``registry.bind(plan)``, compile, and execute
+    under the registry lock so a reload can never swap a handle mid-query.
+
+    The connection is private to registry-aware execution.  Source reload and
+    status lifecycle is delegated to the registry while query and plan
+    signatures are preserved.
+    """
+
+    def __init__(
+        self,
+        semantic_layer: SemanticLayer,
+        *,
+        profiles: RuntimeProfileResolver | None = None,
+        arrow_providers: ArrowProviderResolver | None = None,
+    ) -> None:
         self.semantic_layer = semantic_layer
-        self.conn = duckdb.connect(":memory:")
-        source_error: QueryExecutionError | None = None
-        try:
-            for name, data_source in semantic_layer.data_sources.items():
-                self.conn.register(
-                    name, self._load_source(data_source.type, data_source.path)
-                )
-        except Exception:  # noqa: BLE001 - every source failure must be sanitized
-            with suppress(Exception):
-                self.conn.close()
-            source_error = QueryExecutionError(str(uuid4()), "source loading failed")
-        if source_error is not None:
-            raise source_error
-
-    @staticmethod
-    def _load_source(source_type: str, path: str) -> pl.DataFrame:
-        if source_type == "parquet":
-            return pl.read_parquet(path)
-        if source_type == "csv":
-            return pl.read_csv(path)
-        raise ValueError(f"Unsupported data source type: {source_type}")
+        self._connection = duckdb.connect(":memory:")
+        self._registry = SourceRegistry.create(
+            semantic_layer,
+            self._connection,
+            profiles or MappingProfileResolver({}),
+            arrow_providers or MappingArrowProviderResolver({}),
+        )
 
     def close(self) -> None:
-        self.conn.close()
+        self._registry.close()
 
     def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
+
+    # -- source lifecycle --------------------------------------------------
+
+    def reload_source(self, source_id: str) -> ReloadResult:
+        """Atomically reload one source and return the generation change."""
+        return self._registry.reload_source(source_id)
+
+    def reload_all(self) -> tuple[ReloadResult, ...]:
+        """Atomically reload every source in sorted source-ID order."""
+        return self._registry.reload_all()
+
+    def source_status(self, source_id: str) -> SourceStatus:
+        """Return the current health/generation snapshot for one source."""
+        return self._registry.status(source_id)
+
+    # -- planning and execution -------------------------------------------
 
     def plan(
         self,
@@ -91,22 +126,24 @@ class QueryEngine:
     ) -> pl.DataFrame:
         """Execute a semantic query and return its result as Polars."""
         plan = self.plan(metrics, dimensions, filters)
-        compiled = compile_duckdb(plan)
         query_id = str(uuid4())
         execution_error: QueryExecutionError | None = None
         result: pl.DataFrame | None = None
+        compiled: CompiledQuery | None = None
         try:
-            result = self.conn.execute(compiled.sql, compiled.parameters).pl()
+            with self._registry.bind(plan):
+                # Compile inside the binding so the query-scoped sources are
+                # registered before compilation and the registry lock is held
+                # across both compile and execute.
+                compiled = compile_duckdb(plan)
+                result = self._registry.execute(compiled.sql, compiled.parameters).pl()
         except duckdb.Error as error:
-            if compiled.parameters:
-                category = _duckdb_diagnostic_category(error)
-                message = (
-                    f"query execution failed: parameterized query failed ({category})"
-                )
-            else:
-                # With no caller-provided values, the generated SQL and the
-                # DuckDB diagnostic are useful debugging information.
-                message = f"query execution failed: {error}; SQL: {compiled.sql}"
+            # Driver diagnostics and generated SQL can contain source
+            # locations, endpoints, or authenticated URIs.  Expose only the
+            # allowlisted DuckDB category for every query, including queries
+            # with no caller parameters.
+            category = _duckdb_diagnostic_category(error)
+            message = _query_error_message(category, compiled)
             execution_error = QueryExecutionError(query_id, message)
         if execution_error is not None:
             raise execution_error

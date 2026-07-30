@@ -37,6 +37,51 @@ Run the complete example from the repository root:
 uv run python examples/e_commerce/selayer1.py
 ```
 
+## Connectors, profiles, and reloads
+
+The source connector matrix is closed and catalog-driven:
+
+| Connector | Runtime ownership | Optional extra |
+| --- | --- | --- |
+| Parquet, CSV, PyArrow | PyArrow Dataset/provider | none |
+| Delta | Python `deltalake` snapshots | `delta` |
+| Iceberg | Python `pyiceberg` snapshots and query-scoped readers | `iceberg` |
+| SQLite, DuckDB files | Native DuckDB read-only attachments | none |
+| PostgreSQL | Native DuckDB PostgreSQL scanner | `postgres` |
+
+S3 is a named runtime transport profile for file and lakehouse connectors, not
+an additional source type (`s3` extra). Install every optional connector with
+`uv sync --all-extras`, or install only the extras you need. Profiles contain
+runtime-only values such as credentials and DSNs; they are never written to
+catalogs, plans, OKF, reprs, logs, statuses, or error messages. Use `schema`
+for an inline declaration or `schema_ref` for a contained YAML schema file;
+every source must provide exactly one and a non-empty `grain`:
+
+```yaml
+sources:
+  events:
+    type: parquet
+    location: data/events.parquet
+    schema_ref: schemas/events.yaml
+    grain: [id]
+```
+
+Reloading is explicit and preserves the published source on failure:
+
+```python
+with QueryEngine(layer, profiles=profiles) as engine:
+    result = engine.query(["total_value"])
+    change = engine.reload_source("events")
+    all_changes = engine.reload_all()
+    status = engine.source_status("events")
+```
+
+Arrow and Delta retain projection/filter pushdown. Iceberg owns snapshots in
+PyIceberg and creates a fresh projected/filterable reader per query. SQLite,
+DuckDB-file, and PostgreSQL sources are attached read-only under generated
+internal aliases. Sources are not eagerly materialized into Polars; Polars is
+only the result-frame boundary.
+
 ## Grain-aware semantic model
 
 Every source declares a non-empty grain. Order facts and measures are anchored
@@ -80,7 +125,17 @@ The public interface exports exactly the symbols in `selayer.__all__`:
 - `QueryPlan`
 - `QueryPlanningError`
 - `Relationship`
+- `ReloadResult`
 - `SemanticLayer`
+- `SourceConnectionError`
+- `SourceDependencyError`
+- `SourceError`
+- `SourceProfileError`
+- `SourceReloadError`
+- `SourceSchemaError`
+- `SourceStatus`
+- `TableSchema`
+- `FieldSchema`
 
 Compiler and parser internals are intentionally not public exports.
 

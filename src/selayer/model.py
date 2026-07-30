@@ -24,6 +24,8 @@ from typing import Literal, Self
 
 from selayer.expressions.ast import Expression
 from selayer.expressions.parser import parse_expression
+from selayer.sources.config import SourceConnector
+from selayer.sources.schema import TableSchema
 
 type Aggregation = Literal["sum", "avg", "min", "max", "count", "count_distinct"]
 
@@ -32,11 +34,18 @@ type Cardinality = Literal["one_to_one", "one_to_many", "many_to_one", "many_to_
 
 @dataclass(frozen=True, slots=True)
 class DataSource:
-    """A named tabular source and the columns that identify one of its rows."""
+    """A named tabular source backed by a connector and a declared schema.
+
+    The connector is one of the closed
+    :data:`~selayer.sources.config.SourceConnector` configs and ``schema`` is
+    the declared :class:`~selayer.sources.schema.TableSchema`.  ``grain`` is the
+    tuple of columns that identify one row.  The old ``type``/``path`` shape is
+    gone: a source is fully described by its connector, schema, and grain.
+    """
 
     name: str
-    type: str
-    path: str
+    connector: SourceConnector
+    schema: TableSchema
     grain: tuple[str, ...]
 
 

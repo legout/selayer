@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
+
+from selayer import SemanticLayer
+from selayer.sources.profiles import MappingArrowProviderResolver
 
 VALID_CATALOG_YAML = """\
 version: 1
@@ -14,16 +18,55 @@ description: Semantic model for the example store
 data_sources:
   orders:
     type: parquet
-    path: data/orders.parquet
+    location: data/orders.parquet
     grain: [id]
+    schema:
+      fields:
+        - {name: id, type: utf8, nullable: true}
+        - {name: customer_id, type: utf8, nullable: true}
+        - name: created_at
+          type:
+            timestamp: {unit: ns}
+          nullable: true
+        - {name: status, type: utf8, nullable: true}
+        - {name: payment_method, type: utf8, nullable: true}
+        - {name: shipping_cost, type: float64, nullable: true}
+        - {name: discount_code, type: utf8, nullable: true}
+        - {name: discount_amount, type: float64, nullable: true}
+        - {name: reason, type: utf8, nullable: true}
+        - {name: is_first_purchase, type: boolean, nullable: true}
+        - {name: amount, type: float64, nullable: true}
+        - {name: total_amount, type: float64, nullable: true}
   order_items:
     type: parquet
-    path: data/order_items.parquet
+    location: data/order_items.parquet
     grain: [order_id, product_id]
+    schema:
+      fields:
+        - {name: order_id, type: utf8, nullable: true}
+        - {name: product_id, type: utf8, nullable: true}
+        - {name: quantity, type: int64, nullable: true}
+        - {name: price, type: float64, nullable: true}
+        - {name: total, type: float64, nullable: true}
   products:
     type: parquet
-    path: data/products.parquet
+    location: data/products.parquet
     grain: [id]
+    schema:
+      fields:
+        - {name: id, type: utf8, nullable: true}
+        - {name: name, type: utf8, nullable: true}
+        - {name: category, type: utf8, nullable: true}
+        - {name: subcategory, type: utf8, nullable: true}
+        - {name: base_price, type: float64, nullable: true}
+        - {name: cost, type: float64, nullable: true}
+        - {name: in_stock, type: int64, nullable: true}
+        - {name: supplier_id, type: int64, nullable: true}
+        - name: created_at
+          type:
+            timestamp: {unit: ns}
+          nullable: true
+        - {name: is_active, type: boolean, nullable: true}
 dimensions:
   product_category:
     source: products
@@ -83,3 +126,32 @@ def valid_catalog_path(tmp_path: Path) -> Path:
     path = tmp_path / "layer.yaml"
     path.write_text(VALID_CATALOG_YAML, encoding="utf-8")
     return path
+
+
+@pytest.fixture
+def require_docker() -> None:
+    """Fail in CI when Docker is unavailable; skip that setup locally."""
+
+    try:
+        import docker
+
+        available = bool(docker.from_env().ping())
+    except Exception:  # noqa: BLE001
+        available = False
+    if available:
+        return
+    if os.environ.get("CI") == "true":
+        raise RuntimeError("Docker is unavailable in CI")
+    pytest.skip("Docker daemon is not available")
+
+
+@pytest.fixture
+def valid_layer(valid_catalog_path: Path) -> SemanticLayer:
+    """A loaded valid semantic layer backed by the example parquet fixtures."""
+    return SemanticLayer.load(valid_catalog_path)
+
+
+@pytest.fixture
+def arrow_providers() -> MappingArrowProviderResolver:
+    """An empty arrow-provider resolver for catalogs without pyarrow sources."""
+    return MappingArrowProviderResolver({})

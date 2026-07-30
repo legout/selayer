@@ -192,9 +192,7 @@ def _validate_sources(
     severity: Severity,
 ) -> list[OkfIssue]:
     if not isinstance(value, (list, tuple)):
-        return [
-            _optional_issue(concept, "sources", "sources must be a list", severity)
-        ]
+        return [_optional_issue(concept, "sources", "sources must be a list", severity)]
     issues: list[OkfIssue] = []
     for index, source in enumerate(value):
         field = f"sources[{index}]"
@@ -379,13 +377,19 @@ def _validate_parameters(
         if not _is_nonempty_string(param.get("name")):
             issues.append(
                 _optional_issue(
-                    concept, f"{field}.name", "name must be a non-empty string", severity
+                    concept,
+                    f"{field}.name",
+                    "name must be a non-empty string",
+                    severity,
                 )
             )
         if not _is_nonempty_string(param.get("type")):
             issues.append(
                 _optional_issue(
-                    concept, f"{field}.type", "type must be a non-empty string", severity
+                    concept,
+                    f"{field}.type",
+                    "type must be a non-empty string",
+                    severity,
                 )
             )
         if "required" in param and not isinstance(param.get("required"), bool):
@@ -422,7 +426,9 @@ def _validate_executor(
     severity: Severity,
 ) -> list[OkfIssue]:
     if not isinstance(value, Mapping):
-        return [_optional_issue(concept, "executor", "executor must be a mapping", severity)]
+        return [
+            _optional_issue(concept, "executor", "executor must be a mapping", severity)
+        ]
     issues: list[OkfIssue] = []
     if not _is_nonempty_string(value.get("resource")):
         issues.append(
@@ -437,7 +443,9 @@ def _validate_executor(
     if "receipt" in value:
         if not isinstance(receipt, (list, tuple)):
             issues.append(
-                _optional_issue(concept, "executor.receipt", "receipt must be a list", severity)
+                _optional_issue(
+                    concept, "executor.receipt", "receipt must be a list", severity
+                )
             )
         elif not receipt:
             issues.append(
@@ -469,7 +477,9 @@ def _validate_attester(
     severity: Severity,
 ) -> list[OkfIssue]:
     if not isinstance(value, Mapping):
-        return [_optional_issue(concept, "attester", "attester must be a mapping", severity)]
+        return [
+            _optional_issue(concept, "attester", "attester must be a mapping", severity)
+        ]
     if not _is_nonempty_string(value.get("resource")):
         return [
             _optional_issue(

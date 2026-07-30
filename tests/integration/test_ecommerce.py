@@ -5,10 +5,32 @@ from pathlib import Path
 from typing import Any, cast
 
 import polars as pl
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import yaml
 
 from selayer import QueryEngine, QueryPlanningError, SemanticLayer
+
+
+def _write_fixture_parquet(
+    path: Path, schema: pa.Schema, columns: dict[str, object]
+) -> None:
+    """Write a fixture parquet whose physical schema matches ``schema`` exactly.
+
+    Columns are typed against ``schema`` (``pa.string`` rather than Polars'
+    ``large_string``) so the registry's ``compare_schemas`` physical-drift check
+    observes the declared Arrow types and reports no false
+    ``utf8``/``large_utf8`` type mismatch.  ``compare_schemas`` is *not* weakened:
+    the fixture data is simply written with PyArrow against the declared schema.
+    """
+    pq.write_table(
+        pa.Table.from_arrays(
+            [pa.array(columns[field.name], field.type) for field in schema],
+            schema=schema,
+        ),
+        path,
+    )
 
 
 @pytest.fixture
@@ -16,7 +38,32 @@ def root(tmp_path: Path) -> Path:
     """Create deterministic parquet fixtures and a catalog pointing at them."""
     data = tmp_path / "data"
     data.mkdir()
-    pl.DataFrame(
+    # Every fixture parquet carries the full physical column set and order
+    # declared in ``examples/e_commerce/schemas/*.yaml``.  They are written
+    # with PyArrow against an explicit ``pa.string``/``pa.float64``/... schema
+    # (not Polars) so the on-disk physical schema reads back as the declared
+    # Arrow types: Polars writes strings as ``large_string``, which the
+    # registry's ``compare_schemas`` physical-drift check correctly flags as a
+    # ``utf8``/``large_utf8`` type mismatch.  Timestamps are tz-naive ``ns`` to
+    # match the declared ``timestamp: {unit: ns}``.
+    _write_fixture_parquet(
+        data / "orders.parquet",
+        pa.schema(
+            [
+                pa.field("id", pa.string()),
+                pa.field("customer_id", pa.string()),
+                pa.field("created_at", pa.timestamp("ns")),
+                pa.field("status", pa.string()),
+                pa.field("payment_method", pa.string()),
+                pa.field("shipping_cost", pa.float64()),
+                pa.field("discount_code", pa.string()),
+                pa.field("discount_amount", pa.float64()),
+                pa.field("reason", pa.string()),
+                pa.field("is_first_purchase", pa.bool_()),
+                pa.field("amount", pa.float64()),
+                pa.field("total_amount", pa.float64()),
+            ]
+        ),
         {
             "id": ["O1", "O2", "O3"],
             "customer_id": ["C1", "C1", "C2"],
@@ -28,35 +75,98 @@ def root(tmp_path: Path) -> Path:
             "status": ["completed", "processing", "completed"],
             "payment_method": ["card", "cash", "card"],
             "shipping_cost": [15.0, 3.0, 10.0],
+            "discount_code": ["WELCOME", None, "SAVE10"],
             "discount_amount": [10.0, 5.0, 20.0],
+            "reason": [None, "Changed mind", None],
+            "is_first_purchase": [True, False, False],
             "amount": [100.0, 50.0, 200.0],
             "total_amount": [105.0, 48.0, 190.0],
-        }
-    ).write_parquet(data / "orders.parquet")
-    pl.DataFrame(
+        },
+    )
+    _write_fixture_parquet(
+        data / "order_items.parquet",
+        pa.schema(
+            [
+                pa.field("order_id", pa.string()),
+                pa.field("product_id", pa.string()),
+                pa.field("quantity", pa.int64()),
+                pa.field("price", pa.float64()),
+                pa.field("total", pa.float64()),
+            ]
+        ),
         {
             "order_id": ["O1", "O1", "O2", "O3"],
             "product_id": ["P1", "P2", "P1", "P3"],
             "quantity": [2, 1, 1, 4],
             "price": [30.0, 40.0, 50.0, 50.0],
             "total": [60.0, 40.0, 50.0, 200.0],
-        }
-    ).write_parquet(data / "order_items.parquet")
-    pl.DataFrame(
+        },
+    )
+    _write_fixture_parquet(
+        data / "products.parquet",
+        pa.schema(
+            [
+                pa.field("id", pa.string()),
+                pa.field("name", pa.string()),
+                pa.field("category", pa.string()),
+                pa.field("subcategory", pa.string()),
+                pa.field("base_price", pa.float64()),
+                pa.field("cost", pa.float64()),
+                pa.field("in_stock", pa.int64()),
+                pa.field("supplier_id", pa.int64()),
+                pa.field("created_at", pa.timestamp("ns")),
+                pa.field("is_active", pa.bool_()),
+            ]
+        ),
         {
             "id": ["P1", "P2", "P3"],
+            "name": ["Widget", "Gadget", "Gizmo"],
             "category": ["Books", "Electronics", "Books"],
             "subcategory": ["Fiction", "Audio", "Reference"],
+            "base_price": [25.0, 30.0, 35.0],
             "cost": [20.0, 25.0, 30.0],
-        }
-    ).write_parquet(data / "products.parquet")
-    pl.DataFrame(
+            "in_stock": [10, 5, 8],
+            "supplier_id": [1, 2, 3],
+            "created_at": [
+                datetime(2024, 1, 1, tzinfo=UTC),
+                datetime(2024, 1, 2, tzinfo=UTC),
+                datetime(2024, 1, 3, tzinfo=UTC),
+            ],
+            "is_active": [True, True, True],
+        },
+    )
+    _write_fixture_parquet(
+        data / "customers.parquet",
+        pa.schema(
+            [
+                pa.field("id", pa.string()),
+                pa.field("email", pa.string()),
+                pa.field("name", pa.string()),
+                pa.field("segment", pa.string()),
+                pa.field("acquisition_channel", pa.string()),
+                pa.field("registration_date", pa.timestamp("ns")),
+                pa.field("country", pa.string()),
+                pa.field("city", pa.string()),
+                pa.field("is_active", pa.bool_()),
+                pa.field("lifetime_value", pa.float64()),
+            ]
+        ),
         {
             "id": ["C1", "C2"],
+            "email": ["c1@example.com", "c2@example.com"],
+            "name": ["Alice", "Bob"],
             "segment": ["retail", "enterprise"],
+            "acquisition_channel": ["Direct", "Referral"],
+            "registration_date": [
+                datetime(2024, 1, 1, tzinfo=UTC),
+                datetime(2024, 6, 1, tzinfo=UTC),
+            ],
             "country": ["US", "CA"],
-        }
-    ).write_parquet(data / "customers.parquet")
+            "city": ["NYC", "Toronto"],
+            "is_active": [True, True],
+            "lifetime_value": [500.0, 1500.0],
+        },
+    )
 
     catalog = cast(
         dict[str, Any],
@@ -66,8 +176,16 @@ def root(tmp_path: Path) -> Path:
             )
         ),
     )
+    repo = Path(__file__).parents[2]
     for name in ("orders", "order_items", "products", "customers"):
-        catalog["data_sources"][name]["path"] = str(data / f"{name}.parquet")
+        source = catalog["data_sources"][name]
+        source["location"] = str(data / f"{name}.parquet")
+        # The relocated catalog cannot resolve schema_ref relative to tmp_path,
+        # so inline the referenced schema document from the repository.
+        schema_ref = cast(str, source.pop("schema_ref"))
+        source["schema"] = yaml.safe_load(
+            (repo / schema_ref).read_text(encoding="utf-8")
+        )
     catalog_path = tmp_path / "ecommerce_semantic_layer.yaml"
     catalog_text = cast(str, yaml.safe_dump(catalog, sort_keys=False))
     catalog_path.write_text(catalog_text, encoding="utf-8")
@@ -115,8 +233,22 @@ def test_cross_kind_local_names_execute_with_distinct_internal_aliases(
                     "data_sources": {
                         "events": {
                             "type": "csv",
-                            "path": str(data_path),
+                            "location": str(data_path),
                             "grain": ["total", "value"],
+                            "schema": {
+                                "fields": [
+                                    {
+                                        "name": "total",
+                                        "type": "int64",
+                                        "nullable": False,
+                                    },
+                                    {
+                                        "name": "value",
+                                        "type": "int64",
+                                        "nullable": False,
+                                    },
+                                ]
+                            },
                         }
                     },
                     "dimensions": {
@@ -230,9 +362,13 @@ def test_item_metrics_by_customer_and_order_date_match_polars(root: Path) -> Non
     products = pl.read_parquet(root / "data/products.parquet")
     customers = pl.read_parquet(root / "data/customers.parquet")
     expected = (
-        items.join(products, left_on="product_id", right_on="id")
-        .join(orders, left_on="order_id", right_on="id")
-        .join(customers, left_on="customer_id", right_on="id")
+        items.join(products.select("id", "cost"), left_on="product_id", right_on="id")
+        .join(
+            orders.select("id", "customer_id", "created_at"),
+            left_on="order_id",
+            right_on="id",
+        )
+        .join(customers.select("id", "segment"), left_on="customer_id", right_on="id")
         .with_columns((pl.col("quantity") * pl.col("cost")).alias("item_cost"))
         .group_by("segment", "created_at")
         .agg(
@@ -322,9 +458,18 @@ def _expected_metric_by_dimension(
         products = pl.read_parquet(root / "data/products.parquet")
         customers = pl.read_parquet(root / "data/customers.parquet")
         frame = (
-            items.join(products, left_on="product_id", right_on="id")
+            items.join(
+                products.select("id", "category", "subcategory", "cost"),
+                left_on="product_id",
+                right_on="id",
+            )
             .join(orders, left_on="order_id", right_on="id", suffix="_order")
-            .join(customers, left_on="customer_id", right_on="id", suffix="_customer")
+            .join(
+                customers.select("id", "segment", "country"),
+                left_on="customer_id",
+                right_on="id",
+                suffix="_customer",
+            )
             .with_columns((pl.col("quantity") * pl.col("cost")).alias("item_cost"))
         )
     if dimension in _CUSTOMER_DIMENSIONS and metric in _ORDER_METRICS:

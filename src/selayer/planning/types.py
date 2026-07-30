@@ -145,12 +145,24 @@ class PlannedFilter:
 
 @dataclass(frozen=True, slots=True)
 class QueryPlan:
+    """A validated, connection-free execution plan.
+
+    ``source_grains`` carries each plan-touched source's *declared* row-identity
+    (grain) columns — connection-free, credential-free metadata copied from the
+    semantic layer by :func:`~selayer.planning.planner.plan_query`.  It holds no
+    connector handles, observed schemas, or credentials, so it is safe to pass
+    to requirement extraction (and beyond) without leaking any runtime secret.
+    It defaults to an empty mapping so direct positional construction of a
+    hand-built plan (the legacy six-argument form) remains valid.
+    """
+
     anchor_source: str
     joins: tuple[JoinStep, ...]
     dimensions: tuple[PlannedDimension, ...]
     measures: tuple[PlannedMeasure, ...]
     metrics: tuple[PlannedMetric, ...]
     filters: tuple[PlannedFilter, ...]
+    source_grains: Mapping[str, tuple[str, ...]] = MappingProxyType({})
 
 
 __all__ = [
