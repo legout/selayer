@@ -336,6 +336,7 @@ class SourceRegistry:
         # A concurrent reload_source blocks here and observes the new
         # generation when it acquires the lock, guaranteeing 1 -> 2 -> 3.
         commit_failed = False
+        commit_extension_failed = False
         old_handle: SourceHandle | None = None
         old_generation = 0
         with self._lock:
@@ -344,8 +345,9 @@ class SourceRegistry:
             old_generation = old_registration.generation
             try:
                 adapter.register(self._connection, source_id, candidate)
-            except Exception:  # noqa: BLE001
+            except Exception as error:  # noqa: BLE001
                 commit_failed = True
+                commit_extension_failed = _is_extension_failure(error)
                 # register may have mutated the connection before raising, so
                 # restore the previous handle before releasing the lock.
                 restore_quietly(adapter, self._connection, source_id, old_handle)
@@ -355,6 +357,17 @@ class SourceRegistry:
                 )
         if commit_failed:
             close_quietly(adapter, candidate)
+            if commit_extension_failed:
+                # The commit raised a sanitized dependency error (e.g. a
+                # missing extension surfaced from ``_ensure_extension``).
+                # Raise a fresh one outside the except scope so the stable
+                # ``extension_unavailable`` code — not the generic
+                # ``reload_failed`` — reaches the caller.
+                raise SourceDependencyError(
+                    source_id,
+                    "extension_unavailable",
+                    "a required DuckDB extension is not available",
+                )
             raise SourceReloadError(source_id, "reload_failed", "reload failed")
 
         # The old handle is no longer referenced by DuckDB; release it outside
@@ -437,6 +450,8 @@ class SourceRegistry:
 
         swapped: list[tuple[str, SourceAdapter, SourceHandle, int]] = []
         commit_failed = False
+        commit_extension_failed = False
+        commit_failed_source: str | None = None
         results: list[ReloadResult] = []
         # One critical section: swap every registration and publish every
         # generation.  A register failure rolls back the failing source's old
@@ -448,8 +463,10 @@ class SourceRegistry:
                 old = self._registrations[source_id]
                 try:
                     adapter.register(self._connection, source_id, candidate)
-                except Exception:  # noqa: BLE001
+                except Exception as error:  # noqa: BLE001
                     commit_failed = True
+                    commit_failed_source = source_id
+                    commit_extension_failed = _is_extension_failure(error)
                     # register may have mutated the connection before raising,
                     # so restore the failing source's old handle too — not only
                     # the previously swapped entries.
@@ -481,6 +498,20 @@ class SourceRegistry:
         if commit_failed:
             for adapter, candidate, _observed in candidates.values():
                 close_quietly(adapter, candidate)
+            failed_id = (
+                commit_failed_source if commit_failed_source is not None else "<source>"
+            )
+            if commit_extension_failed:
+                # The commit raised a sanitized dependency error (e.g. a
+                # missing extension surfaced from ``_ensure_extension``).
+                # Raise a fresh one outside the except scope so the stable
+                # ``extension_unavailable`` code — not the generic
+                # ``reload_failed`` — reaches the caller.
+                raise SourceDependencyError(
+                    failed_id,
+                    "extension_unavailable",
+                    "a required DuckDB extension is not available",
+                )
             raise SourceReloadError("<source>", "reload_failed", "reload failed")
 
         # Close old handles outside the lock after the commit succeeded.

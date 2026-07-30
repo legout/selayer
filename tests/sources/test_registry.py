@@ -54,6 +54,7 @@ from selayer.sources.config import (
 )
 from selayer.sources.errors import (
     SourceConnectionError,
+    SourceDependencyError,
     SourceReloadError,
 )
 from selayer.sources.profiles import (
@@ -192,6 +193,7 @@ class _FakeAdapter:
         self.drift_on_inspect: bool = False
         self.raise_on_inspect: bool = False
         self.register_delay: float = 0.0
+        self.register_exception: BaseException | None = None
 
     def prepare(
         self,
@@ -230,6 +232,10 @@ class _FakeAdapter:
     def register(
         self, connection: object, stable_name: str, handle: SourceHandle
     ) -> None:
+        if self.register_exception is not None:
+            failure = self.register_exception
+            self.register_exception = None
+            raise failure
         if self.register_delay > 0:
             time.sleep(self.register_delay)
         self._provider._register_count += 1
@@ -719,6 +725,7 @@ class _SharedCounterAdapter:
         self._register_count = 0
         self.fail_register_on_call: int | None = None
         self.mutate_before_fail: bool = False
+        self.fail_register_exception: BaseException | None = None
         self.register_log: list[str] = []
         self.closed: list[str] = []
 
@@ -761,10 +768,15 @@ class _SharedCounterAdapter:
             # Mutate: register the candidate, then raise, simulating a driver
             # that partially committed before failing.
             connection.register(stable_name, handle.resource)  # type: ignore[attr-defined]
-            raise RuntimeError("injected register failure after mutation")
+            raise self._fail_exception()
         if is_fail:
-            raise RuntimeError("injected register failure")
+            raise self._fail_exception()
         connection.register(stable_name, handle.resource)  # type: ignore[attr-defined]
+
+    def _fail_exception(self) -> BaseException:
+        if self.fail_register_exception is not None:
+            return self.fail_register_exception
+        return RuntimeError("injected register failure")
 
     def bind_query(
         self,
@@ -847,6 +859,91 @@ def test_reload_all_mid_swap_restores_failing_and_prior_swaps() -> None:
     assert adapter.register_log[:2] == ["alpha", "beta"]
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+
+
+# ---------------------------------------------------------------------------
+# Fix 6: reload commit preserves sanitized extension_unavailable dependency errors
+# ---------------------------------------------------------------------------
+
+
+def test_reload_source_preserves_extension_dependency_error(
+    registry_fixture: _RegistryFixture,
+) -> None:
+    """A commit-phase extension failure surfaces as extension_unavailable.
+
+    When ``adapter.register`` raises a sanitized
+    ``SourceDependencyError(code=\"extension_unavailable\")`` during the
+    critical-section commit, ``reload_source`` must re-raise a *fresh*
+    ``SourceDependencyError`` (stable code) — not collapse it into the generic
+    ``reload_failed``.  The old registration stays intact, and no raw
+    ``__cause__``/``__context__`` survives.
+    """
+
+    registry, connection, provider = (
+        registry_fixture.registry,
+        registry_fixture.connection,
+        registry_fixture.provider,
+    )
+    provider.next_dataset = pa.table({"id": [1], "value": [9]})
+
+    adapter = cast("_FakeAdapter", registry._registrations["events"].adapter)
+    adapter.register_exception = SourceDependencyError(
+        "events", "extension_unavailable", "a required extension is missing"
+    )
+
+    with pytest.raises(SourceDependencyError) as caught:
+        registry.reload_source("events")
+
+    assert caught.value.code == "extension_unavailable"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    # Old registration intact: generation unchanged, old data still queryable.
+    assert registry.status("events").generation == 1
+    assert connection.sql('SELECT sum("value") FROM "events"').fetchone() == (1,)
+
+
+def test_reload_all_preserves_extension_dependency_error() -> None:
+    """A commit-phase extension failure in reload_all surfaces as extension_unavailable.
+
+    Two sources (``alpha``, ``beta``) are reloaded atomically.  ``alpha``
+    swaps successfully, then ``beta``'s register raises a sanitized
+    ``SourceDependencyError(code=\"extension_unavailable\")``.  The rollback
+    restores every old handle/generation and a *fresh*
+    ``SourceDependencyError`` (stable code, failing source id) is raised — not
+    the generic ``reload_failed``.
+    """
+
+    fixture = _build_multi_source(("alpha", "beta"))
+    registry, connection, adapter, providers = (
+        fixture.registry,
+        fixture.connection,
+        fixture.adapter,
+        fixture.providers,
+    )
+    for name in ("alpha", "beta"):
+        providers[name].next_dataset = pa.table({"id": [1], "value": [100]})
+
+    before_generations = registry_statuses(registry)
+    before_values = registered_values(connection)
+
+    adapter.reset_count()
+    adapter.fail_register_on_call = 2
+    adapter.fail_register_exception = SourceDependencyError(
+        "beta", "extension_unavailable", "a required extension is missing"
+    )
+
+    with pytest.raises(SourceDependencyError) as caught:
+        registry.reload_all()
+
+    assert caught.value.code == "extension_unavailable"
+    assert caught.value.source_id == "beta"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    # Old registrations restored: generations and queryable values unchanged.
+    assert registry_statuses(registry) == before_generations
+    assert registered_values(connection) == before_values
+    # alpha WAS swapped before beta failed — the rollback restored it.
+    assert adapter.register_log[:2] == ["alpha", "beta"]
 
 
 # ---------------------------------------------------------------------------
