@@ -29,7 +29,6 @@ from selayer.sources.config import PostgresConfig
 from selayer.sources.errors import SourceConnectionError
 from selayer.sources.profiles import MappingProfileResolver, RuntimeProfileResolver
 from selayer.sources.schema import FieldSchema, ScalarType, TableSchema
-from tests.sources._docker import require_docker
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -126,7 +125,9 @@ class PostgresSourceFixture(NamedTuple):
 
 
 @pytest.fixture
-def postgres_source_fixture() -> (
+def postgres_source_fixture(
+    require_docker: None,
+) -> (
     pytest.fixture  # type: ignore[misc]
 ):
     """Start PostgreSQL via testcontainers, create a ``facts`` table, build a layer.
@@ -145,8 +146,6 @@ def postgres_source_fixture() -> (
 
     psycopg = pytest.importorskip("psycopg")
     from testcontainers.community.postgres import PostgresContainer
-
-    require_docker()
 
     container: PostgresContainer = PostgresContainer("postgres:16")
     container.start()

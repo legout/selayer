@@ -38,7 +38,6 @@ from selayer.sources.profiles import (
     RuntimeProfile,
     RuntimeProfileResolver,
 )
-from tests.sources._docker import require_docker
 
 # ---------------------------------------------------------------------------
 # Secret sentinels
@@ -489,7 +488,9 @@ def _events_schema_table_two() -> pa.Table:
 
 
 @pytest.fixture
-def minio_source_fixture() -> (
+def minio_source_fixture(
+    require_docker: None,
+) -> (
     pytest.fixture  # type: ignore[misc]
 ):
     """Start MinIO via testcontainers, upload a Parquet file, build a layer.
@@ -512,8 +513,6 @@ def minio_source_fixture() -> (
     # startup/API/image failure re-raises.
     import boto3
     from testcontainers.community.minio import MinioContainer
-
-    require_docker()
 
     minio: MinioContainer = MinioContainer()
     minio.start()
