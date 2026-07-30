@@ -446,7 +446,7 @@ class SourceRegistry:
                     "extension_unavailable",
                     "a required DuckDB extension is not available",
                 )
-            raise SourceReloadError(failed_id, "reload_failed", "reload failed")
+            raise SourceReloadError(failed_id, "reload_all_failed", "reload failed")
 
         swapped: list[tuple[str, SourceAdapter, SourceHandle, int]] = []
         commit_failed = False
@@ -512,7 +512,7 @@ class SourceRegistry:
                     "extension_unavailable",
                     "a required DuckDB extension is not available",
                 )
-            raise SourceReloadError("<source>", "reload_failed", "reload failed")
+            raise SourceReloadError("<source>", "reload_all_failed", "reload failed")
 
         # Close old handles outside the lock after the commit succeeded.
         for source_id, adapter, old_handle, _gen in swapped:

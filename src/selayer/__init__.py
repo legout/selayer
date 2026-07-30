@@ -14,6 +14,16 @@ from selayer.model import (
 )
 from selayer.planning import QueryPlan, QueryPlanningError
 from selayer.query import QueryEngine
+from selayer.sources.base import ReloadResult, SourceStatus
+from selayer.sources.errors import (
+    SourceConnectionError,
+    SourceDependencyError,
+    SourceError,
+    SourceProfileError,
+    SourceReloadError,
+    SourceSchemaError,
+)
+from selayer.sources.schema import FieldSchema, TableSchema
 
 from .okf import OkfBundle
 
@@ -25,6 +35,7 @@ __all__ = [
     "DataSource",
     "Dimension",
     "Fact",
+    "FieldSchema",
     "Measure",
     "Metric",
     "OkfBundle",
@@ -33,5 +44,14 @@ __all__ = [
     "QueryPlan",
     "QueryPlanningError",
     "Relationship",
+    "ReloadResult",
     "SemanticLayer",
+    "SourceConnectionError",
+    "SourceDependencyError",
+    "SourceError",
+    "SourceProfileError",
+    "SourceReloadError",
+    "SourceSchemaError",
+    "SourceStatus",
+    "TableSchema",
 ]

@@ -22,6 +22,7 @@ in none of ``error.args``, ``repr(error)``, the formatted traceback,
 from __future__ import annotations
 
 import io
+import os
 import traceback
 import types
 from collections.abc import Callable, Mapping
@@ -38,6 +39,23 @@ from selayer.sources.profiles import (
     RuntimeProfile,
     RuntimeProfileResolver,
 )
+
+
+def require_docker() -> None:
+    """Skip locally without Docker, but fail loudly in CI."""
+
+    try:
+        import docker
+
+        available = bool(docker.from_env().ping())
+    except Exception:  # noqa: BLE001
+        available = False
+    if available:
+        return
+    if os.environ.get("CI") == "true":
+        raise RuntimeError("Docker is unavailable in CI")
+    pytest.skip("Docker daemon is not available")
+
 
 # ---------------------------------------------------------------------------
 # Secret sentinels
@@ -487,25 +505,6 @@ def _events_schema_table_two() -> pa.Table:
     )
 
 
-def _docker_available() -> bool:
-    """Return ``True`` when the Docker daemon is reachable.
-
-    The Docker SDK's ``ping`` is probed directly so the MinIO fixture skips
-    *only* when Docker is genuinely unavailable; a healthy daemon followed by
-    a MinIO image/container failure re-raises (and fails CI) rather than being
-    masked as a skip.
-    """
-
-    try:
-        import docker
-    except ImportError:
-        return False
-    try:
-        return bool(docker.from_env().ping())
-    except Exception:  # noqa: BLE001 - any connection/unavailable error = unavailable
-        return False
-
-
 @pytest.fixture
 def minio_source_fixture() -> (
     pytest.fixture  # type: ignore[misc]
@@ -524,13 +523,14 @@ def minio_source_fixture() -> (
     """
 
     # Declared test dependencies — a missing import fails the test (never a
-    # skip).  The Docker daemon availability probe below is the *only* skip
-    # gate; with Docker healthy, any MinIO startup/API/image failure re-raises.
+    # skip).  The Docker daemon availability gate below is the *only* gate:
+    # under CI (``CI=true``) an unavailable daemon fails rather than skipping,
+    # while outside CI a missing daemon skips; with Docker healthy, any MinIO
+    # startup/API/image failure re-raises.
     import boto3
     from testcontainers.community.minio import MinioContainer
 
-    if not _docker_available():
-        pytest.skip("Docker daemon is not available")
+    require_docker()
 
     minio: MinioContainer = MinioContainer()
     minio.start()

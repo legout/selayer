@@ -4,8 +4,10 @@ These tests exercise the real
 :class:`~selayer.sources.adapters.database.PostgresAdapter` through the
 :class:`~selayer.query.QueryEngine` against a live PostgreSQL instance started
 via ``testcontainers[postgres]``.  They are marked ``@pytest.mark.integration``
-and skip cleanly when ``psycopg`` or the Docker daemon is unavailable,
-consistent with the repository's S3 integration-test conventions.
+and skip cleanly when ``psycopg`` is unavailable or when the Docker daemon is
+unavailable *outside CI*.  Under CI (``CI=true``) an unavailable Docker daemon
+fails loudly rather than skipping, consistent with the repository's S3
+integration-test conventions.
 
 Secrecy contract — connection failure and credential-leakage tests assert that
 the DSN (including the password) never appears in any rendered error surface.
@@ -14,6 +16,7 @@ The DSN is never written to assertion output.
 
 from __future__ import annotations
 
+import os
 import traceback
 from collections.abc import Callable
 from typing import NamedTuple
@@ -27,6 +30,23 @@ from selayer.sources.config import PostgresConfig
 from selayer.sources.errors import SourceConnectionError
 from selayer.sources.profiles import MappingProfileResolver, RuntimeProfileResolver
 from selayer.sources.schema import FieldSchema, ScalarType, TableSchema
+
+
+def require_docker() -> None:
+    """Skip locally without Docker, but fail loudly in CI."""
+
+    try:
+        import docker
+
+        available = bool(docker.from_env().ping())
+    except Exception:  # noqa: BLE001
+        available = False
+    if available:
+        return
+    if os.environ.get("CI") == "true":
+        raise RuntimeError("Docker is unavailable in CI")
+    pytest.skip("Docker daemon is not available")
+
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -105,28 +125,6 @@ def _postgres_layer(profile: str, relation: str = "public.facts") -> SemanticLay
 
 
 # ---------------------------------------------------------------------------
-# Docker availability
-# ---------------------------------------------------------------------------
-
-
-def _docker_available() -> bool:
-    """Return ``True`` when the Docker daemon is reachable.
-
-    Mirrors the S3 integration test's probe so this fixture skips *only* when
-    Docker is genuinely unavailable.
-    """
-
-    try:
-        import docker
-    except ImportError:
-        return False
-    try:
-        return bool(docker.from_env().ping())
-    except Exception:  # noqa: BLE001 - any connection error = unavailable
-        return False
-
-
-# ---------------------------------------------------------------------------
 # Fixture
 # ---------------------------------------------------------------------------
 
@@ -153,18 +151,19 @@ def postgres_source_fixture() -> (
     Yields a :class:`PostgresSourceFixture`.
 
     ``psycopg`` is an optional extra (``postgres``); a missing import skips the
-    test.  The Docker daemon availability probe is the only other skip gate;
-    with Docker healthy, any container startup failure re-raises so CI fails
-    rather than silently skipping.  Connection details are used only to
-    construct the runtime profile and the ``insert_row`` callback; they are
-    never printed or written to assertion output.
+    test.  The Docker daemon availability gate is the only other gate: under
+    CI (``CI=true``) an unavailable daemon fails rather than skipping, while
+    outside CI a missing daemon skips.  With Docker healthy, any container
+    startup failure re-raises so CI fails rather than silently skipping.
+    Connection details are used only to construct the runtime profile and the
+    ``insert_row`` callback; they are never printed or written to assertion
+    output.
     """
 
     psycopg = pytest.importorskip("psycopg")
     from testcontainers.community.postgres import PostgresContainer
 
-    if not _docker_available():
-        pytest.skip("Docker daemon is not available")
+    require_docker()
 
     container: PostgresContainer = PostgresContainer("postgres:16")
     container.start()

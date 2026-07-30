@@ -9,7 +9,24 @@ from selayer.catalog import SemanticLayer, SemanticObject
 from selayer.expressions import format_expression
 from selayer.model import DataSource, Dimension, Fact, Measure, Metric, Relationship
 from selayer.sources.config import connector_kind
-from selayer.sources.schema import schema_fingerprint
+from selayer.sources.schema import (
+    DecimalType,
+    DictionaryType,
+    DurationType,
+    FixedSizeBinaryType,
+    FixedSizeListType,
+    IntervalType,
+    LargeListType,
+    ListType,
+    LogicalType,
+    MapType,
+    ScalarType,
+    StructType,
+    TableSchema,
+    TimestampType,
+    TimeType,
+    schema_fingerprint,
+)
 
 from .document import generated_fingerprint
 from .model import OkfConcept, OkfSection
@@ -51,14 +68,65 @@ def generated_directories() -> tuple[str, ...]:
     return tuple(_KIND_DIRECTORIES.values())
 
 
-def _field_summary(schema: object) -> str:
-    """Render an ordered, name/type summary of a declared table schema."""
+def _logical_type_label(logical: LogicalType) -> str:
+    """Render a compact, advisory label for a declared logical type.
 
-    fields = getattr(schema, "fields", ())
+    The label is *advisory* only — it summarizes the catalog-declared type so a
+    human reading the generated concept understands the field shape without the
+    catalog having to be opened.  It is never an execution authority: the
+    :class:`~selayer.sources.schema.TableSchema` (and its fingerprint) are the
+    authoritative record.  No location, profile, or credential material is
+    ever derived from a type, so this label is safe to surface.
+    """
+
+    if isinstance(logical, ScalarType):
+        return logical.name
+    if isinstance(logical, DecimalType):
+        return f"decimal({logical.precision},{logical.scale})"
+    if isinstance(logical, TimestampType):
+        return f"timestamp[{logical.unit}]"
+    if isinstance(logical, TimeType):
+        return f"time[{logical.unit}/{logical.bit_width}]"
+    if isinstance(logical, DurationType):
+        return f"duration[{logical.unit}]"
+    if isinstance(logical, IntervalType):
+        return f"interval[{logical.variant}]"
+    if isinstance(logical, FixedSizeBinaryType):
+        return f"fixed_size_binary[{logical.byte_width}]"
+    if isinstance(logical, ListType):
+        return "list"
+    if isinstance(logical, LargeListType):
+        return "large_list"
+    if isinstance(logical, FixedSizeListType):
+        return f"fixed_size_list[{logical.size}]"
+    if isinstance(logical, StructType):
+        return "struct"
+    if isinstance(logical, MapType):
+        return "map"
+    if isinstance(logical, DictionaryType):
+        return f"dictionary[{logical.index.name}->{logical.value.name}]"
+    return "unknown"
+
+
+def _field_summary(schema: TableSchema) -> str:
+    """Render an ordered, catalog-authoritative field type/nullability summary.
+
+    Each declared field is rendered as ``name: <type> (required|nullable)``.
+    The type label and nullability derive *only* from the declared
+    :class:`~selayer.sources.schema.FieldSchema`; no location, profile name,
+    connector option, observed handle schema, or credential material is ever
+    surfaced.  This is the bounded advisory summary the OKF concept publishes;
+    the catalog :class:`TableSchema` (and its fingerprint) remain the
+    execution authority.
+    """
+
     entries = []
-    for field in fields:
-        entries.append(f"`{field.name}`")
-    return ", ".join(entries)
+    for field in schema.fields:
+        requirement = "required" if not field.nullable else "nullable"
+        entries.append(
+            f"- {field.name}: {_logical_type_label(field.type)} ({requirement})"
+        )
+    return "\n".join(entries)
 
 
 def catalog_definition(semantic_id: str, value: SemanticObject) -> str:
@@ -67,10 +135,11 @@ def catalog_definition(semantic_id: str, value: SemanticObject) -> str:
     if isinstance(value, DataSource):
         lines.extend(
             (
-                f"Connector: `{connector_kind(value.connector)}`",
-                f"Schema fingerprint: `{schema_fingerprint(value.schema)}`",
-                f"Fields: {_field_summary(value.schema)}",
-                f"Grain: {', '.join(f'`{column}`' for column in value.grain)}",
+                f"Connector: {connector_kind(value.connector)}",
+                f"Schema fingerprint: {schema_fingerprint(value.schema)}",
+                f"Grain: {', '.join(value.grain)}",
+                "Schema:",
+                _field_summary(value.schema),
             )
         )
     elif isinstance(value, Dimension):

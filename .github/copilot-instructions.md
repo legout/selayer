@@ -18,6 +18,29 @@ be imported, packaged, linted, or extended as active product code.
 - `tests/`: behavior, regression, and integration tests.
 - `examples/e_commerce/`: migrated schema-version-1 example catalog and script.
 
+## Sources, profiles, and lifecycle
+
+The closed source matrix is Parquet, CSV, programmatic PyArrow, Delta, Iceberg,
+SQLite, DuckDB files, and PostgreSQL. S3 is only a named runtime transport
+profile for file/lakehouse connectors. Optional extras are `delta`, `iceberg`,
+`postgres`, `s3`, and `all`; keep their ranges synchronized with `pyproject.toml`
+and `uv.lock`.
+
+Every source has exactly one complete inline `schema` or contained `schema_ref`
+and a non-empty `grain`. Runtime profiles hold credentials, DSNs, endpoints, and
+other secrets only at execution time. Never put profile values, authenticated
+locations, connector options, or observed schemas in catalogs, plans, OKF,
+reprs, logs, statuses, or errors. The catalog declaration is execution
+authority; OKF summaries are advisory and cannot change planning or execution.
+
+`QueryEngine.reload_source()` and `reload_all()` are explicit. A failed single
+reload preserves the old source, and `reload_all()` is all-or-nothing. Arrow
+Dataset and Delta paths preserve projection/filter pushdown. PyIceberg owns
+snapshot metadata and creates query-scoped projected/filterable readers. Native
+SQLite, DuckDB-file, and PostgreSQL attachments are read-only and detached when
+replaced or closed. Do not eagerly materialize sources into Polars; Polars is
+only the result-frame boundary.
+
 ## Catalog and query conventions
 
 - Schema version is exactly integer `1`; do not add compatibility loaders.

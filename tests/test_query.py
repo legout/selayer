@@ -538,6 +538,7 @@ def test_public_exports_exclude_compiler_internals() -> None:
         "DataSource",
         "Dimension",
         "Fact",
+        "FieldSchema",
         "Measure",
         "Metric",
         "OkfBundle",
@@ -546,11 +547,25 @@ def test_public_exports_exclude_compiler_internals() -> None:
         "QueryPlan",
         "QueryPlanningError",
         "Relationship",
+        "ReloadResult",
         "SemanticLayer",
+        "SourceConnectionError",
+        "SourceDependencyError",
+        "SourceError",
+        "SourceProfileError",
+        "SourceReloadError",
+        "SourceSchemaError",
+        "SourceStatus",
+        "TableSchema",
     }
     assert set(selayer.__all__) == expected
+    # The registry, adapter classes, raw handles, profiles, and schema-parser
+    # internals are deliberately private to the sources package and never
+    # exported from the package root.
     assert not hasattr(selayer, "compile_duckdb")
     assert not hasattr(selayer, "parse_expression")
+    assert not hasattr(selayer, "SourceRegistry")
+    assert not hasattr(selayer, "parse_schema_document")
 
 
 def test_next_package_is_absent() -> None:

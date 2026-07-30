@@ -1,0 +1,50 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: latest
+      - run: uv sync --all-extras
+      - run: uv run --all-extras pytest -q
+      - run: uv run ruff check src tests examples
+      - run: uv run ruff format --check src tests examples
+      - run: uv run pyright src tests examples
+      - run: uv run python examples/e_commerce/selayer1.py
+      - run: rm -rf dist && uv build
+      - name: Verify wheel contents
+        run: |
+          uv run python - <<'PY'
+          from pathlib import Path
+          import zipfile
+
+          wheel = next(Path("dist").glob("*.whl"))
+          with zipfile.ZipFile(wheel) as archive:
+              names = set(archive.namelist())
+          required = {
+              "selayer/sources/schema.py",
+              "selayer/sources/config.py",
+              "selayer/sources/registry.py",
+              "selayer/sources/adapters/arrow.py",
+              "selayer/sources/adapters/delta.py",
+              "selayer/sources/adapters/iceberg.py",
+              "selayer/sources/adapters/database.py",
+          }
+          assert required <= names, required - names
+          assert not any(
+              "legacy/" in name or "tests/" in name for name in names
+          )
+          print(f"verified {wheel}: {len(names)} files")
+          PY

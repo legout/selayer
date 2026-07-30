@@ -86,16 +86,14 @@ def test_projection_contains_every_semantic_object(
         "sources/products",
     )
     source_content = bundle.concepts["sources/order_items"].sections[0].content
-    assert "Connector: `parquet`" in source_content
-    assert "Schema fingerprint: `" in source_content
-    assert (
-        "Fields: `order_id`, `product_id`, `quantity`, `price`, `total`"
-        in source_content
-    )
-    assert "Grain: `order_id`, `product_id`" in source_content
+    assert "Connector: parquet" in source_content
+    assert "Schema fingerprint:" in source_content
+    assert "Grain: order_id, product_id" in source_content
+    assert "- order_id: utf8 (nullable)" in source_content
+    assert "- quantity: int64 (nullable)" in source_content
     # The old ``path``/``location``/profile shape is gone from the rendered
-    # catalog definition — only the connector category, field summary,
-    # fingerprint, and grain remain.
+    # catalog definition — only the connector category, schema fingerprint,
+    # grain, and bounded field type/nullability summary remain.
     assert "location" not in source_content
     assert "profile" not in source_content
     assert (
@@ -118,6 +116,133 @@ def test_projection_contains_every_semantic_object(
         "Target: `order_items.product_id`"
         in bundle.concepts["relationships/product_order_items"].sections[0].content
     )
+
+
+def test_source_definition_carries_bounded_catalog_authoritative_schema_summary(
+    ecommerce_layer: SemanticLayer,
+) -> None:
+    """A generated source concept derives its summary only from the catalog.
+
+    The schema summary is bounded: it surfaces the connector category, the
+    declared schema fingerprint, the grain, and each declared field's logical
+    type and nullability — never the location, profile name, connector
+    options, or any observed/handle-derived metadata.  The catalog is the
+    execution authority; the generated text is advisory only.
+    """
+
+    content = (
+        OkfBundle.from_layer(ecommerce_layer)
+        .concepts["sources/order_items"]
+        .sections[0]
+        .content
+    )
+
+    assert "Connector: parquet" in content
+    assert "Schema fingerprint:" in content
+    assert "Grain: order_id, product_id" in content
+    # Each declared field surfaces its logical type and nullability.
+    assert "order_id: utf8 (nullable)" in content
+    assert "quantity: int64 (nullable)" in content
+    assert "total: float64 (nullable)" in content
+    # The summary is catalog-authoritative: no locations, profile names,
+    # connector options, or credential material ever surface.
+    assert "location" not in content
+    assert "profile" not in content
+    assert "s3://" not in content
+    assert "credential" not in content
+
+
+def test_generated_source_context_contains_bounded_schema_summary(
+    ecommerce_layer: SemanticLayer,
+) -> None:
+    """The retrieved advisory context surfaces the bounded schema summary.
+
+    Mirrors the brief: the advisory context for a source concept must include
+    the schema fingerprint, grain, and bounded field type/nullability lines,
+    and must never surface a location, profile name, or credential.
+    """
+
+    bundle = OkfBundle.from_layer(ecommerce_layer)
+    content = (
+        bundle.context_for(
+            ["source.order_items"], include_linked=False, max_chars=4_000
+        )
+        .items[0]
+        .content
+    )
+
+    assert "Schema fingerprint:" in content
+    assert "Grain: order_id, product_id" in content
+    assert "quantity: int64 (nullable)" in content
+    assert "s3://" not in content
+    assert "credential_profile" not in content
+    assert "location" not in content
+
+
+def test_curated_okf_schema_text_cannot_change_catalog_execution(
+    tmp_path: Path,
+    ecommerce_layer: SemanticLayer,
+) -> None:
+    """Curated advisory OKF text can never override the catalog's authority.
+
+    A human edits the generated source concept to claim ``quantity`` is a
+    string and the grain is ``customer_id``.  Re-syncing the bundle regenerates
+    the authoritative Catalog Definition while *preserving* the curated edit in
+    a non-authoritative section.  The actual catalog schema and grain are
+    unchanged — they derive solely from ``DataSource.schema``/``grain``, never
+    from OKF text — so the execution authority is untouched.
+    """
+
+    destination = tmp_path / "knowledge"
+    OkfBundle.from_layer(ecommerce_layer).write(destination)
+    concept_path = destination / "sources" / "order_items.md"
+    # Curate the advisory Usage Guidance section (a generated empty placeholder)
+    # with misleading text.  The controlled merge must preserve this advisory
+    # text while regenerating the authoritative Catalog Definition.
+    existing = concept_path.read_text(encoding="utf-8")
+    misleading = "quantity is a string and grain is customer_id."
+    curated = existing.replace(
+        "# Usage Guidance\n\n# Examples",
+        f"# Usage Guidance\n\n{misleading}\n\n# Examples",
+    )
+    assert curated != existing, "Usage Guidance placeholder was not found"
+    concept_path.write_text(curated, encoding="utf-8")
+
+    report = OkfBundle.from_layer(ecommerce_layer).sync(destination)
+    # ``sync`` returns a SyncReport.  The curated edit lives in a non-
+    # authoritative section, so the controlled merge preserves it without a
+    # conflict; the source concept is either unchanged or re-written but never
+    # a conflict.
+    relative = "sources/order_items.md"
+    assert relative not in report.conflicts
+
+    # The catalog execution authority is unchanged by the curated edit: the
+    # type and grain derive solely from ``DataSource.schema``/``grain``, never
+    # from OKF text.  ``quantity`` is a scalar ``int64`` in the catalog.
+    from selayer.sources.schema import ScalarType
+
+    quantity_type = (
+        ecommerce_layer.data_sources["order_items"].schema.field("quantity").type
+    )
+    assert isinstance(quantity_type, ScalarType)
+    assert quantity_type.name == "int64"
+    assert ecommerce_layer.data_sources["order_items"].grain == (
+        "order_id",
+        "product_id",
+    )
+    # The curated (advisory) text is preserved after the controlled merge,
+    # while the regenerated Catalog Definition keeps the authoritative type.
+    reloaded = OkfBundle.load(destination, layer=ecommerce_layer)
+    source_concept = reloaded.concepts["sources/order_items"]
+    content = source_concept.sections[0].content
+    assert "quantity: int64 (nullable)" in content
+    assert "Grain: order_id, product_id" in content
+    usage = next(
+        section
+        for section in source_concept.sections
+        if section.title == "Usage Guidance"
+    )
+    assert "quantity is a string" in usage.content
 
 
 def test_semantic_object_named_index_is_rejected_before_reserved_file_collision(
