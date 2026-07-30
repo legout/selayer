@@ -672,7 +672,13 @@ def _iceberg_layer(
         DataSource(
             "events",
             IcebergConfig("catalog", ("default",), "events"),
-            _events_schema(),
+            TableSchema(
+                (
+                    FieldSchema("id", ScalarType("int64"), True),
+                    FieldSchema("category", ScalarType("utf8"), True),
+                    FieldSchema("value", ScalarType("int64"), True),
+                )
+            ),
             ("id",),
         )
     )

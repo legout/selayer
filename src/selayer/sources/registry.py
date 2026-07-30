@@ -333,10 +333,23 @@ class SourceRegistry:
                 source = self._sources[source_id]
                 adapter = self._registrations[source_id].adapter
 
-                prepared_candidate = self._prepare_candidate(adapter, source)
+                preparation_failure: _CandidatePreparationFailed | None = None
+                try:
+                    prepared_candidate = self._prepare_candidate(adapter, source)
+                except _CandidatePreparationFailed as failure:
+                    preparation_failure = failure
+                    prepared_candidate = None
+                if preparation_failure is not None:
+                    if preparation_failure.candidate is not None:
+                        cleanup.append((adapter, preparation_failure.candidate))
+                    if preparation_failure.extension_failure:
+                        raise SourceDependencyError(
+                            source_id,
+                            "extension_unavailable",
+                            "a required DuckDB extension is not available",
+                        )
+                    raise SourceReloadError(source_id, "reload_failed", "reload failed")
                 if prepared_candidate is None:
-                    # prepare or inspect failed; raise outside the except
-                    # scope.
                     raise SourceReloadError(source_id, "reload_failed", "reload failed")
                 candidate, observed = prepared_candidate
                 mismatches = compare_schemas(source.schema, observed)
@@ -442,6 +455,7 @@ class SourceRegistry:
                 prepare_failed_source: str | None = None
                 dependency_failure = False
                 unexpected_failure = False
+                preparation_failure: _CandidatePreparationFailed | None = None
                 try:
                     for source_id in source_ids:
                         source = self._sources[source_id]
@@ -451,9 +465,12 @@ class SourceRegistry:
                             prepared_candidate = self._prepare_candidate(
                                 adapter, source
                             )
-                        except SourceDependencyError:
+                        except _CandidatePreparationFailed as failure:
+                            if failure.candidate is not None:
+                                cleanup.append((adapter, failure.candidate))
                             prepare_failed_source = source_id
-                            raise
+                            preparation_failure = failure
+                            break
                         if prepared_candidate is None:
                             prepare_failed_source = source_id
                             break
@@ -468,6 +485,19 @@ class SourceRegistry:
                     dependency_failure = _is_extension_failure(dep_error)
                 except Exception:  # noqa: BLE001
                     unexpected_failure = True
+
+                if preparation_failure is not None:
+                    if preparation_failure.extension_failure:
+                        raise SourceDependencyError(
+                            prepare_failed_source or "<source>",
+                            "extension_unavailable",
+                            "a required DuckDB extension is not available",
+                        )
+                    raise SourceReloadError(
+                        prepare_failed_source or "<source>",
+                        "reload_all_failed",
+                        "reload failed",
+                    )
 
                 # On any prepare-phase failure (prepare/schema-mismatch via
                 # ``break`` or an unexpected exception), collect every
@@ -741,22 +771,24 @@ class SourceRegistry:
         try:
             candidate = adapter.prepare(source, self._profiles, self._arrow_providers)
             observed = adapter.inspect_schema(candidate)
-        except SourceDependencyError:
-            if candidate is not None:
-                close_quietly(adapter, candidate)
-            raise
+        except SourceDependencyError as error:
+            raise _CandidatePreparationFailed(candidate, _is_extension_failure(error))
         except Exception:  # noqa: BLE001
-            # inspect_schema may have raised after a successful prepare; close
-            # the prepared handle so it is never leaked.
-            if candidate is not None:
-                close_quietly(adapter, candidate)
-            return None
+            raise _CandidatePreparationFailed(candidate, False)
         return candidate, observed
 
 
 # ---------------------------------------------------------------------------
 # Sentinels and quiet helpers
 # ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class _CandidatePreparationFailed(Exception):
+    """Internal failure carrying candidate ownership to the caller."""
+
+    candidate: SourceHandle | None
+    extension_failure: bool
 
 
 class _SchemaDrift(Exception):
