@@ -306,93 +306,121 @@ class SourceRegistry:
     def reload_source(self, source_id: str) -> ReloadResult:
         """Atomically reload one source, publishing a new generation.
 
-        The lifecycle lock spans the *complete* reload operation: candidate
-        preparation, schema verification, the ``register`` commit, registry
-        publication, generation increment, and old/candidate handle cleanup.
-        Holding the lock for the entire operation guarantees that a concurrent
-        :meth:`close` cannot clear registrations or close the connection while
-        a candidate is being prepared — eliminating the close/reload race that
-        would otherwise leave a prepared-but-uncommitted candidate orphaned
-        with a ``KeyError`` on cleared registrations.  Concurrent
+        The lifecycle lock spans state inspection, candidate preparation,
+        schema verification, the ``register`` commit, registry publication,
+        and generation increment.  Rolled-back candidates and replaced old
+        handles are collected while locked and closed *outside* the lock after
+        rollback/publication, so the critical section covers only the state
+        that must be observed consistently.  Holding the lock through
+        preparation prevents a concurrent :meth:`close` from clearing
+        registrations or closing the connection while a candidate is being
+        prepared — eliminating the close/reload race.  Concurrent
         ``reload_source`` calls serialize and produce strictly increasing
         generations (``1 -> 2 -> 3``).  Every candidate is closed on any
         failure.
         """
 
+        cleanup: list[tuple[SourceAdapter, SourceHandle]] = []
+        result: ReloadResult | None = None
+        pending_error: BaseException | None = None
         with self._lock:
-            self._ensure_open(source_id)
-            if source_id not in self._registrations:
-                raise SourceReloadError(source_id, "reload_failed", "unknown source")
-            source = self._sources[source_id]
-            adapter = self._registrations[source_id].adapter
-
-            prepared_candidate = self._prepare_candidate(adapter, source)
-            if prepared_candidate is None:
-                # prepare or inspect failed; raise outside the except scope.
-                raise SourceReloadError(source_id, "reload_failed", "reload failed")
-            candidate, observed = prepared_candidate
-            mismatches = compare_schemas(source.schema, observed)
-            if mismatches:
-                close_quietly(adapter, candidate)
-                raise SourceSchemaError(source_id, "schema_mismatch", "schema mismatch")
-
-            # Snapshot old registration/generation, commit the candidate
-            # registration, and publish the incremented generation — all under
-            # the lifecycle lock so close cannot race ahead.  A concurrent
-            # reload_source blocks and observes the new generation when it
-            # acquires the lock, guaranteeing 1 -> 2 -> 3.
-            old_registration = self._registrations[source_id]
-            old_handle = old_registration.handle
-            old_generation = old_registration.generation
-            commit_failed = False
-            commit_extension_failed = False
             try:
-                adapter.register(self._connection, source_id, candidate)
-            except Exception as error:  # noqa: BLE001
-                commit_failed = True
-                commit_extension_failed = _is_extension_failure(error)
-                # register may have mutated the connection before raising, so
-                # restore the previous handle before proceeding.
-                restore_quietly(adapter, self._connection, source_id, old_handle)
-            else:
-                self._registrations[source_id] = _Registration(
-                    adapter, candidate, old_generation + 1
-                )
-            if commit_failed:
-                close_quietly(adapter, candidate)
-                if commit_extension_failed:
-                    # The commit raised a sanitized dependency error (e.g. a
-                    # missing extension surfaced from
-                    # ``_ensure_extension``).  Raise a fresh one outside the
-                    # except scope so the stable ``extension_unavailable``
-                    # code — not the generic ``reload_failed`` — reaches the
-                    # caller.
-                    raise SourceDependencyError(
-                        source_id,
-                        "extension_unavailable",
-                        "a required DuckDB extension is not available",
+                self._ensure_open(source_id)
+                if source_id not in self._registrations:
+                    raise SourceReloadError(
+                        source_id, "reload_failed", "unknown source"
                     )
-                raise SourceReloadError(source_id, "reload_failed", "reload failed")
+                source = self._sources[source_id]
+                adapter = self._registrations[source_id].adapter
 
-            # The old handle is no longer referenced by DuckDB; release it
-            # under the lock after the commit succeeded.
-            close_quietly(adapter, old_handle)
-            return ReloadResult(
-                source_id=source_id,
-                old_generation=old_generation,
-                new_generation=old_generation + 1,
-                schema_fingerprint=schema_fingerprint(observed),
-                snapshot=candidate.snapshot,
-            )
+                prepared_candidate = self._prepare_candidate(adapter, source)
+                if prepared_candidate is None:
+                    # prepare or inspect failed; raise outside the except
+                    # scope.
+                    raise SourceReloadError(source_id, "reload_failed", "reload failed")
+                candidate, observed = prepared_candidate
+                mismatches = compare_schemas(source.schema, observed)
+                if mismatches:
+                    cleanup.append((adapter, candidate))
+                    raise SourceSchemaError(
+                        source_id, "schema_mismatch", "schema mismatch"
+                    )
+
+                # Snapshot old registration/generation, commit the candidate
+                # registration, and publish the incremented generation — all
+                # under the lifecycle lock so close cannot race ahead.  A
+                # concurrent reload_source blocks and observes the new
+                # generation when it acquires the lock, guaranteeing
+                # 1 -> 2 -> 3.
+                old_registration = self._registrations[source_id]
+                old_handle = old_registration.handle
+                old_generation = old_registration.generation
+                commit_failed = False
+                commit_extension_failed = False
+                try:
+                    adapter.register(self._connection, source_id, candidate)
+                except Exception as error:  # noqa: BLE001
+                    commit_failed = True
+                    commit_extension_failed = _is_extension_failure(error)
+                    # register may have mutated the connection before raising,
+                    # so restore the previous handle before proceeding.
+                    restore_quietly(adapter, self._connection, source_id, old_handle)
+                else:
+                    self._registrations[source_id] = _Registration(
+                        adapter, candidate, old_generation + 1
+                    )
+                if commit_failed:
+                    cleanup.append((adapter, candidate))
+                    if commit_extension_failed:
+                        # The commit raised a sanitized dependency error (e.g.
+                        # a missing extension surfaced from
+                        # ``_ensure_extension``).  Raise a fresh one outside
+                        # the except scope so the stable
+                        # ``extension_unavailable`` code — not the generic
+                        # ``reload_failed`` — reaches the caller.
+                        raise SourceDependencyError(
+                            source_id,
+                            "extension_unavailable",
+                            "a required DuckDB extension is not available",
+                        )
+                    raise SourceReloadError(source_id, "reload_failed", "reload failed")
+
+                # The old handle is no longer referenced by DuckDB; release it
+                # outside the lock after publication.
+                cleanup.append((adapter, old_handle))
+                result = ReloadResult(
+                    source_id=source_id,
+                    old_generation=old_generation,
+                    new_generation=old_generation + 1,
+                    schema_fingerprint=schema_fingerprint(observed),
+                    snapshot=candidate.snapshot,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                pending_error = exc
+
+        # Close rolled-back candidates and replaced old handles outside the
+        # lock.  close() may have already run after unlock, so close_quietly
+        # must remain quiet/idempotent — no raw exception or KeyError can
+        # escape.
+        for _adapter, _handle in cleanup:
+            close_quietly(_adapter, _handle)
+
+        if pending_error is not None:
+            raise pending_error
+        assert result is not None
+        return result
 
     def reload_all(self) -> tuple[ReloadResult, ...]:
         """Atomically reload every source in sorted source-ID order.
 
-        The lifecycle lock spans the *complete* operation: candidate
-        preparation, schema verification, registration swaps, generation
-        publication, rollback, and handle cleanup.  Holding the lock for the
-        entire operation guarantees that a concurrent :meth:`close` cannot
-        clear registrations or close the connection while candidates are being
+        The lifecycle lock spans state inspection, candidate preparation,
+        schema verification, registration swaps, generation publication, and
+        rollback.  Rolled-back candidates and replaced old handles are
+        collected while locked and closed *outside* the lock after
+        rollback/publication, so the critical section covers only the state
+        that must be observed consistently.  Holding the lock through
+        preparation prevents a concurrent :meth:`close` from clearing
+        registrations or closing the connection while candidates are being
         prepared — eliminating the close/reload race.  If any ``register``
         raises — even after mutating the connection — the failing source's old
         handle is restored too (not only the already-swapped entries), every
@@ -401,138 +429,167 @@ class SourceRegistry:
         any failure.
         """
 
+        cleanup: list[tuple[SourceAdapter, SourceHandle]] = []
+        result: tuple[ReloadResult, ...] | None = None
+        pending_error: BaseException | None = None
         with self._lock:
-            self._ensure_open("<source>")
-            source_ids = sorted(self._sources)
-            candidates: dict[str, tuple[SourceAdapter, SourceHandle, TableSchema]] = {}
-            prepare_failed_source: str | None = None
-            dependency_failure = False
-            unexpected_failure = False
             try:
-                for source_id in source_ids:
-                    source = self._sources[source_id]
-                    registration = self._registrations[source_id]
-                    adapter = registration.adapter
-                    try:
-                        prepared_candidate = self._prepare_candidate(adapter, source)
-                    except SourceDependencyError:
-                        prepare_failed_source = source_id
-                        raise
-                    if prepared_candidate is None:
-                        prepare_failed_source = source_id
-                        break
-                    candidate, observed = prepared_candidate
-                    mismatches = compare_schemas(source.schema, observed)
-                    if mismatches:
-                        close_quietly(adapter, candidate)
-                        prepare_failed_source = source_id
-                        break
-                    candidates[source_id] = (adapter, candidate, observed)
-            except SourceDependencyError as error:
-                dependency_failure = _is_extension_failure(error)
-            except Exception:  # noqa: BLE001
-                unexpected_failure = True
-
-            # On any prepare-phase failure (prepare/schema-mismatch via
-            # ``break`` or an unexpected exception), close every candidate
-            # prepared so far and raise a sanitized SourceReloadError
-            # *outside* the except scope so ``__cause__``/``__context__``
-            # remain ``None``.
-            if (
-                prepare_failed_source is not None
-                or dependency_failure
-                or unexpected_failure
-            ):
-                for adapter, candidate, _observed in candidates.values():
-                    close_quietly(adapter, candidate)
-                failed_id = (
-                    prepare_failed_source
-                    if prepare_failed_source is not None
-                    else "<source>"
-                )
-                if dependency_failure:
-                    raise SourceDependencyError(
-                        failed_id,
-                        "extension_unavailable",
-                        "a required DuckDB extension is not available",
-                    )
-                raise SourceReloadError(failed_id, "reload_all_failed", "reload failed")
-
-            swapped: list[tuple[str, SourceAdapter, SourceHandle, int]] = []
-            commit_failed = False
-            commit_extension_failed = False
-            commit_failed_source: str | None = None
-            results: list[ReloadResult] = []
-            # Swap every registration and publish every generation under the
-            # lifecycle lock.  A register failure rolls back the failing
-            # source's old handle *and* every already-swapped entry in reverse
-            # order, leaving all old registrations, query results, and
-            # generations unchanged.
-            for source_id in source_ids:
-                adapter, candidate, _observed = candidates[source_id]
-                old = self._registrations[source_id]
+                self._ensure_open("<source>")
+                source_ids = sorted(self._sources)
+                candidates: dict[
+                    str, tuple[SourceAdapter, SourceHandle, TableSchema]
+                ] = {}
+                prepare_failed_source: str | None = None
+                dependency_failure = False
+                unexpected_failure = False
                 try:
-                    adapter.register(self._connection, source_id, candidate)
-                except Exception as error:  # noqa: BLE001
-                    commit_failed = True
-                    commit_failed_source = source_id
-                    commit_extension_failed = _is_extension_failure(error)
-                    # register may have mutated the connection before raising,
-                    # so restore the failing source's old handle too — not only
-                    # the previously swapped entries.
-                    restore_quietly(adapter, self._connection, source_id, old.handle)
-                    break
-                swapped.append((source_id, adapter, old.handle, old.generation))
-            if commit_failed:
-                # Restore each already-swapped old handle in reverse order.
-                for source_id, adapter, old_handle, _gen in reversed(swapped):
-                    restore_quietly(adapter, self._connection, source_id, old_handle)
-            else:
-                # Publish every generation change only after every swap
-                # succeeded, within the same lock scope.
-                for source_id in source_ids:
-                    adapter, candidate, observed = candidates[source_id]
-                    old_generation = self._registrations[source_id].generation
-                    self._registrations[source_id] = _Registration(
-                        adapter, candidate, old_generation + 1
-                    )
-                    results.append(
-                        ReloadResult(
-                            source_id=source_id,
-                            old_generation=old_generation,
-                            new_generation=old_generation + 1,
-                            schema_fingerprint=schema_fingerprint(observed),
-                            snapshot=candidate.snapshot,
-                        )
-                    )
-            if commit_failed:
-                for adapter, candidate, _observed in candidates.values():
-                    close_quietly(adapter, candidate)
-                failed_id = (
-                    commit_failed_source
-                    if commit_failed_source is not None
-                    else "<source>"
-                )
-                if commit_extension_failed:
-                    # The commit raised a sanitized dependency error (e.g. a
-                    # missing extension surfaced from
-                    # ``_ensure_extension``).  Raise a fresh one outside the
-                    # except scope so the stable ``extension_unavailable``
-                    # code — not the generic ``reload_failed`` — reaches the
-                    # caller.
-                    raise SourceDependencyError(
-                        failed_id,
-                        "extension_unavailable",
-                        "a required DuckDB extension is not available",
-                    )
-                raise SourceReloadError(
-                    "<source>", "reload_all_failed", "reload failed"
-                )
+                    for source_id in source_ids:
+                        source = self._sources[source_id]
+                        registration = self._registrations[source_id]
+                        adapter = registration.adapter
+                        try:
+                            prepared_candidate = self._prepare_candidate(
+                                adapter, source
+                            )
+                        except SourceDependencyError:
+                            prepare_failed_source = source_id
+                            raise
+                        if prepared_candidate is None:
+                            prepare_failed_source = source_id
+                            break
+                        candidate, observed = prepared_candidate
+                        mismatches = compare_schemas(source.schema, observed)
+                        if mismatches:
+                            cleanup.append((adapter, candidate))
+                            prepare_failed_source = source_id
+                            break
+                        candidates[source_id] = (adapter, candidate, observed)
+                except SourceDependencyError as dep_error:
+                    dependency_failure = _is_extension_failure(dep_error)
+                except Exception:  # noqa: BLE001
+                    unexpected_failure = True
 
-            # Close old handles after the commit succeeded, under the lock.
-            for source_id, adapter, old_handle, _gen in swapped:
-                close_quietly(adapter, old_handle)
-            return tuple(results)
+                # On any prepare-phase failure (prepare/schema-mismatch via
+                # ``break`` or an unexpected exception), collect every
+                # candidate prepared so far for outside-lock cleanup and raise
+                # a sanitized SourceReloadError *outside* the except scope so
+                # ``__cause__``/``__context__`` remain ``None``.
+                if (
+                    prepare_failed_source is not None
+                    or dependency_failure
+                    or unexpected_failure
+                ):
+                    for adapter, candidate, _observed in candidates.values():
+                        cleanup.append((adapter, candidate))
+                    failed_id = (
+                        prepare_failed_source
+                        if prepare_failed_source is not None
+                        else "<source>"
+                    )
+                    if dependency_failure:
+                        raise SourceDependencyError(
+                            failed_id,
+                            "extension_unavailable",
+                            "a required DuckDB extension is not available",
+                        )
+                    raise SourceReloadError(
+                        failed_id, "reload_all_failed", "reload failed"
+                    )
+
+                swapped: list[tuple[str, SourceAdapter, SourceHandle, int]] = []
+                commit_failed = False
+                commit_extension_failed = False
+                commit_failed_source: str | None = None
+                results: list[ReloadResult] = []
+                # Swap every registration and publish every generation under
+                # the lifecycle lock.  A register failure rolls back the
+                # failing source's old handle *and* every already-swapped entry
+                # in reverse order, leaving all old registrations, query
+                # results, and generations unchanged.
+                for source_id in source_ids:
+                    adapter, candidate, _observed = candidates[source_id]
+                    old = self._registrations[source_id]
+                    try:
+                        adapter.register(self._connection, source_id, candidate)
+                    except Exception as error:  # noqa: BLE001
+                        commit_failed = True
+                        commit_failed_source = source_id
+                        commit_extension_failed = _is_extension_failure(error)
+                        # register may have mutated the connection before
+                        # raising, so restore the failing source's old handle
+                        # too — not only the previously swapped entries.
+                        restore_quietly(
+                            adapter, self._connection, source_id, old.handle
+                        )
+                        break
+                    swapped.append((source_id, adapter, old.handle, old.generation))
+                if commit_failed:
+                    # Restore each already-swapped old handle in reverse order.
+                    for source_id, adapter, old_handle, _gen in reversed(swapped):
+                        restore_quietly(
+                            adapter, self._connection, source_id, old_handle
+                        )
+                else:
+                    # Publish every generation change only after every swap
+                    # succeeded, within the same lock scope.
+                    for source_id in source_ids:
+                        adapter, candidate, observed = candidates[source_id]
+                        old_generation = self._registrations[source_id].generation
+                        self._registrations[source_id] = _Registration(
+                            adapter, candidate, old_generation + 1
+                        )
+                        results.append(
+                            ReloadResult(
+                                source_id=source_id,
+                                old_generation=old_generation,
+                                new_generation=old_generation + 1,
+                                schema_fingerprint=schema_fingerprint(observed),
+                                snapshot=candidate.snapshot,
+                            )
+                        )
+                if commit_failed:
+                    for adapter, candidate, _observed in candidates.values():
+                        cleanup.append((adapter, candidate))
+                    failed_id = (
+                        commit_failed_source
+                        if commit_failed_source is not None
+                        else "<source>"
+                    )
+                    if commit_extension_failed:
+                        # The commit raised a sanitized dependency error (e.g.
+                        # a missing extension surfaced from
+                        # ``_ensure_extension``).  Raise a fresh one outside
+                        # the except scope so the stable
+                        # ``extension_unavailable`` code — not the generic
+                        # ``reload_failed`` — reaches the caller.
+                        raise SourceDependencyError(
+                            failed_id,
+                            "extension_unavailable",
+                            "a required DuckDB extension is not available",
+                        )
+                    raise SourceReloadError(
+                        "<source>", "reload_all_failed", "reload failed"
+                    )
+
+                # Close old handles after the commit succeeded, outside the
+                # lock.
+                for _sid, adapter, old_handle, _gen in swapped:
+                    cleanup.append((adapter, old_handle))
+                result = tuple(results)
+            except BaseException as exc:  # noqa: BLE001
+                pending_error = exc
+
+        # Close rolled-back candidates and replaced old handles outside the
+        # lock.  close() may have already run after unlock, so close_quietly
+        # must remain quiet/idempotent — no raw exception or KeyError can
+        # escape.
+        for _adapter, _handle in cleanup:
+            close_quietly(_adapter, _handle)
+
+        if pending_error is not None:
+            raise pending_error
+        assert result is not None
+        return result
 
     # -- lifecycle: status / close ----------------------------------------
 

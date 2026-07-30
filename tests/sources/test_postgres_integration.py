@@ -16,7 +16,6 @@ The DSN is never written to assertion output.
 
 from __future__ import annotations
 
-import os
 import traceback
 from collections.abc import Callable
 from typing import NamedTuple
@@ -30,23 +29,7 @@ from selayer.sources.config import PostgresConfig
 from selayer.sources.errors import SourceConnectionError
 from selayer.sources.profiles import MappingProfileResolver, RuntimeProfileResolver
 from selayer.sources.schema import FieldSchema, ScalarType, TableSchema
-
-
-def require_docker() -> None:
-    """Skip locally without Docker, but fail loudly in CI."""
-
-    try:
-        import docker
-
-        available = bool(docker.from_env().ping())
-    except Exception:  # noqa: BLE001
-        available = False
-    if available:
-        return
-    if os.environ.get("CI") == "true":
-        raise RuntimeError("Docker is unavailable in CI")
-    pytest.skip("Docker daemon is not available")
-
+from tests.sources._docker import require_docker
 
 # ---------------------------------------------------------------------------
 # Schema

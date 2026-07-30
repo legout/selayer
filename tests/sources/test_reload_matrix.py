@@ -22,6 +22,7 @@ matrix here covers the in-process connector modes.
 
 from __future__ import annotations
 
+import shutil
 import sqlite3
 import threading
 import time
@@ -637,23 +638,15 @@ def _assert_no_secret_leak(error: BaseException, sentinel: str) -> None:
 def _arrow_layer(
     secret: str,
 ) -> tuple[SemanticLayer, RuntimeProfileResolver, ArrowProviderResolver]:
+    del secret
     layer = _layer(
         DataSource("events", PyArrowConfig("events"), _events_schema(), ("id",))
     )
-    profiles = MappingProfileResolver({})
-    # The provider raises carrying the secret sentinel so the failure path is
-    # exercised; the sentinel must never surface.
-    sentinel_table = pa.table({"id": [1], "value": [1]})
-
-    class _FailingProvider:
-        def __call__(self) -> pa.Table:
-            raise RuntimeError(f"s3://user:{secret}@example/private")
-
     return (
         layer,
-        profiles,
+        MappingProfileResolver({}),
         MappingArrowProviderResolver(
-            {"events": _FailingProvider(), "other": _Provider(sentinel_table)}
+            {"events": _Provider(pa.table({"id": [1], "value": [1]}))}
         ),
     )
 
@@ -661,31 +654,36 @@ def _arrow_layer(
 def _delta_layer(
     secret: str, tmp_path: Path
 ) -> tuple[SemanticLayer, RuntimeProfileResolver, ArrowProviderResolver]:
-    # Point at a nonexistent location embedding the secret sentinel.
+    delta_path = tmp_path / secret / "delta"
+    _make_delta(delta_path, [(1, 1)])
     layer = _layer(
-        DataSource(
-            "events",
-            DeltaConfig(f"/nonexistent/{secret}/events"),
-            _events_schema(),
-            ("id",),
-        )
+        DataSource("events", DeltaConfig(str(delta_path)), _events_schema(), ("id",))
     )
     return layer, MappingProfileResolver({}), MappingArrowProviderResolver({})
 
 
 def _iceberg_layer(
-    secret: str,
+    secret: str, tmp_path: Path
 ) -> tuple[SemanticLayer, RuntimeProfileResolver, ArrowProviderResolver]:
+    root = tmp_path / secret
+    root.mkdir(parents=True)
+    _table, warehouse, db_path = _create_iceberg_table(root)
     layer = _layer(
         DataSource(
             "events",
-            IcebergConfig(f"profile_{secret}", ("default",), "events"),
+            IcebergConfig("catalog", ("default",), "events"),
             _events_schema(),
             ("id",),
         )
     )
     profiles = MappingProfileResolver(
-        {f"profile_{secret}": {"type": "sql", "uri": f"sqlite:///{secret}/x.db"}}
+        {
+            "catalog": {
+                "type": "sql",
+                "uri": f"sqlite:///{db_path}",
+                "warehouse": f"file://{warehouse}",
+            }
+        }
     )
     return layer, profiles, MappingArrowProviderResolver({})
 
@@ -693,10 +691,15 @@ def _iceberg_layer(
 def _database_layer(
     secret: str, tmp_path: Path
 ) -> tuple[SemanticLayer, RuntimeProfileResolver, ArrowProviderResolver]:
+    sqlite_path = tmp_path / secret / "events.sqlite"
+    sqlite_path.parent.mkdir(parents=True)
+    with sqlite3.connect(sqlite_path) as connection:
+        connection.execute("CREATE TABLE events (id INTEGER, value INTEGER)")
+        connection.execute("INSERT INTO events VALUES (1, 1)")
     layer = _layer(
         DataSource(
             "events",
-            SqliteConfig(f"/nonexistent/{secret}/events.sqlite", "events"),
+            SqliteConfig(str(sqlite_path), "events"),
             _events_schema(),
             ("id",),
         )
@@ -709,7 +712,7 @@ def _database_layer(
     [
         ("arrow", lambda secret, tmp: _arrow_layer(secret)),
         ("delta", lambda secret, tmp: _delta_layer(secret, tmp)),
-        ("iceberg", lambda secret, tmp: _iceberg_layer(secret)),
+        ("iceberg", lambda secret, tmp: _iceberg_layer(secret, tmp)),
         ("database", lambda secret, tmp: _database_layer(secret, tmp)),
     ],
 )
@@ -733,6 +736,15 @@ def test_reload_failure_is_secret_free_across_connector_modes(
         # still the contract under test: no secret may escape initialization.
         _assert_no_secret_leak(caught, secret)
         return
+
+    if mode == "arrow":
+        registry._arrow_providers = MappingArrowProviderResolver({})
+    elif mode == "delta":
+        shutil.rmtree(tmp_path / secret / "delta")
+    elif mode == "iceberg":
+        (tmp_path / secret / "catalog.db").unlink()
+    else:
+        (tmp_path / secret / "events.sqlite").unlink()
 
     with pytest.raises(SourceReloadError) as caught:
         registry.reload_all()

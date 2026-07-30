@@ -22,7 +22,6 @@ in none of ``error.args``, ``repr(error)``, the formatted traceback,
 from __future__ import annotations
 
 import io
-import os
 import traceback
 import types
 from collections.abc import Callable, Mapping
@@ -39,23 +38,7 @@ from selayer.sources.profiles import (
     RuntimeProfile,
     RuntimeProfileResolver,
 )
-
-
-def require_docker() -> None:
-    """Skip locally without Docker, but fail loudly in CI."""
-
-    try:
-        import docker
-
-        available = bool(docker.from_env().ping())
-    except Exception:  # noqa: BLE001
-        available = False
-    if available:
-        return
-    if os.environ.get("CI") == "true":
-        raise RuntimeError("Docker is unavailable in CI")
-    pytest.skip("Docker daemon is not available")
-
+from tests.sources._docker import require_docker
 
 # ---------------------------------------------------------------------------
 # Secret sentinels
