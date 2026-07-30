@@ -729,6 +729,8 @@ class _SharedCounterAdapter:
         self.fail_register_on_call: int | None = None
         self.mutate_before_fail: bool = False
         self.fail_register_exception: BaseException | None = None
+        self.fail_inspect_source: str | None = None
+        self.close_lock_probe: object | None = None
         self.register_log: list[str] = []
         self.closed: list[str] = []
 
@@ -756,6 +758,8 @@ class _SharedCounterAdapter:
         )
 
     def inspect_schema(self, handle: SourceHandle) -> TableSchema:
+        if handle.source_id == self.fail_inspect_source:
+            raise RuntimeError("injected inspect failure")
         return handle.schema
 
     def register(
@@ -791,6 +795,8 @@ class _SharedCounterAdapter:
 
     def close(self, handle: SourceHandle) -> None:
         self.closed.append(handle.source_id)
+        if callable(self.close_lock_probe):
+            self.close_lock_probe()
 
 
 @dataclass
@@ -903,6 +909,31 @@ def test_reload_source_preserves_extension_dependency_error(
     # Old registration intact: generation unchanged, old data still queryable.
     assert registry.status("events").generation == 1
     assert connection.sql('SELECT sum("value") FROM "events"').fetchone() == (1,)
+
+
+def test_reload_all_inspect_failure_closes_all_candidates_after_unlock() -> None:
+    """A later inspect failure closes earlier and failing candidates safely."""
+
+    fixture = _build_multi_source(("alpha", "beta"))
+    registry, adapter = fixture.registry, fixture.adapter
+    lock_available: list[bool] = []
+
+    def probe_lock() -> None:
+        acquired = registry._lock.acquire(blocking=False)
+        lock_available.append(acquired)
+        if acquired:
+            registry._lock.release()
+
+    adapter.close_lock_probe = probe_lock
+    adapter.fail_inspect_source = "beta"
+
+    with pytest.raises(SourceReloadError) as caught:
+        registry.reload_all()
+
+    assert sorted(adapter.closed) == ["alpha", "beta"]
+    assert lock_available == [True, True]
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 def test_reload_all_preserves_extension_dependency_error() -> None:

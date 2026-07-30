@@ -487,6 +487,8 @@ class SourceRegistry:
                     unexpected_failure = True
 
                 if preparation_failure is not None:
+                    for adapter, candidate, _observed in candidates.values():
+                        cleanup.append((adapter, candidate))
                     if preparation_failure.extension_failure:
                         raise SourceDependencyError(
                             prepare_failed_source or "<source>",
