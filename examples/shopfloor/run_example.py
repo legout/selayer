@@ -42,6 +42,10 @@ def run_walkthrough(engine: QueryEngine, eol_test_runs: Path) -> None:
     try:
         engine.plan(["average_cycle_seconds", "eol_attempt_pass_rate"])
     except QueryPlanningError as error:
+        # Only the intentional mixed-grain rejection is expected here; any
+        # other planner error indicates a real problem and must propagate.
+        if error.code != "mixed_grain":
+            raise
         print(f"Expected mixed-grain rejection: {error.code}")
 
     before = engine.source_status("eol_test_runs")

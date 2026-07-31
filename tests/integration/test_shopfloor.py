@@ -67,7 +67,11 @@ def _temporary_shopfloor_catalog(tmp_path: Path, paths: ShopfloorDataPaths) -> P
             (_SCHEMA_DIR / Path(schema_ref).name).read_text(encoding="utf-8")
         )
     catalog_path = tmp_path / "shopfloor_semantic_layer.yaml"
-    catalog_path.write_text(yaml.safe_dump(catalog, sort_keys=False), encoding="utf-8")
+    # ``yaml.safe_dump`` is typed as ``str | bytes | None``; with only
+    # text-valued content and default (text) output it always returns ``str``.
+    catalog_path.write_text(
+        cast(str, yaml.safe_dump(catalog, sort_keys=False)), encoding="utf-8"
+    )
     return catalog_path
 
 
@@ -162,6 +166,34 @@ def test_walkthrough_prints_the_planner_boundary_and_reload(
     assert "Expected mixed-grain rejection: mixed_grain" in output
     assert "EOL source generation:" in output
     assert "EOL pass rate after Delta reload:" in output
+
+
+def test_run_walkthrough_propagates_non_mixed_grain_planning_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-mixed-grain QueryPlanningError must not be swallowed by run_walkthrough.
+
+    The walkthrough is only permitted to catch the intentional ``mixed_grain``
+    rejection; every other planner error must propagate. The engine ``plan``
+    boundary is monkeypatched to raise a deterministic ``unknown_metric`` error,
+    exercising the handler's re-raise path without changing ``src/selayer``.
+    """
+    paths = generate_shopfloor_data(tmp_path / "data")
+    layer = SemanticLayer.load(_temporary_shopfloor_catalog(tmp_path, paths))
+
+    with QueryEngine(layer) as engine:
+
+        def raise_unknown_metric(
+            metrics: list[str],
+            dimensions: list[str] | None = None,
+            filters: dict[str, object] | None = None,
+        ) -> None:
+            raise QueryPlanningError("unknown_metric", "simulated unknown metric")
+
+        monkeypatch.setattr(engine, "plan", raise_unknown_metric)
+
+        with pytest.raises(QueryPlanningError, match="unknown_metric"):
+            run_walkthrough(engine, paths.eol_test_runs)
 
 
 def test_main_prints_delta_setup_instruction(monkeypatch: pytest.MonkeyPatch) -> None:
