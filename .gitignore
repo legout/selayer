@@ -32,3 +32,6 @@ skills-lock.json
 # Generated query outputs
 country_x_quarter_*.csv
 polars_country_x_quarter_*.csv
+
+# Generated shop-floor example data
+examples/shopfloor/data/
