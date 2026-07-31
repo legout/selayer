@@ -415,7 +415,9 @@ It evaluates:
 
 The default selected set is every declared metric and dimension.
 
-A successful request records the anchor source, required sources, selected dimensions, and join relationship IDs. A failed request records the existing planner error code and no SQL.
+A compatible request records the anchor source, required sources, selected dimensions, and join relationship IDs. An incompatible request records the existing planner error code and no SQL.
+
+Compatibility outcomes use `status: passed` whenever the planner returned either a plan or a documented planning rejection. The evidence field `compatible` distinguishes those results. `failed` is reserved for a verification malfunction such as an invalid selector or unexpected planner error. A complete report may therefore contain incompatible query combinations and still exit successfully.
 
 The report does not evaluate all dimension pairs or every larger combination. It states its coverage explicitly. Consumers that need a particular multi-metric or multi-dimension query add it as an explicit query case.
 
