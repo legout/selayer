@@ -14,7 +14,8 @@ tasks always consume identical data:
 * ``eol_test_runs.delta``          - Delta Lake end-of-line test results
 
 No randomness, Faker, Pandas, current timestamps, or schema inference are used:
-every value is a literal so the resulting fixture is reproducible bit-for-bit.
+every value is a literal so the logical rows and the queried catalog metrics are
+reproducible/deterministic (Delta and database metadata may vary across runs).
 
 The data literals follow the deterministic fixture contract in
 ``docs/superpowers/plans/2026-07-31-shopfloor-example.md`` exactly, so the
