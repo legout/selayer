@@ -37,6 +37,10 @@ Run the complete example from the repository root:
 uv run python examples/e_commerce/selayer1.py
 ```
 
+For a multi-source manufacturing walkthrough with CSV, SQLite, DuckDB,
+Parquet, and Delta, see
+[`examples/shopfloor/README.md`](examples/shopfloor/README.md).
+
 ## Connectors, profiles, and reloads
 
 The source connector matrix is closed and catalog-driven:

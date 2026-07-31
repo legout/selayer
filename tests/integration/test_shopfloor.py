@@ -175,3 +175,16 @@ def test_main_prints_delta_setup_instruction(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(run_example, "generate_shopfloor_data", missing_delta)
     with pytest.raises(SystemExit, match="uv sync --extra delta"):
         run_example.main()
+
+
+def test_shopfloor_docs_match_the_runnable_contract() -> None:
+    repo = Path(__file__).parents[2]
+    shopfloor_readme = (repo / "examples/shopfloor/README.md").read_text(encoding="utf-8")
+    root_readme = (repo / "README.md").read_text(encoding="utf-8")
+
+    assert "uv sync --extra delta" in shopfloor_readme
+    assert "uv run python examples/shopfloor/run_example.py" in shopfloor_readme
+    assert "mixed_grain" in shopfloor_readme
+    assert "JSON" in shopfloor_readme
+    assert "DuckLake" in shopfloor_readme
+    assert "examples/shopfloor/README.md" in root_readme
