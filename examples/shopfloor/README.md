@@ -8,7 +8,7 @@ runs seven valid business questions, an intentional mixed-grain rejection, and a
 live Delta source reload.
 
 Everything is generated locally and produces deterministic logical data and
-results: the fixed literals and seed guarantee the same rows and metrics on
+results: the fixed literals guarantee the same rows and metrics on
 every run. (Delta transaction metadata is not byte-identical across writes, but
 the queried values are stable.) No cloud storage, credentials, Docker
 containers, or remote services are required.
