@@ -1,0 +1,7 @@
+fields:
+  - {name: customer_order_id, type: utf8, nullable: false}
+  - {name: customer_name, type: utf8, nullable: false}
+  - {name: customer_region, type: utf8, nullable: false}
+  - {name: requested_ship_date, type: date32, nullable: false}
+  - {name: product_model, type: utf8, nullable: false}
+  - {name: order_status, type: utf8, nullable: false}

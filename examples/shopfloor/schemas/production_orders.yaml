@@ -1,0 +1,8 @@
+fields:
+  - {name: production_order_id, type: utf8, nullable: false}
+  - {name: customer_order_id, type: utf8, nullable: false}
+  - {name: product_model, type: utf8, nullable: false}
+  - {name: routing, type: utf8, nullable: false}
+  - {name: planned_units, type: int64, nullable: false}
+  - {name: completed_units, type: int64, nullable: false}
+  - {name: schedule_status, type: utf8, nullable: false}

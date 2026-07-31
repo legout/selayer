@@ -1,0 +1,399 @@
+version: 1
+name: shopfloor
+label: Shop-floor Motor Drive Analytics
+description: Grain-aware semantic model for the deterministic shop-floor example
+
+data_sources:
+  customer_orders:
+    type: csv
+    location: examples/shopfloor/data/customer_orders.csv
+    schema_ref: schemas/customer_orders.yaml
+    grain: [customer_order_id]
+  production_orders:
+    type: sqlite
+    location: examples/shopfloor/data/production_orders.sqlite
+    relation: production_orders
+    schema_ref: schemas/production_orders.yaml
+    grain: [production_order_id]
+  serialized_drives:
+    type: duckdb
+    location: examples/shopfloor/data/shopfloor.duckdb
+    relation: serialized_drives
+    schema_ref: schemas/serialized_drives.yaml
+    grain: [serial_number]
+  component_consumption:
+    type: parquet
+    location: examples/shopfloor/data/component_consumption.parquet
+    schema_ref: schemas/component_consumption.yaml
+    grain: [serial_number, fitted_position]
+  component_lot_inspections:
+    type: parquet
+    location: examples/shopfloor/data/component_lot_inspections.parquet
+    schema_ref: schemas/component_lot_inspections.yaml
+    grain: [component_lot_id]
+  operation_executions:
+    type: parquet
+    location: examples/shopfloor/data/operation_executions.parquet
+    schema_ref: schemas/operation_executions.yaml
+    grain: [operation_execution_id]
+  machine_telemetry:
+    type: parquet
+    location: examples/shopfloor/data/machine_telemetry.parquet
+    schema_ref: schemas/machine_telemetry.yaml
+    grain: [machine_id, recorded_at]
+  eol_test_runs:
+    type: delta
+    location: examples/shopfloor/data/eol_test_runs.delta
+    schema_ref: schemas/eol_test_runs.yaml
+    grain: [eol_test_run_id]
+
+dimensions:
+  customer_region:
+    source: customer_orders
+    column: customer_region
+    data_type: string
+    description: Customer sales region
+  product_model:
+    source: production_orders
+    column: product_model
+    data_type: string
+    description: Drive product model
+  bom_revision:
+    source: serialized_drives
+    column: bom_revision
+    data_type: string
+    description: Bill-of-materials revision
+  firmware_revision:
+    source: serialized_drives
+    column: firmware_revision
+    data_type: string
+    description: Firmware revision flashed onto the drive
+  schedule_status:
+    source: production_orders
+    column: schedule_status
+    data_type: string
+    description: Production-order schedule status
+  routing:
+    source: production_orders
+    column: routing
+    data_type: string
+    description: Manufacturing routing
+  drive_serial_number:
+    source: component_consumption
+    column: serial_number
+    data_type: string
+    description: Drive serial number
+  component_lot_id:
+    source: component_consumption
+    column: component_lot_id
+    data_type: string
+    description: Component lot identifier
+  supplier_name:
+    source: component_lot_inspections
+    column: supplier_name
+    data_type: string
+    description: Component supplier
+  component_type:
+    source: component_lot_inspections
+    column: component_type
+    data_type: string
+    description: Component type
+  line_id:
+    source: operation_executions
+    column: line_id
+    data_type: string
+    description: Production line
+  machine_id:
+    source: operation_executions
+    column: machine_id
+    data_type: string
+    description: Machine identifier
+  shift:
+    source: operation_executions
+    column: shift
+    data_type: string
+    description: Work shift
+  operation_name:
+    source: operation_executions
+    column: operation_name
+    data_type: string
+    description: Operation name
+  station_id:
+    source: eol_test_runs
+    column: station_id
+    data_type: string
+    description: End-of-line test station
+  machine_state:
+    source: machine_telemetry
+    column: machine_state
+    data_type: string
+    description: Machine state sample
+  telemetry_line_id:
+    source: machine_telemetry
+    column: line_id
+    data_type: string
+    description: Production line observed by telemetry
+
+facts:
+  planned_units:
+    source: production_orders
+    expression: production_orders.planned_units
+    data_type: integer
+    description: Units planned on a production order
+  completed_units:
+    source: production_orders
+    expression: production_orders.completed_units
+    data_type: integer
+    description: Units completed on a production order
+  drive_serial_number:
+    source: serialized_drives
+    expression: serialized_drives.serial_number
+    data_type: string
+    description: Drive serial number registry key
+  shipped_drive_serial:
+    source: serialized_drives
+    expression: >-
+      if(serialized_drives.shipment_status = 'shipped',
+      serialized_drives.serial_number, null)
+    data_type: string
+    description: Serial number of a shipped drive
+  component_serial_number:
+    source: component_consumption
+    expression: component_consumption.component_serial_number
+    data_type: string
+    description: Fitted component serial number
+  inspected_component_lot:
+    source: component_lot_inspections
+    expression: component_lot_inspections.component_lot_id
+    data_type: string
+    description: Inspected component lot identifier
+  accepted_component_lot:
+    source: component_lot_inspections
+    expression: >-
+      if(component_lot_inspections.incoming_result = 'pass',
+      component_lot_inspections.component_lot_id, null)
+    data_type: string
+    description: Component lot that passed incoming inspection
+  operation_execution_id:
+    source: operation_executions
+    expression: operation_executions.operation_execution_id
+    data_type: string
+    description: Operation execution identifier
+  rework_operation_execution_id:
+    source: operation_executions
+    expression: >-
+      if(operation_executions.is_rework = true,
+      operation_executions.operation_execution_id, null)
+    data_type: string
+    description: Identifier of a rework operation execution
+  cycle_seconds:
+    source: operation_executions
+    expression: operation_executions.cycle_seconds
+    data_type: decimal
+    description: Operation cycle duration in seconds
+  energy_kwh:
+    source: operation_executions
+    expression: operation_executions.energy_kwh
+    data_type: decimal
+    description: Energy consumed by an operation in kWh
+  eol_test_run_id:
+    source: eol_test_runs
+    expression: eol_test_runs.eol_test_run_id
+    data_type: string
+    description: End-of-line test run identifier
+  passed_eol_test_run_id:
+    source: eol_test_runs
+    expression: >-
+      if(eol_test_runs.result = 'pass',
+      eol_test_runs.eol_test_run_id, null)
+    data_type: string
+    description: Identifier of a passing end-of-line test run
+  first_attempt_serial:
+    source: eol_test_runs
+    expression: if(eol_test_runs.attempt = 1, eol_test_runs.serial_number, null)
+    data_type: string
+    description: Drive serial number on its first end-of-line attempt
+  first_pass_serial:
+    source: eol_test_runs
+    expression: >-
+      if(eol_test_runs.is_first_pass = true,
+      eol_test_runs.serial_number, null)
+    data_type: string
+    description: Drive serial number that passed on the first attempt
+  telemetry_machine_id:
+    source: machine_telemetry
+    expression: machine_telemetry.machine_id
+    data_type: string
+    description: Machine identifier recorded by telemetry
+  alarm_machine_id:
+    source: machine_telemetry
+    expression: >-
+      if(machine_telemetry.machine_state = 'alarm',
+      machine_telemetry.machine_id, null)
+    data_type: string
+    description: Machine identifier during an alarm state
+  temperature_c:
+    source: machine_telemetry
+    expression: machine_telemetry.temperature_c
+    data_type: decimal
+    description: Recorded machine temperature in degrees Celsius
+
+measures:
+  total_planned_units:
+    fact: planned_units
+    aggregation: sum
+    description: Total planned units across production orders
+  total_completed_units:
+    fact: completed_units
+    aggregation: sum
+    description: Total completed units across production orders
+  shipped_units:
+    fact: shipped_drive_serial
+    aggregation: count_distinct
+    description: Distinct shipped drives
+  component_count_measure:
+    fact: component_serial_number
+    aggregation: count
+    description: Count of fitted components
+  inspected_component_lot_count:
+    fact: inspected_component_lot
+    aggregation: count_distinct
+    description: Distinct inspected component lots
+  accepted_component_lot_count:
+    fact: accepted_component_lot
+    aggregation: count_distinct
+    description: Distinct accepted component lots
+  operation_count_measure:
+    fact: operation_execution_id
+    aggregation: count_distinct
+    description: Distinct operation executions
+  rework_operation_count:
+    fact: rework_operation_execution_id
+    aggregation: count_distinct
+    description: Distinct rework operation executions
+  average_cycle_seconds_measure:
+    fact: cycle_seconds
+    aggregation: avg
+    description: Average operation cycle seconds
+  total_operation_energy_kwh:
+    fact: energy_kwh
+    aggregation: sum
+    description: Total operation energy in kWh
+  eol_attempt_count:
+    fact: eol_test_run_id
+    aggregation: count_distinct
+    description: Distinct end-of-line attempts
+  passed_eol_attempt_count:
+    fact: passed_eol_test_run_id
+    aggregation: count_distinct
+    description: Distinct passing end-of-line attempts
+  first_attempt_unit_count:
+    fact: first_attempt_serial
+    aggregation: count_distinct
+    description: Distinct drives with a first end-of-line attempt
+  first_pass_unit_count:
+    fact: first_pass_serial
+    aggregation: count_distinct
+    description: Distinct drives passing on the first attempt
+  telemetry_event_count:
+    fact: telemetry_machine_id
+    aggregation: count
+    description: Count of telemetry events
+  alarm_event_count_measure:
+    fact: alarm_machine_id
+    aggregation: count
+    description: Count of alarm telemetry events
+  average_temperature_c_measure:
+    fact: temperature_c
+    aggregation: avg
+    description: Average machine temperature in degrees Celsius
+
+metrics:
+  production_completion_rate:
+    expression: total_completed_units / nullif(total_planned_units, 0)
+    measures: [total_completed_units, total_planned_units]
+    description: Completed units as a share of planned units
+  shipped_unit_count:
+    expression: shipped_units
+    measures: [shipped_units]
+    description: Number of shipped drives
+  component_count:
+    expression: component_count_measure
+    measures: [component_count_measure]
+    description: Number of fitted components
+  incoming_acceptance_rate:
+    expression: >-
+      accepted_component_lot_count /
+      nullif(inspected_component_lot_count, 0)
+    measures: [accepted_component_lot_count, inspected_component_lot_count]
+    description: Accepted lots as a share of inspected lots
+  average_cycle_seconds:
+    expression: average_cycle_seconds_measure
+    measures: [average_cycle_seconds_measure]
+    description: Average operation cycle seconds
+  operation_count:
+    expression: operation_count_measure
+    measures: [operation_count_measure]
+    description: Number of operation executions
+  rework_rate:
+    expression: rework_operation_count / nullif(operation_count_measure, 0)
+    measures: [rework_operation_count, operation_count_measure]
+    description: Rework operations as a share of all operations
+  energy_per_operation_kwh:
+    expression: total_operation_energy_kwh / nullif(operation_count_measure, 0)
+    measures: [total_operation_energy_kwh, operation_count_measure]
+    description: Average energy per operation in kWh
+  eol_attempt_pass_rate:
+    expression: passed_eol_attempt_count / nullif(eol_attempt_count, 0)
+    measures: [passed_eol_attempt_count, eol_attempt_count]
+    description: Passing end-of-line attempts as a share of all attempts
+  first_pass_yield:
+    expression: first_pass_unit_count / nullif(first_attempt_unit_count, 0)
+    measures: [first_pass_unit_count, first_attempt_unit_count]
+    description: First-pass yield across drives
+  alarm_event_count:
+    expression: alarm_event_count_measure
+    measures: [alarm_event_count_measure]
+    description: Number of alarm telemetry events
+  average_temperature_c:
+    expression: average_temperature_c_measure
+    measures: [average_temperature_c_measure]
+    description: Average machine temperature in degrees Celsius
+
+relationships:
+  customer_orders_production_orders:
+    source: customer_orders
+    target: production_orders
+    type: one_to_many
+    source_column: customer_order_id
+    target_column: customer_order_id
+  production_orders_serialized_drives:
+    source: production_orders
+    target: serialized_drives
+    type: one_to_many
+    source_column: production_order_id
+    target_column: production_order_id
+  serialized_drives_component_consumption:
+    source: serialized_drives
+    target: component_consumption
+    type: one_to_many
+    source_column: serial_number
+    target_column: serial_number
+  component_lot_inspections_component_consumption:
+    source: component_lot_inspections
+    target: component_consumption
+    type: one_to_many
+    source_column: component_lot_id
+    target_column: component_lot_id
+  serialized_drives_operation_executions:
+    source: serialized_drives
+    target: operation_executions
+    type: one_to_many
+    source_column: serial_number
+    target_column: serial_number
+  serialized_drives_eol_test_runs:
+    source: serialized_drives
+    target: eol_test_runs
+    type: one_to_many
+    source_column: serial_number
+    target_column: serial_number

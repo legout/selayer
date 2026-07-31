@@ -1,0 +1,8 @@
+fields:
+  - {name: serial_number, type: utf8, nullable: false}
+  - {name: production_order_id, type: utf8, nullable: false}
+  - {name: product_model, type: utf8, nullable: false}
+  - {name: bom_revision, type: utf8, nullable: false}
+  - {name: firmware_revision, type: utf8, nullable: false}
+  - {name: completion_status, type: utf8, nullable: false}
+  - {name: shipment_status, type: utf8, nullable: false}

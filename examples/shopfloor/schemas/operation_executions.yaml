@@ -1,0 +1,13 @@
+fields:
+  - {name: operation_execution_id, type: utf8, nullable: false}
+  - {name: serial_number, type: utf8, nullable: false}
+  - {name: operation_name, type: utf8, nullable: false}
+  - {name: line_id, type: utf8, nullable: false}
+  - {name: machine_id, type: utf8, nullable: false}
+  - {name: shift, type: utf8, nullable: false}
+  - {name: cycle_seconds, type: float64, nullable: false}
+  - {name: energy_kwh, type: float64, nullable: false}
+  - {name: max_torque_nm, type: float64, nullable: false}
+  - {name: max_temperature_c, type: float64, nullable: false}
+  - {name: result, type: utf8, nullable: false}
+  - {name: is_rework, type: boolean, nullable: false}

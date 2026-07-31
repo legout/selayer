@@ -1,0 +1,10 @@
+fields:
+  - {name: machine_id, type: utf8, nullable: false}
+  - name: recorded_at
+    type:
+      timestamp: {unit: ns}
+    nullable: false
+  - {name: line_id, type: utf8, nullable: false}
+  - {name: machine_state, type: utf8, nullable: false}
+  - {name: temperature_c, type: float64, nullable: false}
+  - {name: power_kw, type: float64, nullable: false}

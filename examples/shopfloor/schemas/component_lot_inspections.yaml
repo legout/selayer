@@ -1,0 +1,6 @@
+fields:
+  - {name: component_lot_id, type: utf8, nullable: false}
+  - {name: supplier_name, type: utf8, nullable: false}
+  - {name: component_type, type: utf8, nullable: false}
+  - {name: incoming_result, type: utf8, nullable: false}
+  - {name: disposition, type: utf8, nullable: false}

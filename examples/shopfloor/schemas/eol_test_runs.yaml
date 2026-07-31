@@ -1,0 +1,10 @@
+fields:
+  - {name: eol_test_run_id, type: utf8, nullable: false}
+  - {name: serial_number, type: utf8, nullable: false}
+  - {name: station_id, type: utf8, nullable: false}
+  - {name: attempt, type: int64, nullable: false}
+  - {name: result, type: utf8, nullable: false}
+  - {name: is_first_pass, type: boolean, nullable: false}
+  - {name: input_voltage_v, type: float64, nullable: false}
+  - {name: output_voltage_v, type: float64, nullable: false}
+  - {name: power_w, type: float64, nullable: false}

@@ -1,0 +1,6 @@
+fields:
+  - {name: serial_number, type: utf8, nullable: false}
+  - {name: fitted_position, type: utf8, nullable: false}
+  - {name: component_part_number, type: utf8, nullable: false}
+  - {name: component_serial_number, type: utf8, nullable: false}
+  - {name: component_lot_id, type: utf8, nullable: false}
