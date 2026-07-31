@@ -666,3 +666,25 @@ def _write_eol_test_runs(path: Path) -> None:
     # table is materialised against it so no schema inference occurs.
     table = pa.Table.from_pylist(_EOL_TEST_RUNS, schema=_EOL_SCHEMA)
     write_deltalake(str(path), table, mode="overwrite")
+
+
+def append_eol_retest(delta_path: Path) -> None:
+    """Append the deterministic DRV-003 passing second EOL attempt."""
+    _delta_writer()(
+        delta_path,
+        pa.Table.from_pylist(
+            [{
+                "eol_test_run_id": "EOL-004",
+                "serial_number": "DRV-003",
+                "station_id": "EOL-1",
+                "attempt": 2,
+                "result": "pass",
+                "is_first_pass": False,
+                "input_voltage_v": 400.0,
+                "output_voltage_v": 400.2,
+                "power_w": 752.0,
+            }],
+            schema=_EOL_SCHEMA,
+        ),
+        mode="append",
+    )

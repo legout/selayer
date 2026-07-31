@@ -21,9 +21,12 @@ import yaml
 from deltalake import DeltaTable
 
 from examples.shopfloor.generate_data import (
+    DeltaDependencyError,
     ShopfloorDataPaths,
+    append_eol_retest,
     generate_shopfloor_data,
 )
+from examples.shopfloor.run_example import run_walkthrough
 from selayer import QueryEngine, QueryPlanningError, SemanticLayer
 
 _REPO = Path(__file__).parents[2]
@@ -123,3 +126,52 @@ def test_shopfloor_catalog_answers_documented_questions(tmp_path: Path) -> None:
             engine.plan(["average_cycle_seconds", "eol_attempt_pass_rate"])
 
     assert caught.value.code == "mixed_grain"
+
+
+def test_delta_retest_reload_changes_only_attempt_rate(tmp_path: Path) -> None:
+    paths = generate_shopfloor_data(tmp_path / "data")
+    layer = SemanticLayer.load(_temporary_shopfloor_catalog(tmp_path, paths))
+
+    with QueryEngine(layer) as engine:
+        before_status = engine.source_status("eol_test_runs")
+        before = engine.query(["eol_attempt_pass_rate", "first_pass_yield"])
+        append_eol_retest(paths.eol_test_runs)
+        reload = engine.reload_source("eol_test_runs")
+        after = engine.query(["eol_attempt_pass_rate", "first_pass_yield"])
+
+    assert reload.old_generation == before_status.generation
+    assert reload.new_generation == before_status.generation + 1
+    assert before["eol_attempt_pass_rate"].item() == pytest.approx(2 / 3)
+    assert after["eol_attempt_pass_rate"].item() == pytest.approx(3 / 4)
+    assert before["first_pass_yield"].item() == pytest.approx(2 / 3)
+    assert after["first_pass_yield"].item() == pytest.approx(2 / 3)
+
+
+def test_walkthrough_prints_the_planner_boundary_and_reload(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    paths = generate_shopfloor_data(tmp_path / "data")
+    layer = SemanticLayer.load(_temporary_shopfloor_catalog(tmp_path, paths))
+
+    with QueryEngine(layer) as engine:
+        run_walkthrough(engine, paths.eol_test_runs)
+
+    output = capsys.readouterr().out
+    assert "Production completion rate:" in output
+    assert "Component genealogy for DRV-003:" in output
+    assert "Expected mixed-grain rejection: mixed_grain" in output
+    assert "EOL source generation:" in output
+    assert "EOL pass rate after Delta reload:" in output
+
+
+def test_main_prints_delta_setup_instruction(monkeypatch: pytest.MonkeyPatch) -> None:
+    from examples.shopfloor import run_example
+
+    def missing_delta(_: Path) -> ShopfloorDataPaths:
+        raise DeltaDependencyError(
+            "Delta support is required for the shop-floor example; run: uv sync --extra delta"
+        )
+
+    monkeypatch.setattr(run_example, "generate_shopfloor_data", missing_delta)
+    with pytest.raises(SystemExit, match="uv sync --extra delta"):
+        run_example.main()
