@@ -255,12 +255,13 @@ Raw discovery artifacts live under an ignored project directory:
 │   ├── reference-drafts/
 │   ├── overlay-drafts/
 │   └── verification.json
-└── approvals.jsonl
+├── approvals.jsonl
+└── exports/<batch-hash>/
 ```
 
-The local workspace may contain normalized source text, redacted values, complete interview answers, provider snapshots, model drafts, and recovery backups. It is never committed.
+The local workspace may contain normalized source text, redacted values, complete interview answers, provider snapshots, model drafts, approved-summary previews, and recovery backups. It is never committed.
 
-Approved summaries export to a configured versioned directory, defaulting to:
+Successful apply publishes the attested approved summary to a configured versioned directory, defaulting to:
 
 ```text
 semantic_changes/<date>-<slug>/
@@ -398,15 +399,15 @@ class SourceScanSession(Protocol):
 
     def recheck_snapshot(self) -> bool: ...
 
+    def cancel(self) -> None: ...
+
 
 SourceRegistry.open_scan_session(
     source_name,
-    *,
-    runtime_profile,
 ) -> ContextManager[SourceScanSession]
 ```
 
-The interface exposes typed batches and snapshot metadata, not a raw connector handle or arbitrary SQL. Adapters remain responsible for connection setup, runtime credentials, schema normalization, transaction lifetime, cancellation, and cleanup. Profiling algorithms remain in `selayer-discovery`; this does not add profiling to the verification orchestrator.
+The interface exposes typed batches and snapshot metadata, not a raw connector handle or arbitrary SQL. A registry is already constructed with its `RuntimeProfileResolver`; scan sessions use that resolver and cannot override credentials per call. Discovery creates a dedicated registry and connection for profiling so its full-session lock does not block query execution or verification on an application registry. Adapters remain responsible for connection setup, runtime credentials, schema normalization, transaction lifetime, cancellation, and cleanup. Profiling algorithms remain in `selayer-discovery`; this does not add profiling to the verification orchestrator.
 
 The aggregate profile performs a full exact scan and records:
 
@@ -773,7 +774,7 @@ selayer-discovery intake add-document|add-provider|snapshot
 selayer-discovery profile scan|propose-policy|activate-policy|export-context
 selayer-discovery interview ask|answer|correct|set-gate
 selayer-discovery evidence add-claim|add-conflict|resolve-conflict
-selayer-discovery proposal import|show|verify|attest|prepare-apply|attest-apply|export|apply
+selayer-discovery proposal import|show|verify|attest|prepare-apply|attest-apply|export-preview|apply
 selayer-discovery recover
 ```
 
@@ -806,7 +807,7 @@ The skill follows this order:
 13. obtain group decisions from the named approver;
 14. prepare an explicit dependency-closed, non-overlapping apply batch;
 15. show the combined candidate and verification, then obtain the named apply-batch attestation;
-16. export approved summaries;
+16. render the attested approved-summary preview inside the ignored session;
 17. invoke apply only after a separate explicit user request;
 18. show changed files and verification results without committing them.
 
@@ -1059,7 +1060,7 @@ No acceptance test calls a live model.
 
 ### Stage 5: attestation, export, apply, and recovery
 
-- Add named group decisions, dependency-closed batch preparation, batch attestation, and approved-summary export.
+- Add named group decisions, dependency-closed batch preparation, batch attestation, ignored approved-summary preview, and apply-time summary publication.
 - Add project locking, fsynced write-ahead recovery journals, hash-guarded rollback, idempotent recovery, and explicit apply.
 - Complete the Agent Skill approval and apply flow.
 
