@@ -1518,8 +1518,16 @@ class _QueryScopedRecordingAdapter:
         self._table = table
         self.bind_calls: list[SourceScanRequirement] = []
         self.cleanup_calls: int = 0
+        self.close_calls: int = 0
         self.fail_source: str | None = None
         self.fail_cleanup_source: str | None = None
+        # When set, ``bind_query`` returns ``None`` for the matching source so
+        # the registry exercises the fallback ``prepare``/``register`` path.
+        self.fallback_source: str | None = None
+        # When set, ``register`` raises for the matching (stable) source name.
+        # Set after registry creation so it only fires on the fallback
+        # registration, not the create-time persistent registration.
+        self.fail_register_source: str | None = None
 
     def prepare(
         self,
@@ -1543,7 +1551,12 @@ class _QueryScopedRecordingAdapter:
     def register(
         self, connection: object, stable_name: str, handle: SourceHandle
     ) -> None:
-        del connection, stable_name, handle
+        del connection, handle
+        if (
+            self.fail_register_source is not None
+            and stable_name == self.fail_register_source
+        ):
+            raise RuntimeError("s3://user:secret@example/private")
 
     def bind_query(
         self,
@@ -1552,6 +1565,12 @@ class _QueryScopedRecordingAdapter:
         requirement: SourceScanRequirement,
     ) -> QueryBinding | None:
         self.bind_calls.append(requirement)
+        if (
+            self.fallback_source is not None
+            and handle.source_id == self.fallback_source
+        ):
+            # Force the registry's fallback ``prepare``/``register`` path.
+            return None
         if self.fail_source is not None and handle.source_id == self.fail_source:
             raise RuntimeError("s3://user:secret@example/private")
         reader = handle.resource.select(list(requirement.columns))  # type: ignore[union-attr]
@@ -1579,6 +1598,7 @@ class _QueryScopedRecordingAdapter:
 
     def close(self, handle: SourceHandle) -> None:
         del handle
+        self.close_calls += 1
 
 
 def _events_schema_with_grain() -> TableSchema:
@@ -1746,6 +1766,55 @@ def test_bind_requirements_sanitizes_cleanup_failure_and_preserves_cleanup() -> 
         # ``beta`` failed first (recorded), then ``alpha`` still ran.
         assert adapter.cleanup_calls == 2
         # The lock is released even on the cleanup-failure path.
+        assert registry._lock.acquire(blocking=False)
+        registry._lock.release()
+    finally:
+        registry.close()
+
+
+def test_bind_requirements_closes_fresh_handle_when_register_fails() -> None:
+    """A fallback ``prepare`` that succeeds but a ``register`` that fails leaks.
+
+    For ``beta`` the adapter's ``bind_query`` returns ``None``, so the registry
+    takes the fallback ``prepare``/``register`` path; ``register`` then raises a
+    raw error carrying a fake credential.  The freshly-prepared handle must be
+    closed (no leak) and any partial registration defensively unregistered in
+    the cleanup, while the already-bound ``alpha`` binding still cleans up
+    (reverse order preserved), the registry lock is released, and the failure
+    surfaces as a sanitized ``SourceConnectionError`` (code ``bind_failed``)
+    raised outside the except scope (``__cause__``/``__context__`` ``None``).
+    """
+
+    adapter = _QueryScopedRecordingAdapter(pa.table({}))
+    adapter.fallback_source = "beta"
+    registry = _build_query_scoped_registry(adapter, ("alpha", "beta"))
+    # Set after creation so create-time registration succeeds and only the
+    # fallback registration during binding raises.
+    adapter.fail_register_source = "beta"
+    try:
+        credential = "s3://user:secret@example/private"
+        requirements = {
+            "alpha": SourceScanRequirement(columns=("machine_id", "recorded_at")),
+            "beta": SourceScanRequirement(columns=("machine_id", "recorded_at")),
+        }
+        with (
+            pytest.raises(SourceConnectionError) as caught,
+            registry.bind_requirements(requirements),
+        ):
+            pytest.fail("body should not run when binding fails")
+        assert caught.value.code == "bind_failed"
+        assert caught.value.source_id == "beta"
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        assert credential not in str(caught.value)
+        assert credential not in repr(caught.value)
+        assert "secret" not in str(caught.value)
+        assert "secret" not in repr(caught.value)
+        # The already-bound ``alpha`` binding still cleaned up (reverse order).
+        assert adapter.cleanup_calls == 1
+        # The freshly-prepared ``beta`` handle was closed: no leak.
+        assert adapter.close_calls == 1
+        # The lock is released even on the failure path.
         assert registry._lock.acquire(blocking=False)
         registry._lock.release()
     finally:

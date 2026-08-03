@@ -717,8 +717,13 @@ class SourceRegistry:
                     fresh = adapter.prepare(
                         source, self._profiles, self._arrow_providers
                     )
-                    adapter.register(self._connection, source_id, fresh)
+                    # Track the fresh handle *before* registration so a
+                    # ``register`` failure still closes it (the ``finally``
+                    # cleanup runs ``unregister_quietly`` for any partial
+                    # registration and ``close_quietly`` for the handle) instead
+                    # of leaking the freshly-prepared resource.
                     prepared.append((adapter, fresh, source_id))
+                    adapter.register(self._connection, source_id, fresh)
                 except Exception:  # noqa: BLE001
                     # Catch every raw binding-stage exception (PyIceberg scan
                     # failure, Arrow reader failure, DuckDB registration
