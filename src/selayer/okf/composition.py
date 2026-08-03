@@ -15,6 +15,7 @@ links, and links that lexically escape the bundle root.
 
 from __future__ import annotations
 
+import os
 import posixpath
 import stat as stat_module
 from collections.abc import Mapping
@@ -32,7 +33,7 @@ from .document import (
     _FRONTMATTER,
     _LINK,
     OkfDocumentError,
-    parse_concept,
+    parse_concept_text,
     split_sections,
 )
 from .generation import concept_path, display_title
@@ -66,6 +67,11 @@ _MAX_FILES = 1_000
 _MAX_FILE_BYTES = 1_048_576
 _MAX_TOTAL_BYTES = 16_777_216
 _MAX_LINKS_PER_FILE = 1_000
+# ``O_NOFOLLOW`` refuses to open a path that is a symlink at open time, closing
+# the lstat->open window. It is present on every supported (POSIX) platform;
+# the ``getattr`` fallback keeps the module importable elsewhere.
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_READ_CHUNK = 1 << 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,7 +217,9 @@ def _reject_duplicate_keys(
                     raise OkfDocumentError("YAML merge keys are not supported")
                 key = key_node.value
                 if key in seen:
-                    raise OkfDocumentError(f"duplicate frontmatter key '{key}'")
+                    # Fixed message: a key name is attacker-controlled and may
+                    # carry a secret token, so it is never interpolated.
+                    raise OkfDocumentError("duplicate frontmatter key")
                 seen.add(key)
             else:
                 # A complex (non-scalar) mapping key; recurse into it too.
@@ -250,9 +258,48 @@ def _compose_frontmatter(text: str) -> dict[str, Any]:
     return loaded
 
 
-def _read_text(path: Path, relative: str) -> str:
+def _safe_read_text(path: Path, root: Path, relative: str) -> str:
+    """Read a trusted input file with an immediate re-validation of the lstat.
+
+    ``_walk_inputs`` lstat-checks every entry during enumeration, but the file
+    is read later. This closes that time-of-check/time-of-use window: the path
+    is re-checked with ``lstat`` immediately before opening, the open refuses
+    to follow a symlink (``O_NOFOLLOW``) so a regular file swapped for a
+    symlink after the walk cannot be followed out of the root, and ``fstat``
+    on the opened descriptor confirms it is still a regular file. Any detected
+    replacement raises a safe domain error rather than reading
+    attacker-controlled content. Lexical containment is re-checked as a
+    defensive string-level guard.
+    """
     try:
-        return path.read_text(encoding="utf-8").replace("\r\n", "\n")
+        path.relative_to(root)
+    except ValueError as error:
+        raise OkfDocumentError(f"path escapes input root: '{relative}'") from error
+    try:
+        info = path.lstat()
+    except OSError as error:
+        raise OkfDocumentError(f"cannot stat '{relative}'") from error
+    if stat_module.S_ISLNK(info.st_mode) or not stat_module.S_ISREG(info.st_mode):
+        raise OkfDocumentError(f"input file was replaced: '{relative}'")
+    try:
+        fd = os.open(path, os.O_RDONLY | _O_NOFOLLOW)
+    except OSError as error:
+        # A symlink swapped in between the lstat above and the open surfaces
+        # here (ELOOP under O_NOFOLLOW); never follow it.
+        raise OkfDocumentError(f"input file was replaced: '{relative}'") from error
+    try:
+        if not stat_module.S_ISREG(os.fstat(fd).st_mode):
+            raise OkfDocumentError(f"input file was replaced: '{relative}'")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, _READ_CHUNK)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    try:
+        return b"".join(chunks).decode("utf-8").replace("\r\n", "\n")
     except UnicodeDecodeError as error:
         raise OkfDocumentError(f"invalid UTF-8 in '{relative}'") from error
 
@@ -284,11 +331,15 @@ def load_references(root: Path) -> Mapping[str, OkfConcept]:
                 _issue(relative_posix, f"reserved path '{path.name}' is not allowed")
             )
             continue
-        text = _read_text(path, relative_posix)
-        # Duplicate-key-safe composition before parse_concept re-parses, so
-        # malformed or duplicate-keyed frontmatter is reported with a fixed,
-        # secret-safe message and never reaches parse_concept's error path
-        # (which would otherwise forward PyYAML's source-bearing diagnostic).
+        # Read once with an immediate re-validation of the walk's lstat
+        # (TOCTOU-safe: O_NOFOLLOW + fstat refuse a symlink or file-type swap
+        # made after the walk), then parse the concept from this in-memory text
+        # so parse_concept never re-opens the path.
+        text = _safe_read_text(path, input_root, relative_posix)
+        # Duplicate-key-safe composition before parsing, so malformed or
+        # duplicate-keyed frontmatter is reported with a fixed, secret-safe
+        # message and never reaches parse_concept_text's source-bearing path
+        # (which would otherwise forward PyYAML's diagnostic).
         frontmatter_match = _FRONTMATTER.match(text)
         if frontmatter_match is not None:
             try:
@@ -297,11 +348,7 @@ def load_references(root: Path) -> Mapping[str, OkfConcept]:
                 issues.append(_issue(relative_posix, str(error)))
                 continue
         try:
-            concept = parse_concept(path, base)
-        except UnicodeDecodeError as error:
-            raise OkfDocumentError(
-                f"invalid UTF-8 in '{relative_posix}'"
-            ) from error
+            concept = parse_concept_text(text, path, base)
         except OkfDocumentError as error:
             issues.append(_issue(relative_posix, str(error)))
             continue
@@ -442,7 +489,7 @@ def load_overlays(root: Path, layer: SemanticLayer) -> tuple[OkfOverlay, ...]:
                 _issue(relative_posix, f"reserved path '{path.name}' is not allowed")
             )
             continue
-        text = _read_text(path, relative_posix)
+        text = _safe_read_text(path, input_root, relative_posix)
         try:
             frontmatter, preamble, sections, links = _parse_overlay(text)
         except OkfDocumentError as error:

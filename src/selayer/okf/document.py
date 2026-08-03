@@ -53,8 +53,15 @@ class _FrontmatterLayout:
     spans: Mapping[str, tuple[int, int]]
 
 
-def parse_concept(path: Path, root: Path) -> OkfConcept:
-    text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+def parse_concept_text(text: str, path: Path, root: Path) -> OkfConcept:
+    """Parse a concept from already-read ``text`` without re-opening ``path``.
+
+    Splitting the parse off the read lets callers validate the file open
+    themselves (for example closing a time-of-check/time-of-use window on a
+    symlink swap) and then parse the in-memory text, instead of having this
+    helper re-open the path. ``path``/``root`` are used only to compute the
+    concept's relative path; the bytes are never read here.
+    """
     match = _FRONTMATTER.match(text)
     if match is None:
         raise OkfDocumentError("missing YAML frontmatter")
@@ -78,6 +85,11 @@ def parse_concept(path: Path, root: Path) -> OkfConcept:
         )
     except OkfMetadataError as error:
         raise OkfDocumentError("cyclic YAML frontmatter is not supported") from error
+
+
+def parse_concept(path: Path, root: Path) -> OkfConcept:
+    text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+    return parse_concept_text(text, path, root)
 
 
 def _fence_marker(line: str) -> str | None:
@@ -388,6 +400,7 @@ __all__ = [
     "generated_fingerprint",
     "merge_generated_concept_text",
     "parse_concept",
+    "parse_concept_text",
     "render_concept",
     "split_sections",
 ]

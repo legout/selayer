@@ -692,3 +692,138 @@ def test_duplicate_overlay_id_flagged_even_when_paths_differ(
     ]
     assert duplicate_issues, "expected a true duplicate-ID diagnostic"
     assert all("metric.gross_margin" in issue.message for issue in duplicate_issues)
+
+
+# ---------------------------------------------------------------------------
+# TOCTOU hardening: a regular file enumerated by the walk must not be followed
+# as a symlink if it is replaced before the read.
+# ---------------------------------------------------------------------------
+
+
+def test_safe_read_text_rejects_symlink_replacement(tmp_path: Path) -> None:
+    references = _references(tmp_path)
+    target = tmp_path / "outside.md"
+    target.write_text("SECRET-VALUE-DO-NOT-LEAK", encoding="utf-8")
+    link = references / "link.md"
+    link.symlink_to(target)
+    # The safe reader must refuse the symlink outright (replacement detected)
+    # and never follow it to read the secret-bearing target.
+    with pytest.raises(OkfDocumentError) as exc:
+        composition._safe_read_text(link, references, "link.md")
+    assert "replaced" in str(exc.value)
+    assert "SECRET-VALUE-DO-NOT-LEAK" not in str(exc.value)
+
+
+def test_reference_file_replaced_with_symlink_after_walk_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    references = _references(tmp_path)
+    target = tmp_path / "secret.md"
+    target.write_text("SECRET-VALUE-DO-NOT-LEAK", encoding="utf-8")
+    guide = references / "guide.md"
+    _write(guide, REFERENCE)
+    real_walk = composition._walk_inputs
+
+    def swapping_walk(root: Path) -> list[Path]:
+        files = real_walk(root)
+        # Swap the regular file for an escaping symlink AFTER the walk's lstat
+        # validated it as a regular file (the TOCTOU window) but before read.
+        guide.unlink()
+        guide.symlink_to(target)
+        return files
+
+    monkeypatch.setattr(composition, "_walk_inputs", swapping_walk)
+    with pytest.raises(OkfDocumentError) as exc:
+        load_references(references)
+    assert "replaced" in str(exc.value)
+    assert "SECRET-VALUE-DO-NOT-LEAK" not in str(exc.value)
+
+
+def test_overlay_file_replaced_with_symlink_after_walk_is_rejected(
+    tmp_path: Path, valid_layer: SemanticLayer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    overlays = _overlays_root(tmp_path)
+    target = tmp_path / "secret.md"
+    target.write_text("SECRET-VALUE-DO-NOT-LEAK", encoding="utf-8")
+    overlay = overlays / "metrics" / "gross_margin.md"
+    _write(overlay, OVERLAY)
+    real_walk = composition._walk_inputs
+
+    def swapping_walk(root: Path) -> list[Path]:
+        files = real_walk(root)
+        overlay.unlink()
+        overlay.symlink_to(target)
+        return files
+
+    monkeypatch.setattr(composition, "_walk_inputs", swapping_walk)
+    with pytest.raises(OkfDocumentError) as exc:
+        load_overlays(overlays, valid_layer)
+    assert "replaced" in str(exc.value)
+    assert "SECRET-VALUE-DO-NOT-LEAK" not in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Secret-safe duplicate-key diagnostics: a key name is attacker-controlled
+# and may carry a secret token, so it must never be interpolated.
+# ---------------------------------------------------------------------------
+
+
+def test_overlay_duplicate_key_name_is_not_leaked(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    overlays = _overlays_root(tmp_path)
+    _write(
+        overlays / "metrics" / "gross_margin.md",
+        "---\n"
+        "selayer_id: metric.gross_margin\n"
+        "secret_token_hunter2: a\n"
+        "secret_token_hunter2: b\n"
+        "---\n\n# Usage Guidance\nx\n",
+    )
+    with pytest.raises(OkfValidationError) as exc:
+        load_overlays(overlays, valid_layer)
+    messages = " ".join(issue.message for issue in exc.value.issues)
+    assert "hunter2" not in messages
+    assert "duplicate frontmatter key" in messages
+
+
+def test_reference_duplicate_key_name_is_not_leaked(tmp_path: Path) -> None:
+    references = _references(tmp_path)
+    _write(
+        references / "guide.md",
+        "---\n"
+        "type: Reference\n"
+        "title: Guide\n"
+        "secret_token_hunter2: a\n"
+        "secret_token_hunter2: b\n"
+        "---\n\n# Guidance\n",
+    )
+    with pytest.raises(OkfValidationError) as exc:
+        load_references(references)
+    messages = " ".join(issue.message for issue in exc.value.issues)
+    assert "hunter2" not in messages
+    assert "duplicate frontmatter key" in messages
+
+
+def test_overlay_nested_duplicate_key_name_is_not_leaked(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    overlays = _overlays_root(tmp_path)
+    # A duplicate key buried inside a nested mapping; recursive detection must
+    # still fire, and the secret-bearing key name must not appear in the fix.
+    _write(
+        overlays / "metrics" / "gross_margin.md",
+        "---\n"
+        "selayer_id: metric.gross_margin\n"
+        "sources:\n"
+        "- secret_field_hunter2: a\n"
+        "  secret_field_hunter2: b\n"
+        "---\n\n# Usage Guidance\nx\n",
+    )
+    with pytest.raises(OkfValidationError) as exc:
+        load_overlays(overlays, valid_layer)
+    messages = " ".join(issue.message for issue in exc.value.issues)
+    assert "hunter2" not in messages
+    assert any(
+        "duplicate frontmatter key" in issue.message for issue in exc.value.issues
+    )
