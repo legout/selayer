@@ -1,6 +1,7 @@
 # src/selayer/verification/model.py
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -61,16 +62,23 @@ def _canonical_sort_key(value: Any) -> tuple[Any, ...]:
 def _freeze_evidence(value: object) -> object:
     """Recursively freeze evidence into immutable, deterministic structures.
 
-    Mappings become ``MappingProxyType``. Ordered sequences (``list``/``tuple``)
-    become ``tuple`` while preserving the caller's order exactly — they are
-    *not* reordered. Unordered collections (``set``/``frozenset``) become a
-    ``tuple`` whose members are ordered by :func:`_canonical_sort_key`, so the
-    result is deterministic and hash-seed independent. Scalars are returned
-    unchanged.
+    Mappings become ``MappingProxyType`` whose keys are reordered by
+    :func:`_canonical_sort_key`, so serialised output is hash-seed independent
+    even when the source mapping was built from an unordered input; mapping
+    values are preserved and recursively frozen. Ordered sequences
+    (``list``/``tuple``) become ``tuple`` while preserving the caller's order
+    exactly — they are *not* reordered. Unordered collections
+    (``set``/``frozenset``) become a ``tuple`` whose members are ordered by
+    :func:`_canonical_sort_key`, so the result is deterministic and hash-seed
+    independent. Scalars are returned unchanged. Non-finite floats are rejected
+    up front by :func:`_validate_evidence_json_safe`.
     """
     if isinstance(value, Mapping):
+        ordered_items = sorted(
+            value.items(), key=lambda kv: _canonical_sort_key(kv[0])
+        )
         return MappingProxyType(
-            {key: _freeze_evidence(item) for key, item in value.items()}
+            {key: _freeze_evidence(item) for key, item in ordered_items}
         )
     if isinstance(value, (list, tuple)):
         return tuple(_freeze_evidence(item) for item in value)
@@ -93,6 +101,34 @@ def _evidence_to_plain(value: object) -> object:
     if isinstance(value, tuple):
         return [_evidence_to_plain(item) for item in value]
     return value
+
+
+def _validate_evidence_json_safe(value: object) -> None:
+    """Reject accepted evidence values that strict JSON cannot emit.
+
+    ``json.dumps(..., allow_nan=False)`` raises on ``nan``/``inf``/``-inf``, so
+    a non-finite float is rejected here, at construction time. Every other
+    accepted scalar (``bool``/``int``/finite ``float``/``str``/``None``) is
+    strict-JSON-safe and is retained. Collections are validated recursively,
+    including mapping keys.
+    """
+    # ``bool`` is a subclass of ``int``; this single check covers
+    # ``None``/``bool``/``int``/``str``.
+    if value is None or isinstance(value, (bool, int, str)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"evidence contains non-finite float: {value!r}")
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            _validate_evidence_json_safe(key)
+            _validate_evidence_json_safe(item)
+        return
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            _validate_evidence_json_safe(item)
+        return
 
 
 def _validate_schema_version(schema_version: object) -> None:
@@ -155,6 +191,7 @@ class VerificationOutcome:
     diagnostics: tuple[VerificationDiagnostic, ...]
 
     def __post_init__(self) -> None:
+        _validate_evidence_json_safe(self.evidence)
         object.__setattr__(self, "evidence", _freeze_evidence(self.evidence))
         object.__setattr__(self, "diagnostics", tuple(sorted(self.diagnostics)))
 

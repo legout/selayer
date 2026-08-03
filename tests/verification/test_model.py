@@ -283,3 +283,142 @@ def test_unordered_nested_evidence_is_hash_seed_independent() -> None:
         ["delta", "gamma"],
         ["epsilon", "zeta"],
     ]
+
+
+def test_mapping_evidence_keys_are_canonicalised() -> None:
+    # Mapping keys are reordered deterministically (sorted) while values are
+    # preserved exactly, so serialised evidence is stable regardless of the
+    # source mapping's iteration order.
+    outcome = VerificationOutcome(
+        check_id="source.orders.grain",
+        status="passed",
+        scope="full_scan",
+        path="data_sources.orders.grain",
+        evidence={"zebra": 1, "apple": 2, "mango": 3},
+        diagnostics=(),
+    )
+    assert list(outcome.evidence.keys()) == ["apple", "mango", "zebra"]
+    assert outcome.evidence == {"zebra": 1, "apple": 2, "mango": 3}
+
+    report = VerificationReport(1, "shopfloor", "physical", True, (outcome,), ())
+    outcomes = report.to_dict()["outcomes"]
+    assert isinstance(outcomes, list)
+    first = outcomes[0]
+    assert isinstance(first, dict)
+    evidence = first["evidence"]
+    assert isinstance(evidence, dict)
+    assert list(evidence.keys()) == ["apple", "mango", "zebra"]
+
+
+def test_mapping_evidence_key_order_is_hash_seed_independent() -> None:
+    # Mapping keys built from an unordered set have PYTHONHASHSEED-dependent
+    # insertion order. The canonicalised frozen evidence (and its JSON form via
+    # to_dict) must be identical across seeds, with values preserved verbatim.
+    snippet = (
+        "import json\n"
+        "from selayer.verification.model import "
+        "VerificationOutcome, VerificationReport\n"
+        "o = VerificationOutcome(\n"
+        "    check_id='c', status='passed', scope='declaration', path='p',\n"
+        "    evidence={k: len(k) for k in {'alpha', 'beta', 'gamma'}},\n"
+        "    diagnostics=(),\n"
+        ")\n"
+        "report = VerificationReport(1, 'shopfloor', 'physical', True, (o,), ())\n"
+        "print(json.dumps(report.to_dict()['outcomes'][0]['evidence']))\n"
+    )
+    outputs: set[str] = set()
+    for seed in ("0", "1", "2", "13", "random"):
+        env = {**os.environ, "PYTHONHASHSEED": seed}
+        result = subprocess.run(
+            [sys.executable, "-c", snippet],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=True,
+        )
+        outputs.add(result.stdout.strip())
+    assert len(outputs) == 1, (
+        f"non-deterministic across hash seeds: {sorted(outputs)!r}"
+    )
+    parsed = json.loads(next(iter(outputs)))
+    # Keys canonicalised (sorted); values preserved verbatim.
+    assert list(parsed.keys()) == ["alpha", "beta", "gamma"]
+    assert parsed == {"alpha": 5, "beta": 4, "gamma": 5}
+
+
+def test_outcome_rejects_non_finite_float_evidence() -> None:
+    # ``nan``/``inf``/``-inf`` cannot be emitted by strict JSON
+    # (``json.dumps(..., allow_nan=False)`` raises), so they are rejected at
+    # construction. Finite scalar floats are retained.
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            VerificationOutcome(
+                check_id="source.orders.grain",
+                status="passed",
+                scope="full_scan",
+                path="data_sources.orders.grain",
+                evidence={"ratio": bad},
+                diagnostics=(),
+            )
+    outcome = VerificationOutcome(
+        check_id="source.orders.grain",
+        status="passed",
+        scope="full_scan",
+        path="data_sources.orders.grain",
+        evidence={"ratio": 1.5},
+        diagnostics=(),
+    )
+    assert outcome.evidence["ratio"] == 1.5
+
+
+def test_outcome_rejects_nested_non_finite_float_evidence() -> None:
+    # Non-finite floats are rejected wherever they appear: nested in mappings,
+    # sequences, and sets.
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            VerificationOutcome(
+                check_id="c",
+                status="passed",
+                scope="declaration",
+                path="p",
+                evidence={"summary": {"ratio": bad}},  # type: ignore[arg-type]
+                diagnostics=(),
+            )
+        with pytest.raises(ValueError):
+            VerificationOutcome(
+                check_id="c",
+                status="passed",
+                scope="declaration",
+                path="p",
+                evidence={"rows": [bad]},  # type: ignore[arg-type]
+                diagnostics=(),
+            )
+        with pytest.raises(ValueError):
+            VerificationOutcome(
+                check_id="c",
+                status="passed",
+                scope="declaration",
+                path="p",
+                evidence={"vals": {bad}},  # type: ignore[arg-type]
+                diagnostics=(),
+            )
+
+
+def test_valid_evidence_serialises_strict_json() -> None:
+    # Finite scalar evidence round-trips through strict JSON (allow_nan=False).
+    outcome = VerificationOutcome(
+        check_id="source.orders.grain",
+        status="passed",
+        scope="full_scan",
+        path="data_sources.orders.grain",
+        evidence={
+            "count": 3,
+            "ratio": 0.5,
+            "name": "orders",
+            "flag": True,
+            "missing": None,
+        },
+        diagnostics=(),
+    )
+    report = VerificationReport(1, "shopfloor", "physical", True, (outcome,), ())
+    json.dumps(report.to_dict(), allow_nan=False)
