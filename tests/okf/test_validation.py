@@ -1290,3 +1290,184 @@ def test_internal_link_to_generated_index_with_present_heading_is_valid(
     assert "okf.link.missing_fragment" not in {
         issue.code for issue in bundle.diagnostics
     }
+
+
+# --- Third re-review Finding 1: a descriptive bundle whose descriptions were
+# stripped and re-stamped must still be detected, while legitimate
+# include_descriptive=False bundles stay compatible. ---
+
+
+def test_catalog_aware_load_detects_descriptions_stripped_from_descriptive_bundle(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    from selayer.okf.document import (
+        generated_fingerprint,
+        parse_concept,
+        render_concept,
+    )
+
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root, include_descriptive=True)
+    # Strip every description and re-stamp each fingerprint so the documents
+    # are internally self-consistent while diverging from a descriptive bundle.
+    # The generator-declared ``descriptive`` flag survives, so the validator
+    # must project descriptions and catch the omission instead of inferring
+    # ``descriptive=False`` from the now-empty descriptions.
+    for concept_path in sorted(root.rglob("*.md")):
+        if concept_path.name in {"index.md", "log.md"}:
+            continue
+        concept = parse_concept(concept_path, root)
+        frontmatter = _deep_thaw(concept.frontmatter)
+        assert isinstance(frontmatter, dict)
+        if frontmatter.pop("description", None) is None:
+            continue
+        definition = next(
+            section.content
+            for section in concept.sections
+            if section.title == "Catalog Definition"
+        )
+        generated = frontmatter["generated"]
+        assert isinstance(generated, dict)
+        generated["fingerprint"] = generated_fingerprint(frontmatter, definition)
+        concept_path.write_text(
+            render_concept(_render_with_frontmatter(concept, frontmatter)),
+            encoding="utf-8",
+        )
+
+    with pytest.raises(OkfValidationError) as raised:
+        OkfBundle.load(root, layer=valid_layer)
+
+    assert "okf.generated.frontmatter_mismatch" in {
+        issue.code for issue in raised.value.issues
+    }
+
+
+def test_catalog_aware_load_accepts_legitimate_non_descriptive_bundle(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)  # default include_descriptive=False
+
+    bundle = OkfBundle.load(root, layer=valid_layer)
+
+    assert "okf.generated.frontmatter_mismatch" not in {
+        issue.code for issue in bundle.diagnostics
+    }
+
+
+# --- Third re-review Finding 2: an authored bundle that carries only a valid
+# optional root index.md okf_version must not be misclassified as generated. ---
+
+
+def test_authored_bundle_with_root_index_is_not_misclassified_as_generated(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    root.mkdir()
+    (root / "index.md").write_text(
+        '---\nokf_version: "0.2"\n---\n\n# Authored notes\n',
+        encoding="utf-8",
+    )
+    (root / "notes").mkdir()
+    (root / "notes" / "guide.md").write_text(
+        "---\ntype: Reference\ntitle: Guide\n---\n\n# Body\n",
+        encoding="utf-8",
+    )
+
+    # No generated per-directory indexes and no generated metadata: the bundle
+    # is authored even though it carries a root ``index.md``, so catalog-aware
+    # loading must not flag missing generated concepts or indexes.
+    bundle = OkfBundle.load(root, layer=valid_layer)
+
+    codes = {issue.code for issue in bundle.diagnostics}
+    assert "okf.generated.missing_concept" not in codes
+    assert "okf.generated.index_mismatch" not in codes
+    assert "okf.generated.missing_metadata" not in codes
+
+
+# --- Third re-review Finding 3: link/fragment diagnostics must not echo the
+# raw link or any query-string secret. ---
+
+
+def test_fragment_diagnostic_does_not_echo_raw_link_or_query_secret(
+    tmp_path: Path,
+) -> None:
+    _write_concept(
+        tmp_path,
+        "type: Metric",
+        "\n# Related\n\n"
+        "[secret](other.md?token=SHOULD-NOT-LEAK#missing-heading)\n",
+    )
+    (tmp_path / "other.md").write_text(
+        "---\ntype: Reference\n---\n\n# Real\n",
+        encoding="utf-8",
+    )
+
+    bundle = OkfBundle.load(tmp_path)
+
+    fragment_issues = [
+        issue
+        for issue in bundle.diagnostics
+        if issue.code == "okf.link.missing_fragment"
+    ]
+    assert len(fragment_issues) == 1
+    message = fragment_issues[0].message
+    assert "SHOULD-NOT-LEAK" not in message
+    assert "token=" not in message
+    # The fragment slug itself is safe and informative to surface.
+    assert "missing-heading" in message
+
+
+def test_broken_link_diagnostic_does_not_echo_query_secret(
+    tmp_path: Path,
+) -> None:
+    _write_concept(
+        tmp_path,
+        "type: Metric",
+        "\n# Related\n\n[secret](missing.md?token=SHOULD-NOT-LEAK)\n",
+    )
+
+    bundle = OkfBundle.load(tmp_path)
+
+    broken = [
+        issue for issue in bundle.diagnostics if issue.path == "concept.md.links"
+    ]
+    assert len(broken) == 1
+    message = broken[0].message
+    assert "SHOULD-NOT-LEAK" not in message
+    assert "token=" not in message
+    # The normalized path (no query/fragment) is safe to surface.
+    assert "missing.md" in message
+
+
+# --- Third re-review Finding 4: malformed YAML-valid controlled frontmatter
+# values must produce a coded issue, not let a generated_fingerprint TypeError
+# escape the validator. ---
+
+
+def test_malformed_controlled_frontmatter_yields_coded_issue_not_typeerror(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    from datetime import date
+
+    from selayer.okf.document import parse_concept, render_concept
+
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    path = root / "metrics" / "gross_margin.md"
+    concept = parse_concept(path, root)
+    frontmatter = _deep_thaw(concept.frontmatter)
+    assert isinstance(frontmatter, dict)
+    # A YAML-valid but non-JSON-serializable controlled value (a date-typed
+    # title) must not crash fingerprint computation with a bare TypeError.
+    frontmatter["title"] = date(2026, 1, 1)
+    path.write_text(
+        render_concept(_render_with_frontmatter(concept, frontmatter)),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OkfValidationError) as raised:
+        OkfBundle.load(root, layer=valid_layer)
+
+    codes = {issue.code for issue in raised.value.issues}
+    assert "okf.generated.fingerprint_invalid" in codes

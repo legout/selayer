@@ -230,8 +230,16 @@ def catalog_definition(semantic_id: str, value: SemanticObject) -> str:
     return "\n\n".join(lines)
 
 
-def _generated_metadata(generated_at: datetime | None) -> dict[str, str]:
-    generated = {"by": "process:selayer-okf"}
+def _generated_metadata(
+    generated_at: datetime | None, *, include_descriptive: bool
+) -> dict[str, object]:
+    # Stamp the generation mode so catalog-aware integrity can detect a
+    # descriptive bundle whose descriptions were stripped and re-stamped
+    # instead of inferring the mode from the (now-stripped) documents.
+    generated: dict[str, object] = {
+        "by": "process:selayer-okf",
+        "descriptive": include_descriptive,
+    }
     if generated_at is not None:
         if generated_at.tzinfo is None:
             generated_at = generated_at.replace(tzinfo=timezone(timedelta(0)))
@@ -266,7 +274,7 @@ def concepts_from_layer(
         if include_descriptive and isinstance(description, str) and description:
             frontmatter["description"] = description
         definition = catalog_definition(semantic_id, value)
-        generated = _generated_metadata(generated_at)
+        generated = _generated_metadata(generated_at, include_descriptive=include_descriptive)
         frontmatter.update(
             {
                 "selayer_id": semantic_id,

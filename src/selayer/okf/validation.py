@@ -34,6 +34,9 @@ _FRONTMATTER = re.compile(r"\A---\n(.*?)\n---(?:\n|\Z)", re.DOTALL)
 _LOG_HEADING = re.compile(r"^## (.+?)\s*$")
 _SLUG_STRIP = re.compile(r"[^\w\s-]+", re.UNICODE)
 _SLUG_COLLAPSE = re.compile(r"[\s_-]+")
+# Maximum length of a path/fragment label echoed in a link diagnostic, so an
+# attacker-controlled link cannot bloat messages or smuggle long secrets.
+_MAX_LINK_LABEL = 80
 
 
 def _issue(
@@ -575,6 +578,35 @@ def _link_issue(
     )
 
 
+def _bounded_label(value: str) -> str:
+    """Truncate a diagnostic label so a hostile link cannot bloat messages."""
+    return (
+        value
+        if len(value) <= _MAX_LINK_LABEL
+        else value[:_MAX_LINK_LABEL] + "..."
+    )
+
+
+def _fragment_link_message(fragment: str) -> str:
+    """Message for a missing fragment heading that echoes only the fragment.
+
+    The raw link (which may carry a ``?query=...`` secret) is never echoed;
+    only the already URL-decoded fragment slug is surfaced, bounded in length.
+    """
+    return f"internal link fragment '{_bounded_label(fragment)}' heading not found"
+
+
+def _broken_link_message(normalized: PurePosixPath | None) -> str:
+    """Message for a broken internal link that echoes only the safe path.
+
+    The normalized bundle-relative path excludes any query/fragment, so a
+    ``?query=...`` secret on the raw link is never surfaced.
+    """
+    if normalized is None:
+        return "broken internal link"
+    return f"broken internal link to '{_bounded_label(normalized.as_posix())}'"
+
+
 def _normalized_link_path(source: OkfConcept, link: str) -> PurePosixPath | None:
     """Return the normalized bundle-relative path for an internal link, or None."""
     try:
@@ -644,12 +676,13 @@ def validate_links(
                 continue
             path_text = unquote(split.path)
             fragment = unquote(split.fragment) if split.fragment else ""
+            normalized = _normalized_link_path(concept, link)
             if not path_text:
                 if fragment and fragment not in source_slugs:
                     issues.append(
                         _link_issue(
                             concept,
-                            f"link '{link}' fragment heading not found",
+                            _fragment_link_message(fragment),
                             code="okf.link.missing_fragment",
                         )
                     )
@@ -660,11 +693,10 @@ def validate_links(
                 else source.parent / path_text
             ).resolve()
             if not target.is_relative_to(resolved_root) or not target.exists():
-                issues.append(_link_issue(concept, f"broken internal link '{link}'"))
+                issues.append(_link_issue(concept, _broken_link_message(normalized)))
                 continue
             if not fragment:
                 continue
-            normalized = _normalized_link_path(concept, link)
             target_slugs = (
                 slugs_by_path.get(normalized) if normalized is not None else None
             )
@@ -672,7 +704,7 @@ def validate_links(
                 issues.append(
                     _link_issue(
                         concept,
-                        f"link '{link}' fragment heading not found",
+                        _fragment_link_message(fragment),
                         code="okf.link.missing_fragment",
                     )
                 )
@@ -782,31 +814,25 @@ def _controlled_frontmatter_signature(
     return signature
 
 
-def _root_index_claims_generated(root: Path) -> bool:
-    """Return True when the root index.md carries generated-bundle frontmatter.
+def _has_generated_directory_indexes(
+    root: Path, expected_paths: Iterable[PurePosixPath]
+) -> bool:
+    """Return True when the bundle carries generated per-directory indexes.
 
-    ``OkfBundle.generate`` always stamps a root ``index.md`` with an
-    ``okf_version`` field. That structural marker survives even if every
-    generated concept loses its ``generated`` metadata, so catalog-aware
-    integrity keys off it (in addition to per-concept generated metadata) to
-    avoid silently skipping a stripped bundle, while authored bundles that
-    have no root index are left untouched.
+    ``OkfBundle.generate`` always stamps a per-directory ``index.md`` for every
+    semantic kind that has at least one concept. That structural artifact is
+    not removed by the generated-metadata-stripping attack, so it reliably
+    marks a bundle as generated (even when every ``generated`` mapping was
+    stripped) while authored bundles — which carry no such indexes — stay
+    compatible. The root ``index.md`` is intentionally excluded: an authored
+    bundle may legitimately carry one (``okf_version`` is an allowed optional
+    field), so it cannot distinguish generated from authored bundles and must
+    not be used as a marker on its own.
     """
-    index_path = root / "index.md"
-    if not index_path.is_file():
-        return False
-    try:
-        text = index_path.read_text(encoding="utf-8").replace("\r\n", "\n")
-    except OSError:
-        return False
-    match = _FRONTMATTER.match(text)
-    if match is None:
-        return False
-    try:
-        loaded = yaml.safe_load(match.group(1))
-    except yaml.YAMLError:
-        return False
-    return isinstance(loaded, Mapping) and "okf_version" in loaded
+    directories = sorted(
+        {path.parts[0] for path in expected_paths if len(path.parts) > 1}
+    )
+    return any((root / directory / "index.md").is_file() for directory in directories)
 
 
 def validate_generated_integrity(
@@ -825,20 +851,39 @@ def validate_generated_integrity(
         isinstance(concept.frontmatter.get("generated"), Mapping)
         for concept in concepts.values()
     )
-    is_generated_bundle = has_generated or _root_index_claims_generated(root)
-    # Match the loaded bundle's descriptive mode so the controlled-frontmatter
-    # projection check never flags a legitimately mapped description.
-    descriptive = any(
-        "description" in concept.frontmatter
+    # Prefer the generator-declared descriptive mode (stamped in the generated
+    # metadata) over inferring it from the loaded documents, so a descriptive
+    # bundle whose descriptions were stripped and re-stamped is still detected.
+    # Legacy bundles that predate the declared flag fall back to inferring the
+    # mode from the loaded documents.
+    declared_modes = [
+        gen["descriptive"]
         for concept in concepts.values()
-        if isinstance(concept.frontmatter.get("generated"), Mapping)
-    )
+        if isinstance((gen := concept.frontmatter.get("generated")), Mapping)
+        and isinstance(gen.get("descriptive"), bool)
+    ]
+    if declared_modes:
+        descriptive = any(declared_modes)
+    else:
+        descriptive = any(
+            "description" in concept.frontmatter
+            for concept in concepts.values()
+            if isinstance(concept.frontmatter.get("generated"), Mapping)
+        )
     expected = concepts_from_layer(layer, include_descriptive=descriptive)
     expected_by_selayer = {
         concept.frontmatter["selayer_id"]: concept
         for concept in expected.values()
     }
+    expected_paths = {concept.relative_path for concept in expected.values()}
     controlled_keys = CONTROLLED_FRONTMATTER_KEYS
+    # Detect generated bundles from generated artifacts (per-directory indexes
+    # the generator always stamps, plus any surviving generated metadata)
+    # rather than the root index marker alone, so authored bundles that happen
+    # to carry a root ``index.md`` are not misclassified.
+    is_generated_bundle = has_generated or _has_generated_directory_indexes(
+        root, expected_paths
+    )
     issues: list[OkfIssue] = []
 
     if is_generated_bundle:
@@ -983,19 +1028,38 @@ def validate_generated_integrity(
                 )
             )
         else:
-            recomputed = generated_fingerprint(concept.frontmatter, loaded_definition)
-            if stored_fingerprint.lower() != recomputed:
+            # Malformed but YAML-valid controlled values (e.g. a date-typed
+            # title) make the canonical digest uncomputable. Surface that as a
+            # coded issue instead of letting the TypeError escape the validator.
+            try:
+                recomputed = generated_fingerprint(
+                    concept.frontmatter, loaded_definition
+                )
+            except (TypeError, ValueError):
                 issues.append(
                     OkfIssue(
                         path=concept.relative_path.as_posix(),
                         message=(
-                            f"generated concept '{semantic_id}' fingerprint "
-                            f"does not match its content"
+                            f"generated concept '{semantic_id}' has controlled "
+                            f"frontmatter that prevents fingerprint computation"
                         ),
                         severity=severity,
-                        code="okf.generated.fingerprint_mismatch",
+                        code="okf.generated.fingerprint_invalid",
                     )
                 )
+            else:
+                if stored_fingerprint.lower() != recomputed:
+                    issues.append(
+                        OkfIssue(
+                            path=concept.relative_path.as_posix(),
+                            message=(
+                                f"generated concept '{semantic_id}' fingerprint "
+                                f"does not match its content"
+                            ),
+                            severity=severity,
+                            code="okf.generated.fingerprint_mismatch",
+                        )
+                    )
 
     if is_generated_bundle:
         issues.extend(_validate_generated_indexes(root, expected, layer, severity))

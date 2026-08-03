@@ -39,8 +39,9 @@ def test_generate_metric_concept(ecommerce_layer: SemanticLayer) -> None:
         "selayer_id": "metric.gross_margin",
         "generated": {
             "by": "process:selayer-okf",
+            "descriptive": True,
             "at": "2026-07-27T12:00:00Z",
-            "fingerprint": "14c8c17f850c1e0b580437e2a03de7c325cee3ebb36502570ae53e1297195d6f",
+            "fingerprint": "91e758434868f3a3efc1ac84805be2837aa2d195316075c36beec35f86ec16d4",
         },
         "status": "stable",
     }
