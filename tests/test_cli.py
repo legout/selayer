@@ -250,3 +250,145 @@ def test_legacy_okf_still_echoes_exception_text(
     # The legacy envelope still interpolates the message (contrast with the
     # unified secret-safe JSON failure above).
     assert captured.err.startswith("error: bad.md.frontmatter.type:")
+
+
+# ---------------------------------------------------------------------------
+# catalog compatibility
+# ---------------------------------------------------------------------------
+
+
+def test_catalog_compatibility_emits_report(
+    valid_catalog_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    """A default compatibility run emits a passed compatibility report."""
+    assert main(["catalog", "compatibility", str(valid_catalog_path)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema_version"] == 1
+    assert payload["check_kind"] == "compatibility"
+    assert payload["passed"] is True
+    check_ids = {outcome["check_id"] for outcome in payload["outcomes"]}
+    assert "compatibility.metric.gross_margin" in check_ids
+
+
+def test_catalog_compatibility_with_flags_focuses_requests(
+    valid_catalog_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    """Repeated ``--metric``/``--dimension`` flags restrict the request set."""
+    assert (
+        main(
+            [
+                "catalog",
+                "compatibility",
+                str(valid_catalog_path),
+                "--metric",
+                "gross_margin",
+                "--dimension",
+                "product_category",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    check_ids = {outcome["check_id"] for outcome in payload["outcomes"]}
+    assert "compatibility.metric_dimension.gross_margin.product_category" in check_ids
+
+
+def test_catalog_compatibility_query_cases_accepted(
+    valid_catalog_path: Path,
+    tmp_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    """A query-cases JSON file of valid objects yields explicit outcomes."""
+    cases = tmp_path / "cases.json"
+    cases.write_text(
+        json.dumps([{"metrics": ["gross_margin"], "dimensions": ["product_category"]}]),
+        encoding="utf-8",
+    )
+    assert (
+        main(
+            [
+                "catalog",
+                "compatibility",
+                str(valid_catalog_path),
+                "--metric",
+                "gross_margin",
+                "--query-cases",
+                str(cases),
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    check_ids = {outcome["check_id"] for outcome in payload["outcomes"]}
+    assert "compatibility.explicit.0000" in check_ids
+
+
+def test_catalog_compatibility_query_cases_reject_unknown_keys_secret_safe(
+    valid_catalog_path: Path,
+    tmp_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    """Unknown query-case keys are rejected without leaking file content.
+
+    A query-cases file may carry attacker-controlled or credential-bearing
+    bytes; the CLI must reject an unknown key (here ``sql``) with the fixed
+    secret-safe envelope and never echo the offending value to either stream.
+    """
+    cases = tmp_path / "cases.json"
+    cases.write_text(
+        json.dumps([{"metrics": ["gross_margin"], "sql": "SELECT 'leak'"}]),
+        encoding="utf-8",
+    )
+    assert (
+        main(
+            [
+                "catalog",
+                "compatibility",
+                str(valid_catalog_path),
+                "--query-cases",
+                str(cases),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.err)
+    assert set(payload) == {"error"}
+    assert payload["error"]  # non-empty fixed message
+    # The offending SQL/value and the path must never reach either stream.
+    assert "SELECT 'leak'" not in captured.err
+    assert "SELECT 'leak'" not in captured.out
+    assert str(cases) not in captured.err
+    assert "Traceback" not in captured.err
+    assert captured.out == ""
+
+
+def test_catalog_compatibility_invalid_catalog_emits_static_failure(
+    tmp_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    """An invalid catalog has no layer, so its static failure report is shown."""
+    path = tmp_path / "bad.yaml"
+    path.write_text("version: 2\nname: bad\ndata_sources: {}\n", encoding="utf-8")
+    assert main(["catalog", "compatibility", str(path)]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["check_kind"] == "static"
+    assert payload["passed"] is False
+
+
+def test_catalog_compatibility_missing_catalog_is_secret_safe(
+    tmp_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    """A missing catalog surfaces only the fixed secret-safe envelope."""
+    missing = tmp_path / "does_not_exist.yaml"
+    assert main(["catalog", "compatibility", str(missing)]) == 1
+    captured = capsys.readouterr()
+    payload = json.loads(captured.err)
+    assert payload["error"] == "could not run compatibility check"
+    assert str(missing) not in captured.err
+    assert str(missing) not in captured.out
+    assert "Traceback" not in captured.err
+    assert captured.out == ""

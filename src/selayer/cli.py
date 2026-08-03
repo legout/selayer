@@ -35,10 +35,13 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
 from selayer.catalog import SemanticLayer
 from selayer.okf import OkfBundle
 from selayer.okf.cli import add_okf_commands, execute_okf
+from selayer.planning.types import QueryRequest
+from selayer.verification import CompatibilityCheck, verify
 from selayer.verification.static import validate_catalog
 
 #: Fixed, secret-safe failure emitted for the expected I/O error (a missing
@@ -59,6 +62,20 @@ _FAILURE_MESSAGE = "could not read or validate catalog"
 #: code; only the unified ``okf`` area is hardened here.
 _OKF_FAILURE_MESSAGE = "okf command failed"
 
+#: Fixed, secret-safe failure emitted for the ``catalog compatibility``
+#: command when a domain or I/O error escapes. Like the other envelopes, the
+#: exception text is never interpolated: a malformed query-cases file may echo
+#: attacker-controlled or credential-bearing bytes, and an ``OSError`` may
+#: carry the catalog/query-cases path, so echoing either would re-leak what
+#: the loaders already scrubbed. An invalid catalog never reaches this path:
+#: it is adapted into a failed static report by ``validate_catalog``.
+_COMPAT_FAILURE_MESSAGE = "could not run compatibility check"
+
+#: Object keys accepted by a query-cases JSON entry. Whitelisting (rather
+#: than forwarding arbitrary keys) enforces "do not accept SQL or expression
+#: text": a ``sql``/``expression``/``where`` key is rejected up front.
+_ALLOWED_QUERY_CASE_KEYS = frozenset({"metrics", "dimensions", "filters"})
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="selayer")
@@ -67,6 +84,12 @@ def _parser() -> argparse.ArgumentParser:
     catalog_commands = catalog.add_subparsers(dest="command", required=True)
     validate = catalog_commands.add_parser("validate")
     validate.add_argument("catalog")
+    compatibility = catalog_commands.add_parser("compatibility")
+    compatibility.add_argument("catalog")
+    # ``append`` lets the flags repeat; the default empty list means "all".
+    compatibility.add_argument("--metric", action="append", default=[])
+    compatibility.add_argument("--dimension", action="append", default=[])
+    compatibility.add_argument("--query-cases", action="append", default=[])
     add_okf_commands(commands)
     return parser
 
@@ -96,6 +119,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         print(json.dumps(result.report.to_dict(), sort_keys=True))
         return 0 if result.report.passed else 1
+    if args.area == "catalog" and args.command == "compatibility":
+        return _run_catalog_compatibility(args)
     if args.area == "okf":
         # The unified ``okf`` area reuses the legacy command handler for
         # generate/sync/validate/retrieve so parity (stdout/exit) is exact on
@@ -120,6 +145,83 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 1
     raise AssertionError("unhandled command")
+
+
+def _query_request_from_json(entry: object) -> QueryRequest:
+    """Build a :class:`QueryRequest` from one query-cases JSON object.
+
+    Only ``metrics``/``dimensions``/``filters`` are accepted: any other key
+    (``sql``/``expression``/``where``/...) is rejected so SQL or expression
+    text can never reach the planner through this path.
+    """
+    if not isinstance(entry, dict):
+        raise ValueError("query case must be a JSON object")  # noqa: TRY004
+    unknown = set(entry) - _ALLOWED_QUERY_CASE_KEYS
+    if unknown:
+        raise ValueError("query case has unknown keys")
+    metrics = entry.get("metrics") or ()
+    dimensions = entry.get("dimensions") or ()
+    if not isinstance(metrics, list) or not isinstance(dimensions, list):
+        # ValueError (not TypeError) is deliberate: these are domain errors
+        # from a user-supplied JSON file and must be caught by the secret-safe
+        # ``(OSError, ValueError)`` envelope below.
+        raise ValueError("query case metrics and dimensions must be lists")  # noqa: TRY004
+    return QueryRequest(metrics, dimensions, entry.get("filters"))
+
+
+def _load_query_cases(paths: Sequence[str]) -> tuple[QueryRequest, ...]:
+    """Load every query-cases JSON file into validated ``QueryRequest``s.
+
+    Each file must hold a JSON list of objects accepted by
+    :func:`_query_request_from_json`. ``ValueError`` (bad JSON, wrong shape,
+    unknown keys) and ``OSError`` (missing/unreadable file) are raised for the
+    caller's secret-safe envelope.
+    """
+    cases: list[QueryRequest] = []
+    for path in paths:
+        with Path(path).open(encoding="utf-8") as handle:
+            data = json.load(handle)
+        if not isinstance(data, list):
+            raise ValueError("query-cases file must hold a JSON list")  # noqa: TRY004
+        for entry in data:
+            cases.append(_query_request_from_json(entry))
+    return tuple(cases)
+
+
+def _run_catalog_compatibility(arguments: argparse.Namespace) -> int:
+    """Run compatibility verification and render its report as JSON.
+
+    An invalid catalog is reported via the static failure report produced by
+    :func:`validate_catalog` (there is no layer to verify compatibility
+    against). I/O and query-cases domain errors are masked by the same
+    secret-safe envelope used elsewhere: their text may carry paths,
+    credentials, or attacker-controlled bytes, so it is never echoed.
+    """
+    try:
+        result = validate_catalog(arguments.catalog)
+        if result.layer is None:
+            print(json.dumps(result.report.to_dict(), sort_keys=True))
+            return 1
+        query_cases = _load_query_cases(arguments.query_cases)
+        check = CompatibilityCheck(
+            metrics=tuple(arguments.metric) or None,
+            dimensions=tuple(arguments.dimension) or None,
+            query_cases=query_cases,
+        )
+        report = verify(result.layer, check)
+    except (OSError, ValueError):
+        # Secret-safe failure: never echo the exception, whose text may carry
+        # the catalog/query-cases path, credentials, or attacker-controlled
+        # bytes from a malformed query-cases file. Do not broaden to
+        # ``LookupError``: ``KeyError``/``IndexError`` here is a programmer
+        # mistake that must propagate.
+        print(
+            json.dumps({"error": _COMPAT_FAILURE_MESSAGE}, sort_keys=True),
+            file=sys.stderr,
+        )
+        return 1
+    print(json.dumps(report.to_dict(), sort_keys=True))
+    return 0 if report.passed else 1
 
 
 def _run_okf_build(arguments: argparse.Namespace) -> int:
