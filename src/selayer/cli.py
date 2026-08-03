@@ -152,23 +152,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     raise AssertionError("unhandled command")
 
 
-def _selector_list(value: object, field: str) -> list[str]:
-    """Validate that ``value`` is a list of selector strings.
+def _selector_list(value: object, field: str, *, non_empty: bool) -> list[str]:
+    """Validate a *present* selector-list value as non-empty strings.
 
-    Omitted (``None``) is allowed and yields an empty list, so a metric-alone
-    query case may omit ``dimensions``. A bare string is rejected: it would
-    otherwise be character-iterated into single-letter "selectors" by
-    :class:`QueryRequest`. ``ValueError`` (not ``TypeError``) is raised so the
-    caller's secret-safe ``(OSError, ValueError)`` envelope masks it.
+    ``value`` must be a list whose every entry is a non-empty string;
+    ``non_empty`` additionally requires at least one entry. The caller decides
+    whether an *absent* key is permitted before calling, so a ``None`` reaching
+    here means the key was present but explicitly null, which is always
+    rejected (only omission/``[]`` are allowed for optional selectors). A bare
+    string is rejected: it would otherwise be character-iterated into
+    single-letter "selectors" by :class:`QueryRequest`. ``ValueError`` (not
+    ``TypeError``) is raised so the caller's secret-safe
+    ``(OSError, ValueError)`` envelope masks it.
     """
     if value is None:
-        return []
+        # Present-but-null is always invalid; the caller permits omission by
+        # not calling this function at all.
+        raise ValueError(f"query case {field} must not be null")
     if not isinstance(value, list):
         raise ValueError(f"query case {field} must be a list")  # noqa: TRY004
+    result: list[str] = []
     for item in value:
-        if not isinstance(item, str):
-            raise ValueError(f"query case {field} entries must be strings")  # noqa: TRY004
-    return value
+        if not isinstance(item, str) or not item:
+            raise ValueError(f"query case {field} entries must be non-empty strings")
+        result.append(item)
+    if non_empty and not result:
+        raise ValueError(f"query case {field} must not be empty")
+    return result
 
 
 def _normalise_filter_value(value: object) -> FilterInput:
@@ -215,17 +225,34 @@ def _query_request_from_json(entry: object) -> QueryRequest:
     example a non-mapping ``filters`` value) and selector names are never
     silently character-iterated. Only ``metrics``/``dimensions``/``filters``
     are accepted: any other key (``sql``/``expression``/``where``/...) is
-    rejected so SQL or expression text can never reach the planner. ``filters``
-    must be a mapping whose values are scalar, list, or range forms. Invalid
-    shapes raise ``ValueError`` for the caller's secret-safe envelope.
+    rejected so SQL or expression text can never reach the planner.
+
+    ``metrics`` is **required**: it must be present, non-null, and a non-empty
+    list of non-empty strings. ``dimensions`` is optional for metric-alone
+    cases: it may be omitted entirely or be an empty list, but a
+    present-but-null value (or a non-list, or a bad member) is rejected.
+    ``filters`` must be a mapping whose values are scalar, list, or range
+    forms. Invalid shapes raise ``ValueError`` for the caller's secret-safe
+    envelope.
     """
     if not isinstance(entry, dict):
         raise ValueError("query case must be a JSON object")  # noqa: TRY004
     unknown = set(entry) - _ALLOWED_QUERY_CASE_KEYS
     if unknown:
         raise ValueError("query case has unknown keys")
-    metrics = _selector_list(entry.get("metrics"), "metrics")
-    dimensions = _selector_list(entry.get("dimensions"), "dimensions")
+    # ``metrics`` is required: a missing key, explicit null, empty list,
+    # non-list, or bad member is rejected up front.
+    if "metrics" not in entry:
+        raise ValueError("query case metrics must be present")
+    metrics = _selector_list(entry["metrics"], "metrics", non_empty=True)
+    # ``dimensions`` is optional: only omission or ``[]`` are permitted for a
+    # metric-alone case. A present-but-null value is rejected (only
+    # omission/``[]`` allowed); non-list and bad members are rejected.
+    dimensions: list[str]
+    if "dimensions" not in entry:
+        dimensions = []
+    else:
+        dimensions = _selector_list(entry["dimensions"], "dimensions", non_empty=False)
     raw_filters = entry.get("filters")
     if raw_filters is None:
         normalised_filters: dict[str, FilterInput] = {}

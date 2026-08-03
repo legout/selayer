@@ -580,3 +580,67 @@ def test_catalog_compatibility_query_cases_metric_alone_allows_no_dimensions(
     )
     assert explicit["evidence"]["compatible"] is True
     assert explicit["evidence"]["selected_dimensions"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Re-review finding: explicit query-case metrics/dimensions presence rules
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("payload", "sentinel"),
+    [
+        # ``metrics`` is required: a missing key is rejected.
+        ({"dimensions": ["LEAK_DIM_4f1a"]}, "LEAK_DIM_4f1a"),
+        # ``metrics`` must not be an explicit null.
+        ({"metrics": None, "dimensions": ["LEAK_DIM_4f1a"]}, "LEAK_DIM_4f1a"),
+        # ``metrics`` must be a non-empty list.
+        ({"metrics": [], "dimensions": ["LEAK_DIM_4f1a"]}, "LEAK_DIM_4f1a"),
+        # ``metrics`` entries must be non-empty strings.
+        ({"metrics": [""], "dimensions": ["LEAK_DIM_4f1a"]}, "LEAK_DIM_4f1a"),
+        # ``dimensions`` may be omitted/``[]`` only: a present null is rejected.
+        (
+            {"metrics": ["LEAK_METRIC_7c2b"], "dimensions": None},
+            "LEAK_METRIC_7c2b",
+        ),
+    ],
+)
+def test_catalog_compatibility_query_cases_reject_metrics_dimensions_presence_secret_safe(
+    valid_catalog_path: Path,
+    tmp_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
+    payload: dict[str, object],
+    sentinel: str,
+) -> None:
+    """Explicit query-case metrics/dimensions presence rules are enforced.
+
+    ``metrics`` must be present, non-null, and a non-empty list of non-empty
+    strings; ``dimensions`` may only be omitted or an empty list (a present
+    null is rejected). Every rejection is masked by the secret-safe envelope:
+    no offending selector/bytes reach stdout or stderr and there is no
+    traceback.
+    """
+    cases = tmp_path / "cases.json"
+    cases.write_text(json.dumps([payload]), encoding="utf-8")
+    assert (
+        main(
+            [
+                "catalog",
+                "compatibility",
+                str(valid_catalog_path),
+                "--query-cases",
+                str(cases),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    body = json.loads(captured.err)
+    assert set(body) == {"error"}
+    assert body["error"]  # non-empty fixed message
+    # No traceback and no echo of the offending selector or the file path.
+    assert "Traceback" not in captured.err
+    assert sentinel not in captured.err
+    assert sentinel not in captured.out
+    assert str(cases) not in captured.err
+    assert captured.out == ""
