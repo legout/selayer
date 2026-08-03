@@ -497,3 +497,198 @@ def test_overlay_invalid_stale_after_is_rejected(
     )
     with pytest.raises(OkfValidationError):
         load_overlays(overlays, valid_layer)
+
+
+# ---------------------------------------------------------------------------
+# Review-fix regressions: input-root validation, safe YAML diagnostics,
+# recursive duplicate-key composition, and true duplicate-ID tracking.
+# ---------------------------------------------------------------------------
+
+
+def test_reference_root_symlink_is_rejected(tmp_path: Path) -> None:
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    link = tmp_path / "references"
+    link.symlink_to(real_dir)
+    with pytest.raises(FileExistsError):
+        load_references(link)
+
+
+def test_overlay_root_symlink_is_rejected(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    link = tmp_path / "overlays"
+    link.symlink_to(real_dir)
+    with pytest.raises(FileExistsError):
+        load_overlays(link, valid_layer)
+
+
+def test_input_root_regular_file_is_rejected(tmp_path: Path) -> None:
+    root = tmp_path / "references"
+    root.write_text("not a directory", encoding="utf-8")
+    with pytest.raises(NotADirectoryError):
+        load_references(root)
+
+
+def test_input_root_special_file_is_rejected(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "overlays"
+    os.mkfifo(root)
+    with pytest.raises(NotADirectoryError):
+        load_overlays(root, valid_layer)
+
+
+def test_overlay_yaml_parse_error_message_is_safe(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    overlays = _overlays_root(tmp_path)
+    # An unterminated flow sequence is a compose (parse) error; the injected
+    # secret token must never appear in the resulting diagnostic.
+    _write(
+        overlays / "metrics" / "gross_margin.md",
+        "---\nselayer_id: metric.gross_margin\nsecret: [hunter2\n"
+        "---\n\n# Usage Guidance\nx\n",
+    )
+    with pytest.raises(OkfValidationError) as exc:
+        load_overlays(overlays, valid_layer)
+    messages = " ".join(issue.message for issue in exc.value.issues)
+    assert "hunter2" not in messages
+    assert "invalid YAML frontmatter" in messages
+
+
+def test_overlay_yaml_construction_error_message_is_safe(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    overlays = _overlays_root(tmp_path)
+    # An unknown explicit tag composes but fails construction under SafeLoader;
+    # the constructor diagnostic (which echoes the tag) must not leak.
+    _write(
+        overlays / "metrics" / "gross_margin.md",
+        "---\nselayer_id: metric.gross_margin\nsecret: !!leaked hunter2\n"
+        "---\n\n# Usage Guidance\nx\n",
+    )
+    with pytest.raises(OkfValidationError) as exc:
+        load_overlays(overlays, valid_layer)
+    messages = " ".join(issue.message for issue in exc.value.issues)
+    assert "hunter2" not in messages
+    assert "leaked" not in messages
+    assert "invalid YAML frontmatter" in messages
+
+
+def test_reference_yaml_error_message_is_safe(tmp_path: Path) -> None:
+    references = _references(tmp_path)
+    _write(
+        references / "guide.md",
+        "---\ntype: Reference\ntitle: Guide\nsecret: [hunter2\n"
+        "---\n\n# Guidance\n",
+    )
+    with pytest.raises(OkfValidationError) as exc:
+        load_references(references)
+    messages = " ".join(issue.message for issue in exc.value.issues)
+    assert "hunter2" not in messages
+    assert "invalid YAML frontmatter" in messages
+
+
+def test_overlay_nested_duplicate_key_is_rejected(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    overlays = _overlays_root(tmp_path)
+    # A duplicate `resource` buried inside a nested sources mapping; a
+    # top-level-only check would miss it (SafeLoader would silently overwrite).
+    _write(
+        overlays / "metrics" / "gross_margin.md",
+        "---\n"
+        "selayer_id: metric.gross_margin\n"
+        "sources:\n"
+        "- resource: s3://example/a\n"
+        "  resource: s3://example/b\n"
+        "---\n\n# Usage Guidance\nx\n",
+    )
+    with pytest.raises(OkfValidationError) as exc:
+        load_overlays(overlays, valid_layer)
+    assert any(
+        "duplicate frontmatter key" in issue.message for issue in exc.value.issues
+    )
+
+
+def test_overlay_merge_key_is_rejected(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    overlays = _overlays_root(tmp_path)
+    # A merge key (<<) can mask a duplicate after merge resolution; reject it.
+    _write(
+        overlays / "metrics" / "gross_margin.md",
+        "---\n"
+        "selayer_id: metric.gross_margin\n"
+        "base: &b\n"
+        "  resource: s3://example/a\n"
+        "override:\n"
+        "  <<: *b\n"
+        "  resource: s3://example/b\n"
+        "---\n\n# Usage Guidance\nx\n",
+    )
+    with pytest.raises(OkfValidationError) as exc:
+        load_overlays(overlays, valid_layer)
+    assert any(
+        "merge keys are not supported" in issue.message for issue in exc.value.issues
+    )
+
+
+def test_reference_duplicate_frontmatter_key_is_rejected(tmp_path: Path) -> None:
+    references = _references(tmp_path)
+    _write(
+        references / "guide.md",
+        "---\ntype: Reference\ntype: Guide\ntitle: Guide\n---\n\n# Guidance\n",
+    )
+    with pytest.raises(OkfValidationError) as exc:
+        load_references(references)
+    assert any(
+        "duplicate frontmatter key" in issue.message for issue in exc.value.issues
+    )
+
+
+def test_reference_nested_duplicate_key_is_rejected(tmp_path: Path) -> None:
+    references = _references(tmp_path)
+    _write(
+        references / "guide.md",
+        "---\n"
+        "type: Reference\n"
+        "title: Guide\n"
+        "sources:\n"
+        "- resource: a\n"
+        "  resource: b\n"
+        "---\n\n# Guidance\n",
+    )
+    with pytest.raises(OkfValidationError) as exc:
+        load_references(references)
+    assert any(
+        "duplicate frontmatter key" in issue.message for issue in exc.value.issues
+    )
+
+
+def test_duplicate_overlay_id_flagged_even_when_paths_differ(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    overlays = _overlays_root(tmp_path)
+    # Two files bind the same id; neither sits at its canonical path, so path
+    # validation alone would not surface the duplicate binding.
+    _write(
+        overlays / "metrics" / "a.md",
+        "---\nselayer_id: metric.gross_margin\n---\n\n# Usage Guidance\na\n",
+    )
+    _write(
+        overlays / "metrics" / "b.md",
+        "---\nselayer_id: metric.gross_margin\n---\n\n# Usage Guidance\nb\n",
+    )
+    with pytest.raises(OkfValidationError) as exc:
+        load_overlays(overlays, valid_layer)
+    duplicate_issues = [
+        issue
+        for issue in exc.value.issues
+        if "duplicate overlay selayer_id" in issue.message
+    ]
+    assert duplicate_issues, "expected a true duplicate-ID diagnostic"
+    assert all("metric.gross_margin" in issue.message for issue in duplicate_issues)

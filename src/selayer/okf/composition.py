@@ -61,6 +61,7 @@ _ALLOWED_OVERLAY_SECTIONS = (
 )
 _RESERVED_NAMES = frozenset({"index.md", "log.md"})
 _RELATED_CONCEPTS_SECTION = "Related Concepts"
+_YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
 _MAX_FILES = 1_000
 _MAX_FILE_BYTES = 1_048_576
 _MAX_TOTAL_BYTES = 16_777_216
@@ -116,13 +117,20 @@ def _relative_posix(path: Path, root: Path) -> str:
 def _walk_inputs(root: Path) -> list[Path]:
     """Return sorted regular files under ``root`` within the size/count limits.
 
-    Symbolic links, special files, and lexically-escaping paths are rejected
-    before any file is read. File count and byte totals are accumulated during
-    the walk so a pathological input cannot exhaust memory.
+    The root itself is validated with ``lstat`` (never following a symlink): a
+    root that is a symlink, special file, or non-directory is rejected before
+    the walk begins. Each walked path is then checked for lexical containment
+    and read only when it is a regular file. Symbolic links and special files
+    are rejected before any content is read, and file count and byte totals are
+    accumulated during the walk so a pathological input cannot exhaust memory.
     """
-    if not root.exists():
-        raise FileNotFoundError(f"input root does not exist: '{root}'")
-    if not root.is_dir():
+    try:
+        info = root.lstat()
+    except OSError as error:
+        raise FileNotFoundError(f"input root does not exist: '{root}'") from error
+    if stat_module.S_ISLNK(info.st_mode):
+        raise FileExistsError(f"input root is a symbolic link: '{root}'")
+    if not stat_module.S_ISDIR(info.st_mode):
         raise NotADirectoryError(f"input root is not a directory: '{root}'")
     candidates = sorted(root.rglob("*.md"), key=lambda path: path.as_posix())
     files: list[Path] = []
@@ -174,28 +182,69 @@ def _walk_inputs(root: Path) -> list[Path]:
 # ---------------------------------------------------------------------------
 
 
-def _reject_duplicate_keys(node: yaml.MappingNode) -> None:
-    seen: set[Any] = set()
-    for key_node, _value_node in node.value:
-        if isinstance(key_node, yaml.ScalarNode):
-            key = key_node.value
-            if key in seen:
-                raise OkfDocumentError(f"duplicate frontmatter key '{key}'")
-            seen.add(key)
+def _reject_duplicate_keys(
+    node: yaml.Node, _visited: set[int] | None = None
+) -> None:
+    """Recursively reject duplicate scalar keys and merge keys.
+
+    The walk descends into nested mappings and sequences so a duplicate buried
+    inside (for example) a list of sources is still detected, rather than only
+    the top-level keys. YAML merge keys (``<<``) are rejected outright: merge
+    resolution can silently mask a duplicate and introduce binding ambiguity,
+    which defeats the purpose of duplicate-key detection.
+
+    ``_visited`` guards against self-referential alias cycles in the composed
+    node graph, which would otherwise make the recursion non-terminating.
+    """
+    if _visited is None:
+        _visited = set()
+    if not isinstance(node, yaml.CollectionNode):
+        return
+    if id(node) in _visited:
+        return
+    _visited.add(id(node))
+    if isinstance(node, yaml.MappingNode):
+        seen: set[Any] = set()
+        for key_node, value_node in node.value:
+            if isinstance(key_node, yaml.ScalarNode):
+                if key_node.tag == _YAML_MERGE_TAG:
+                    raise OkfDocumentError("YAML merge keys are not supported")
+                key = key_node.value
+                if key in seen:
+                    raise OkfDocumentError(f"duplicate frontmatter key '{key}'")
+                seen.add(key)
+            else:
+                # A complex (non-scalar) mapping key; recurse into it too.
+                _reject_duplicate_keys(key_node, _visited)
+            _reject_duplicate_keys(value_node, _visited)
+    else:  # SequenceNode
+        for item in node.value:
+            _reject_duplicate_keys(item, _visited)
 
 
-def _safe_load_mapping(text: str) -> dict[str, Any]:
-    """safe_load a YAML mapping, rejecting duplicate scalar keys first."""
+def _compose_frontmatter(text: str) -> dict[str, Any]:
+    """Compose YAML frontmatter with recursive duplicate-key detection.
+
+    All YAML parse and construction failures are wrapped into a single fixed,
+    secret-safe message: the underlying error text from PyYAML can include
+    source snippets, anchors, tags, or file paths, so it is never surfaced.
+    A top-level non-mapping and any duplicate or merge key is rejected.
+    """
     try:
         node = yaml.compose(text, Loader=cast(type[yaml.Loader], yaml.SafeLoader))
-    except yaml.YAMLError as error:
-        raise OkfDocumentError(f"invalid YAML frontmatter: {error}") from error
+    except yaml.YAMLError:
+        raise OkfDocumentError("invalid YAML frontmatter")
     if node is None:
         return {}
     if not isinstance(node, yaml.MappingNode):
         raise OkfDocumentError("frontmatter must be a mapping")
     _reject_duplicate_keys(node)
-    loaded = yaml.safe_load(text)
+    try:
+        loaded = yaml.safe_load(text)
+    except yaml.YAMLError:
+        # A YAML that composes but fails construction (e.g. an explicit tag
+        # SafeLoader cannot build) must not leak the constructor diagnostic.
+        raise OkfDocumentError("invalid YAML frontmatter")
     if not isinstance(loaded, dict):
         raise OkfDocumentError("frontmatter must be a mapping")
     return loaded
@@ -235,6 +284,18 @@ def load_references(root: Path) -> Mapping[str, OkfConcept]:
                 _issue(relative_posix, f"reserved path '{path.name}' is not allowed")
             )
             continue
+        text = _read_text(path, relative_posix)
+        # Duplicate-key-safe composition before parse_concept re-parses, so
+        # malformed or duplicate-keyed frontmatter is reported with a fixed,
+        # secret-safe message and never reaches parse_concept's error path
+        # (which would otherwise forward PyYAML's source-bearing diagnostic).
+        frontmatter_match = _FRONTMATTER.match(text)
+        if frontmatter_match is not None:
+            try:
+                _compose_frontmatter(frontmatter_match.group(1))
+            except OkfDocumentError as error:
+                issues.append(_issue(relative_posix, str(error)))
+                continue
         try:
             concept = parse_concept(path, base)
         except UnicodeDecodeError as error:
@@ -284,7 +345,7 @@ def _parse_overlay(text: str) -> tuple[dict[str, Any], str, tuple[OkfSection, ..
     match = _FRONTMATTER.match(text)
     if match is None:
         raise OkfDocumentError("missing YAML frontmatter")
-    frontmatter = _safe_load_mapping(match.group(1))
+    frontmatter = _compose_frontmatter(match.group(1))
     body = text[match.end() :].lstrip("\n")
     preamble, sections = split_sections(body)
     links = _LINK.findall(body)
@@ -372,7 +433,7 @@ def load_overlays(root: Path, layer: SemanticLayer) -> tuple[OkfOverlay, ...]:
     files = _walk_inputs(input_root)
     overlays: list[OkfOverlay] = []
     issues: list[OkfIssue] = []
-    seen_ids: dict[str, str] = {}
+    all_ids: list[tuple[str, str]] = []
     for path in files:
         relative = PurePosixPath(path.relative_to(input_root).as_posix())
         relative_posix = relative.as_posix()
@@ -421,6 +482,11 @@ def load_overlays(root: Path, layer: SemanticLayer) -> tuple[OkfOverlay, ...]:
             )
         else:
             identifier = cast(str, selayer_id)
+            # Track every valid-format identifier for duplicate detection,
+            # independent of path validation (reported separately). A list
+            # (not a dict keyed by id) preserves repeated IDs so a true
+            # duplicate-ID diagnostic is emitted even when paths mismatch.
+            all_ids.append((identifier, relative_posix))
             valid_id = _validate_bound_overlay(
                 identifier,
                 layer,
@@ -465,9 +531,8 @@ def load_overlays(root: Path, layer: SemanticLayer) -> tuple[OkfOverlay, ...]:
                     sections=sections,
                 )
             )
-            seen_ids[identifier] = relative_posix
 
-    _report_duplicate_ids(seen_ids, issues)
+    _report_duplicate_ids(all_ids, issues)
     _raise_if_errors(issues)
     return tuple(
         sorted(overlays, key=lambda overlay: overlay.relative_path.as_posix())
@@ -527,20 +592,29 @@ def _validate_bound_overlay(
 
 
 def _report_duplicate_ids(
-    seen_ids: Mapping[str, str], issues: list[OkfIssue]
+    all_ids: list[tuple[str, str]], issues: list[OkfIssue]
 ) -> None:
-    counts: dict[str, int] = {}
-    for identifier in seen_ids:
-        counts[identifier] = counts.get(identifier, 0) + 1
-    for identifier, count in counts.items():
-        if count > 1:
-            issues.append(
-                _frontmatter_issue(
-                    seen_ids[identifier],
-                    "selayer_id",
-                    f"duplicate overlay selayer_id '{identifier}'",
+    """Emit a duplicate-ID diagnostic for every repeated overlay identifier.
+
+    ``all_ids`` carries every valid-format selayer_id alongside its path, so a
+    repeated identifier is detected even when its paths also mismatch (the
+    duplicate binding is the defect, independent of path validation). Each
+    occurrence of a duplicated identifier is reported.
+    """
+    by_id: dict[str, list[str]] = {}
+    for identifier, relative_posix in all_ids:
+        by_id.setdefault(identifier, []).append(relative_posix)
+    for identifier in sorted(by_id):
+        paths = by_id[identifier]
+        if len(paths) > 1:
+            for relative_posix in sorted(paths):
+                issues.append(
+                    _frontmatter_issue(
+                        relative_posix,
+                        "selayer_id",
+                        f"duplicate overlay selayer_id '{identifier}'",
+                    )
                 )
-            )
 
 
 __all__ = ["OkfOverlay", "load_overlays", "load_references"]
