@@ -462,7 +462,7 @@ def test_unavailable_registry_produces_unavailable_outcomes() -> None:
     assert report.complete is False
     assert report.passed is False
     unavailable_diags = [
-        diag for diag in report.diagnostics if diag.code == "source_unavailable"
+        diag for diag in report.diagnostics if diag.code == "source.audit.unavailable"
     ]
     assert unavailable_diags
     assert unavailable_diags[0].severity == "error"
@@ -675,9 +675,9 @@ def test_unavailable_outcome_marks_report_incomplete(tmp_path: Path) -> None:
     """Any required unavailable source makes the report incomplete + non-passing.
 
     A clean layer (all sources pass) yields a complete, passing report with no
-    ``source_unavailable`` diagnostic; once a source is unavailable the report
-    flips to ``complete=False`` with the stable diagnostic and ``passed`` is
-    ``False``.
+    ``source.audit.unavailable`` diagnostic; once a source is unavailable the
+    report flips to ``complete=False`` with the stable diagnostic and
+    ``passed`` is ``False``.
     """
 
     path = tmp_path / "events.parquet"
@@ -697,7 +697,8 @@ def test_unavailable_outcome_marks_report_incomplete(tmp_path: Path) -> None:
     assert clean_report.complete is True
     assert clean_report.passed is True
     assert not [
-        diag for diag in clean_report.diagnostics if diag.code == "source_unavailable"
+        diag for diag in clean_report.diagnostics
+        if diag.code == "source.audit.unavailable"
     ]
 
     unavailable_layer = _single_source_layer(
@@ -709,7 +710,7 @@ def test_unavailable_outcome_marks_report_incomplete(tmp_path: Path) -> None:
     unavailable_diags = [
         diag
         for diag in unavailable_report.diagnostics
-        if diag.code == "source_unavailable"
+        if diag.code == "source.audit.unavailable"
     ]
     assert unavailable_diags
     assert unavailable_diags[0].severity == "error"

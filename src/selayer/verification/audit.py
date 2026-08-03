@@ -54,7 +54,7 @@ _PATH = "physical"
 
 #: Stable code for the single report-level diagnostic emitted when any source
 #: is unavailable, marking the report incomplete.
-_UNAVAILABLE_CODE = "source_unavailable"
+_UNAVAILABLE_CODE = "source.audit.unavailable"
 
 #: Locally scoped alias for the supported evidence leaf types (mirrors the
 #: runtime contract enforced by ``VerificationOutcome``).
