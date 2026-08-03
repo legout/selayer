@@ -1,22 +1,35 @@
 """Runtime profile-file parsing into a :class:`MappingProfileResolver`.
 
 A *profile document* is a small version-1 YAML mapping that declares named
-profiles of credential/option values.  Each profile is a mapping of *keys* to
-*sources*; a source resolves its value from one of exactly two places:
+profiles of credential/option values.  Each profile is a non-empty mapping of
+*keys* to *sources*; a source resolves its value from one of exactly two
+places:
 
 * ``env`` — read from the process environment (or an injected mapping) at load
   time, accepted only as an exact builtin ``str`` so a hostile ``str`` subclass
   (whose own ``__repr__`` could leak a secret) is rejected rather than retained;
-* ``literal`` — an inline scalar/structure copied verbatim from the document.
+* ``literal`` — an inline *boolean* copied verbatim from the document.  Only an
+  exact builtin ``bool`` is accepted: strings, numbers, ``null``, sequences, and
+  mappings are rejected so a credential-bearing value can never be inlined into
+  a profile document (and never rendered by an error).
+
+Each entry mapping may declare *only* ``env`` and/or ``literal`` — any other
+field (including a YAML merge key ``<<``) is rejected — and exactly one of the
+two.  The document version must be the integer ``1`` (``type(value) is int``),
+``profiles`` must be a non-empty mapping, and every named profile must be a
+non-empty mapping.
 
 Resolution never retains or renders any resolved value or environment value.
-Every failure — a malformed document, a duplicate key, an unsupported version,
-an unknown top-level key, an invalid profile name, an invalid source shape, an
-invalid environment name, or a missing environment variable — surfaces as a
-:class:`ProfileFileValidationError` carrying only a stable ``code``, a
-structural document ``path``, and a *constant* message looked up from a fixed
-code-to-message mapping.  The error is always raised *outside* an active
-``except`` scope, so ``__cause__`` and ``__context__`` remain ``None``.
+Every failure surfaces as an immutable :class:`ProfileFileValidationError`
+carrying only a stable ``code``, a structural document ``path`` composed
+exclusively of *validated* identifier tokens and fixed redaction tokens, and a
+*constant* message looked up from a fixed code-to-message mapping.  No raw YAML
+key, value, or secret ever reaches ``repr``, ``str``, ``args``, ``path``,
+``message``, the traceback, or ``__cause__``/``__context__``.  Every error is
+constructed and raised *outside* an active ``except`` scope, so ``__cause__``
+and ``__context__`` remain ``None`` (a YAML parse failure is captured, the raw
+PyYAML exception discarded, and the sanitized error raised after the
+``except``/``finally`` completes).
 
 Runtime resolver failures (an unknown profile *name* at resolve time) remain
 the responsibility of :class:`~selayer.sources.errors.SourceProfileError`, which
@@ -39,16 +52,24 @@ __all__ = ["ProfileFileValidationError", "load_profile_file"]
 
 # Constant, generic messages keyed by stable error code.  Only these constant
 # strings are ever stored or rendered by a :class:`ProfileFileValidationError`;
-# no resolved value, environment value, or environment name surfaces.
+# no resolved value, environment value, or raw YAML key surfaces.
 _CODE_MESSAGES: dict[str, str] = {
     "source.profile.malformed": "the profile document is not valid YAML",
+    "source.profile.merge_key": "the profile document uses an unsupported merge key",
     "source.profile.duplicate_key": "the profile document contains a duplicate key",
     "source.profile.not_mapping": "the profile document root must be a mapping",
     "source.profile.unknown_key": "the profile document has an unknown top-level key",
     "source.profile.wrong_version": "the profile document version is not supported",
     "source.profile.profiles_not_mapping": "the profiles section must be a mapping",
+    "source.profile.profiles_empty": (
+        "the profiles section must declare at least one profile"
+    ),
     "source.profile.invalid_profile_name": "a profile name is not a valid identifier",
     "source.profile.entry_not_mapping": "a profile entry must be a mapping",
+    "source.profile.profile_empty": "a profile must declare at least one entry",
+    "source.profile.unknown_source_field": (
+        "a profile entry has an unknown source field"
+    ),
     "source.profile.missing_source": "a profile entry must declare exactly one source",
     "source.profile.ambiguous_source": (
         "a profile entry must declare exactly one source"
@@ -62,15 +83,17 @@ _CODE_MESSAGES: dict[str, str] = {
     "source.profile.invalid_environment_value": (
         "a profile environment value is invalid"
     ),
+    "source.profile.invalid_literal": "a profile literal value must be a boolean",
 }
 
 _FALLBACK_MESSAGE = "a profile document could not be loaded"
 
 # Identifier shape shared with the catalog source-name convention
-# (lowercase snake_case).  A profile name must match it exactly to be retained
-# or interpolated into a structural path; a non-conformant name is rejected
-# (and never rendered) so hostile text can never reach a diagnostic.
-_PROFILE_NAME_RE = re.compile(r"\A[a-z][a-z0-9_]*\Z")
+# (lowercase snake_case).  A profile name, an entry key, or a structural path
+# token must match it exactly to be retained or interpolated into a structural
+# path; a non-conformant value is rejected (profile names) or redacted to a
+# fixed token (entry/path keys) so hostile text can never reach a diagnostic.
+_IDENTIFIER_RE = re.compile(r"\A[a-z][a-z0-9_]*\Z")
 
 # Environment-variable-name shape: a leading letter or underscore followed by
 # letters, digits, or underscores.  Only an env name matching this shape is
@@ -78,21 +101,33 @@ _PROFILE_NAME_RE = re.compile(r"\A[a-z][a-z0-9_]*\Z")
 # never rendered) so hostile text can never reach a diagnostic.
 _ENV_NAME_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
 
-# The closed set of permitted top-level document keys.
+# The closed set of permitted top-level document keys, and the only permitted
+# source-field names within an entry mapping.
 _TOP_LEVEL_KEYS = frozenset({"version", "profiles"})
+_SOURCE_FIELDS = frozenset({"env", "literal"})
+
+# Fixed structural path tokens used wherever a raw, unvalidated value must not
+# be interpolated into a diagnostic path.
+_ROOT_PATH = "<document>"
+_UNKNOWN_KEY_PATH = "top_level"
+_REDACTED_KEY = "<key>"
 
 
 class ProfileFileValidationError(Exception):
     """Raised when a profile document cannot be loaded or resolved safely.
 
-    Only safe, derived attributes are stored:
+    Only safe, derived attributes are stored, once, at construction, and are
+    immutable thereafter:
 
-    * ``code`` — a stable symbolic code from a fixed allowlist.
-    * ``path`` — a structural document path (never a resolved value).
+    * ``code`` — a stable symbolic code (a constant, never a credential).
+    * ``path`` — a structural document path built only from *validated*
+      identifier tokens and fixed redaction tokens (never a raw value).
     * ``message`` — a constant generic message looked up from ``code``.
 
-    No resolved profile value or environment value is ever stored or rendered.
-    The attributes are set once at construction and are not mutated thereafter.
+    No resolved profile value, environment value, or raw YAML key/value is ever
+    stored or rendered.  The class uses ``__slots__`` and overrides
+    ``__setattr__``/``__delattr__`` to reject mutation, so ``code``, ``path``,
+    and ``message`` cannot be altered after construction.
 
     Attributes:
         code: stable symbolic error code (constant, no credentials).
@@ -100,15 +135,31 @@ class ProfileFileValidationError(Exception):
         message: constant, sanitized human-readable detail.
     """
 
+    __slots__ = ("code", "message", "path")
+
     def __init__(self, code: str, path: str) -> None:
-        self.code = code
-        self.path = path
-        self.message = _CODE_MESSAGES.get(code, _FALLBACK_MESSAGE)
+        # All attributes are set exactly once via the base ``__setattr__`` so
+        # the immutability guard below cannot block construction.  ``code`` and
+        # ``path`` are only ever constructed internally from constant codes and
+        # structural paths composed of validated tokens.
+        object.__setattr__(self, "code", code)
+        object.__setattr__(self, "path", path)
+        object.__setattr__(self, "message", _CODE_MESSAGES.get(code, _FALLBACK_MESSAGE))
+        # ``BaseException.__init__`` writes ``args`` through the C-level slot
+        # and does not route through this class's ``__setattr__``; ``args`` is
+        # therefore the single constant ``message`` (never a raw value).
         super().__init__(self.message)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("ProfileFileValidationError is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("ProfileFileValidationError is immutable")
 
     def __repr__(self) -> str:
         return (
-            f"ProfileFileValidationError(code={self.code!r}, path={self.path!r})"
+            f"ProfileFileValidationError(code={self.code!r}, "
+            f"path={self.path!r}, message={self.message!r})"
         )
 
 
@@ -120,10 +171,12 @@ def load_profile_file(
     """Load a version-1 profile document into a profile resolver.
 
     Each profile value is resolved from ``env`` (read from *environ*, accepted
-    only as an exact builtin ``str``) or ``literal`` (copied verbatim).  Any
-    malformed document or unresolvable value raises a sanitized
+    only as an exact builtin ``str``) or ``literal`` (an exact builtin ``bool``
+    copied verbatim).  Any malformed document, unresolvable value, or
+    disallowed literal raises an immutable, sanitized
     :class:`ProfileFileValidationError` outside any ``except`` scope; no
-    resolved or environment value is ever retained or rendered.
+    resolved value, environment value, or raw YAML key is ever retained or
+    rendered.
     """
     document = _compose_without_duplicate_keys(Path(path))
     profiles = _validate_document_shape(document)
@@ -132,57 +185,84 @@ def load_profile_file(
 
 
 def _compose_without_duplicate_keys(path: Path) -> object:
-    """Read and parse a profile document, rejecting duplicate mapping keys.
+    """Read and parse a profile document, rejecting duplicate and merge keys.
 
-    Duplicate keys (which PyYAML would silently collapse) are detected by
-    walking the composed node tree and rejected *before* construction, so a
-    silently-shadowed value can never reach resolution.  Returns the
-    constructed document, or ``None`` for an empty/null document.  A
-    syntactically invalid document is reported as a constant-code validation
-    error; the PyYAML diagnostic (which may quote document text) is discarded.
+    Duplicate keys (which PyYAML would silently collapse) and YAML merge keys
+    (``<<``, which PyYAML would silently flatten) are detected by walking the
+    composed node tree and rejected *before* construction, so a silently
+    shadowed or merged value can never reach resolution.  Returns the
+    constructed document, or ``None`` for an empty/null document.
+
+    A syntactically invalid document is reported as a constant-code validation
+    error: the PyYAML exception (whose message may quote document text) is
+    captured inside the ``except`` and the sanitized error is raised *after*
+    the ``except``/``finally`` completes, so no raw exception reaches
+    ``__cause__``, ``__context__``, the traceback, or ``args``.
     """
     text = path.read_text(encoding="utf-8")
     loader = yaml.SafeLoader(text)
+    parse_error: ProfileFileValidationError | None = None
+    data: object = None
     try:
         node = loader.get_single_node()
-        if node is None:
-            return None
-        _reject_duplicate_keys(node)
-        data = loader.construct_document(node)
+        if node is not None:
+            # Raises ProfileFileValidationError (not a yaml.YAMLError), so it
+            # propagates straight through ``except yaml.YAMLError``; being
+            # raised inside the ``try`` (not an ``except``) leaves
+            # ``__context__`` None.
+            _reject_duplicate_and_merge_keys(node)
+            data = loader.construct_document(node)
     except yaml.YAMLError:
-        raise ProfileFileValidationError(
+        # Capture only the constant code; discard the raw PyYAML exception.  The
+        # sanitized error is raised below, outside any active ``except`` scope.
+        parse_error = ProfileFileValidationError(
             "source.profile.malformed", str(path)
-        ) from None
+        )
     finally:
         loader.dispose()
+    if parse_error is not None:
+        # Raised outside the ``except`` so __cause__/__context__ are None and
+        # the traceback carries no PyYAML frames.
+        raise parse_error
     return data
 
 
-def _reject_duplicate_keys(node: yaml.Node) -> None:
-    """Walk a YAML node tree raising on the first duplicate mapping key."""
+def _reject_duplicate_and_merge_keys(node: yaml.Node) -> None:
+    """Walk a YAML node tree raising on the first merge or duplicate key."""
 
-    _walk_for_duplicate_keys(node, "")
+    _walk_for_duplicate_and_merge_keys(node, "")
 
 
-def _walk_for_duplicate_keys(node: yaml.Node, path: str) -> None:
+def _walk_for_duplicate_and_merge_keys(node: yaml.Node, path: str) -> None:
     if isinstance(node, yaml.MappingNode):
         seen: set[str] = set()
         for key_node, value_node in node.value:
-            child_path = path
-            if isinstance(key_node, yaml.ScalarNode) and isinstance(
-                key_node.value, str
-            ):
+            if isinstance(key_node, yaml.ScalarNode):
                 key = key_node.value
-                child_path = f"{path}.{key}" if path else key
-                if key in seen:
+                # A merge key is an unsupported construct anywhere in the
+                # document; reject it before construction can flatten it.
+                if key == "<<":
                     raise ProfileFileValidationError(
-                        "source.profile.duplicate_key", child_path
+                        "source.profile.merge_key", path or _ROOT_PATH
                     )
-                seen.add(key)
-            _walk_for_duplicate_keys(value_node, child_path)
+                if isinstance(key, str):
+                    # The error path renders only a validated identifier token;
+                    # a hostile key is redacted.  Duplicate detection compares
+                    # the raw key (never rendered) so two hostile keys that
+                    # redact identically are still distinguished internally.
+                    safe = _safe_key_token(key)
+                    child_path = f"{path}.{safe}" if path else safe
+                    if key in seen:
+                        raise ProfileFileValidationError(
+                            "source.profile.duplicate_key", child_path
+                        )
+                    seen.add(key)
+                    _walk_for_duplicate_and_merge_keys(value_node, child_path)
+                    continue
+            _walk_for_duplicate_and_merge_keys(value_node, path)
     elif isinstance(node, yaml.SequenceNode):
         for index, item in enumerate(node.value):
-            _walk_for_duplicate_keys(item, f"{path}[{index}]")
+            _walk_for_duplicate_and_merge_keys(item, f"{path}[{index}]")
 
 
 def _validate_document_shape(
@@ -192,24 +272,36 @@ def _validate_document_shape(
 
     Every structural failure raises a :class:`ProfileFileValidationError`
     before any environment value is read, so a structurally invalid document
-    can never cause a resolved value to be retained.  Returns the validated
-    profiles section typed as ``{profile_name: entry_mapping}``.
+    can never cause a resolved value to be retained.  Returns the validated,
+    non-empty profiles section typed as ``{profile_name: entry_mapping}``.
     """
     if not isinstance(document, Mapping):
         raise ProfileFileValidationError("source.profile.not_mapping", "profiles")
     for key in document:
+        # An unknown top-level key is never rendered: the structural path is
+        # the fixed ``top_level`` token so a hostile key cannot reach a
+        # diagnostic.
         if key not in _TOP_LEVEL_KEYS:
-            raise ProfileFileValidationError("source.profile.unknown_key", str(key))
-    if document.get("version") != 1:
+            raise ProfileFileValidationError(
+                "source.profile.unknown_key", _UNKNOWN_KEY_PATH
+            )
+    version = document.get("version")
+    # The version must be the integer 1 exactly: ``type(value) is int`` rejects
+    # ``1.0`` (float), ``true`` (bool, which equals 1), and missing/null values.
+    if type(version) is not int or version != 1:
         raise ProfileFileValidationError("source.profile.wrong_version", "version")
     raw_profiles = document.get("profiles")
     if not isinstance(raw_profiles, Mapping):
         raise ProfileFileValidationError(
             "source.profile.profiles_not_mapping", "profiles"
         )
+    if not raw_profiles:
+        raise ProfileFileValidationError(
+            "source.profile.profiles_empty", "profiles"
+        )
     profiles: dict[str, Mapping[object, object]] = {}
     for name in raw_profiles:
-        if not (isinstance(name, str) and _PROFILE_NAME_RE.fullmatch(name)):
+        if not (type(name) is str and _IDENTIFIER_RE.fullmatch(name)):
             # The non-conformant name is never rendered: the structural path is
             # the generic ``"profiles"`` so hostile text cannot reach a
             # diagnostic.
@@ -220,6 +312,10 @@ def _validate_document_shape(
         if not isinstance(entries, Mapping):
             raise ProfileFileValidationError(
                 "source.profile.entry_not_mapping", f"profiles.{name}"
+            )
+        if not entries:
+            raise ProfileFileValidationError(
+                "source.profile.profile_empty", f"profiles.{name}"
             )
         profiles[name] = entries
     return profiles
@@ -253,15 +349,23 @@ def _resolve_entry(
     caller hands to :class:`MappingProfileResolver`, whose
     :class:`~selayer.sources.profiles.RuntimeProfile` excludes values from its
     repr).  No resolved value or environment value is ever interpolated into an
-    error; every failure carries only a constant message and a structural path.
-    The entry key is a YAML string in every well-formed profile document and is
-    rendered only through a structural path.
+    error; every failure carries only a constant message and a structural path
+    whose only interpolated component is a validated profile name plus a
+    redacted entry-key token.
     """
+    # The entry key is stored verbatim (coerced to ``str``) so adapters can
+    # look it up; only the *error path* is sanitized via ``_safe_key_token``.
     key_name = str(key)
-    entry_path = f"profiles.{name}.{key_name}"
+    entry_path = f"profiles.{name}.{_safe_key_token(key)}"
     if not isinstance(source, Mapping):
         raise ProfileFileValidationError(
             "source.profile.entry_not_mapping", entry_path
+        )
+    # An entry may declare only ``env`` and/or ``literal``; any other field is
+    # rejected (merge keys are already rejected during composition).
+    if not set(source) <= _SOURCE_FIELDS:
+        raise ProfileFileValidationError(
+            "source.profile.unknown_source_field", entry_path
         )
     has_env = "env" in source
     has_literal = "literal" in source
@@ -273,7 +377,7 @@ def _resolve_entry(
         raise ProfileFileValidationError("source.profile.missing_source", entry_path)
     if has_env:
         env_name = source["env"]
-        if not (isinstance(env_name, str) and _ENV_NAME_RE.fullmatch(env_name)):
+        if not (type(env_name) is str and _ENV_NAME_RE.fullmatch(env_name)):
             # A malformed env name is never rendered: the path is the structural
             # ``...env`` location, not the name itself.
             raise ProfileFileValidationError(
@@ -293,4 +397,27 @@ def _resolve_entry(
             )
         values[key_name] = value
     else:
-        values[key_name] = source["literal"]
+        literal = source["literal"]
+        # Only an exact builtin ``bool`` literal is accepted: strings, numbers,
+        # ``null``, sequences, and mappings are rejected so a credential-bearing
+        # value can never be inlined (and never rendered by an error).
+        if type(literal) is not bool:
+            raise ProfileFileValidationError(
+                "source.profile.invalid_literal", entry_path
+            )
+        values[key_name] = literal
+
+
+def _safe_key_token(value: object) -> str:
+    """Render a structural-path key token, redacting hostile values.
+
+    Only an *exact* builtin ``str`` that matches the identifier shape is
+    rendered; a hostile ``str`` subclass (whose custom ``__repr__`` could leak a
+    secret), a non-string, or a non-conformant key is redacted to the fixed
+    ``<key>`` token so it can never reach a diagnostic path.
+    """
+    return (
+        value
+        if type(value) is str and _IDENTIFIER_RE.fullmatch(value)
+        else _REDACTED_KEY
+    )
