@@ -894,12 +894,21 @@ def load(path: str | Path) -> SemanticLayer:
     try:
         text = Path(path).read_text(encoding="utf-8")
         node, data = _compose_and_construct(text)
-    except yaml.YAMLError as error:
-        collector.add("", f"invalid YAML: {error}")
+    except yaml.YAMLError:
+        # PyYAML's diagnostic echoes the offending source line(s) verbatim, so
+        # ``str(error)`` can carry credentials, authenticated locations, or
+        # other secrets from the file into a ``CatalogIssue``/verification
+        # report. Report a fixed, secret-safe domain message instead and never
+        # interpolate the parser's text. The code stays on the default
+        # ``catalog.invalid`` so catalog error behavior is unchanged.
+        collector.add("", "catalog file is not valid YAML")
         collector.raise_if_any()
         raise AssertionError("unreachable")
-    except (TypeError, ValueError) as error:
-        collector.add("", f"invalid catalog structure: {error}")
+    except (TypeError, ValueError):
+        # Structural construction failures are reported with a fixed
+        # secret-safe message; the exception text is never interpolated
+        # because it could carry source values from the document.
+        collector.add("", "catalog file has an invalid structure")
         collector.raise_if_any()
         raise AssertionError("unreachable")
 

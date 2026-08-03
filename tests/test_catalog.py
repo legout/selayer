@@ -312,6 +312,32 @@ def test_catalog_malformed_yaml_is_catalog_error(tmp_path: Path) -> None:
         SemanticLayer.load(path)
 
 
+def test_catalog_malformed_yaml_does_not_leak_source_secrets(
+    tmp_path: Path,
+) -> None:
+    """A YAML parse error never echoes offending source lines (secret safety).
+
+    PyYAML reproduces the offending line verbatim in its diagnostic; the loader
+    must surface a fixed domain message so credentials in the file cannot leak
+    into ``CatalogIssue`` messages, the error ``str``, or any ``repr``.
+    """
+    secret = "XYZ-SECRET-123"
+    path = _write(
+        tmp_path,
+        "version: 1\nname: ecommerce\ndata_sources:\n  orders:\n"
+        f"    pwd: {secret} {{ a: b\n",
+    )
+    with pytest.raises(CatalogValidationError) as caught:
+        SemanticLayer.load(path)
+    error = caught.value
+    assert len(error.issues) == 1
+    issue = error.issues[0]
+    assert issue.code == "catalog.invalid"
+    assert issue.message == "catalog file is not valid YAML"
+    for surface in (issue.message, str(error), repr(error), repr(issue)):
+        assert secret not in surface
+
+
 def test_catalog_root_must_be_mapping(tmp_path: Path) -> None:
     path = _write(tmp_path, "- version: 1\n- name: ecommerce\n")
     with pytest.raises(CatalogValidationError) as caught:
