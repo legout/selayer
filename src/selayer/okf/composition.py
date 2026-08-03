@@ -166,7 +166,7 @@ def _open_root(root: Path) -> int:
 
 
 def _walk_inputs(root: Path) -> tuple[list[Path], int]:
-    """Return sorted regular files under ``root`` and a pinned root directory fd.
+    """Return sorted regular ``.md`` files under ``root`` and a pinned root fd.
 
     The root is opened once with no-follow semantics (:func:`_open_root`) and
     the returned descriptor is pinned to the validated root inode. Every file is
@@ -175,57 +175,85 @@ def _walk_inputs(root: Path) -> tuple[list[Path], int]:
     intermediate directory, or the file itself cannot redirect a read out of
     the input root. The caller must close the returned fd.
 
-    Each walked path is still checked for lexical containment and read only when
-    it is a regular file. Symbolic links and special files are rejected before
-    any content is read, and file count and byte totals are accumulated during
-    the walk so a pathological input cannot exhaust memory.
+    Unlike a ``*.md`` glob (which never inspects a directory entry and so
+    silently skips -- or silently follows -- a symlinked directory), the walk
+    visits **every** directory entry. Each entry, including an intermediate
+    directory, is ``lstat``-checked, and any symlink, special file, or
+    path-escaping entry is rejected *before* a non-``.md`` regular file is
+    silently skipped. A valid ``.md`` file that lives behind a symlinked
+    directory therefore produces a safe rejection instead of being silently
+    included or dropped. File count and byte totals are accumulated after the
+    walk so a pathological input cannot exhaust memory.
     """
     root_fd = _open_root(root)
     try:
-        candidates = sorted(root.rglob("*.md"), key=lambda path: path.as_posix())
-        files: list[Path] = []
-        total = 0
-        for path in candidates:
+        # Walk every directory entry (not only *.md): a glob for *.md never
+        # inspects a directory entry, so a symlinked or special intermediate
+        # directory would be silently traversed or skipped rather than rejected.
+        candidates: list[tuple[Path, int]] = []
+        stack: list[Path] = [root]
+        while stack:
+            current = stack.pop()
             try:
-                info = path.lstat()
+                entries = sorted(current.iterdir(), key=lambda path: path.name)
             except OSError as error:
                 raise OkfDocumentError(
-                    f"cannot stat '{_relative_posix(path, root)}'"
+                    f"cannot read input directory: '{_relative_posix(current, root)}'"
                 ) from error
-            if stat_module.S_ISLNK(info.st_mode):
-                # Echo only the local input-relative path (never a URL secret);
-                # a symlink is a structural file-system concern, not a link
-                # target.
-                raise FileExistsError(
-                    f"symbolic link is not allowed: '{_relative_posix(path, root)}'"
-                )
-            # Lexical containment: rglob normalizes, so a real escape requires a
-            # symlink (rejected above). The check is defensive belt-and-suspenders.
-            try:
-                path.relative_to(root)
-            except ValueError as error:
-                raise OkfDocumentError(
-                    f"path escapes input root: '{_relative_posix(path, root)}'"
-                ) from error
-            if not stat_module.S_ISREG(info.st_mode):
-                raise OkfDocumentError(
-                    f"special file is not allowed: '{_relative_posix(path, root)}'"
-                )
-            size = info.st_size
+            for entry in entries:
+                try:
+                    info = entry.lstat()
+                except OSError as error:
+                    raise OkfDocumentError(
+                        f"cannot stat '{_relative_posix(entry, root)}'"
+                    ) from error
+                # Reject a symlink (file or directory) before anything else.
+                # Echo only the local input-relative path (never a link target):
+                # a symlink is a structural file-system concern, not a URL.
+                if stat_module.S_ISLNK(info.st_mode):
+                    raise FileExistsError(
+                        f"symbolic link is not allowed: "
+                        f"'{_relative_posix(entry, root)}'"
+                    )
+                # Lexical containment: defensive belt-and-suspenders (iterdir
+                # never yields a path outside its argument), mirroring the
+                # no-follow traversal used at read time.
+                try:
+                    entry.relative_to(root)
+                except ValueError as error:
+                    raise OkfDocumentError(
+                        f"path escapes input root: '{_relative_posix(entry, root)}'"
+                    ) from error
+                if stat_module.S_ISDIR(info.st_mode):
+                    stack.append(entry)
+                    continue
+                if not stat_module.S_ISREG(info.st_mode):
+                    raise OkfDocumentError(
+                        f"special file is not allowed: '{_relative_posix(entry, root)}'"
+                    )
+                # A regular non-.md file is silently skipped (preserving the
+                # reserved/non-md semantics); only .md inputs compose.
+                if entry.suffix != ".md":
+                    continue
+                candidates.append((entry, info.st_size))
+        files = sorted(candidates, key=lambda item: item[0].as_posix())
+        accepted: list[Path] = []
+        total = 0
+        for path, size in files:
             if size > _MAX_FILE_BYTES:
                 raise OkfDocumentError(
                     f"file exceeds {_MAX_FILE_BYTES} bytes: "
                     f"'{_relative_posix(path, root)}'"
                 )
-            if len(files) + 1 > _MAX_FILES:
+            if len(accepted) + 1 > _MAX_FILES:
                 raise OkfDocumentError(f"more than {_MAX_FILES} input files")
             total += size
             if total > _MAX_TOTAL_BYTES:
                 raise OkfDocumentError(
                     f"total input exceeds {_MAX_TOTAL_BYTES} bytes"
                 )
-            files.append(path)
-        return files, root_fd
+            accepted.append(path)
+        return accepted, root_fd
     except BaseException:
         try:
             os.close(root_fd)
@@ -310,7 +338,7 @@ def _compose_frontmatter(text: str) -> dict[str, Any]:
 
 
 def _safe_read_text(
-    path: Path, root: Path, root_fd: int, relative: str
+    path: Path, root: Path, root_fd: int, relative: str, byte_budget: int
 ) -> tuple[str, int]:
     """Read a trusted input file via a pinned root fd with no-follow traversal.
 
@@ -321,13 +349,19 @@ def _safe_read_text(
     in for an intermediate directory or the file itself cannot be followed out
     of the input root.
 
-    Byte limits are enforced on the opened descriptor, not only at walk time:
-    the descriptor is ``fstat``-checked for a regular file, its size is capped at
-    ``_MAX_FILE_BYTES``, and the read is bounded to that cap (then re-checked by
-    ``fstat``) so a file that grows after enumeration cannot bypass the limit or
-    accumulate an unbounded chunk. Any detected replacement raises a fixed,
-    secret-safe domain error. Returns the decoded text and the raw byte count
-    read, so the caller can enforce an aggregate cap across files.
+    ``byte_budget`` is the remaining aggregate byte allowance
+    (``_MAX_TOTAL_BYTES`` minus the bytes already consumed by prior reads). Byte
+    limits are enforced on the opened descriptor, not only at walk time: the
+    descriptor is ``fstat``-checked for a regular file, its size is capped at
+    ``_MAX_FILE_BYTES``, and the read is **prospectively** capped at
+    ``min(_MAX_FILE_BYTES, byte_budget)`` so no bytes beyond ``_MAX_TOTAL_BYTES``
+    are consumed before a rejection is raised. A file that exceeds the per-file
+    cap is rejected (``file exceeds``); a file that fits the per-file cap but
+    exhausts the remaining aggregate budget is rejected (``total input
+    exceeds``). A post-read ``fstat`` re-checks growth past the per-file cap. Any
+    detected replacement raises a fixed, secret-safe domain error. Returns the
+    decoded text and the raw byte count read, so the caller can keep the running
+    aggregate current.
     """
     try:
         rel = PurePosixPath(path.relative_to(root).as_posix())
@@ -383,16 +417,25 @@ def _safe_read_text(
             raise OkfDocumentError(
                 f"file exceeds {_MAX_FILE_BYTES} bytes: '{relative}'"
             )
+        # Prospective aggregate cap: bound the read to the smaller of the
+        # per-file cap and the remaining aggregate budget so no bytes beyond
+        # _MAX_TOTAL_BYTES are consumed before a rejection is raised. A file
+        # that fits the per-file cap but exhausts the budget is rejected here.
+        effective_cap = min(_MAX_FILE_BYTES, byte_budget)
+        if info.st_size > effective_cap:
+            raise OkfDocumentError(
+                f"total input exceeds {_MAX_TOTAL_BYTES} bytes"
+            )
         chunks: list[bytes] = []
-        remaining = _MAX_FILE_BYTES
+        remaining = effective_cap
         while remaining > 0:
             chunk = os.read(fd, min(_READ_CHUNK, remaining))
             if not chunk:
                 break
             chunks.append(chunk)
             remaining -= len(chunk)
-        # Re-check after reading: a file that grew past the cap mid-read must be
-        # rejected even though the bounded read stopped at the limit.
+        # Re-check after reading: a file that grew past the per-file cap mid-read
+        # must be rejected even though the bounded read stopped at the limit.
         try:
             final_size = os.fstat(fd).st_size
         except OSError as error:
@@ -404,7 +447,7 @@ def _safe_read_text(
         try:
             return (
                 b"".join(chunks).decode("utf-8").replace("\r\n", "\n"),
-                _MAX_FILE_BYTES - remaining,
+                effective_cap - remaining,
             )
         except UnicodeDecodeError as error:
             raise OkfDocumentError(f"invalid UTF-8 in '{relative}'") from error
@@ -455,12 +498,14 @@ def load_references(root: Path) -> Mapping[str, OkfConcept]:
             # a symlink swap at the root, an intermediate directory, or the file
             # itself cannot redirect the read), then parse the concept from this
             # in-memory text so parse_concept never re-opens the path.
+            budget = _MAX_TOTAL_BYTES - total_read
             text, consumed = _safe_read_text(
-                path, input_root, root_fd, relative_posix
+                path, input_root, root_fd, relative_posix, budget
             )
-            # Aggregate byte cap is re-enforced on the bytes actually read, so
-            # files that grew after the walk-time lstat accounting cannot
-            # accumulate past the total limit.
+            # _safe_read_text caps the read to the remaining budget so no bytes
+            # beyond _MAX_TOTAL_BYTES are consumed before a rejection; the
+            # running total is kept current for the next file's budget. The
+            # post-read check is belt-and-suspenders against growth.
             total_read += consumed
             if total_read > _MAX_TOTAL_BYTES:
                 raise OkfDocumentError(
@@ -626,12 +671,14 @@ def load_overlays(root: Path, layer: SemanticLayer) -> tuple[OkfOverlay, ...]:
                     _issue(relative_posix, f"reserved path '{path.name}' is not allowed")
                 )
                 continue
+            budget = _MAX_TOTAL_BYTES - total_read
             text, consumed = _safe_read_text(
-                path, input_root, root_fd, relative_posix
+                path, input_root, root_fd, relative_posix, budget
             )
-            # Aggregate byte cap re-enforced on the bytes actually read, so
-            # files that grew after the walk-time lstat accounting cannot
-            # accumulate past the total limit.
+            # _safe_read_text caps the read to the remaining budget so no bytes
+            # beyond _MAX_TOTAL_BYTES are consumed before a rejection; the
+            # running total is kept current for the next file's budget. The
+            # post-read check is belt-and-suspenders against growth.
             total_read += consumed
             if total_read > _MAX_TOTAL_BYTES:
                 raise OkfDocumentError(

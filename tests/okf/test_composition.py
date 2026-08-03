@@ -712,7 +712,9 @@ def test_safe_read_text_rejects_symlink_replacement(tmp_path: Path) -> None:
         # The safe reader must refuse the symlink outright (replacement
         # detected) and never follow it to read the secret-bearing target.
         with pytest.raises(OkfDocumentError) as exc:
-            composition._safe_read_text(link, references, root_fd, "link.md")
+            composition._safe_read_text(
+                link, references, root_fd, "link.md", composition._MAX_TOTAL_BYTES
+            )
         assert "replaced" in str(exc.value)
         assert "SECRET-VALUE-DO-NOT-LEAK" not in str(exc.value)
     finally:
@@ -857,7 +859,11 @@ def test_safe_read_text_pins_root_against_symlink_swap(tmp_path: Path) -> None:
         shutil.move(str(root), str(tmp_path / "moved"))
         root.symlink_to(secret_dir)
         text, _ = composition._safe_read_text(
-            root / "guide.md", root, root_fd, "guide.md"
+            root / "guide.md",
+            root,
+            root_fd,
+            "guide.md",
+            composition._MAX_TOTAL_BYTES,
         )
         assert text == "original-content"
         assert "SECRET-VALUE-DO-NOT-LEAK" not in text
@@ -889,6 +895,7 @@ def test_safe_read_text_rejects_intermediate_directory_symlink_swap(
                 root,
                 root_fd,
                 "metrics/gross_margin.md",
+                composition._MAX_TOTAL_BYTES,
             )
         assert "replaced" in str(exc.value)
         assert "SECRET-VALUE-DO-NOT-LEAK" not in str(exc.value)
@@ -1000,6 +1007,155 @@ def test_total_grown_after_walk_is_rejected(
         # Grow one file AFTER the walk so the read-time aggregate total exceeds
         # the cap while each file stays under _MAX_FILE_BYTES (aggregate fires).
         _write(b, small + "z" * 200)
+        return files, root_fd
+
+    monkeypatch.setattr(composition, "_walk_inputs", growing_walk)
+    with pytest.raises(OkfDocumentError) as exc:
+        load_references(references)
+    assert "total input exceeds" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Medium-finding follow-up: walk every directory entry (not only *.md) so a
+# symlinked/special intermediate directory is rejected rather than silently
+# skipped or followed; non-md regular files are still silently ignored.
+# ---------------------------------------------------------------------------
+
+
+def test_overlay_behind_symlinked_directory_is_rejected(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    # rglob('*.md') silently skips a valid file behind a symlinked directory;
+    # a full entry walk must reject the symlinked directory explicitly.
+    overlays = _overlays_root(tmp_path)
+    real = tmp_path / "real" / "metrics"
+    real.mkdir(parents=True)
+    _write(real / "gross_margin.md", OVERLAY)
+    (overlays / "metrics").symlink_to(real)
+    with pytest.raises(FileExistsError):
+        load_overlays(overlays, valid_layer)
+
+
+def test_reference_behind_symlinked_directory_is_rejected(tmp_path: Path) -> None:
+    references = _references(tmp_path)
+    real = tmp_path / "real"
+    real.mkdir(parents=True)
+    _write(real / "guide.md", REFERENCE)
+    (references / "linked").symlink_to(real)
+    with pytest.raises(FileExistsError):
+        load_references(references)
+
+
+def test_special_file_in_subdirectory_is_rejected(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    # A special file nested in a subdirectory must be rejected during the walk,
+    # not silently skipped or only checked at the top level.
+    overlays = _overlays_root(tmp_path)
+    (overlays / "metrics").mkdir(parents=True)
+    os.mkfifo(overlays / "metrics" / "pipe.md")
+    with pytest.raises(OkfDocumentError):
+        load_overlays(overlays, valid_layer)
+
+
+def test_non_md_regular_file_is_silently_skipped(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    # Non-md regular files are not candidates and must not be rejected (the
+    # reserved/non-md semantics are preserved by the full entry walk).
+    overlays = _overlays_root(tmp_path)
+    _write(overlays / "metrics" / "gross_margin.md", OVERLAY)
+    _write(overlays / "notes.txt", "ignore me")
+    _write(overlays / "metrics" / "README", "ignore me too")
+    loaded = load_overlays(overlays, valid_layer)
+    assert loaded[0].selayer_id == "metric.gross_margin"
+
+
+def test_symlinked_non_md_entry_is_rejected_not_skipped(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    # A symlink whose name does not end in .md is still rejected: the lstat
+    # check runs before the .md suffix filter, so no symlinked entry is ever
+    # silently skipped.
+    overlays = _overlays_root(tmp_path)
+    _write(overlays / "metrics" / "gross_margin.md", OVERLAY)
+    target = tmp_path / "outside"
+    target.write_text("secret", encoding="utf-8")
+    (overlays / "metrics" / "linked.txt").symlink_to(target)
+    with pytest.raises(FileExistsError):
+        load_overlays(overlays, valid_layer)
+
+
+# ---------------------------------------------------------------------------
+# Medium-finding follow-up: pass the remaining aggregate byte budget into the
+# descriptor read so each read is prospectively capped and no bytes beyond
+# _MAX_TOTAL_BYTES are consumed before a rejection.
+# ---------------------------------------------------------------------------
+
+
+def test_safe_read_text_prospectively_caps_to_remaining_budget(
+    tmp_path: Path,
+) -> None:
+    references = _references(tmp_path)
+    guide = references / "guide.md"
+    _write(guide, "x" * 200)
+    root_fd = os.open(str(references), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        # A budget smaller than both the file size and _MAX_FILE_BYTES must be
+        # rejected as an aggregate overflow before any byte beyond the budget
+        # is consumed.
+        with pytest.raises(OkfDocumentError) as exc:
+            composition._safe_read_text(guide, references, root_fd, "guide.md", 10)
+        assert "total input exceeds" in str(exc.value)
+    finally:
+        os.close(root_fd)
+
+
+def test_safe_read_text_per_file_cap_precedes_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(composition, "_MAX_FILE_BYTES", 8)
+    references = _references(tmp_path)
+    guide = references / "guide.md"
+    _write(guide, "x" * 200)
+    root_fd = os.open(str(references), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        # The per-file cap is the tighter defect and is reported first, even
+        # though the remaining budget would also reject the file.
+        with pytest.raises(OkfDocumentError) as exc:
+            composition._safe_read_text(
+                guide,
+                references,
+                root_fd,
+                "guide.md",
+                composition._MAX_TOTAL_BYTES,
+            )
+        assert "exceeds" in str(exc.value)
+        assert "total input exceeds" not in str(exc.value)
+    finally:
+        os.close(root_fd)
+
+
+def test_aggregate_budget_caps_read_prospectively(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The remaining aggregate budget caps each read: two files whose combined
+    # walk-time size fits, but the second is grown past the remaining budget
+    # (while staying under the per-file cap) so the read-time prospective cap
+    # rejects it before the aggregate overflows.
+    monkeypatch.setattr(composition, "_MAX_TOTAL_BYTES", 80)
+    references = _references(tmp_path)
+    a = references / "a.md"
+    b = references / "b.md"
+    _write(a, "a" * 50)
+    _write(b, "b" * 20)
+    real_walk = composition._walk_inputs
+
+    def growing_walk(root: Path) -> tuple[list[Path], int]:
+        files, root_fd = real_walk(root)
+        # Grow b past the remaining budget (80 - 50 = 30) but under the per-file
+        # cap; the prospective read cap rejects it as a total overflow.
+        _write(b, "b" * 200)
         return files, root_fd
 
     monkeypatch.setattr(composition, "_walk_inputs", growing_walk)
