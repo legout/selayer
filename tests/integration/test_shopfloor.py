@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 import sqlite3
+import tempfile
 from pathlib import Path
 from typing import Any, cast
 
@@ -27,12 +28,15 @@ from examples.shopfloor.generate_data import (
     generate_shopfloor_data,
 )
 from examples.shopfloor.generate_data import main as generate_main
-from examples.shopfloor.run_example import run_walkthrough
+from examples.shopfloor.run_example import _layer_for_paths, run_walkthrough
+from examples.shopfloor.run_example import main as run_main
 from selayer import QueryEngine, QueryPlanningError, SemanticLayer
 
 _REPO = Path(__file__).parents[2]
-_CATALOG = _REPO / "examples" / "shopfloor" / "shopfloor_semantic_layer.yaml"
-_SCHEMA_DIR = _REPO / "examples" / "shopfloor" / "schemas"
+SHOPFLOOR_ROOT = _REPO / "examples" / "shopfloor"
+SHOPFLOOR_CATALOG = SHOPFLOOR_ROOT / "shopfloor_semantic_layer.yaml"
+_CATALOG = SHOPFLOOR_CATALOG
+_SCHEMA_DIR = SHOPFLOOR_ROOT / "schemas"
 
 #: Maps each catalog data-source name to the matching :class:`ShopfloorDataPaths`
 #: attribute that holds its absolute physical location.
@@ -81,6 +85,66 @@ def _temporary_shopfloor_catalog(tmp_path: Path, paths: ShopfloorDataPaths) -> P
 def _delta_row_count(delta_path: Path) -> int:
     """Return the live row count of a generated Delta table."""
     return DeltaTable(delta_path).to_pyarrow_table().num_rows
+
+
+def _logical_source_snapshot(data_dir: Path) -> dict[str, tuple[str, object]] | None:
+    """Record relative filenames, logical row counts, and Delta versions.
+
+    Deliberately avoids byte-identical database metadata so that re-opening a
+    SQLite/DuckDB file that has not logically changed still compares equal.
+    """
+    if not data_dir.exists():
+        return None
+    snapshot: dict[str, tuple[str, object]] = {}
+    for path in sorted(data_dir.iterdir()):
+        name = path.name
+        if path.suffix == ".csv":
+            with path.open(newline="", encoding="utf-8") as stream:
+                snapshot[name] = ("csv", len(list(csv.DictReader(stream))))
+        elif path.suffix == ".sqlite":
+            counts: dict[str, int] = {}
+            with sqlite3.connect(path) as connection:
+                tables = [
+                    row[0]
+                    for row in connection.execute(
+                        "select name from sqlite_master where type = 'table'"
+                    ).fetchall()
+                ]
+                for table in tables:
+                    row = connection.execute(
+                        f"select count(*) from {table}"
+                    ).fetchone()
+                    counts[table] = row[0] if row is not None else 0
+            snapshot[name] = ("sqlite", counts)
+        elif path.suffix == ".duckdb":
+            duck_counts: dict[str, int] = {}
+            with duckdb.connect(str(path), read_only=True) as connection:
+                tables = [
+                    row[0]
+                    for row in connection.execute(
+                        "select table_name from information_schema.tables"
+                    ).fetchall()
+                ]
+                for table in tables:
+                    row = connection.execute(
+                        f"select count(*) from {table}"
+                    ).fetchone()
+                    duck_counts[table] = row[0] if row is not None else 0
+            snapshot[name] = ("duckdb", duck_counts)
+        elif path.suffix == ".parquet":
+            snapshot[name] = ("parquet", pq.read_table(path).num_rows)
+        elif path.suffix == ".delta":
+            snapshot[name] = ("delta", DeltaTable(path).version())
+    return snapshot
+
+
+def _temp_factory(base: Path):
+    """Return a TemporaryDirectory substitute rooted under ``base``."""
+
+    def factory(*_args: object, **_kwargs: object) -> tempfile.TemporaryDirectory:
+        return tempfile.TemporaryDirectory(dir=str(base))
+
+    return factory
 
 
 def test_generate_data_cli_requires_output_dir(tmp_path: Path) -> None:
@@ -183,6 +247,61 @@ def test_delta_retest_reload_changes_only_attempt_rate(tmp_path: Path) -> None:
     assert after["first_pass_yield"].item() == pytest.approx(2 / 3)
 
 
+def test_layer_for_paths_rebases_every_source(tmp_path: Path) -> None:
+    paths = generate_shopfloor_data(tmp_path / "data")
+    original = SemanticLayer.load(SHOPFLOOR_CATALOG)
+    rebased = _layer_for_paths(original, paths)
+    expected = {
+        "customer_orders": paths.customer_orders,
+        "production_orders": paths.production_orders_db,
+        "serialized_drives": paths.shopfloor_db,
+        "component_consumption": paths.component_consumption,
+        "component_lot_inspections": paths.component_lot_inspections,
+        "operation_executions": paths.operation_executions,
+        "machine_telemetry": paths.machine_telemetry,
+        "eol_test_runs": paths.eol_test_runs,
+    }
+    assert {
+        name: Path(cast("Any", source.connector).location)
+        for name, source in rebased.data_sources.items()
+    } == expected
+    assert SemanticLayer.load(SHOPFLOOR_CATALOG).data_sources == original.data_sources
+
+
+def test_runner_does_not_write_repository_data(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The walkthrough must generate and mutate only temporary data."""
+    repository_data = SHOPFLOOR_ROOT / "data"
+    generate_main(["--output-dir", str(repository_data)])
+    before = _logical_source_snapshot(repository_data)
+    monkeypatch.setattr(
+        "examples.shopfloor.run_example.TemporaryDirectory",
+        _temp_factory(tmp_path),
+    )
+    assert run_main() == 0
+    after = _logical_source_snapshot(repository_data)
+    assert after == before
+
+
+def test_rebased_layer_reload_changes_only_attempt_rate(tmp_path: Path) -> None:
+    """A rebased temporary layer reloads the temporary retest identically."""
+    paths = generate_shopfloor_data(tmp_path / "data")
+    layer = _layer_for_paths(SemanticLayer.load(SHOPFLOOR_CATALOG), paths)
+
+    with QueryEngine(layer) as engine:
+        before = engine.query(["eol_attempt_pass_rate", "first_pass_yield"])
+        append_eol_retest(paths.eol_test_runs)
+        engine.reload_source("eol_test_runs")
+        after = engine.query(["eol_attempt_pass_rate", "first_pass_yield"])
+
+    assert before["eol_attempt_pass_rate"].item() == pytest.approx(2 / 3)
+    assert after["eol_attempt_pass_rate"].item() == pytest.approx(3 / 4)
+    assert before["first_pass_yield"].item() == pytest.approx(2 / 3)
+    assert after["first_pass_yield"].item() == pytest.approx(2 / 3)
+
+
 def test_walkthrough_prints_the_planner_boundary_and_reload(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -196,7 +315,8 @@ def test_walkthrough_prints_the_planner_boundary_and_reload(
     assert "Production completion rate:" in output
     assert "Component genealogy for DRV-003:" in output
     assert "Expected mixed-grain rejection: mixed_grain" in output
-    assert "EOL source generation:" in output
+    assert "EOL quality before Delta reload:" in output
+    assert "EOL source generation: 1 -> 2" in output
     assert "EOL pass rate after Delta reload:" in output
 
 
@@ -228,7 +348,9 @@ def test_run_walkthrough_propagates_non_mixed_grain_planning_error(
             run_walkthrough(engine, paths.eol_test_runs)
 
 
-def test_main_prints_delta_setup_instruction(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_main_returns_delta_setup_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     from examples.shopfloor import run_example
 
     def missing_delta(_: Path) -> ShopfloorDataPaths:
@@ -237,8 +359,8 @@ def test_main_prints_delta_setup_instruction(monkeypatch: pytest.MonkeyPatch) ->
         )
 
     monkeypatch.setattr(run_example, "generate_shopfloor_data", missing_delta)
-    with pytest.raises(SystemExit, match="uv sync --extra delta"):
-        run_example.main()
+    assert run_example.main() == 1
+    assert "uv sync --extra delta" in capsys.readouterr().err
 
 
 def test_shopfloor_docs_match_the_runnable_contract() -> None:

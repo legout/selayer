@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 ROOT = Path(__file__).resolve().parents[2]
 # Make the repository root importable when this script is executed directly
@@ -13,14 +15,71 @@ sys.path.insert(0, str(ROOT))
 
 from examples.shopfloor.generate_data import (
     DeltaDependencyError,
+    ShopfloorDataPaths,
     append_eol_retest,
     generate_shopfloor_data,
 )
 from selayer import QueryEngine, QueryPlanningError, SemanticLayer
+from selayer.sources.config import (
+    CsvConfig,
+    DeltaConfig,
+    DuckDbConfig,
+    ParquetConfig,
+    SqliteConfig,
+)
 
 EXAMPLE_DIR = ROOT / "examples" / "shopfloor"
 CATALOG = EXAMPLE_DIR / "shopfloor_semantic_layer.yaml"
-DATA_DIR = EXAMPLE_DIR / "data"
+
+#: The closed set of connector configs that expose a file-system ``location``.
+#: Every shop-floor source is one of these, so a non-matching connector is a
+#: programmer error rather than a supported adaptation.
+_LOCATION_CONNECTORS = (
+    CsvConfig,
+    DeltaConfig,
+    DuckDbConfig,
+    ParquetConfig,
+    SqliteConfig,
+)
+
+#: Maps each catalog data-source name to the matching :class:`ShopfloorDataPaths`
+#: attribute that holds its absolute physical location.
+_LOCATION_ATTRS: dict[str, str] = {
+    "customer_orders": "customer_orders",
+    "production_orders": "production_orders_db",
+    "serialized_drives": "shopfloor_db",
+    "component_consumption": "component_consumption",
+    "component_lot_inspections": "component_lot_inspections",
+    "operation_executions": "operation_executions",
+    "machine_telemetry": "machine_telemetry",
+    "eol_test_runs": "eol_test_runs",
+}
+
+
+def _layer_for_paths(
+    layer: SemanticLayer,
+    paths: ShopfloorDataPaths,
+) -> SemanticLayer:
+    """Return a copy of ``layer`` whose every source points at ``paths``.
+
+    The catalog (execution authority) is loaded once and never mutated; only the
+    connector ``location`` of each source is rewritten to the temporary physical
+    files via :func:`dataclasses.replace`. :class:`~selayer.QueryEngine` revalidates
+    the returned programmatic layer before opening any source.
+    """
+    locations = {
+        name: str(getattr(paths, attr)) for name, attr in _LOCATION_ATTRS.items()
+    }
+    sources = {}
+    for name, source in layer.data_sources.items():
+        connector = source.connector
+        if not isinstance(connector, _LOCATION_CONNECTORS):
+            raise TypeError("shopfloor source has no file location")
+        sources[name] = replace(
+            source,
+            connector=replace(connector, location=locations[name]),
+        )
+    return replace(layer, data_sources=sources)
 
 
 def run_walkthrough(engine: QueryEngine, eol_test_runs: Path) -> None:
@@ -79,15 +138,18 @@ def run_walkthrough(engine: QueryEngine, eol_test_runs: Path) -> None:
     print(engine.query(["eol_attempt_pass_rate", "first_pass_yield"]))
 
 
-def main() -> None:
+def main() -> int:
     try:
-        paths = generate_shopfloor_data(DATA_DIR)
+        with TemporaryDirectory(prefix="selayer-shopfloor-") as directory:
+            paths = generate_shopfloor_data(Path(directory) / "data")
+            layer = _layer_for_paths(SemanticLayer.load(CATALOG), paths)
+            with QueryEngine(layer) as engine:
+                run_walkthrough(engine, paths.eol_test_runs)
     except DeltaDependencyError as error:
-        raise SystemExit(str(error)) from error
-    layer = SemanticLayer.load(CATALOG)
-    with QueryEngine(layer) as engine:
-        run_walkthrough(engine, paths.eol_test_runs)
+        print(str(error), file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
