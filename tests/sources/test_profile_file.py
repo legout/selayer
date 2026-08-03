@@ -282,6 +282,73 @@ def test_profile_file_entry_not_a_mapping_rejected(tmp_path: Path) -> None:
     assert error.path == "profiles.warehouse.dsn"
 
 
+# ---------------------------------------------------------------------------
+# Non-string entry keys are rejected before resolution (never str-coerced)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "key_literal",
+    ["1", "1.0", "true", "yes", "~", "null"],
+    ids=["int", "float", "bool_true", "yaml_yes", "null_tilde", "null_word"],
+)
+def test_profile_file_rejects_non_string_entry_key(
+    tmp_path: Path, key_literal: str
+) -> None:
+    # A YAML entry key that constructs to a non-string (an int, float, bool, or
+    # null) must be rejected *before* resolution, never str-coerced.  The old
+    # code coerced it with ``str(key)``, which let a non-string key reach the
+    # resolved profile under its stringified spelling.
+    body = (
+        "version: 1\nprofiles:\n  warehouse:\n"
+        f"    {key_literal}:\n      env: A\n"
+    )
+    path = _write(tmp_path, body)
+    with pytest.raises(ProfileFileValidationError) as caught:
+        load_profile_file(path, environ={"A": "v"})
+    error = caught.value
+    assert error.code == "source.profile.invalid_entry_key"
+    # The raw (non-string) key spelling is never rendered: it is redacted to
+    # the fixed ``<key>`` token.
+    assert error.path == "profiles.warehouse.<key>"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+def test_profile_file_int_and_string_keys_do_not_collide(tmp_path: Path) -> None:
+    # YAML ``1`` (int) and ``"1"`` (string) are distinct mapping keys
+    # (``1 == "1"`` is False), so the duplicate walker does not flag them.
+    # Without rejecting the non-string key, both would be str-coerced to
+    # ``"1"`` and the second would silently overwrite the first in the
+    # resolved profile (a runtime collision).  The int key must instead be
+    # rejected before resolution.
+    body = (
+        "version: 1\nprofiles:\n  warehouse:\n"
+        "    1:\n      env: A\n"
+        '    "1":\n      env: B\n'
+    )
+    path = _write(tmp_path, body)
+    with pytest.raises(ProfileFileValidationError) as caught:
+        load_profile_file(path, environ={"A": "a", "B": "b"})
+    error = caught.value
+    assert error.code == "source.profile.invalid_entry_key"
+    assert error.path == "profiles.warehouse.<key>"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+def test_profile_file_single_string_numeric_key_still_loads(tmp_path: Path) -> None:
+    # A *string* key that merely looks numeric (``"1"``) is valid and must
+    # still load after the non-string-key rejection is added.
+    path = _write(
+        tmp_path,
+        'version: 1\nprofiles:\n  warehouse:\n    "1":\n      env: A\n',
+    )
+    resolver = load_profile_file(path, environ={"A": "v"})
+    profile = resolver.resolve("warehouse", source_id="orders")
+    assert profile.value("1") == "v"
+
+
 def test_profile_file_unknown_source_field_rejected(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
@@ -555,6 +622,91 @@ def test_profile_file_error_is_immutable(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Constructor hardening: arbitrary caller code/path never leaks
+# ---------------------------------------------------------------------------
+
+
+def test_profile_file_validation_error_arbitrary_code_is_normalized() -> None:
+    # The public constructor must never retain an arbitrary caller-supplied
+    # code: an unknown code is normalized to the fixed fallback code, and the
+    # supplied string never reaches code/message/repr/str/args.
+    secret = f"code_{_SECRET}"
+    error = ProfileFileValidationError(secret, "profiles")
+    assert error.code == "source.profile.error"
+    assert error.message == "a profile document could not be loaded"
+    for surface in (
+        repr(error),
+        str(error),
+        repr(error.args),
+        error.code,
+        error.message,
+    ):
+        assert secret not in surface
+
+
+def test_profile_file_validation_error_arbitrary_path_is_normalized() -> None:
+    # The public constructor must never retain an arbitrary caller-supplied
+    # path: a path not matching the structural-path grammar is normalized to
+    # the fixed ``<path>`` token, and the supplied string never reaches
+    # path/repr/str/args.  A known code is preserved.
+    secret = f"path_{_SECRET}"
+    error = ProfileFileValidationError("source.profile.malformed", secret)
+    assert error.code == "source.profile.malformed"
+    assert error.path == "<path>"
+    for surface in (
+        repr(error),
+        str(error),
+        repr(error.args),
+        error.path,
+        error.message,
+    ):
+        assert secret not in surface
+
+
+def test_profile_file_validation_error_known_code_and_path_preserved() -> None:
+    # Internal known codes and grammar-valid structural paths are preserved
+    # verbatim: the hardening must not change internal behavior.
+    error = ProfileFileValidationError(
+        "source.profile.missing_environment", "profiles.warehouse.dsn.env"
+    )
+    assert error.code == "source.profile.missing_environment"
+    assert error.path == "profiles.warehouse.dsn.env"
+    assert error.message == "a required profile environment variable is missing"
+
+
+def test_profile_file_validation_error_non_string_args_normalized() -> None:
+    # Non-string code/path arguments must not crash and must not leak.
+    error = ProfileFileValidationError(12345, 67890)
+    assert error.code == "source.profile.error"
+    assert error.path == "<path>"
+    assert error.message == "a profile document could not be loaded"
+
+
+def test_profile_file_validation_error_arbitrary_args_do_not_leak_secret(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A secret-bearing arbitrary code and path supplied to the public
+    # constructor must never reach any rendered surface.
+    error = ProfileFileValidationError(_SECRET, _SECRET)
+    formatted = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    captured = capsys.readouterr()
+    for surface in (
+        repr(error),
+        str(error),
+        repr(error.args),
+        error.code,
+        error.path,
+        error.message,
+        formatted,
+        captured.out,
+        captured.err,
+    ):
+        assert _SECRET not in surface
+
+
+# ---------------------------------------------------------------------------
 # Secrecy contract: resolved / environment values never leak
 # ---------------------------------------------------------------------------
 
@@ -814,6 +966,26 @@ def test_profile_file_unencodable_surrogate_path_raises_sanitized_error(
     ):
         assert _SECRET not in surface
         assert surrogate not in surface
+
+
+def test_profile_file_embedded_nul_path_raises_sanitized_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # An embedded NUL (``\x00``) in the caller-supplied filesystem path makes
+    # ``open``/``os.stat`` raise ``ValueError("embedded null byte")`` -- a
+    # ``ValueError``, *not* an ``OSError`` (nor a Unicode error), so without an
+    # explicit handler it escapes sanitization.  It must be captured and
+    # reported with the fixed safe path token, never the caller-supplied path
+    # (which here carries the sentinel) or the NUL.
+    path = tmp_path / f"{_SECRET}\x00.yaml"
+    with pytest.raises(ProfileFileValidationError) as caught:
+        load_profile_file(path, environ={})
+    error = caught.value
+    assert error.code == "source.profile.invalid_path"
+    assert error.path == "<file>"
+    _assert_secret_absent(error, _SECRET, capsys)
+    assert "\x00" not in repr(error)
+    assert "\x00" not in str(error)
 
 
 # ---------------------------------------------------------------------------

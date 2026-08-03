@@ -16,8 +16,10 @@ places:
 Each entry mapping may declare *only* ``env`` and/or ``literal`` — any other
 field (including a YAML merge key ``<<``) is rejected — and exactly one of the
 two.  The document version must be the integer ``1`` (``type(value) is int``),
-``profiles`` must be a non-empty mapping, and every named profile must be a
-non-empty mapping.
+``profiles`` must be a non-empty mapping, every named profile must be a
+non-empty mapping, and every entry *key* must be an exact builtin ``str``
+(a YAML int/float/bool/null key is rejected *before* resolution rather than
+str-coerced, so a numeric key can never collide with its string spelling).
 
 Resolution never retains or renders any resolved value or environment value.
 Every failure surfaces as an immutable :class:`ProfileFileValidationError`
@@ -28,15 +30,16 @@ key, value, or secret ever reaches ``repr``, ``str``, ``args``, ``path``,
 ``message``, the traceback, or ``__cause__``/``__context__``.  The
 caller-supplied filesystem path is never stored: a malformed document and
 any file I/O failure (a missing or unreadable file, one that is not valid
-UTF-8, or a path that cannot be encoded to the filesystem encoding) use a
-fixed safe path token.
+UTF-8, a path that cannot be encoded to the filesystem encoding, or a path
+with an embedded NUL) use a fixed safe path token.
 Every error is constructed and raised *outside* an active ``except`` scope, so
 ``__cause__`` and ``__context__`` remain ``None`` (a YAML parse failure is
 captured, the raw PyYAML exception discarded, and the sanitized error raised
 after the ``except``/``finally`` completes; a missing/unreadable file, one
-that is not valid UTF-8, or a path that cannot be encoded to the filesystem
-encoding, is captured and the raw ``OSError``, ``UnicodeDecodeError``, or
-``UnicodeEncodeError`` discarded the same way).
+that is not valid UTF-8, a path that cannot be encoded to the filesystem
+encoding, or a path with an embedded NUL, is captured and the raw
+``OSError``, ``UnicodeDecodeError``, ``UnicodeEncodeError``, or ``ValueError``
+discarded the same way).
 
 Duplicate and merge keys are detected during node-tree composition, *before*
 construction.  Duplicate keys are compared by their **constructed semantic**
@@ -109,9 +112,14 @@ _CODE_MESSAGES: dict[str, str] = {
         "a profile environment value is invalid"
     ),
     "source.profile.invalid_literal": "a profile literal value must be a boolean",
+    "source.profile.invalid_entry_key": "a profile entry key must be a string",
+    # The fixed code an arbitrary/unknown caller-supplied code is normalized to
+    # by the public constructor (so an unknown code can never leak).
+    "source.profile.error": "a profile document could not be loaded",
 }
 
-_FALLBACK_MESSAGE = "a profile document could not be loaded"
+# The fixed code an arbitrary/unknown caller-supplied code is normalized to.
+_FALLBACK_CODE = "source.profile.error"
 
 # Identifier shape shared with the catalog source-name convention
 # (lowercase snake_case).  A profile name, an entry key, or a structural path
@@ -137,6 +145,32 @@ _ROOT_PATH = "<document>"
 _UNKNOWN_KEY_PATH = "top_level"
 _REDACTED_KEY = "<key>"
 _FILE_PATH = "<file>"
+# Fixed token an arbitrary caller-supplied path is normalized to when it does
+# not match the structural-path grammar below.
+_REDACTED_PATH = "<path>"
+
+# Grammar every retained structural ``path`` must match: the whole path is one
+# of the fixed tokens (``<document>``/``<file>``), or a dot-joined sequence of
+# name segments (a lowercase identifier or the ``<key>`` redaction token), each
+# optionally suffixed with ``[<index>]`` sequence indices, with an optional
+# leading run of indices (for a path rooted in a sequence).  Every retained
+# path is therefore built only from a fixed safe alphabet (lowercase letters,
+# digits, ``_``, ``.``, ``[``, ``]``, and the literal ``<key>``/``<document>``/
+# ``<file>`` tokens), so an arbitrary/secret-bearing path supplied by a public
+# caller can never be stored or rendered.
+_PATH_NAME = r"[a-z][a-z0-9_]*|<key>"
+_PATH_INDEX = r"\[\d+\]"
+# A structural path is: an initial name or index, then any run of (".", name)
+# pairs and bare indices -- a NAME is always dot-prefixed except the very first
+# atom, while an INDEX is appended directly (e.g. ``a[0]`` or ``[0][1].a``).
+# Every retained path is therefore built only from a fixed safe alphabet
+# (lowercase letters, digits, ``_``, ``.``, ``[``, ``]``, and the literal
+# ``<key>``/``<document>``/``<file>`` tokens), so an arbitrary/secret-bearing
+# path supplied by a public caller can never be stored or rendered.
+_PATH_RE = re.compile(
+    rf"\A(?:<document>|<file>|(?:{_PATH_NAME}|{_PATH_INDEX})"
+    rf"(?:\.(?:{_PATH_NAME})|{_PATH_INDEX})*)\Z"
+)
 
 # Bounds for the duplicate/merge node-tree walker.  A path-based visited set
 # rejects cyclic aliases the instant they revisit a node on the current
@@ -159,6 +193,14 @@ class ProfileFileValidationError(Exception):
       identifier tokens and fixed redaction tokens (never a raw value).
     * ``message`` — a constant generic message looked up from ``code``.
 
+    Because the class is public, the caller-supplied ``code`` and ``path`` are
+    normalized at construction: an unknown/non-string ``code`` is replaced by
+    the fixed ``source.profile.error`` code, and a ``path`` that does not match
+    the structural-path grammar is replaced by the fixed ``<path>`` token.  An
+    arbitrary caller string can therefore never reach ``code``/``message``/
+    ``path``/``repr``/``str``/``args``; internal known codes and grammar-valid
+    structural paths are preserved verbatim.
+
     No resolved profile value, environment value, or raw YAML key/value is ever
     stored or rendered.  The class uses ``__slots__`` and overrides
     ``__setattr__``/``__delattr__`` to reject mutation, so ``code``, ``path``,
@@ -172,14 +214,24 @@ class ProfileFileValidationError(Exception):
 
     __slots__ = ("code", "message", "path")
 
-    def __init__(self, code: str, path: str) -> None:
+    def __init__(self, code: object, path: object) -> None:
         # All attributes are set exactly once via the base ``__setattr__`` so
-        # the immutability guard below cannot block construction.  ``code`` and
-        # ``path`` are only ever constructed internally from constant codes and
-        # structural paths composed of validated tokens.
-        object.__setattr__(self, "code", code)
-        object.__setattr__(self, "path", path)
-        object.__setattr__(self, "message", _CODE_MESSAGES.get(code, _FALLBACK_MESSAGE))
+        # the immutability guard below cannot block construction.  Because this
+        # class is public, the caller-supplied ``code`` and ``path`` are never
+        # trusted verbatim: an unknown/non-string ``code`` is normalized to the
+        # fixed ``_FALLBACK_CODE``, and a ``path`` that does not match the
+        # structural-path grammar is normalized to the fixed ``_REDACTED_PATH``
+        # token (see ``_normalize_path``).  Only the normalized, constant
+        # code/path/message are ever stored, so no arbitrary caller string can
+        # reach ``repr``/``str``/``args``/``path``/``message``.  Internal
+        # callers always pass a known code and a grammar-valid structural path,
+        # so their behavior is preserved.
+        known_code = (
+            code if type(code) is str and code in _CODE_MESSAGES else _FALLBACK_CODE
+        )
+        object.__setattr__(self, "code", known_code)
+        object.__setattr__(self, "path", _normalize_path(path))
+        object.__setattr__(self, "message", _CODE_MESSAGES[known_code])
         # ``BaseException.__init__`` writes ``args`` through the C-level slot
         # and does not route through this class's ``__setattr__``; ``args`` is
         # therefore the single constant ``message`` (never a raw value).
@@ -208,11 +260,12 @@ def load_profile_file(
     Each profile value is resolved from ``env`` (read from *environ*, accepted
     only as an exact builtin ``str``) or ``literal`` (an exact builtin ``bool``
     copied verbatim).  Any missing/unreadable/non-UTF-8 file, a path that
-    cannot be encoded to the filesystem encoding, a malformed document, an
-    unresolvable value, or a disallowed literal raises an immutable,
-    sanitized :class:`ProfileFileValidationError` outside any ``except``
-    scope; no resolved value, environment value, or raw YAML key is ever
-    retained or rendered.
+    cannot be encoded to the filesystem encoding or contains an embedded NUL,
+    a malformed document, a non-string entry key, an unresolvable value, or a
+    disallowed literal raises an immutable, sanitized
+    :class:`ProfileFileValidationError` outside any ``except`` scope; no
+    resolved value, environment value, or raw YAML key is ever retained or
+    rendered.
     """
     document = _compose_without_duplicate_keys(Path(path))
     profiles = _validate_document_shape(document)
@@ -277,6 +330,18 @@ def _compose_without_duplicate_keys(path: Path) -> object:
         # is captured and discarded, and the sanitized error is raised below
         # outside any active ``except`` scope using the fixed safe path token
         # (never the caller-supplied path).
+        io_error = ProfileFileValidationError(
+            "source.profile.invalid_path", _FILE_PATH
+        )
+    except ValueError:
+        # A plain ``ValueError`` — e.g. an embedded NUL (``\x00``) in the
+        # caller-supplied filesystem path raised by ``open``/``os.stat`` — is
+        # not an ``OSError`` (nor the ``UnicodeDecodeError``/``UnicodeEncodeError``
+        # subclasses of ``ValueError`` matched above), so without this handler
+        # it would escape sanitization and leak the path via its message/
+        # traceback.  It is captured and reported with the fixed safe path
+        # token (never the caller-supplied path, which may itself carry a
+        # secret).
         io_error = ProfileFileValidationError(
             "source.profile.invalid_path", _FILE_PATH
         )
@@ -476,7 +541,7 @@ def _walk_for_duplicate_and_merge_keys(
 
 def _validate_document_shape(
     document: object,
-) -> dict[str, Mapping[object, object]]:
+) -> dict[str, Mapping[str, object]]:
     """Validate the top-level document structure and profile-name shape.
 
     Every structural failure raises a :class:`ProfileFileValidationError`
@@ -508,7 +573,7 @@ def _validate_document_shape(
         raise ProfileFileValidationError(
             "source.profile.profiles_empty", "profiles"
         )
-    profiles: dict[str, Mapping[object, object]] = {}
+    profiles: dict[str, Mapping[str, object]] = {}
     for name in raw_profiles:
         if not (type(name) is str and _IDENTIFIER_RE.fullmatch(name)):
             # The non-conformant name is never rendered: the structural path is
@@ -526,12 +591,24 @@ def _validate_document_shape(
             raise ProfileFileValidationError(
                 "source.profile.profile_empty", f"profiles.{name}"
             )
+        for entry_key in entries:
+            # A non-string entry key (a YAML int/float/bool/null) is rejected
+            # *before* resolution rather than str-coerced.  Coercing it with
+            # ``str(key)`` would let e.g. the int key ``1`` and the string key
+            # ``"1"`` both collapse to ``"1"`` in the resolved profile (a
+            # silent runtime collision).  The non-conformant key is never
+            # rendered: the structural path uses the fixed ``<key>`` token.
+            if type(entry_key) is not str:
+                raise ProfileFileValidationError(
+                    "source.profile.invalid_entry_key",
+                    f"profiles.{name}.{_REDACTED_KEY}",
+                )
         profiles[name] = entries
     return profiles
 
 
 def _resolve_profiles(
-    profiles: Mapping[str, Mapping[object, object]],
+    profiles: Mapping[str, Mapping[str, object]],
     environ: Mapping[str, str],
 ) -> dict[str, dict[str, object]]:
     """Resolve every profile entry, raising on any unresolvable source."""
@@ -547,7 +624,7 @@ def _resolve_profiles(
 
 def _resolve_entry(
     name: str,
-    key: object,
+    key: str,
     source: object,
     environ: Mapping[str, str],
     values: dict[str, object],
@@ -562,9 +639,10 @@ def _resolve_entry(
     whose only interpolated component is a validated profile name plus a
     redacted entry-key token.
     """
-    # The entry key is stored verbatim (coerced to ``str``) so adapters can
-    # look it up; only the *error path* is sanitized via ``_safe_key_token``.
-    key_name = str(key)
+    # The entry key is validated as an exact builtin ``str`` during structural
+    # validation, so it is stored verbatim (never str-coerced); only the *error
+    # path* is sanitized via ``_safe_key_token``.
+    key_name = key
     entry_path = f"profiles.{name}.{_safe_key_token(key)}"
     if not isinstance(source, Mapping):
         raise ProfileFileValidationError(
@@ -615,6 +693,18 @@ def _resolve_entry(
                 "source.profile.invalid_literal", entry_path
             )
         values[key_name] = literal
+
+
+def _normalize_path(path: object) -> str:
+    """Return *path* if it matches the structural-path grammar, else redact it.
+
+    The public :class:`ProfileFileValidationError` constructor passes the
+    caller-supplied path through this so an arbitrary/secret-bearing string
+    (or non-string) can never be stored or rendered: only an *exact* builtin
+    ``str`` that fully matches ``_PATH_RE`` is retained; anything else is
+    replaced by the fixed ``_REDACTED_PATH`` token.
+    """
+    return path if type(path) is str and _PATH_RE.match(path) else _REDACTED_PATH
 
 
 def _safe_key_token(value: object) -> str:
