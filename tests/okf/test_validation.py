@@ -1143,3 +1143,150 @@ def test_duplicate_heading_suffix_slugs_resolve_within_a_document(
     ]
     assert len(fragment_issues) == 1
     assert "examples-2" in fragment_issues[0].message
+
+
+# --- Re-review High 1: catalog-aware integrity must not be skipped when every
+# generated document loses its generated metadata. ---
+
+
+def test_catalog_aware_load_rejects_bundle_with_every_generated_metadata_stripped(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    for concept_path in sorted(root.rglob("*.md")):
+        if concept_path.name in {"index.md", "log.md"}:
+            continue
+        _drop_frontmatter_key(
+            root,
+            concept_path.relative_to(root).as_posix(),
+            "generated",
+        )
+
+    with pytest.raises(OkfValidationError) as raised:
+        OkfBundle.load(root, layer=valid_layer)
+
+    codes = {issue.code for issue in raised.value.issues}
+    assert "okf.generated.missing_metadata" in codes
+    assert any(
+        issue.code == "okf.generated.missing_metadata"
+        and issue.path == "metrics/gross_margin.md"
+        for issue in raised.value.issues
+    )
+
+
+# --- Re-review High 2: forged controlled frontmatter must be caught even when
+# the stored fingerprint is recomputed to remain internally self-consistent. ---
+
+
+def test_catalog_aware_load_rejects_forged_controlled_frontmatter(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    from selayer.okf.document import (
+        generated_fingerprint,
+        parse_concept,
+        render_concept,
+    )
+
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    path = root / "metrics" / "gross_margin.md"
+    concept = parse_concept(path, root)
+    frontmatter = _deep_thaw(concept.frontmatter)
+    assert isinstance(frontmatter, dict)
+    assert isinstance(frontmatter.get("generated"), dict)
+    # Forge a controlled field (title) and re-stamp the fingerprint so the
+    # document is internally self-consistent while it diverges from the catalog.
+    frontmatter["title"] = "Forged title"
+    definition = next(
+        section.content
+        for section in concept.sections
+        if section.title == "Catalog Definition"
+    )
+    frontmatter["generated"]["fingerprint"] = generated_fingerprint(
+        frontmatter, definition
+    )
+    path.write_text(
+        render_concept(_render_with_frontmatter(concept, frontmatter)),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OkfValidationError) as raised:
+        OkfBundle.load(root, layer=valid_layer)
+
+    codes = {issue.code for issue in raised.value.issues}
+    assert "okf.generated.frontmatter_mismatch" in codes
+    assert "okf.generated.fingerprint_mismatch" not in codes
+    assert "okf.generated.definition_mismatch" not in codes
+
+
+def test_catalog_aware_load_preserves_curated_non_controlled_frontmatter(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    path = root / "metrics" / "gross_margin.md"
+    text = path.read_text(encoding="utf-8")
+    # Curate a non-controlled field; the controlled region is untouched, so the
+    # controlled-frontmatter projection check must not fire.
+    curated = text.replace(
+        "status: stable",
+        "status: stable\nverified: {by: human:owner, at: 2026-07-27T15:00:00Z}",
+    )
+    path.write_text(curated, encoding="utf-8")
+
+    bundle = OkfBundle.load(root, layer=valid_layer)
+
+    assert "okf.generated.frontmatter_mismatch" not in {
+        issue.code for issue in bundle.diagnostics
+    }
+
+
+# --- Re-review Medium: fragment links to generated index.md targets must be
+# validated too, while external URLs and layer-free behavior are retained. ---
+
+
+def test_internal_link_to_generated_index_with_missing_fragment_is_a_warning(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    metric_path = root / "metrics" / "gross_margin.md"
+    text = metric_path.read_text(encoding="utf-8")
+    text = text.replace(
+        "# Related Concepts",
+        "# Related Concepts\n\n[Metrics index](index.md#nonexistent)\n",
+    )
+    metric_path.write_text(text, encoding="utf-8")
+
+    bundle = OkfBundle.load(root, layer=valid_layer)
+
+    fragment_issues = [
+        issue
+        for issue in bundle.diagnostics
+        if issue.code == "okf.link.missing_fragment"
+    ]
+    assert len(fragment_issues) == 1
+    assert fragment_issues[0].severity == "warning"
+    assert fragment_issues[0].path == "metrics/gross_margin.md.links"
+    assert "nonexistent" in fragment_issues[0].message
+
+
+def test_internal_link_to_generated_index_with_present_heading_is_valid(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    metric_path = root / "metrics" / "gross_margin.md"
+    text = metric_path.read_text(encoding="utf-8")
+    text = text.replace(
+        "# Related Concepts",
+        "# Related Concepts\n\n[Metrics index](index.md#metrics)\n",
+    )
+    metric_path.write_text(text, encoding="utf-8")
+
+    bundle = OkfBundle.load(root, layer=valid_layer)
+
+    assert "okf.link.missing_fragment" not in {
+        issue.code for issue in bundle.diagnostics
+    }

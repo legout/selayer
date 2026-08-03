@@ -3,7 +3,7 @@ from __future__ import annotations
 import posixpath
 import re
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import date, datetime
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
@@ -537,7 +537,7 @@ def _heading_slug(heading: str) -> str:
     return text.strip("-")
 
 
-def _section_slugs(concept: OkfConcept) -> frozenset[str]:
+def _heading_slugs_from_titles(titles: Iterable[str]) -> frozenset[str]:
     """GitHub-style anchors with duplicate-heading suffix disambiguation.
 
     The first occurrence of a heading keeps the bare lowercase hyphenated
@@ -547,8 +547,8 @@ def _section_slugs(concept: OkfConcept) -> frozenset[str]:
     """
     emitted: set[str] = set()
     counts: dict[str, int] = {}
-    for section in concept.sections:
-        base = _heading_slug(section.title)
+    for title in titles:
+        base = _heading_slug(title)
         candidate = base
         if base in emitted:
             counts[base] = counts.get(base, 0) + 1
@@ -558,6 +558,10 @@ def _section_slugs(concept: OkfConcept) -> frozenset[str]:
                 candidate = f"{base}-{counts[base]}"
         emitted.add(candidate)
     return frozenset(emitted)
+
+
+def _section_slugs(concept: OkfConcept) -> frozenset[str]:
+    return _heading_slugs_from_titles(section.title for section in concept.sections)
 
 
 def _link_issue(
@@ -571,11 +575,8 @@ def _link_issue(
     )
 
 
-def _resolve_link_concept(
-    source: OkfConcept,
-    link: str,
-    concepts_by_path: Mapping[PurePosixPath, OkfConcept],
-) -> OkfConcept | None:
+def _normalized_link_path(source: OkfConcept, link: str) -> PurePosixPath | None:
+    """Return the normalized bundle-relative path for an internal link, or None."""
     try:
         split = urlsplit(link)
     except ValueError:
@@ -591,7 +592,23 @@ def _resolve_link_concept(
         )
     if normalized == ".." or normalized.startswith("../"):
         return None
-    return concepts_by_path.get(PurePosixPath(normalized))
+    return PurePosixPath(normalized)
+
+
+def _index_markdown_paths(root: Path) -> tuple[Path, ...]:
+    return tuple(sorted(path for path in root.rglob("index.md") if path.is_file()))
+
+
+def _file_section_slugs(path: Path) -> frozenset[str]:
+    """Heading slugs for a non-concept markdown file (e.g. a generated index)."""
+    from .document import split_sections
+
+    try:
+        text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+    except (OSError, UnicodeDecodeError):
+        return frozenset()
+    sections = split_sections(text)[1]
+    return _heading_slugs_from_titles(section.title for section in sections)
 
 
 def validate_links(
@@ -602,17 +619,25 @@ def validate_links(
 
     Same-document fragment links (``#heading``) resolve against the source
     concept's own section slugs; cross-document links resolve the file target
-    first, then the fragment against the resolved concept's slugs. External
-    URLs are out of scope and fragments are URL-decoded before comparison.
+    first, then the fragment against the target's slugs. Fragments are checked
+    against generated ``index.md`` files too (they are not parsed as concepts).
+    External URLs are out of scope and fragments are URL-decoded before
+    comparison.
     """
     resolved_root = root.resolve()
-    concepts_by_path = {
-        concept.relative_path: concept for concept in concepts.values()
+    slugs_by_path: dict[PurePosixPath, frozenset[str]] = {
+        concept.relative_path: _section_slugs(concept)
+        for concept in concepts.values()
     }
+    for index_path in _index_markdown_paths(root):
+        relative = PurePosixPath(index_path.relative_to(root).as_posix())
+        slugs_by_path.setdefault(relative, _file_section_slugs(index_path))
     issues: list[OkfIssue] = []
     for concept in concepts.values():
         source = root / Path(concept.relative_path.as_posix())
-        source_slugs = _section_slugs(concept)
+        source_slugs = slugs_by_path.get(
+            concept.relative_path, _section_slugs(concept)
+        )
         for link in concept.links:
             split = urlsplit(link)
             if split.scheme or split.netloc:
@@ -639,10 +664,11 @@ def validate_links(
                 continue
             if not fragment:
                 continue
-            target_concept = _resolve_link_concept(concept, link, concepts_by_path)
-            if target_concept is not None and fragment not in _section_slugs(
-                target_concept
-            ):
+            normalized = _normalized_link_path(concept, link)
+            target_slugs = (
+                slugs_by_path.get(normalized) if normalized is not None else None
+            )
+            if target_slugs is not None and fragment not in target_slugs:
                 issues.append(
                     _link_issue(
                         concept,
@@ -732,6 +758,57 @@ def _validate_generated_indexes(
     return issues
 
 
+def _controlled_frontmatter_signature(
+    frontmatter: Mapping[str, object],
+    controlled_keys: tuple[str, ...],
+) -> dict[str, object]:
+    """Return controlled frontmatter with generated.fingerprint and .at removed.
+
+    The digest and the generation timestamp are validated or tolerated
+    separately, so both are excluded when comparing the generator-owned
+    frontmatter against the fresh catalog projection.
+    """
+    signature: dict[str, object] = {}
+    for key in controlled_keys:
+        if key not in frontmatter:
+            continue
+        value = frontmatter[key]
+        if key == "generated" and isinstance(value, Mapping):
+            signature[key] = {
+                name: value[name] for name in value if name not in ("fingerprint", "at")
+            }
+        else:
+            signature[key] = value
+    return signature
+
+
+def _root_index_claims_generated(root: Path) -> bool:
+    """Return True when the root index.md carries generated-bundle frontmatter.
+
+    ``OkfBundle.generate`` always stamps a root ``index.md`` with an
+    ``okf_version`` field. That structural marker survives even if every
+    generated concept loses its ``generated`` metadata, so catalog-aware
+    integrity keys off it (in addition to per-concept generated metadata) to
+    avoid silently skipping a stripped bundle, while authored bundles that
+    have no root index are left untouched.
+    """
+    index_path = root / "index.md"
+    if not index_path.is_file():
+        return False
+    try:
+        text = index_path.read_text(encoding="utf-8").replace("\r\n", "\n")
+    except OSError:
+        return False
+    match = _FRONTMATTER.match(text)
+    if match is None:
+        return False
+    try:
+        loaded = yaml.safe_load(match.group(1))
+    except yaml.YAMLError:
+        return False
+    return isinstance(loaded, Mapping) and "okf_version" in loaded
+
+
 def validate_generated_integrity(
     root: Path,
     concepts: Mapping[str, OkfConcept],
@@ -740,22 +817,31 @@ def validate_generated_integrity(
     strict: bool = True,
 ) -> tuple[OkfIssue, ...]:
     """Compare a catalog-aware bundle against the fresh generated projection."""
-    from .document import generated_fingerprint
+    from .document import CONTROLLED_FRONTMATTER_KEYS, generated_fingerprint
     from .generation import concepts_from_layer
 
     severity: Severity = "error" if strict else "warning"
-    expected = concepts_from_layer(layer, include_descriptive=False)
-    expected_by_selayer = {
-        concept.frontmatter["selayer_id"]: concept
-        for concept in expected.values()
-    }
-    issues: list[OkfIssue] = []
     has_generated = any(
         isinstance(concept.frontmatter.get("generated"), Mapping)
         for concept in concepts.values()
     )
+    is_generated_bundle = has_generated or _root_index_claims_generated(root)
+    # Match the loaded bundle's descriptive mode so the controlled-frontmatter
+    # projection check never flags a legitimately mapped description.
+    descriptive = any(
+        "description" in concept.frontmatter
+        for concept in concepts.values()
+        if isinstance(concept.frontmatter.get("generated"), Mapping)
+    )
+    expected = concepts_from_layer(layer, include_descriptive=descriptive)
+    expected_by_selayer = {
+        concept.frontmatter["selayer_id"]: concept
+        for concept in expected.values()
+    }
+    controlled_keys = CONTROLLED_FRONTMATTER_KEYS
+    issues: list[OkfIssue] = []
 
-    if has_generated:
+    if is_generated_bundle:
         for concept_id, expected_concept in expected.items():
             semantic_id = expected_concept.frontmatter["selayer_id"]
             relative = expected_concept.relative_path.as_posix()
@@ -856,6 +942,25 @@ def validate_generated_integrity(
                     code="okf.generated.definition_mismatch",
                 )
             )
+        # Compare the controlled frontmatter against the fresh catalog
+        # projection so a forged controlled field is detected even when the
+        # stored fingerprint was recomputed to stay internally self-consistent.
+        if _controlled_frontmatter_signature(
+            concept.frontmatter, controlled_keys
+        ) != _controlled_frontmatter_signature(
+            expected_concept.frontmatter, controlled_keys
+        ):
+            issues.append(
+                OkfIssue(
+                    path=concept.relative_path.as_posix(),
+                    message=(
+                        f"generated concept '{semantic_id}' controlled "
+                        f"frontmatter does not match the catalog"
+                    ),
+                    severity=severity,
+                    code="okf.generated.frontmatter_mismatch",
+                )
+            )
         generated = concept.frontmatter.get("generated")
         stored_fingerprint = (
             generated.get("fingerprint")
@@ -892,7 +997,7 @@ def validate_generated_integrity(
                     )
                 )
 
-    if has_generated:
+    if is_generated_bundle:
         issues.extend(_validate_generated_indexes(root, expected, layer, severity))
 
     return tuple(sorted(issues, key=lambda issue: (issue.path, issue.message)))
