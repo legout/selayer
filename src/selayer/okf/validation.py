@@ -942,25 +942,25 @@ def _has_generated_directory_indexes(
 def _has_generated_concept_structure(
     root: Path,
     expected: Mapping[str, OkfConcept],
-    expected_indexes: Mapping[PurePosixPath, str],
 ) -> bool:
     """Return True when the bundle carries the expected generated concept set.
 
     Survives the combined attack of stripping *every* ``generated`` mapping
-    AND tampering one (or a few) generated directory indexes: even then a
-    genuine generated bundle still contains a document at *every* expected
-    generated concept path (stripping metadata and altering an index never
-    removes the concept documents), while the bulk of its per-directory
-    indexes still byte-match the generator output. That evidence is what the
-    ``OkfBundle.generate`` layout always produces and an authored bundle never
-    reproduces.
+    AND tampering *every* generated directory index: even then a genuine
+    generated bundle still contains a document at *every* expected generated
+    concept path (stripping metadata and altering indexes never removes the
+    concept documents themselves), and that complete expected concept-path set
+    is exactly what the ``OkfBundle.generate`` layout always produces.
 
-    Both conditions are required so authored bundles stay compatible: the
-    concept-path set is the tamper-resistant structural evidence, and at least
-    one matching per-directory index corroborates a generated origin rather
-    than a coincidental authored file layout. Authored bundles -- which carry
-    arbitrary nested indexes but no documents at the expected generated
-    concept paths -- fail the concept-path condition and are left untouched.
+    The complete expected concept-path set is sufficient evidence on its own,
+    without requiring a matching index, so the attack that strips all
+    generated metadata *and* tampers every directory index is still caught.
+    Authored bundles -- which carry arbitrary nested indexes but no documents
+    at the expected generated concept paths -- fail the concept-path condition
+    and are left untouched. (An authored bundle that coincidentally authored a
+    document at *every* deterministic generated path would be
+    indistinguishable from a generated one; that inherent whole-bundle
+    ambiguity is out of scope.)
     """
     expected_paths = {
         PurePosixPath(concept.relative_path.as_posix())
@@ -968,25 +968,9 @@ def _has_generated_concept_structure(
     }
     if not expected_paths:
         return False
-    for relative in expected_paths:
-        if not (root / Path(relative.as_posix())).is_file():
-            return False
-    expected_dir_indexes = {
-        relative_path: expected_text
-        for relative_path, expected_text in expected_indexes.items()
-        if len(relative_path.parts) >= 2  # per-directory index, not the root
-    }
-    for relative_path, expected_text in expected_dir_indexes.items():
-        index_file = root / Path(relative_path.as_posix())
-        if not index_file.is_file():
-            continue
-        try:
-            actual = index_file.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        if actual == expected_text:
-            return True
-    return False
+    return all(
+        (root / Path(relative.as_posix())).is_file() for relative in expected_paths
+    )
 
 
 def validate_generated_integrity(
@@ -1043,7 +1027,7 @@ def validate_generated_integrity(
     is_generated_bundle = (
         has_generated
         or _has_generated_directory_indexes(root, expected_indexes)
-        or _has_generated_concept_structure(root, expected, expected_indexes)
+        or _has_generated_concept_structure(root, expected)
     )
     issues: list[OkfIssue] = []
 

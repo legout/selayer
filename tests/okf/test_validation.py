@@ -1875,6 +1875,49 @@ def test_stripped_generated_bundle_is_still_detected_when_one_index_is_tampered(
     )
 
 
+def test_stripped_generated_bundle_is_still_detected_when_every_index_is_tampered(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    # Strip every generated mapping (the metadata-stripping attack)...
+    for concept_path in sorted(root.rglob("*.md")):
+        if concept_path.name in {"index.md", "log.md"}:
+            continue
+        _drop_frontmatter_key(
+            root,
+            concept_path.relative_to(root).as_posix(),
+            "generated",
+        )
+    # ...and tamper *every* generated directory index at once, which defeats
+    # both the coherent-index-set marker and the single-corroborating-index
+    # marker. The expected generated concept documents remain in place, so the
+    # concept-path-set evidence alone must still classify this as a generated
+    # bundle and audit it.
+    for kind in (
+        "dimensions",
+        "facts",
+        "measures",
+        "metrics",
+        "relationships",
+        "sources",
+    ):
+        (root / kind / "index.md").write_text("# tampered\n", encoding="utf-8")
+
+    with pytest.raises(OkfValidationError) as raised:
+        OkfBundle.load(root, layer=valid_layer)
+
+    codes = {issue.code for issue in raised.value.issues}
+    # The bundle is still audited: every concept document lost its generated
+    # metadata, so missing_metadata fires for each expected concept.
+    assert "okf.generated.missing_metadata" in codes
+    assert any(
+        issue.code == "okf.generated.missing_metadata"
+        and issue.path == "metrics/gross_margin.md"
+        for issue in raised.value.issues
+    )
+
+
 def test_authored_bundle_with_arbitrary_nested_indexes_is_not_generated(
     tmp_path: Path, valid_layer: SemanticLayer
 ) -> None:
