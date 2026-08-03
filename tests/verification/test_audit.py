@@ -748,6 +748,64 @@ def test_duplicate_row_count_evidence(tmp_path: Path) -> None:
     assert outcome.evidence["null_grain_rows"] == 0
 
 
+def test_single_column_nullable_grain_is_null_safe(tmp_path: Path) -> None:
+    """Single-column grains count NULL as one distinct grain tuple.
+
+    ``count(distinct "col")`` drops NULL, so a nullable single-column grain
+    would undercount distinct grains and overcount duplicate rows.  The audit
+    uses a null-safe formulation consistent with the composite ``struct_pack``
+    path: NULL is one distinct grain tuple, ``{1, NULL}`` has no duplicate
+    group, and a repeated NULL is one duplicate group.
+    """
+
+    # {1, NULL, 2}: three distinct grains (1, NULL, 2), no duplicates.
+    path = tmp_path / "nullable.parquet"
+    _write_parquet(
+        path,
+        pa.table(
+            {
+                "id": pa.array([1, None, 2], pa.int64()),
+                "value": pa.array([1, 2, 3], pa.int64()),
+            }
+        ),
+    )
+    layer = _single_source_layer(
+        "nullable", ParquetConfig(str(path)), _id_value_schema(), ("id",)
+    )
+    report = verify(layer, PhysicalCheck())
+    outcome = _outcome(report, "source.nullable.grain")
+    assert outcome.status == "failed"
+    assert outcome.evidence["row_count"] == 3
+    assert outcome.evidence["distinct_grain_count"] == 3
+    assert outcome.evidence["null_grain_rows"] == 1
+    assert outcome.evidence["duplicate_grain_groups"] == 0
+    assert outcome.evidence["duplicate_row_count"] == 0
+
+    # {1, NULL, NULL}: two distinct grains (1, NULL), one duplicate group
+    # (the repeated NULL), one surplus duplicate row.
+    dup_path = tmp_path / "nullable_dup.parquet"
+    _write_parquet(
+        dup_path,
+        pa.table(
+            {
+                "id": pa.array([1, None, None], pa.int64()),
+                "value": pa.array([1, 2, 3], pa.int64()),
+            }
+        ),
+    )
+    dup_layer = _single_source_layer(
+        "nullable_dup", ParquetConfig(str(dup_path)), _id_value_schema(), ("id",)
+    )
+    dup_report = verify(dup_layer, PhysicalCheck())
+    dup_outcome = _outcome(dup_report, "source.nullable_dup.grain")
+    assert dup_outcome.status == "failed"
+    assert dup_outcome.evidence["row_count"] == 3
+    assert dup_outcome.evidence["distinct_grain_count"] == 2
+    assert dup_outcome.evidence["null_grain_rows"] == 2
+    assert dup_outcome.evidence["duplicate_grain_groups"] == 1
+    assert dup_outcome.evidence["duplicate_row_count"] == 1
+
+
 def test_audit_reads_status_inside_binding_context(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

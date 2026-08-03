@@ -89,25 +89,29 @@ def _grain_sql(source_id: str, grain: tuple[str, ...]) -> str:
     grain groups — the full aggregate specified by the audit contract.
     ``struct_pack`` field aliases are generated positionally
     (``g1``, ``g2``, …) — never from source values — so a grain column whose
-    name carries a secret can never surface as a field alias.  For a single
-    grain column the dialect-specific ``struct_pack``/tuple syntax is avoided:
-    a plain ``count(distinct "col")`` and a single-column ``group by`` are used
-    instead, sharing the same grouped duplicate-subquery shape as the
-    multi-column case.  ``duplicate_row_count`` reuses the same distinct
-    expression so single- and multi-column grains stay consistent.
+    name carries a secret can never surface as a field alias.
+
+    The distinct tuple is always built with ``struct_pack``, for single- and
+    multi-column grains alike, so the distinct count is null-safe and the two
+    cases stay consistent.  ``count(distinct "col")`` drops SQL NULL, which
+    would undercount distinct grains and overcount duplicate rows for a
+    nullable single-column grain; ``struct_pack(g1 := "col")`` yields a
+    non-NULL struct ``{'g1': NULL}`` when the column is NULL, so NULL counts
+    as exactly one distinct grain tuple (matching the composite path, where a
+    fully-NULL grain is one struct value) and ``duplicate_row_count`` is exact.
+    The grouped duplicate-subquery uses a plain ``group by`` over the grain
+    columns, whose standard-SQL semantics already group all NULLs together, so
+    a repeated NULL grain is one duplicate group.
     """
 
     quoted_source = _quote_identifier(source_id)
     quoted_grain = [_quote_identifier(column) for column in grain]
     null_filter = " or ".join(f"{column} is null" for column in quoted_grain)
-    if len(quoted_grain) == 1:
-        distinct_expr = f"count(distinct {quoted_grain[0]})"
-    else:
-        pack = ", ".join(
-            f"g{index} := {column}"
-            for index, column in enumerate(quoted_grain, start=1)
-        )
-        distinct_expr = f"count(distinct struct_pack({pack}))"
+    pack = ", ".join(
+        f"g{index} := {column}"
+        for index, column in enumerate(quoted_grain, start=1)
+    )
+    distinct_expr = f"count(distinct struct_pack({pack}))"
     group_columns = ", ".join(quoted_grain)
     duplicate_groups = (
         "select count(*) from ("
