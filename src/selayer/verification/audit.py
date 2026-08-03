@@ -9,12 +9,16 @@ aggregate counts and registry-derived metadata (connector kind, generation,
 safe snapshot, schema fingerprint) reach the report.
 
 Connector metadata is read exclusively through
-:meth:`SourceRegistry.status` so the audit never inspects an adapter handle,
-location, or credential.  Sanitized
+:meth:`SourceRegistry.status` *inside* the per-source binding context (the
+registry lock is held) so generation/snapshot/schema evidence reflects the
+same bound scan; a concurrent reload cannot swap the handle between the status
+read and the grain scan.  Sanitized
 :class:`~selayer.sources.errors.SourceError` values raised during registry
-creation or per-source binding/execution are adapted to ``unavailable``
-outcomes; unexpected programmer errors (a malformed grain column, a frozen
-evidence contract violation) propagate unchanged.
+creation, per-source binding, or the bound scan are adapted to ``unavailable``
+outcomes, and a raw connector/scan failure is normalized to a sanitized
+``scan_failed`` error so no driver-derived location or credential text can
+ever escape.  Truly-internal programmer errors (a malformed grain column)
+propagate unchanged, and any unavailable source makes the report incomplete.
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ import duckdb
 
 from selayer.model import SemanticLayer
 from selayer.sources.base import SourceScanRequirement, SourceStatus
-from selayer.sources.errors import SourceError
+from selayer.sources.errors import SourceConnectionError, SourceError
 from selayer.sources.profiles import (
     ArrowProviderResolver,
     MappingArrowProviderResolver,
@@ -36,6 +40,7 @@ from selayer.sources.profiles import (
 from selayer.sources.registry import SourceRegistry
 from selayer.verification.model import (
     PhysicalCheck,
+    VerificationDiagnostic,
     VerificationOutcome,
     VerificationReport,
 )
@@ -46,6 +51,10 @@ __all__ = ["verify_physical"]
 #: deterministically by ``(path, check_id)``; sharing one path keeps the
 #: source order driven by the sorted ``check_id`` suffix.
 _PATH = "physical"
+
+#: Stable code for the single report-level diagnostic emitted when any source
+#: is unavailable, marking the report incomplete.
+_UNAVAILABLE_CODE = "source_unavailable"
 
 #: Locally scoped alias for the supported evidence leaf types (mirrors the
 #: runtime contract enforced by ``VerificationOutcome``).
@@ -75,14 +84,17 @@ def _quote_identifier(name: str) -> str:
 def _grain_sql(source_id: str, grain: tuple[str, ...]) -> str:
     """Build the exact full-scan grain-count SQL for one source.
 
-    Counts row count, distinct grain tuples, null grain rows, and duplicate
-    grain groups.  ``struct_pack`` field aliases are generated positionally
+    Counts row count, distinct grain tuples, duplicate row count
+    (``row_count - distinct_grain_count``), null grain rows, and duplicate
+    grain groups — the full aggregate specified by the audit contract.
+    ``struct_pack`` field aliases are generated positionally
     (``g1``, ``g2``, …) — never from source values — so a grain column whose
     name carries a secret can never surface as a field alias.  For a single
     grain column the dialect-specific ``struct_pack``/tuple syntax is avoided:
     a plain ``count(distinct "col")`` and a single-column ``group by`` are used
     instead, sharing the same grouped duplicate-subquery shape as the
-    multi-column case.
+    multi-column case.  ``duplicate_row_count`` reuses the same distinct
+    expression so single- and multi-column grains stay consistent.
     """
 
     quoted_source = _quote_identifier(source_id)
@@ -113,6 +125,7 @@ def _grain_sql(source_id: str, grain: tuple[str, ...]) -> str:
         "select "
         "count(*) as row_count, "
         f"{distinct_expr} as distinct_grain_count, "
+        f"count(*) - {distinct_expr} as duplicate_row_count, "
         f"count(*) filter (where {null_filter}) as null_grain_rows, "
         f"({duplicate_groups}) as duplicate_grain_groups "
         f"from {quoted_source}"
@@ -121,12 +134,13 @@ def _grain_sql(source_id: str, grain: tuple[str, ...]) -> str:
 
 def _grain_counts(
     registry: SourceRegistry, source_id: str, grain: tuple[str, ...]
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, int]:
     """Run the grain-count SQL under the registry lock.
 
-    Returns ``(row_count, distinct_grain_count, null_grain_rows,
-    duplicate_grain_groups)``.  Called inside :meth:`bind_requirements` so the
-    lock spans the whole scan and any query-scoped reader is bound.
+    Returns ``(row_count, distinct_grain_count, duplicate_row_count,
+    null_grain_rows, duplicate_grain_groups)``.  Called inside
+    :meth:`bind_requirements` so the lock spans the whole scan and any
+    query-scoped reader is bound.
 
     The bound source is materialized into a private temp table holding only
     the grain columns *once*, then the multi-scan grain SQL runs against that
@@ -159,6 +173,7 @@ def _grain_counts(
         int(row[1]),
         int(row[2]),
         int(row[3]),
+        int(row[4]),
     )
 
 
@@ -177,17 +192,24 @@ def _status_evidence(status: SourceStatus | None) -> dict[str, EvidenceValue]:
 def _grain_outcome(
     source_id: str,
     status: SourceStatus | None,
-    counts: tuple[int, int, int, int],
+    counts: tuple[int, int, int, int, int],
 ) -> VerificationOutcome:
     """A passed/failed full-scan grain outcome carrying counts and metadata."""
 
-    row_count, distinct_grain_count, null_grain_rows, duplicate_grain_groups = counts
+    (
+        row_count,
+        distinct_grain_count,
+        duplicate_row_count,
+        null_grain_rows,
+        duplicate_grain_groups,
+    ) = counts
     passed = null_grain_rows == 0 and duplicate_grain_groups == 0
     evidence = _status_evidence(status)
     evidence.update(
         {
             "row_count": row_count,
             "distinct_grain_count": distinct_grain_count,
+            "duplicate_row_count": duplicate_row_count,
             "null_grain_rows": null_grain_rows,
             "duplicate_grain_groups": duplicate_grain_groups,
         }
@@ -221,14 +243,49 @@ def _unavailable_outcome(
     )
 
 
-def _report(layer: SemanticLayer, outcomes: list[VerificationOutcome]) -> VerificationReport:
+def _validate_grain_identifiers(source_id: str, grain: tuple[str, ...]) -> None:
+    """Validate the source ID and grain columns before any scan.
+
+    A malformed identifier (a SQL fragment smuggled into a grain column or
+    source ID) raises ``ValueError`` here — a clean, truly-internal programmer
+    error that propagates rather than being sanitized into an availability
+    outcome.  Running this validation *before* the binding/scan try-block keeps
+    the scan-time error handling free to catch every connector/scan failure
+    (a raw driver error) without also masking a layer-declaration bug.
+    """
+
+    _quote_identifier(source_id)
+    for column in grain:
+        _quote_identifier(column)
+
+
+def _report(
+    layer: SemanticLayer, outcomes: list[VerificationOutcome]
+) -> VerificationReport:
+    # Any required source that could not be audited makes the report
+    # incomplete and is flagged by a single stable diagnostic so consumers can
+    # treat the report as "not fully verified".  Failed outcomes (a data
+    # quality issue the scan did observe) keep the report complete.
+    unavailable = any(
+        outcome.status == "unavailable" for outcome in outcomes
+    )
+    diagnostics: tuple[VerificationDiagnostic, ...] = ()
+    if unavailable:
+        diagnostics = (
+            VerificationDiagnostic(
+                code=_UNAVAILABLE_CODE,
+                severity="error",
+                path=_PATH,
+                message="one or more required sources were unavailable for verification",
+            ),
+        )
     return VerificationReport(
         schema_version=1,
         subject=layer.name,
         check_kind="physical",
-        complete=True,
+        complete=not unavailable,
         outcomes=tuple(outcomes),
-        diagnostics=(),
+        diagnostics=diagnostics,
     )
 
 
@@ -243,9 +300,11 @@ def verify_physical(layer: SemanticLayer, check: PhysicalCheck) -> VerificationR
 
     A sanitized :class:`~selayer.sources.errors.SourceError` from registry
     creation is adapted to an ``unavailable`` outcome for every source; a
-    per-source binding or execution error is adapted to an ``unavailable``
-    outcome for that source alone.  Programmer errors (a malformed grain
-    column, a connection that is unexpectedly ``None``) propagate unchanged.
+    per-source binding failure or a raw connector/scan failure from the bound
+    scan is adapted to an ``unavailable`` outcome (binding failures keep their
+    sanitized code; raw scan failures are normalized to ``scan_failed``) so no
+    driver-derived detail can ever escape.  Truly-internal programmer errors
+    (a malformed grain column) propagate unchanged.
     """
 
     profiles: RuntimeProfileResolver = (
@@ -274,14 +333,42 @@ def verify_physical(layer: SemanticLayer, check: PhysicalCheck) -> VerificationR
         try:
             for source_id in source_ids:
                 grain = layer.data_sources[source_id].grain
-                status = registry.status(source_id)
+                # Validate grain identifiers *before* binding so a malformed
+                # layer declaration raises a clean programmer error instead of
+                # being sanitized into an availability outcome.  This keeps the
+                # scan-time handling below free to catch every connector/scan
+                # failure without masking a layer-declaration bug.
+                _validate_grain_identifiers(source_id, grain)
+                status: SourceStatus | None = None
                 try:
                     with registry.bind_requirements(
                         {source_id: SourceScanRequirement(columns=grain)}
                     ):
+                        # Read connector metadata *inside* the binding context
+                        # (the registry lock is held) so generation/snapshot/
+                        # schema_fingerprint reflect the same bound scan the
+                        # grain SQL runs over; a concurrent reload cannot swap
+                        # the handle between the status read and the scan.
+                        status = registry.status(source_id)
                         counts = _grain_counts(registry, source_id, grain)
-                except SourceError as error:
-                    outcomes.append(_unavailable_outcome(source_id, error, status))
+                except (SourceError, duckdb.Error) as error:
+                    # Global "no raw error wins": a sanitized ``SourceError``
+                    # from binding or status, or any raw connector/scan
+                    # ``duckdb.Error`` from the bound scan, is adapted to a
+                    # sanitized ``unavailable`` outcome so no driver-derived
+                    # location, handle, or credential text can ever escape.
+                    # The error is constructed (not raised) here, so
+                    # ``__cause__``/``__context__`` remain ``None``.
+                    sanitized = (
+                        error
+                        if isinstance(error, SourceError)
+                        else SourceConnectionError(
+                            source_id, "scan_failed", "the source scan failed"
+                        )
+                    )
+                    outcomes.append(
+                        _unavailable_outcome(source_id, sanitized, status)
+                    )
                 else:
                     outcomes.append(_grain_outcome(source_id, status, counts))
         finally:

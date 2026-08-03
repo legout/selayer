@@ -9,7 +9,7 @@ exactly and never echoes offending values.
 
 from __future__ import annotations
 
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -343,6 +343,7 @@ def test_valid_single_and_composite_grains_pass(grain_sources: _GrainSources) ->
     assert single.evidence["distinct_grain_count"] == 2
     assert single.evidence["null_grain_rows"] == 0
     assert single.evidence["duplicate_grain_groups"] == 0
+    assert single.evidence["duplicate_row_count"] == 0
     assert single.evidence["connector"] == "parquet"
     assert single.evidence["generation"] == 1
     assert isinstance(single.evidence["schema_fingerprint"], str)
@@ -351,6 +352,7 @@ def test_valid_single_and_composite_grains_pass(grain_sources: _GrainSources) ->
     assert composite.status == "passed"
     assert composite.evidence["row_count"] == 2
     assert composite.evidence["distinct_grain_count"] == 2
+    assert composite.evidence["duplicate_row_count"] == 0
     assert composite.evidence["null_grain_rows"] == 0
     assert composite.evidence["duplicate_grain_groups"] == 0
 
@@ -361,6 +363,7 @@ def test_null_grain_field_is_reported(grain_sources: _GrainSources) -> None:
     assert outcome.status == "failed"
     assert outcome.evidence["null_grain_rows"] == 1
     assert outcome.evidence["duplicate_grain_groups"] == 0
+    assert outcome.evidence["duplicate_row_count"] == 0
     assert outcome.evidence["row_count"] == 2
 
 
@@ -370,6 +373,8 @@ def test_duplicate_composite_tuple_is_reported(grain_sources: _GrainSources) -> 
     assert outcome.status == "failed"
     assert outcome.evidence["null_grain_rows"] == 1
     assert outcome.evidence["duplicate_grain_groups"] == 1
+    # One row beyond the distinct grain tuples is a duplicate.
+    assert outcome.evidence["duplicate_row_count"] == 1
     assert outcome.evidence["row_count"] == 4
     # Distinct grain tuples: (m1,t1), (null,t3), (secret-key-value,t4) -> 3.
     assert outcome.evidence["distinct_grain_count"] == 3
@@ -452,6 +457,15 @@ def test_unavailable_registry_produces_unavailable_outcomes() -> None:
     # No connector metadata is available because nothing registered.
     assert "connector" not in outcome.evidence
     assert "schema_fingerprint" not in outcome.evidence
+    # An unavailable source makes the report incomplete and non-passing, with
+    # a single stable diagnostic flagging the gap.
+    assert report.complete is False
+    assert report.passed is False
+    unavailable_diags = [
+        diag for diag in report.diagnostics if diag.code == "source_unavailable"
+    ]
+    assert unavailable_diags
+    assert unavailable_diags[0].severity == "error"
     rendered = repr(report.to_dict())
     assert "events" not in rendered.lower().replace("source.events.grain", "")
 
@@ -600,3 +614,189 @@ def test_audit_duckdb_source(tmp_path: Path) -> None:
     report = verify(layer, PhysicalCheck())
     _assert_clean_grain(report, "facts", connector="duckdb", sentinels=(str(path),))
 
+
+# ---------------------------------------------------------------------------
+# Review findings: raw scan error sanitization, completeness/diagnostic,
+# duplicate_row_count evidence, and metadata binding-context timing.
+# ---------------------------------------------------------------------------
+
+
+def test_raw_scan_error_is_sanitized_to_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raw DuckDB scan failure becomes a secret-safe ``unavailable`` outcome.
+
+    The registry's ``execute`` (the bound scan) raises a raw ``duckdb.Error``
+    carrying a fake credential/location sentinel.  The audit adapts it to an
+    ``unavailable`` outcome with the stable ``scan_failed`` code, the report is
+    incomplete, and no raw driver text escapes.
+    """
+
+    path = tmp_path / "events.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "id": pa.array([1, 2, 3], pa.int64()),
+                "value": pa.array([1, 2, 3], pa.int64()),
+            }
+        ),
+        path,
+    )
+    layer = _single_source_layer(
+        "events", ParquetConfig(str(path)), _id_value_schema(), ("id",)
+    )
+
+    secret = "s3://user:RAWSECRETtoken@host/private/location"
+
+    def _boom(
+        self: SourceRegistry, sql: str, parameters: tuple[object, ...] = ()
+    ) -> Any:
+        del self, sql, parameters
+        raise duckdb.Error(f"scan failure reading {secret}")
+
+    monkeypatch.setattr(SourceRegistry, "execute", _boom)
+
+    report = verify(layer, PhysicalCheck())
+    outcome = _outcome(report, "source.events.grain")
+    assert outcome.status == "unavailable"
+    assert outcome.evidence["error_code"] == "scan_failed"
+    # The bound-scan status was read (under the lock) before the scan failed,
+    # so connector metadata is present.
+    assert outcome.evidence["connector"] == "parquet"
+    assert report.complete is False
+    assert report.passed is False
+    rendered = repr(report.to_dict())
+    assert "RAWSECRETtoken" not in rendered
+    assert secret not in rendered
+    assert "scan failure" not in rendered
+
+
+def test_unavailable_outcome_marks_report_incomplete(tmp_path: Path) -> None:
+    """Any required unavailable source makes the report incomplete + non-passing.
+
+    A clean layer (all sources pass) yields a complete, passing report with no
+    ``source_unavailable`` diagnostic; once a source is unavailable the report
+    flips to ``complete=False`` with the stable diagnostic and ``passed`` is
+    ``False``.
+    """
+
+    path = tmp_path / "events.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "id": pa.array([1, 2, 3], pa.int64()),
+                "value": pa.array([1, 2, 3], pa.int64()),
+            }
+        ),
+        path,
+    )
+    layer = _single_source_layer(
+        "events", ParquetConfig(str(path)), _id_value_schema(), ("id",)
+    )
+    clean_report = verify(layer, PhysicalCheck())
+    assert clean_report.complete is True
+    assert clean_report.passed is True
+    assert not [
+        diag for diag in clean_report.diagnostics if diag.code == "source_unavailable"
+    ]
+
+    unavailable_layer = _single_source_layer(
+        "events", PyArrowConfig("events"), _id_value_schema(), ("id",)
+    )
+    unavailable_report = verify(unavailable_layer, PhysicalCheck())
+    assert unavailable_report.complete is False
+    assert unavailable_report.passed is False
+    unavailable_diags = [
+        diag
+        for diag in unavailable_report.diagnostics
+        if diag.code == "source_unavailable"
+    ]
+    assert unavailable_diags
+    assert unavailable_diags[0].severity == "error"
+    # The diagnostic message is a constant (no source id / driver detail).
+    assert "events" not in unavailable_diags[0].message
+
+
+def test_duplicate_row_count_evidence(tmp_path: Path) -> None:
+    """``duplicate_row_count`` counts the excess rows beyond distinct grains.
+
+    Three identical tuples plus one distinct one: row_count=4, distinct=2,
+    duplicate_row_count=2 (the two surplus copies of the repeated tuple),
+    duplicate_grain_groups=1, and the outcome fails.
+    """
+
+    path = tmp_path / "dup.parquet"
+    _write_parquet(
+        path,
+        pa.table(
+            {
+                "id": pa.array([1, 1, 1, 2], pa.int64()),
+                "value": pa.array([10, 10, 10, 20], pa.int64()),
+            }
+        ),
+    )
+    layer = _single_source_layer(
+        "dup", ParquetConfig(str(path)), _id_value_schema(), ("id",)
+    )
+    report = verify(layer, PhysicalCheck())
+    outcome = _outcome(report, "source.dup.grain")
+    assert outcome.status == "failed"
+    assert outcome.evidence["row_count"] == 4
+    assert outcome.evidence["distinct_grain_count"] == 2
+    assert outcome.evidence["duplicate_row_count"] == 2
+    assert outcome.evidence["duplicate_grain_groups"] == 1
+    assert outcome.evidence["null_grain_rows"] == 0
+
+
+def test_audit_reads_status_inside_binding_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Connector status is read while the per-source binding context is active.
+
+    Moving the ``status`` read out of the binding context (so a concurrent
+    reload could swap the handle between the status read and the scan) would
+    flip ``status_while_binding`` to ``[False]`` and fail this test.
+    """
+
+    path = tmp_path / "events.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "id": pa.array([1, 2, 3], pa.int64()),
+                "value": pa.array([1, 2, 3], pa.int64()),
+            }
+        ),
+        path,
+    )
+    layer = _single_source_layer(
+        "events", ParquetConfig(str(path)), _id_value_schema(), ("id",)
+    )
+
+    binding_active: list[bool] = []
+    status_while_binding: list[bool] = []
+    original_status = SourceRegistry.status
+
+    def _recording_status(self: SourceRegistry, source_id: str) -> Any:
+        status_while_binding.append(bool(binding_active) and binding_active[-1])
+        return original_status(self, source_id)
+
+    monkeypatch.setattr(SourceRegistry, "status", _recording_status)
+
+    original_bind = SourceRegistry.bind_requirements
+
+    @contextmanager
+    def _tracking_bind(self: SourceRegistry, requirements: Any):
+        binding_active.append(True)
+        try:
+            with original_bind(self, requirements):
+                yield
+        finally:
+            binding_active.pop()
+
+    monkeypatch.setattr(SourceRegistry, "bind_requirements", _tracking_bind)
+
+    report = verify(layer, PhysicalCheck())
+    outcome = _outcome(report, "source.events.grain")
+    assert outcome.status == "passed"
+    assert status_while_binding  # status was read
+    assert all(status_while_binding)  # always while the binding is active
