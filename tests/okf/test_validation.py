@@ -1833,3 +1833,124 @@ def test_malformed_link_url_yields_coded_diagnostic_not_valueerror(
         assert "SHOULD-NOT-LEAK" not in issue.message
         assert "token=" not in issue.message
         assert "http://[" not in issue.message
+
+
+# --- Seventh re-review High: detection must survive stripping every generated
+# concept metadata mapping AND tampering a single generated directory index.
+# The complete-index-set marker fails when one index is altered, so generated
+# bundles are additionally detected from the surviving expected generated
+# concept path set corroborated by index-structure evidence. Authored-only
+# bundles that merely carry arbitrary nested indexes stay compatible. ---
+
+
+def test_stripped_generated_bundle_is_still_detected_when_one_index_is_tampered(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    # Strip every generated mapping (the metadata-stripping attack)...
+    for concept_path in sorted(root.rglob("*.md")):
+        if concept_path.name in {"index.md", "log.md"}:
+            continue
+        _drop_frontmatter_key(
+            root,
+            concept_path.relative_to(root).as_posix(),
+            "generated",
+        )
+    # ...and tamper exactly one generated directory index, which defeats the
+    # complete-coherent-index-set marker on its own.
+    (root / "metrics" / "index.md").write_text("# tampered\n", encoding="utf-8")
+
+    with pytest.raises(OkfValidationError) as raised:
+        OkfBundle.load(root, layer=valid_layer)
+
+    codes = {issue.code for issue in raised.value.issues}
+    # The bundle is still audited: every concept document lost its generated
+    # metadata, so missing_metadata fires for each expected concept.
+    assert "okf.generated.missing_metadata" in codes
+    assert any(
+        issue.code == "okf.generated.missing_metadata"
+        and issue.path == "metrics/gross_margin.md"
+        for issue in raised.value.issues
+    )
+
+
+def test_authored_bundle_with_arbitrary_nested_indexes_is_not_generated(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    (root / "metrics").mkdir(parents=True)
+    (root / "dimensions").mkdir(parents=True)
+    (root / "sources").mkdir(parents=True)
+    # Authored-only bundle: several arbitrary nested indexes (human prose, not
+    # the generator's output) and crucially no documents at the expected
+    # generated concept paths. It must not be classified as generated.
+    (root / "metrics" / "index.md").write_text(
+        "# Authored metrics notes\n\nCurated commentary only.\n",
+        encoding="utf-8",
+    )
+    (root / "dimensions" / "index.md").write_text(
+        "# Authored dimension notes\n", encoding="utf-8"
+    )
+    (root / "sources" / "index.md").write_text(
+        "# Authored source notes\n", encoding="utf-8"
+    )
+
+    bundle = OkfBundle.load(root, layer=valid_layer)
+
+    codes = {issue.code for issue in bundle.diagnostics}
+    assert "okf.generated.missing_concept" not in codes
+    assert "okf.generated.index_mismatch" not in codes
+    assert "okf.generated.missing_metadata" not in codes
+
+
+# --- Seventh re-review Medium: after ``urlsplit`` succeeds, a URL-decoded
+# link path may contain an embedded NUL byte (``%00.md``) or be pathologically
+# long, which makes ``Path.resolve``/``Path.exists`` raise ValueError/OSError.
+# The validator must emit a coded, secret-safe ``okf.link.malformed`` warning
+# instead of escaping the exception, and must never echo the raw link. ---
+
+
+def test_null_byte_link_path_yields_coded_diagnostic_not_valueerror(
+    tmp_path: Path,
+) -> None:
+    _write_concept(
+        tmp_path,
+        "type: Metric",
+        "\n# Related\n\n[broken](%00.md?token=SHOULD-NOT-LEAK)\n",
+    )
+
+    bundle = OkfBundle.load(tmp_path)
+
+    malformed = [
+        issue
+        for issue in bundle.diagnostics
+        if issue.code == "okf.link.malformed"
+    ]
+    assert len(malformed) == 1
+    assert malformed[0].severity == "warning"
+    assert malformed[0].path == "concept.md.links"
+    for issue in bundle.diagnostics:
+        assert "SHOULD-NOT-LEAK" not in issue.message
+        assert "token=" not in issue.message
+
+
+def test_oversized_link_path_yields_coded_diagnostic_not_oserror(
+    tmp_path: Path,
+) -> None:
+    _write_concept(
+        tmp_path,
+        "type: Metric",
+        f"\n# Related\n\n[broken]({'a' * 4000}.md)\n",
+    )
+
+    bundle = OkfBundle.load(tmp_path)
+
+    malformed = [
+        issue
+        for issue in bundle.diagnostics
+        if issue.code == "okf.link.malformed"
+    ]
+    assert len(malformed) == 1
+    assert malformed[0].severity == "warning"
+    assert malformed[0].path == "concept.md.links"

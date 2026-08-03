@@ -653,6 +653,37 @@ def _normalized_link_path(source: OkfConcept, link: str) -> PurePosixPath | None
     return PurePosixPath(normalized)
 
 
+def _resolve_link_target(
+    root: Path, source: Path, path_text: str
+) -> tuple[Path | None, bool | None]:
+    """Safely resolve a cross-document link target and probe its existence.
+
+    Returns ``(resolved, exists)``. ``urlsplit`` accepts paths whose URL-
+    decoded form is unsafe for the filesystem -- an embedded NUL byte
+    (``%00.md``) makes ``Path.resolve`` raise ``ValueError``, and a
+    pathologically long name makes ``Path.exists`` raise ``OSError``. A
+    validator must never crash on attacker-controlled link text, so any such
+    failure is surfaced by the caller as a coded ``okf.link.malformed``
+    diagnostic instead. On success ``resolved`` is the resolved path and
+    ``exists`` is its existence boolean (a genuinely missing target is a
+    broken link, not a malformed one).
+    """
+    candidate = (
+        root / path_text.lstrip("/")
+        if path_text.startswith("/")
+        else source.parent / path_text
+    )
+    try:
+        resolved = candidate.resolve()
+    except (ValueError, OSError):
+        return None, None
+    try:
+        exists = resolved.exists()
+    except (ValueError, OSError):
+        return None, None
+    return resolved, exists
+
+
 def _index_markdown_paths(root: Path) -> tuple[Path, ...]:
     return tuple(sorted(path for path in root.rglob("index.md") if path.is_file()))
 
@@ -722,12 +753,20 @@ def validate_links(
                         )
                     )
                 continue
-            target = (
-                root / path_text.lstrip("/")
-                if path_text.startswith("/")
-                else source.parent / path_text
-            ).resolve()
-            if not target.is_relative_to(resolved_root) or not target.exists():
+            target, exists = _resolve_link_target(root, source, path_text)
+            if target is None:
+                # The decoded path could not be safely resolved or probed
+                # (embedded NUL byte, pathologically long name, ...). Surface a
+                # coded, secret-safe diagnostic instead of crashing.
+                issues.append(
+                    _link_issue(
+                        concept,
+                        _malformed_link_message(),
+                        code="okf.link.malformed",
+                    )
+                )
+                continue
+            if not target.is_relative_to(resolved_root) or not exists:
                 issues.append(_link_issue(concept, _broken_link_message(normalized)))
                 continue
             if not fragment:
@@ -900,6 +939,56 @@ def _has_generated_directory_indexes(
     return True
 
 
+def _has_generated_concept_structure(
+    root: Path,
+    expected: Mapping[str, OkfConcept],
+    expected_indexes: Mapping[PurePosixPath, str],
+) -> bool:
+    """Return True when the bundle carries the expected generated concept set.
+
+    Survives the combined attack of stripping *every* ``generated`` mapping
+    AND tampering one (or a few) generated directory indexes: even then a
+    genuine generated bundle still contains a document at *every* expected
+    generated concept path (stripping metadata and altering an index never
+    removes the concept documents), while the bulk of its per-directory
+    indexes still byte-match the generator output. That evidence is what the
+    ``OkfBundle.generate`` layout always produces and an authored bundle never
+    reproduces.
+
+    Both conditions are required so authored bundles stay compatible: the
+    concept-path set is the tamper-resistant structural evidence, and at least
+    one matching per-directory index corroborates a generated origin rather
+    than a coincidental authored file layout. Authored bundles -- which carry
+    arbitrary nested indexes but no documents at the expected generated
+    concept paths -- fail the concept-path condition and are left untouched.
+    """
+    expected_paths = {
+        PurePosixPath(concept.relative_path.as_posix())
+        for concept in expected.values()
+    }
+    if not expected_paths:
+        return False
+    for relative in expected_paths:
+        if not (root / Path(relative.as_posix())).is_file():
+            return False
+    expected_dir_indexes = {
+        relative_path: expected_text
+        for relative_path, expected_text in expected_indexes.items()
+        if len(relative_path.parts) >= 2  # per-directory index, not the root
+    }
+    for relative_path, expected_text in expected_dir_indexes.items():
+        index_file = root / Path(relative_path.as_posix())
+        if not index_file.is_file():
+            continue
+        try:
+            actual = index_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if actual == expected_text:
+            return True
+    return False
+
+
 def validate_generated_integrity(
     root: Path,
     concepts: Mapping[str, OkfConcept],
@@ -951,8 +1040,10 @@ def validate_generated_integrity(
     # matches the generator output) rather than the mere presence of an index
     # file, so authored bundles that happen to carry a nested ``index.md`` are
     # not misclassified.
-    is_generated_bundle = has_generated or _has_generated_directory_indexes(
-        root, expected_indexes
+    is_generated_bundle = (
+        has_generated
+        or _has_generated_directory_indexes(root, expected_indexes)
+        or _has_generated_concept_structure(root, expected, expected_indexes)
     )
     issues: list[OkfIssue] = []
 
