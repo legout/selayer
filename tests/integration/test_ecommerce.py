@@ -4,13 +4,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
+import pandas as pd
 import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import yaml
 
+from examples.e_commerce.selayer1 import load_layer
 from selayer import QueryEngine, QueryPlanningError, SemanticLayer
+from selayer.sources.config import ParquetConfig
 
 
 def _write_fixture_parquet(
@@ -31,6 +34,175 @@ def _write_fixture_parquet(
         ),
         path,
     )
+
+
+def test_generator_default_output_dir_is_example_local() -> None:
+    from examples.e_commerce import gen_data
+
+    repo = Path(__file__).parents[2]
+    assert gen_data.DEFAULT_OUTPUT_DIR == repo / "examples/e_commerce/data"
+
+
+def test_generator_writes_empty_non_nullable_object_column(tmp_path: Path) -> None:
+    from examples.e_commerce import gen_data
+
+    output = tmp_path / "empty.parquet"
+    frame = pd.DataFrame({"id": pd.Series(dtype="object")})
+
+    gen_data._write_parquet(frame, output, non_nullable={"id"})
+
+    schema = pq.read_schema(output)
+    assert schema.field("id").type == pa.string()
+    assert not schema.field("id").nullable
+
+
+def test_generator_main_accepts_explicit_output_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from examples.e_commerce import gen_data
+
+    def frame(*columns: str) -> pd.DataFrame:
+        timestamp_columns = {
+            "created_at",
+            "registration_date",
+            "touch_date",
+            "visit_date",
+            "closed_at",
+            "start_date",
+            "end_date",
+            "date",
+        }
+        boolean_columns = {"is_active", "is_first_purchase", "is_bounce"}
+        integer_columns = {
+            "quantity",
+            "in_stock",
+            "supplier_id",
+            "impressions",
+            "clicks",
+            "conversions",
+        }
+        float_columns = {
+            "base_price",
+            "cost",
+            "price",
+            "total",
+            "amount",
+            "total_amount",
+            "shipping_cost",
+            "discount_amount",
+            "budget",
+            "spend",
+            "time_on_page",
+            "response_time_hours",
+            "satisfaction_score",
+            "lifetime_value",
+        }
+        data: dict[str, pd.Series] = {}
+        for column in columns:
+            if column in timestamp_columns:
+                data[column] = pd.Series([], dtype="datetime64[ns]")
+            elif column in boolean_columns:
+                data[column] = pd.Series([], dtype="bool")
+            elif column in integer_columns:
+                data[column] = pd.Series([], dtype="int64")
+            elif column in float_columns:
+                data[column] = pd.Series([], dtype="float64")
+            else:
+                data[column] = pd.Series([], dtype="object")
+        return pd.DataFrame(data)
+
+    monkeypatch.setattr(
+        gen_data,
+        "generate_customers",
+        lambda **_: frame(
+            "id",
+            "email",
+            "name",
+            "segment",
+            "acquisition_channel",
+            "registration_date",
+            "country",
+            "city",
+            "is_active",
+            "lifetime_value",
+        ),
+    )
+    monkeypatch.setattr(
+        gen_data,
+        "generate_products",
+        lambda **_: frame(
+            "id",
+            "name",
+            "category",
+            "subcategory",
+            "base_price",
+            "cost",
+            "in_stock",
+            "supplier_id",
+            "created_at",
+            "is_active",
+        ),
+    )
+    monkeypatch.setattr(
+        gen_data,
+        "generate_orders",
+        lambda *_args, **_kwargs: (
+            frame(
+                "id",
+                "customer_id",
+                "created_at",
+                "status",
+                "payment_method",
+                "shipping_cost",
+                "discount_code",
+                "discount_amount",
+                "reason",
+                "is_first_purchase",
+                "amount",
+                "total_amount",
+            ),
+            frame("order_id", "product_id", "quantity", "price", "total"),
+        ),
+    )
+    monkeypatch.setattr(
+        gen_data,
+        "generate_marketing_campaigns",
+        lambda **_: frame("id"),
+    )
+    monkeypatch.setattr(
+        gen_data,
+        "generate_marketing_touches",
+        lambda *_args, **_kwargs: frame("id"),
+    )
+    monkeypatch.setattr(
+        gen_data,
+        "generate_website_visits",
+        lambda *_args, **_kwargs: frame("id"),
+    )
+    monkeypatch.setattr(
+        gen_data,
+        "generate_customer_support_tickets",
+        lambda *_args, **_kwargs: frame("id"),
+    )
+    monkeypatch.setattr(
+        gen_data,
+        "generate_inventory_snapshots",
+        lambda *_args, **_kwargs: frame("id"),
+    )
+
+    output_dir = tmp_path / "ecommerce-data"
+    gen_data.main(output_dir)
+
+    assert (output_dir / "customers.parquet").exists()
+    assert (output_dir / "orders.csv").exists()
+    assert not (tmp_path / "data").exists()
+
+    layer = load_layer(output_dir)
+    with QueryEngine(layer) as engine:
+        assert engine.query(["gross_margin"], ["product_category"]).columns == [
+            "product_category",
+            "gross_margin",
+        ]
 
 
 @pytest.fixture
@@ -192,6 +364,18 @@ def root(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def test_runner_rebinds_catalog_to_explicit_data_dir(root: Path) -> None:
+    layer = load_layer(root / "data")
+    orders_connector = layer.data_sources["orders"].connector
+    products_connector = layer.data_sources["products"].connector
+
+    assert layer.version == 1
+    assert isinstance(orders_connector, ParquetConfig)
+    assert orders_connector.location == str(root / "data/orders.parquet")
+    assert isinstance(products_connector, ParquetConfig)
+    assert products_connector.location == str(root / "data/products.parquet")
+
+
 def expected_product_metrics(root: Path) -> pl.DataFrame:
     items = pl.read_parquet(root / "data/order_items.parquet")
     products = pl.read_parquet(root / "data/products.parquet")
@@ -295,9 +479,10 @@ def test_cross_kind_local_names_execute_with_distinct_internal_aliases(
     )
 
 
-def test_catalog_is_schema_version_one_and_executes_from_repo_path() -> None:
-    repo = Path(__file__).parents[2]
-    layer = SemanticLayer.load(repo / "ecommerce_semantic_layer.yaml")
+def test_catalog_is_schema_version_one_and_executes_from_fixture_path(
+    root: Path,
+) -> None:
+    layer = SemanticLayer.load(root / "ecommerce_semantic_layer.yaml")
     assert layer.version == 1
     assert all(source.grain for source in layer.data_sources.values())
     assert layer.facts["item_cost"].source == "order_items"
@@ -305,7 +490,7 @@ def test_catalog_is_schema_version_one_and_executes_from_repo_path() -> None:
         actual = engine.query(["gross_margin"], ["product_category"]).sort(
             "product_category"
         )
-    expected = expected_product_metrics(repo)
+    expected = expected_product_metrics(root)
     assert actual["product_category"].to_list() == expected["category"].to_list()
     assert actual["gross_margin"].to_list() == pytest.approx(
         expected["gross_margin"].to_list()

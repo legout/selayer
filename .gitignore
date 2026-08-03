@@ -33,5 +33,12 @@ skills-lock.json
 country_x_quarter_*.csv
 polars_country_x_quarter_*.csv
 
+# Generated e-commerce example data
+examples/e_commerce/data/
+
 # Generated shop-floor example data
 examples/shopfloor/data/
+
+# Local code graph and Graphify output
+.codegraph/
+graphify-out/

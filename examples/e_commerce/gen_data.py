@@ -1,8 +1,9 @@
 # sample_data_generator.py
-import os
+import argparse
 import random
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -16,8 +17,63 @@ Faker.seed(42)
 np.random.seed(42)
 random.seed(42)
 
-# Create output directory
-os.makedirs("data", exist_ok=True)
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "data"
+
+_SOURCE_SCHEMAS = {
+    "customers.parquet": pa.schema(
+        [
+            pa.field("id", pa.string()),
+            pa.field("email", pa.string()),
+            pa.field("name", pa.string()),
+            pa.field("segment", pa.string()),
+            pa.field("acquisition_channel", pa.string()),
+            pa.field("registration_date", pa.timestamp("ns")),
+            pa.field("country", pa.string()),
+            pa.field("city", pa.string()),
+            pa.field("is_active", pa.bool_()),
+            pa.field("lifetime_value", pa.float64()),
+        ]
+    ),
+    "products.parquet": pa.schema(
+        [
+            pa.field("id", pa.string()),
+            pa.field("name", pa.string()),
+            pa.field("category", pa.string()),
+            pa.field("subcategory", pa.string()),
+            pa.field("base_price", pa.float64()),
+            pa.field("cost", pa.float64()),
+            pa.field("in_stock", pa.int64()),
+            pa.field("supplier_id", pa.int64()),
+            pa.field("created_at", pa.timestamp("ns")),
+            pa.field("is_active", pa.bool_()),
+        ]
+    ),
+    "orders.parquet": pa.schema(
+        [
+            pa.field("id", pa.string()),
+            pa.field("customer_id", pa.string()),
+            pa.field("created_at", pa.timestamp("ns")),
+            pa.field("status", pa.string()),
+            pa.field("payment_method", pa.string()),
+            pa.field("shipping_cost", pa.float64()),
+            pa.field("discount_code", pa.string()),
+            pa.field("discount_amount", pa.float64()),
+            pa.field("reason", pa.string()),
+            pa.field("is_first_purchase", pa.bool_()),
+            pa.field("amount", pa.float64()),
+            pa.field("total_amount", pa.float64()),
+        ]
+    ),
+    "order_items.parquet": pa.schema(
+        [
+            pa.field("order_id", pa.string()),
+            pa.field("product_id", pa.string()),
+            pa.field("quantity", pa.int64()),
+            pa.field("price", pa.float64()),
+            pa.field("total", pa.float64()),
+        ]
+    ),
+}
 
 
 def generate_customers(num_customers=1000):
@@ -468,37 +524,57 @@ def generate_inventory_snapshots(products_df, num_days=90):
     return pd.DataFrame(snapshots)
 
 
-def _write_parquet(df, path, *, non_nullable=()):
-    """Write ``df`` to parquet, marking grain columns non-nullable.
-
-    Pandas writes every column as nullable and encodes strings as
-    ``large_string``. The catalog's grain rule requires grain columns to be
-    non-nullable, and the declared schemas use ``utf8`` (``string``), so the
-    table is written through an explicit Arrow schema: string columns become
-    ``string`` and the named ``non_nullable`` grain columns become
-    ``nullable=False``. Values are never coerced.
-    """
-    table = pa.Table.from_pandas(df, preserve_index=False)
-    fields = []
-    for field in table.schema:
-        if field.type == pa.large_string():
+def _write_parquet(
+    frame: pd.DataFrame,
+    path: Path,
+    *,
+    non_nullable: set[str] | frozenset[str] = frozenset(),
+) -> None:
+    """Write a generated frame with declared Arrow types and grain nullability."""
+    declared_schema = _SOURCE_SCHEMAS.get(path.name)
+    if declared_schema is not None:
+        schema = pa.schema(
+            [
+                pa.field(
+                    field.name,
+                    field.type,
+                    nullable=(False if field.name in non_nullable else field.nullable),
+                    metadata=field.metadata,
+                )
+                for field in declared_schema
+            ],
+            metadata=declared_schema.metadata,
+        )
+        table = pa.Table.from_pandas(frame, schema=schema, preserve_index=False)
+    else:
+        table = pa.Table.from_pandas(frame, preserve_index=False)
+        fields = []
+        for field in table.schema:
+            nullable = False if field.name in non_nullable else field.nullable
+            if (
+                field.type == pa.large_string()
+                or pa.types.is_null(field.type)
+                and field.name in non_nullable
+            ):
+                field_type = pa.string()
+            else:
+                field_type = field.type
             fields.append(
                 pa.field(
                     field.name,
-                    pa.string(),
-                    nullable=False if field.name in non_nullable else field.nullable,
+                    field_type,
+                    nullable=nullable,
+                    metadata=field.metadata,
                 )
             )
-        elif field.name in non_nullable:
-            fields.append(pa.field(field.name, field.type, nullable=False))
-        else:
-            fields.append(field)
-    table = table.cast(pa.schema(fields))
+        table = table.cast(pa.schema(fields, metadata=table.schema.metadata))
     pq.write_table(table, path)
 
 
-def main():
-    print("Generating sample data...")
+def main(output_dir: Path | str = DEFAULT_OUTPUT_DIR) -> None:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Generating sample data in {output_dir}...")
 
     # Generate base datasets
     print("Generating customers...")
@@ -533,25 +609,25 @@ def main():
     print("Saving datasets...")
     # Grain columns identify a row and must be non-nullable to satisfy the
     # catalog grain rule; the other datasets are not part of the catalog.
-    _write_parquet(customers, "data/customers.parquet", non_nullable={"id"})
-    _write_parquet(products, "data/products.parquet", non_nullable={"id"})
-    _write_parquet(orders, "data/orders.parquet", non_nullable={"id"})
+    _write_parquet(customers, output_dir / "customers.parquet", non_nullable={"id"})
+    _write_parquet(products, output_dir / "products.parquet", non_nullable={"id"})
+    _write_parquet(orders, output_dir / "orders.parquet", non_nullable={"id"})
     _write_parquet(
         order_items,
-        "data/order_items.parquet",
+        output_dir / "order_items.parquet",
         non_nullable={"order_id", "product_id"},
     )
-    campaigns.to_parquet("data/campaigns.parquet", index=False)
-    marketing_touches.to_parquet("data/marketing_touches.parquet", index=False)
-    website_visits.to_parquet("data/website_visits.parquet", index=False)
-    support_tickets.to_parquet("data/support_tickets.parquet", index=False)
-    inventory.to_parquet("data/inventory.parquet", index=False)
+    campaigns.to_parquet(output_dir / "campaigns.parquet", index=False)
+    marketing_touches.to_parquet(output_dir / "marketing_touches.parquet", index=False)
+    website_visits.to_parquet(output_dir / "website_visits.parquet", index=False)
+    support_tickets.to_parquet(output_dir / "support_tickets.parquet", index=False)
+    inventory.to_parquet(output_dir / "inventory.parquet", index=False)
 
     # Also save as CSV for easier inspection
-    customers.to_csv("data/customers.csv", index=False)
-    products.to_csv("data/products.csv", index=False)
-    orders.to_csv("data/orders.csv", index=False)
-    order_items.to_csv("data/order_items.csv", index=False)
+    customers.to_csv(output_dir / "customers.csv", index=False)
+    products.to_csv(output_dir / "products.csv", index=False)
+    orders.to_csv(output_dir / "orders.csv", index=False)
+    order_items.to_csv(output_dir / "order_items.csv", index=False)
 
     print("Sample data generation complete!")
     print(f"Generated {len(customers)} customers")
@@ -566,4 +642,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Generate e-commerce example data")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help="Directory for generated datasets (default: examples/e_commerce/data)",
+    )
+    main(parser.parse_args().output_dir)
