@@ -1,7 +1,7 @@
 # src/selayer/verification/model.py
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Literal
@@ -20,32 +20,65 @@ EvidenceValue = bool | int | float | str | None
 _SCHEMA_VERSION = 1
 
 
-def _ordered(values: Iterable[Any]) -> list[Any]:
-    """Deterministically order ``set``/``frozenset`` contents.
+def _canonical_sort_key(value: Any) -> tuple[Any, ...]:
+    """Total, deterministic sort key for unordered-evidence members.
 
-    Naturally sortable contents sort directly; mixed or unorderable contents
-    fall back to a stable total order by type name then ``repr`` so iteration
-    is always reproducible and never raises at runtime.
+    ``set``/``frozenset`` members are only *partially* ordered (the ``<``
+    operator is subset containment), so ``sorted(values)`` never raises but
+    silently yields a result that depends on the iteration order of the set,
+    which is PYTHONHASHSEED-dependent whenever members hash on ``str``/
+    ``bytes``. Falling back to ``repr`` is no better, since the ``repr`` of a
+    set or frozenset is itself hash-seed dependent.
+
+    Instead this returns a rank-tagged tuple per value so comparison is always
+    total: the leading element is an ``int`` rank in every branch, so two keys
+    only ever compare element-wise within the *same* rank (hence the same
+    value kind) and never raise ``TypeError``. The key is recursive, so the
+    same logical value maps to the same key regardless of hash seed.
     """
-    try:
-        return sorted(values)
-    except TypeError:
-        return sorted(values, key=lambda value: (type(value).__qualname__, repr(value)))
+    if value is None:
+        return (0,)
+    # ``bool`` is a subclass of ``int``: test it first so True/False do not
+    # fall through to the integer branch.
+    if isinstance(value, bool):
+        return (1, value)
+    if isinstance(value, int):
+        return (2, value)
+    if isinstance(value, float):
+        return (3, value)
+    if isinstance(value, str):
+        return (4, value)
+    if isinstance(value, (list, tuple)):
+        return (5, tuple(_canonical_sort_key(item) for item in value))
+    if isinstance(value, (set, frozenset)):
+        return (6, tuple(sorted(_canonical_sort_key(item) for item in value)))
+    # Any other (necessarily hashable, non-collection) scalar: deterministic
+    # last resort. This never receives a set/frozenset, so its ``repr`` is not
+    # hash-seed dependent the way a collection repr is.
+    return (7, type(value).__qualname__, repr(value))
 
 
 def _freeze_evidence(value: object) -> object:
     """Recursively freeze evidence into immutable, deterministic structures.
 
-    Mappings become ``MappingProxyType``; sequences become ``tuple``; sets (the
-    unordered, mutable runtime evidence structures) become a deterministically
-    sorted ``tuple`` so ordering is stable. Scalars are returned unchanged.
+    Mappings become ``MappingProxyType``. Ordered sequences (``list``/``tuple``)
+    become ``tuple`` while preserving the caller's order exactly — they are
+    *not* reordered. Unordered collections (``set``/``frozenset``) become a
+    ``tuple`` whose members are ordered by :func:`_canonical_sort_key`, so the
+    result is deterministic and hash-seed independent. Scalars are returned
+    unchanged.
     """
     if isinstance(value, Mapping):
         return MappingProxyType(
             {key: _freeze_evidence(item) for key, item in value.items()}
         )
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return tuple(_freeze_evidence(item) for item in _ordered(value))
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_evidence(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return tuple(
+            _freeze_evidence(item)
+            for item in sorted(value, key=_canonical_sort_key)
+        )
     return value
 
 

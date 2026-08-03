@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+import sys
 from types import MappingProxyType
 
 import pytest
@@ -189,3 +192,94 @@ def test_report_to_dict_emits_deterministic_set_evidence() -> None:
     # The whole payload round-trips through JSON (sets are not JSON-serialisable,
     # so this confirms determinism + serialisability of the serialised form).
     json.dumps(report.to_dict())
+
+
+def test_outcome_preserves_sequence_evidence_order() -> None:
+    # Ordered sequence evidence must keep the caller's order exactly: lists and
+    # tuples are frozen but NOT reordered (regression for the prior
+    # _ordered()-based reordering that silently sorted [2, 1] -> (1, 2)).
+    outcome = VerificationOutcome(
+        check_id="source.orders.grain",
+        status="passed",
+        scope="full_scan",
+        path="data_sources.orders.grain",
+        evidence={"descending": [3, 1, 2], "pairs": [(2, 1), (1, 2)]},  # type: ignore[arg-type]
+        diagnostics=(),
+    )
+    assert outcome.evidence["descending"] == (3, 1, 2)
+    assert outcome.evidence["pairs"] == ((2, 1), (1, 2))
+
+    report = VerificationReport(1, "shopfloor", "physical", True, (outcome,), ())
+    outcomes = report.to_dict()["outcomes"]
+    assert isinstance(outcomes, list)
+    first = outcomes[0]
+    assert isinstance(first, dict)
+    evidence = first["evidence"]
+    assert isinstance(evidence, dict)
+    assert evidence["descending"] == [3, 1, 2]
+    assert evidence["pairs"] == [[2, 1], [1, 2]]
+
+
+def test_outcome_canonicalizes_unordered_nested_evidence() -> None:
+    # A set of partially ordered members (frozensets) is canonicalised to a
+    # deterministic order that does not rely on Python's subset-based `<`,
+    # which is not a total order and would otherwise leave members in iteration
+    # order.
+    outcome = VerificationOutcome(
+        check_id="source.orders.grain",
+        status="passed",
+        scope="full_scan",
+        path="data_sources.orders.grain",
+        evidence={"groups": {frozenset({3, 1, 2}), frozenset({5, 4})}},  # type: ignore[arg-type]
+        diagnostics=(),
+    )
+    groups = outcome.evidence["groups"]
+    assert groups == ((1, 2, 3), (4, 5))
+
+    report = VerificationReport(1, "shopfloor", "physical", True, (outcome,), ())
+    outcomes = report.to_dict()["outcomes"]
+    assert isinstance(outcomes, list)
+    first = outcomes[0]
+    assert isinstance(first, dict)
+    evidence = first["evidence"]
+    assert isinstance(evidence, dict)
+    assert evidence["groups"] == [[1, 2, 3], [4, 5]]
+
+
+def test_unordered_nested_evidence_is_hash_seed_independent() -> None:
+    # Members are frozensets of strings: PYTHONHASHSEED randomises str hashes,
+    # so a partially-ordered ``sorted()`` over them is non-deterministic. The
+    # canonical ordering must yield identical evidence in fresh interpreters
+    # regardless of the seed (hash randomisation is fixed at interpreter start,
+    # hence the subprocess). JSON is used as the wire format so the comparison
+    # does not depend on tuple ``repr`` formatting.
+    snippet = (
+        "import json\n"
+        "from selayer.verification.model import VerificationOutcome\n"
+        "o = VerificationOutcome(\n"
+        "    check_id='c', status='passed', scope='declaration', path='p',\n"
+        "    evidence={'g': {frozenset({'alpha', 'beta'}),\n"
+        "                    frozenset({'gamma', 'delta'}),\n"
+        "                    frozenset({'epsilon', 'zeta'})}},\n"
+        "    diagnostics=(),\n"
+        ")\n"
+        "print(json.dumps(o.evidence['g']))\n"
+    )
+    outputs: set[str] = set()
+    for seed in ("0", "1", "2", "13", "random"):
+        env = {**os.environ, "PYTHONHASHSEED": seed}
+        result = subprocess.run(
+            [sys.executable, "-c", snippet],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=True,
+        )
+        outputs.add(result.stdout.strip())
+    assert len(outputs) == 1, f"non-deterministic across hash seeds: {sorted(outputs)!r}"
+    parsed = json.loads(next(iter(outputs)))
+    assert parsed == [
+        ["alpha", "beta"],
+        ["delta", "gamma"],
+        ["epsilon", "zeta"],
+    ]
