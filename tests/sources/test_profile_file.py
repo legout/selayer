@@ -778,6 +778,44 @@ def test_profile_file_invalid_utf8_filename_does_not_leak(
     _assert_secret_absent(error, _SECRET, capsys)
 
 
+def test_profile_file_unencodable_surrogate_path_raises_sanitized_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A lone high surrogate (``\ud800``) in the caller-supplied filesystem path
+    # cannot be encoded to the filesystem encoding: ``read_text`` -> ``open`` ->
+    # ``os.fsencode`` raises ``UnicodeEncodeError`` (a ``ValueError``, *not* an
+    # ``OSError``), so without an explicit handler it escapes sanitization and
+    # leaks the path (here carrying the sentinel) via ``args``/``object``/the
+    # traceback.  It must be captured and discarded; the sanitized error uses a
+    # fixed safe path token and neither the secret-bearing path nor the
+    # surrogate ever reaches any rendered surface.
+    surrogate = "\ud800"
+    path = tmp_path / f"{_SECRET}{surrogate}.yaml"
+    with pytest.raises(ProfileFileValidationError) as caught:
+        load_profile_file(path, environ={})
+    error = caught.value
+    assert error.code == "source.profile.invalid_path"
+    assert error.path == "<file>"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    formatted = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    captured = capsys.readouterr()
+    for surface in (
+        repr(error),
+        str(error),
+        repr(error.args),
+        error.path,
+        error.message,
+        formatted,
+        captured.out,
+        captured.err,
+    ):
+        assert _SECRET not in surface
+        assert surrogate not in surface
+
+
 # ---------------------------------------------------------------------------
 # Runtime resolver failures remain SourceProfileError (unchanged)
 # ---------------------------------------------------------------------------
