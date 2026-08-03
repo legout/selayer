@@ -656,19 +656,25 @@ class SourceRegistry:
     # -- query binding -----------------------------------------------------
 
     @contextmanager
-    def bind(self, plan: QueryPlan) -> Iterator[None]:
-        """Hold the registry lock for one query and bind query-scoped sources.
+    def bind_requirements(
+        self,
+        requirements: Mapping[str, SourceScanRequirement],
+    ) -> Iterator[None]:
+        """Hold the registry lock and bind the query-scoped sources in a
+        requirement map.
 
-        Persistent sources need no per-query binding.  Query-scoped sources are
-        bound once per query via ``adapter.bind_query`` (which creates a
-        fresh reader, registers it, and returns a cleanup) so the reload lock
-        cannot swap a handle mid-query.  When ``bind_query`` returns ``None``
-        the registry falls back to preparing and registering a fresh handle
-        from the adapter's provider.
+        Persistent sources need no per-query binding.  Each query-scoped source
+        named in ``requirements`` is bound once via ``adapter.bind_query``
+        (which creates a fresh reader, registers it, and returns a cleanup) so
+        the reload lock cannot swap a handle mid-query.  When ``bind_query``
+        returns ``None`` the registry falls back to preparing and registering a
+        fresh handle from the adapter's provider.
 
-        Every query-time binding failure (a raw PyIceberg/Arrow/registration
-        exception from ``bind_query`` or the fallback prepare/register) is
-        caught here and surfaced as a sanitized
+        Sources are visited in sorted ID order; a binding failure on one
+        source aborts the remaining bindings.  Every query-time binding
+        failure (a raw PyIceberg/Arrow/registration exception from
+        ``bind_query`` or the fallback prepare/register) is caught here and
+        surfaced as a sanitized
         :class:`~selayer.sources.errors.SourceConnectionError` (code
         ``bind_failed``) raised *outside* the active ``except`` scope so no
         driver-derived detail — authenticated locations, credentials, opaque
@@ -681,30 +687,18 @@ class SourceRegistry:
         bindings: list[QueryBinding] = []
         bind_failed_source: str | None = None
         try:
-            # One-argument form: the plan carries each source's declared grain
-            # (``source_grains``), so ``requirements_for_plan`` seeds
-            # row-identity columns without the registry supplying them.
-            requirements = requirements_for_plan(plan)
-            for source_id in _plan_sources(plan):
+            for source_id in sorted(requirements):
                 registration = self._registrations.get(source_id)
-                if registration is None:
-                    continue
-                handle = registration.handle
-                if not handle.query_scoped:
+                if registration is None or not registration.handle.query_scoped:
                     continue
                 adapter = registration.adapter
-                requirement = requirements.get(source_id)
-                binding: QueryBinding | None = None
+                handle = registration.handle
+                requirement = requirements[source_id]
                 try:
-                    if requirement is not None:
-                        binding = adapter.bind_query(
-                            self._connection, handle, requirement
-                        )
+                    binding = adapter.bind_query(self._connection, handle, requirement)
                     if binding is not None:
                         bindings.append(binding)
                         continue
-                    # Fall back to prepare + register for provider-backed
-                    # readers.
                     source = self._sources[source_id]
                     fresh = adapter.prepare(
                         source, self._profiles, self._arrow_providers
@@ -738,6 +732,24 @@ class SourceRegistry:
                 "bind_failed",
                 "the source could not be bound for the query",
             )
+
+    @contextmanager
+    def bind(self, plan: QueryPlan) -> Iterator[None]:
+        """Hold the registry lock for one query and bind query-scoped sources.
+
+        Thin wrapper over :meth:`bind_requirements`: the plan's per-source scan
+        requirements (each carrying its declared grain) are computed once and
+        restricted to the sources the plan touches, so the requirement
+        calculation lives in the caller and the binding body is reusable for
+        a direct requirement map (e.g. the physical grain audit).
+        """
+
+        requirements = requirements_for_plan(plan)
+        selected = {
+            source_id: requirements[source_id] for source_id in _plan_sources(plan)
+        }
+        with self.bind_requirements(selected):
+            yield
 
     @contextmanager
     def execute_lock(self) -> Iterator[None]:

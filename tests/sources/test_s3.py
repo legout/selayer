@@ -626,3 +626,41 @@ def test_s3_parquet_reload_discovers_new_objects(
         upload_second_file()
         engine.reload_source("events")
         assert engine.query(["row_count"])["row_count"].item() == 2
+
+
+@pytest.mark.integration
+def test_s3_parquet_grain_audit_reports_clean_full_scan(
+    minio_source_fixture: MinioSourceFixture,
+) -> None:
+    """A full grain audit over S3-backed Parquet reports a clean outcome with
+    connector kind, generation, schema fingerprint, full-scan scope, and zero
+    leaked location or credential text.
+    """
+
+    from selayer.verification import PhysicalCheck, verify
+
+    layer, profiles, _upload = minio_source_fixture
+    report = verify(layer, PhysicalCheck(profiles=profiles))
+    outcome = next(
+        item for item in report.outcomes if item.check_id == "source.events.grain"
+    )
+    assert outcome.status == "passed"
+    assert outcome.scope == "full_scan"
+    assert outcome.evidence["connector"] == "parquet"
+    assert outcome.evidence["generation"] == 1
+    assert isinstance(outcome.evidence["schema_fingerprint"], str)
+    assert outcome.evidence["snapshot"] is None
+    assert outcome.evidence["row_count"] == 1
+    assert outcome.evidence["null_grain_rows"] == 0
+    assert outcome.evidence["duplicate_grain_groups"] == 0
+    # Read the resolved credentials through the public resolver API so the
+    # no-leak assertion checks the actual secret values without touching
+    # private attributes.
+    minio_profile = profiles.resolve("minio", source_id="events")
+    rendered = repr(report.to_dict())
+    for sentinel in (
+        str(minio_profile.value("access_key")),
+        str(minio_profile.value("secret_key")),
+        "events-bucket",
+    ):
+        assert sentinel not in rendered

@@ -1497,3 +1497,199 @@ def test_one_argument_form_seeds_grain_from_plan_source_grains() -> None:
     )
     assert "order_id" in with_grain["order_items"].columns
     assert "product_id" in with_grain["order_items"].columns
+
+
+# ---------------------------------------------------------------------------
+# Requirement-scoped binding context (Task 12 Step 1)
+# ---------------------------------------------------------------------------
+
+
+class _QueryScopedRecordingAdapter:
+    """Query-scoped adapter that records ``bind_query`` calls and cleanups.
+
+    Mirrors the real Iceberg pattern: ``prepare`` retains a persistent table
+    resource (so create does not close it), ``register`` is a no-op, and
+    ``bind_query`` creates a fresh projected reader per query.  A non-
+    ``pyarrow`` connector keeps the registry's create path from closing the
+    resource, so the binding receives the live handle.
+    """
+
+    def __init__(self, table: pa.Table) -> None:
+        self._table = table
+        self.bind_calls: list[SourceScanRequirement] = []
+        self.cleanup_calls: int = 0
+        self.fail_source: str | None = None
+
+    def prepare(
+        self,
+        source: Any,
+        profiles: RuntimeProfileResolver,
+        arrow_providers: ArrowProviderResolver,
+    ) -> SourceHandle:
+        del profiles, arrow_providers
+        return SourceHandle(
+            source_id=source.name,
+            connector="iceberg",
+            resource=self._table,
+            schema=source.schema,
+            snapshot=None,
+            query_scoped=True,
+        )
+
+    def inspect_schema(self, handle: SourceHandle) -> TableSchema:
+        return handle.schema
+
+    def register(
+        self, connection: object, stable_name: str, handle: SourceHandle
+    ) -> None:
+        del connection, stable_name, handle
+
+    def bind_query(
+        self,
+        connection: object,
+        handle: SourceHandle,
+        requirement: SourceScanRequirement,
+    ) -> QueryBinding | None:
+        self.bind_calls.append(requirement)
+        if self.fail_source is not None and handle.source_id == self.fail_source:
+            raise RuntimeError("s3://user:secret@example/private")
+        reader = handle.resource.select(list(requirement.columns))  # type: ignore[union-attr]
+        connection.register(handle.source_id, reader)  # type: ignore[attr-defined]
+        outer = self
+
+        def _cleanup() -> None:
+            outer.cleanup_calls += 1
+            try:
+                connection.unregister(handle.source_id)  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001, S110
+                pass
+
+        return QueryBinding(
+            source_id=handle.source_id,
+            stable_name=handle.source_id,
+            cleanup=_cleanup,
+        )
+
+    def close(self, handle: SourceHandle) -> None:
+        del handle
+
+
+def _events_schema_with_grain() -> TableSchema:
+    return TableSchema(
+        (
+            FieldSchema("machine_id", ScalarType("utf8"), False),
+            FieldSchema("recorded_at", ScalarType("utf8"), False),
+            FieldSchema("value", ScalarType("int64"), False),
+        )
+    )
+
+
+def _build_query_scoped_registry(
+    adapter: _QueryScopedRecordingAdapter,
+    names: tuple[str, ...],
+) -> SourceRegistry:
+    table = pa.table(
+        {
+            "machine_id": pa.array(["m1", "m2"], pa.utf8()),
+            "recorded_at": pa.array(["t1", "t2"], pa.utf8()),
+            "value": pa.array([1, 2], pa.int64()),
+        }
+    )
+    # Reuse the supplied adapter's table for every source.
+    adapter._table = table
+    connection = _TrackingConnection()
+    layer = _layer(
+        *[
+            DataSource(
+                name,
+                PyArrowConfig(name),
+                _events_schema_with_grain(),
+                ("machine_id", "recorded_at"),
+            )
+            for name in names
+        ]
+    )
+    return SourceRegistry.create(
+        layer,
+        connection,
+        _empty_profiles(),
+        MappingArrowProviderResolver({name: _ScriptedProvider() for name in names}),
+        adapters=MappingProxyType({"pyarrow": adapter}),
+    )
+
+
+def test_bind_requirements_binds_query_scoped_sources_in_sorted_order() -> None:
+    """``bind_requirements`` binds query-scoped sources in sorted ID order.
+
+    Each source receives its exact grain-column requirement, a query under the
+    context scans the bound relations, and every binding cleanup runs on exit.
+    The registry lock is released after the context exits.
+    """
+
+    adapter = _QueryScopedRecordingAdapter(pa.table({}))
+    registry = _build_query_scoped_registry(adapter, ("beta", "alpha"))
+    try:
+        requirements = {
+            "alpha": SourceScanRequirement(columns=("machine_id", "recorded_at")),
+            "beta": SourceScanRequirement(columns=("machine_id", "recorded_at")),
+        }
+        with registry.bind_requirements(requirements):
+            alpha_count = registry.execute(
+                'select count(*) from "alpha"'
+            ).fetchone()
+            beta_count = registry.execute(
+                'select count(*) from "beta"'
+            ).fetchone()
+        assert alpha_count == (2,)
+        assert beta_count == (2,)
+        # Bindings visited in sorted ID order.
+        assert [r.columns for r in adapter.bind_calls] == [
+            ("machine_id", "recorded_at"),
+            ("machine_id", "recorded_at"),
+        ]
+        assert adapter.cleanup_calls == 2
+        # The lock is released after the context exits.
+        assert registry._lock.acquire(blocking=False)
+        registry._lock.release()
+    finally:
+        registry.close()
+
+
+def test_bind_requirements_sanitizes_binding_failure() -> None:
+    """A raw bind failure surfaces as ``bind_failed`` with no retained detail.
+
+    A ``RuntimeError`` carrying a fake credential is injected into the second
+    source's ``bind_query``.  The already-bound first binding is cleaned up, the
+    sanitized ``SourceConnectionError`` (code ``bind_failed``) is raised
+    outside the except scope (``__cause__``/``__context__`` ``None``), and the
+    credential never reaches any error surface.
+    """
+
+    adapter = _QueryScopedRecordingAdapter(pa.table({}))
+    adapter.fail_source = "beta"
+    registry = _build_query_scoped_registry(adapter, ("alpha", "beta"))
+    try:
+        credential = "s3://user:secret@example/private"
+        requirements = {
+            "alpha": SourceScanRequirement(columns=("machine_id", "recorded_at")),
+            "beta": SourceScanRequirement(columns=("machine_id", "recorded_at")),
+        }
+        with (
+            pytest.raises(SourceConnectionError) as caught,
+            registry.bind_requirements(requirements),
+        ):
+            pytest.fail("body should not run when binding fails")
+        assert caught.value.code == "bind_failed"
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        assert credential not in str(caught.value)
+        assert credential not in repr(caught.value)
+        assert "secret" not in str(caught.value)
+        assert "secret" not in repr(caught.value)
+        # The first (already-bound) binding was cleaned up before the error.
+        assert adapter.cleanup_calls == 1
+        # The lock is released even on the failure path.
+        assert registry._lock.acquire(blocking=False)
+        registry._lock.release()
+    finally:
+        registry.close()

@@ -29,6 +29,7 @@ from selayer.sources.config import PostgresConfig
 from selayer.sources.errors import SourceConnectionError
 from selayer.sources.profiles import MappingProfileResolver, RuntimeProfileResolver
 from selayer.sources.schema import FieldSchema, ScalarType, TableSchema
+from selayer.verification import PhysicalCheck, verify
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -295,3 +296,31 @@ def test_postgres_wrong_password_hides_credentials(
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
     _assert_no_secret_leak(caught.value, secret_password)
+
+
+@pytest.mark.integration
+def test_postgres_grain_audit_reports_clean_full_scan(
+    postgres_source_fixture: PostgresSourceFixture,
+) -> None:
+    """A full grain audit over PostgreSQL reports a clean ``parquet``-style
+    outcome with connector kind, generation, schema fingerprint, full-scan
+    scope, and zero leaked DSN/credential text.
+    """
+
+    fixture = postgres_source_fixture
+    report = verify(fixture.layer, PhysicalCheck(profiles=fixture.profiles))
+    outcome = next(
+        item for item in report.outcomes if item.check_id == "source.facts.grain"
+    )
+    assert outcome.status == "passed"
+    assert outcome.scope == "full_scan"
+    assert outcome.evidence["connector"] == "postgres"
+    assert outcome.evidence["generation"] == 1
+    assert isinstance(outcome.evidence["schema_fingerprint"], str)
+    assert outcome.evidence["snapshot"] is None
+    assert outcome.evidence["row_count"] == 1
+    assert outcome.evidence["null_grain_rows"] == 0
+    assert outcome.evidence["duplicate_grain_groups"] == 0
+    rendered = repr(report.to_dict())
+    for sentinel in (fixture.password, fixture.user, fixture.host):
+        assert sentinel not in rendered

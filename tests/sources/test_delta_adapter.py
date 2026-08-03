@@ -35,6 +35,7 @@ from selayer.sources.profiles import (
 )
 from selayer.sources.registry import SourceRegistry
 from selayer.sources.schema import FieldSchema, ScalarType, TableSchema
+from selayer.verification import PhysicalCheck, verify
 
 # ---------------------------------------------------------------------------
 # Schemas
@@ -710,3 +711,41 @@ def test_delta_handles_close_after_reload_and_engine_close(
     assert current in closed
     assert current.resource.table is None  # type: ignore[attr-defined]
     assert current.resource.dataset is None  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Step 7: Delta grain audit smoke test
+# ---------------------------------------------------------------------------
+
+
+def test_delta_grain_audit_reports_clean_full_scan(
+    tmp_path: Path,
+    delta_layer_factory: Callable[[str | Path], SemanticLayer],
+) -> None:
+    """A full grain audit over a Delta source reports connector kind,
+    generation, schema fingerprint, a safe integer snapshot, full-scan scope,
+    and zero leaked location text.
+    """
+
+    location = tmp_path / "events.delta"
+    write_deltalake(location, _events_table({"id": [1, 2, 3], "value": [10, 20, 30]}))
+    layer = delta_layer_factory(location)
+
+    report = verify(layer, PhysicalCheck())
+    outcome = next(
+        item for item in report.outcomes if item.check_id == "source.events.grain"
+    )
+    assert outcome.status == "passed"
+    assert outcome.scope == "full_scan"
+    assert outcome.evidence["connector"] == "delta"
+    assert outcome.evidence["generation"] == 1
+    assert isinstance(outcome.evidence["schema_fingerprint"], str)
+    snapshot = outcome.evidence["snapshot"]
+    assert snapshot is not None
+    assert isinstance(snapshot, str)
+    assert snapshot.isdigit()
+    assert outcome.evidence["row_count"] == 3
+    assert outcome.evidence["null_grain_rows"] == 0
+    assert outcome.evidence["duplicate_grain_groups"] == 0
+    rendered = repr(report.to_dict())
+    assert str(location) not in rendered

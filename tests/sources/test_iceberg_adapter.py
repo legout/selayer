@@ -28,6 +28,7 @@ from selayer.query import QueryEngine
 from selayer.sources.config import IcebergConfig
 from selayer.sources.profiles import MappingProfileResolver
 from selayer.sources.schema import FieldSchema, ScalarType, TableSchema
+from selayer.verification import PhysicalCheck, verify
 
 if TYPE_CHECKING:
     from selayer.catalog import SemanticLayer
@@ -815,3 +816,37 @@ def test_register_failure_closes_reader_and_sanitizes_error(
     # No retained driver exception.
     assert error.__cause__ is None
     assert error.__context__ is None
+
+
+# ---------------------------------------------------------------------------
+# Step 7: Iceberg grain audit smoke test
+# ---------------------------------------------------------------------------
+
+
+def test_iceberg_grain_audit_reports_clean_full_scan(
+    iceberg_table_fixture: _IcebergFixture,
+) -> None:
+    """A full grain audit over an Iceberg source reports connector kind,
+    generation, schema fingerprint, a safe snapshot id, full-scan scope, and
+    zero leaked catalog/warehouse text.
+    """
+
+    fixture = iceberg_table_fixture
+    report = verify(fixture.layer, PhysicalCheck(profiles=fixture.profiles))
+    outcome = next(
+        item for item in report.outcomes if item.check_id == "source.events.grain"
+    )
+    assert outcome.status == "passed"
+    assert outcome.scope == "full_scan"
+    assert outcome.evidence["connector"] == "iceberg"
+    assert outcome.evidence["generation"] == 1
+    assert isinstance(outcome.evidence["schema_fingerprint"], str)
+    snapshot = outcome.evidence["snapshot"]
+    assert isinstance(snapshot, str)
+    assert snapshot.isdigit()
+    assert outcome.evidence["row_count"] == 3
+    assert outcome.evidence["null_grain_rows"] == 0
+    assert outcome.evidence["duplicate_grain_groups"] == 0
+    rendered = repr(report.to_dict())
+    assert "warehouse" not in rendered
+    assert "sqlite" not in rendered
