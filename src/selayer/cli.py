@@ -231,9 +231,13 @@ def _query_request_from_json(entry: object) -> QueryRequest:
     list of non-empty strings. ``dimensions`` is optional for metric-alone
     cases: it may be omitted entirely or be an empty list, but a
     present-but-null value (or a non-list, or a bad member) is rejected.
-    ``filters`` must be a mapping whose values are scalar, list, or range
-    forms. Invalid shapes raise ``ValueError`` for the caller's secret-safe
-    envelope.
+    ``filters`` is optional: an *omitted* key yields ``{}``, but a present
+    value must be a mapping whose values are scalar, list, or range forms — a
+    present ``null`` or any other non-mapping shape is rejected (it would
+    otherwise reach ``QueryRequest.__init__`` and call ``.items()`` on it,
+    raising ``AttributeError``). ``entry.get`` cannot distinguish omission from
+    an explicit ``null``, so presence is checked with ``in``. Invalid shapes
+    raise ``ValueError`` for the caller's secret-safe envelope.
     """
     if not isinstance(entry, dict):
         raise ValueError("query case must be a JSON object")  # noqa: TRY004
@@ -253,15 +257,19 @@ def _query_request_from_json(entry: object) -> QueryRequest:
         dimensions = []
     else:
         dimensions = _selector_list(entry["dimensions"], "dimensions", non_empty=False)
-    raw_filters = entry.get("filters")
-    if raw_filters is None:
+    # ``filters`` is optional but, when present, must be a mapping. Only an
+    # *omitted* key defaults to ``{}``; an explicit ``null`` or any other
+    # non-mapping shape is rejected so it never reaches
+    # ``QueryRequest.__init__`` (which would call ``.items()`` on it and raise
+    # ``AttributeError``). ``entry.get`` returns ``None`` for both omission and
+    # an explicit ``null``, so presence is checked with ``in`` to tell them
+    # apart.
+    if "filters" not in entry:
         normalised_filters: dict[str, FilterInput] = {}
-    elif not isinstance(raw_filters, dict):
-        # A non-mapping ``filters`` value would reach ``QueryRequest.__init__``
-        # and call ``.items()`` on it, raising ``AttributeError``. Reject the
-        # shape here so the secret-safe envelope handles it cleanly.
-        raise ValueError("query case filters must be a JSON object")
     else:
+        raw_filters = entry["filters"]
+        if not isinstance(raw_filters, dict):
+            raise ValueError("query case filters must be a JSON object")
         normalised_filters = {
             key: _normalise_filter_value(item) for key, item in raw_filters.items()
         }

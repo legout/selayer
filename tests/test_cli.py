@@ -448,9 +448,18 @@ def test_catalog_compatibility_missing_catalog_is_secret_safe(
         ({"metrics": "gross_margin"}, "gross_margin"),
         # A non-string selector element is a bad shape.
         ({"metrics": [123]}, "123"),
+        # A present-but-null ``filters`` is rejected (only omission yields
+        # ``{}``); it previously fell through ``entry.get``'s ``None`` branch.
+        ({"metrics": ["gross_margin"], "filters": None}, "null"),
         # A non-mapping ``filters`` value must not reach QueryRequest.__init__
         # (which would call ``.items()`` on it and raise AttributeError).
         ({"metrics": ["gross_margin"], "filters": [1, 2, 3]}, "AttributeError"),
+        # A non-mapping scalar ``filters`` value (e.g. a secret string) is
+        # rejected rather than echoed.
+        (
+            {"metrics": ["gross_margin"], "filters": "LEAK_FILTER_TOKEN_b3e1"},
+            "LEAK_FILTER_TOKEN_b3e1",
+        ),
         # A filter value that is neither scalar, list, nor range is rejected.
         (
             {
@@ -504,6 +513,47 @@ def test_catalog_compatibility_query_cases_reject_bad_shape_secret_safe(
     assert "Traceback" not in captured.err
     assert sentinel not in captured.err
     assert sentinel not in captured.out
+    assert str(cases) not in captured.err
+    assert captured.out == ""
+
+
+def test_catalog_compatibility_query_cases_reject_filters_null_secret_safe(
+    valid_catalog_path: Path,
+    tmp_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    """A present ``filters: null`` is rejected, not silently treated as ``{}``.
+
+    Only an *omitted* ``filters`` key defaults to ``{}``; an explicit ``null``
+    must be rejected through the secret-safe envelope. Previously
+    ``entry.get("filters")`` returned ``None`` for both omission and an
+    explicit ``null``, so the request silently became unfilled and succeeded.
+    A present ``null`` would also reach ``QueryRequest.__init__`` and call
+    ``.items()`` on it if not caught here.
+    """
+    cases = tmp_path / "cases.json"
+    cases.write_text(
+        json.dumps([{"metrics": ["gross_margin"], "filters": None}]),
+        encoding="utf-8",
+    )
+    assert (
+        main(
+            [
+                "catalog",
+                "compatibility",
+                str(valid_catalog_path),
+                "--query-cases",
+                str(cases),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    body = json.loads(captured.err)
+    assert set(body) == {"error"}
+    assert body["error"]  # non-empty fixed message
+    # No traceback, no echo of the file path, and no offending bytes.
+    assert "Traceback" not in captured.err
     assert str(cases) not in captured.err
     assert captured.out == ""
 
