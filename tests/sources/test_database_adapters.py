@@ -23,7 +23,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from selayer.catalog import SemanticLayer
+from selayer.catalog import CatalogValidationError, SemanticLayer
 from selayer.model import DataSource, Fact, Measure, Metric
 from selayer.query import QueryEngine
 from selayer.sources.adapters import database as dbmod
@@ -377,7 +377,12 @@ def test_invalid_relation_segment_is_catalog_error(tmp_path: Path) -> None:
 
 
 def test_programmatic_source_name_cannot_inject_view_sql(tmp_path: Path) -> None:
-    """Programmatic source IDs are revalidated before stable-view SQL."""
+    """A malicious programmatic source ID is rejected before any view SQL.
+
+    The engine validates the declaration rules before opening any resource, so
+    a source key carrying SQL metacharacters is rejected at construction with a
+    catalog validation error and never reaches the stable-view CREATE statement.
+    """
 
     path = tmp_path / "facts.duckdb"
     with duckdb.connect(str(path)) as connection:
@@ -385,14 +390,45 @@ def test_programmatic_source_name_cannot_inject_view_sql(tmp_path: Path) -> None
         connection.execute("insert into facts values (1, 10)")
 
     malicious = 'facts"; CREATE TABLE injected AS SELECT 1; --'
-    with pytest.raises(SourceConnectionError) as caught:
+    with pytest.raises(CatalogValidationError) as caught:
         QueryEngine(_duckdb_layer(path, source_name="facts", source_key=malicious))
+    assert any("must match" in issue.message for issue in caught.value.issues)
 
-    assert caught.value.code == "source_initialization_failed"
-    assert "injected" not in str(caught.value)
-    assert "CREATE TABLE" not in str(caught.value)
-    assert caught.value.__cause__ is None
-    assert caught.value.__context__ is None
+    # The malicious key never reached the stable-view CREATE statement, so the
+    # injection payload created no object in the target database file.
+    with duckdb.connect(str(path)) as connection:
+        names = {
+            row[0]
+            for row in connection.execute(
+                "select table_name from information_schema.tables"
+            ).fetchall()
+        }
+    assert "injected" not in names
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        'facts"; CREATE TABLE injected AS SELECT 1; --',
+        "'; DROP TABLE x; --",
+        "weird name",
+        "Has-Periods",
+    ],
+)
+def test_stable_view_name_validation_rejects_sql_fragments(fragment: str) -> None:
+    """The adapter revalidates the stable view name as defense in depth.
+
+    Although the engine now validates declaration rules at construction, the
+    adapter still rejects any stable name that is not a catalog-shaped
+    identifier before interpolating it into the CREATE VIEW statement, and the
+    constant message never echoes the rejected fragment.
+    """
+    with pytest.raises(ValueError, match="invalid stable name") as caught:
+        dbmod._validate_stable_name(fragment)
+    assert fragment not in str(caught.value)
+
+    # A catalog-shaped name is accepted unchanged.
+    dbmod._validate_stable_name("facts")
 
 
 def test_missing_extension_is_dependency_error(

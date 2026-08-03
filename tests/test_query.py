@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date
 from pathlib import Path
-from types import MappingProxyType
+from unittest.mock import patch
 from uuid import UUID
 
 import duckdb
@@ -11,6 +10,7 @@ import pytest
 
 import selayer
 from selayer import (
+    CatalogValidationError,
     DataSource,
     Dimension,
     QueryEngine,
@@ -60,9 +60,36 @@ def test_query_engine_normalizes_mutable_inputs(valid_catalog_path: Path) -> Non
     assert tuple(item.id for item in plan.dimensions) == ("product_category",)
 
 
-def test_query_execution_error_does_not_leak_bound_values(
-    valid_catalog_path: Path,
+def test_query_engine_rejects_invalid_direct_layer_before_duckdb(
+    valid_layer: SemanticLayer,
 ) -> None:
+    """The engine validates a programmatic layer before opening any resource."""
+    source = valid_layer.data_sources["orders"]
+    bad = replace(
+        valid_layer,
+        data_sources={
+            **valid_layer.data_sources,
+            "orders": replace(source, grain=("id", "id")),
+        },
+    )
+    with (
+        patch("selayer.query.duckdb.connect") as connect,
+        pytest.raises(CatalogValidationError) as raised,
+    ):
+        QueryEngine(bad)
+    connect.assert_not_called()
+    assert raised.value.issues[0].code == "catalog.grain.duplicate_column"
+
+
+def test_query_execution_error_does_not_leak_bound_values(
+    valid_catalog_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An execution error never leaks the driver diagnostic or bound value.
+
+    After the planner admits only correctly typed values, the execution
+    boundary is exercised through a failing connection whose diagnostic
+    carries the secret; the parameterized bound value is a benign integer.
+    """
     layer = SemanticLayer.load(valid_catalog_path)
     layer = replace(
         layer,
@@ -73,8 +100,18 @@ def test_query_execution_error_does_not_leak_bound_values(
     )
     engine = QueryEngine(layer)
     secret = "UNIQUE_SECRET_BOUND_VALUE"
+
+    class FailingConnection:
+        def __init__(self) -> None:
+            self.sql: str | None = None
+
+        def execute(self, sql: str, _parameters: tuple[object, ...]) -> object:
+            self.sql = sql
+            raise duckdb.ConversionException(f"Conversion Error: bound {secret}")
+
+    monkeypatch.setattr(engine._registry, "_connection", FailingConnection())
     with pytest.raises(QueryExecutionError) as caught:
-        engine.query(["gross_margin"], filters={"stock": secret})
+        engine.query(["gross_margin"], filters={"stock": 1})
     error = caught.value
     formatted = "".join(__import__("traceback").format_exception(error))
     assert UUID(error.query_id).version == 4
@@ -119,7 +156,7 @@ def test_diagnostic_category_requires_an_anchored_token(
     connection = FailingConnection()
     monkeypatch.setattr(engine._registry, "_connection", connection)
     with pytest.raises(QueryExecutionError) as caught:
-        engine.query(["gross_margin"], filters={"stock": "secret"})
+        engine.query(["gross_margin"], filters={"stock": 1})
     error = caught.value
     assert connection.sql is not None
     formatted = "".join(__import__("traceback").format_exception(error))
@@ -133,18 +170,16 @@ def test_diagnostic_category_requires_an_anchored_token(
     )
 
 
-@pytest.mark.parametrize(
-    ("value", "diagnostic", "context"),
-    [
-        ("UNIQUE_SECRET_BOUND_VALUE", "Conversion Error", "INT64"),
-        ("x' OR 1=1 -- \\ metachar", "Conversion Error", "INT64"),
-        (10**100, "Invalid Input Error", "128-bit"),
-        (date(2024, 1, 2), "Conversion Error", "DATE"),
-    ],
-)
 def test_parameterized_query_errors_expose_only_allowlisted_diagnostic_category(
-    valid_catalog_path: Path, value: object, diagnostic: str, context: str
+    valid_catalog_path: Path,
 ) -> None:
+    """A reachable real-DuckDB error exposes only the allowlisted category.
+
+    A 128-bit integer overflow is the one out-of-range scenario that survives
+    the planner's type check (the value is a valid ``int``), so it still reaches
+    DuckDB and exercises the execution-boundary sanitizer against a real driver
+    diagnostic. The driver context and the bound value never reach the message.
+    """
     layer = SemanticLayer.load(valid_catalog_path)
     layer = replace(
         layer,
@@ -154,15 +189,16 @@ def test_parameterized_query_errors_expose_only_allowlisted_diagnostic_category(
         },
     )
     engine = QueryEngine(layer)
+    value = 10**100
     with pytest.raises(QueryExecutionError) as caught:
         engine.query(["gross_margin"], filters={"stock": value})
     error = caught.value
     formatted = "".join(__import__("traceback").format_exception(error))
-    assert diagnostic in error.message
+    assert "Invalid Input Error" in error.message
     assert "parameterized query" in error.message
     assert "SQL:" not in error.message
-    assert context not in error.message
-    assert context not in formatted
+    assert "128-bit" not in error.message
+    assert "128-bit" not in formatted
     for printable in (str(value), repr(value)):
         assert printable not in str(error)
         assert printable not in repr(error.args)
@@ -171,24 +207,6 @@ def test_parameterized_query_errors_expose_only_allowlisted_diagnostic_category(
     assert error.__cause__ is None
     assert error.__context__ is None
     assert error.message in formatted
-
-
-_UNPRINTABLE_STR_ERROR = "parameter __str__ must not be called"
-_UNPRINTABLE_REPR_ERROR = "parameter __repr__ must not be called"
-
-
-class _UnprintableParameter:
-    def __init__(self) -> None:
-        self.str_calls = 0
-        self.repr_calls = 0
-
-    def __str__(self) -> str:
-        self.str_calls += 1
-        raise AssertionError(_UNPRINTABLE_STR_ERROR)
-
-    def __repr__(self) -> str:
-        self.repr_calls += 1
-        raise AssertionError(_UNPRINTABLE_REPR_ERROR)
 
 
 def test_parameterized_errors_reach_execution_with_immutable_parameters_and_sanitize(
@@ -216,57 +234,16 @@ def test_parameterized_errors_reach_execution_with_immutable_parameters_and_sani
 
     connection = FailingConnection()
     monkeypatch.setattr(engine._registry, "_connection", connection)
-    custom = _UnprintableParameter()
+    # Correctly typed integer-family values exercise the scalar/list/range
+    # shapes the planner now admits; each is frozen before reaching execution.
+    secret = 4242424242
     cases: tuple[tuple[object, tuple[object, ...], tuple[str, ...]], ...] = (
+        (secret, (secret,), (str(secret),)),
+        ([secret], (secret,), (str(secret), f"[{secret}]", f"({secret},)")),
         (
-            b"secret-bytes",
-            (b"secret-bytes",),
-            ("secret-bytes", "b'secret-bytes'"),
-        ),
-        (
-            {"secret-key": "secret-value"},
-            (MappingProxyType({"secret-key": "secret-value"}),),
-            (
-                "secret-key",
-                "secret-value",
-                "{'secret-key': 'secret-value'}",
-                "mappingproxy({'secret-key': 'secret-value'})",
-            ),
-        ),
-        (
-            ["list-secret-a", "list-secret-b"],
-            ("list-secret-a", "list-secret-b"),
-            (
-                "list-secret-a",
-                "list-secret-b",
-                "['list-secret-a', 'list-secret-b']",
-                "('list-secret-a', 'list-secret-b')",
-            ),
-        ),
-        (True, (True,), ("True",)),
-        (1.0, (1.0,), ("1.0",)),
-        (
-            10**100,
-            (10**100,),
-            (
-                "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            ),
-        ),
-        ("<redacted>", ("<redacted>",), ("<redacted>",)),
-        (
-            "x' OR 1=1 -- \\ metachar",
-            ("x' OR 1=1 -- \\ metachar",),
-            ("x' OR 1=1 -- \\ metachar", "x' OR 1=1 -- \\\\ metachar"),
-        ),
-        (
-            date(2024, 1, 2),
-            (date(2024, 1, 2),),
-            ("2024-01-02", "datetime.date(2024, 1, 2)"),
-        ),
-        (
-            custom,
-            (custom,),
-            (_UNPRINTABLE_STR_ERROR, _UNPRINTABLE_REPR_ERROR),
+            (secret, secret),
+            (secret, secret),
+            (str(secret), f"({secret}, {secret})"),
         ),
     )
     for value, expected_parameters, leak_sentinels in cases:
@@ -285,8 +262,6 @@ def test_parameterized_errors_reach_execution_with_immutable_parameters_and_sani
         assert "SQL:" not in error.message
         assert error.__cause__ is None
         assert error.__context__ is None
-        assert custom.str_calls == 0
-        assert custom.repr_calls == 0
 
 
 def test_parameterized_errors_never_format_values_or_driver_messages(
@@ -314,36 +289,15 @@ def test_parameterized_errors_never_format_values_or_driver_messages(
 
     connection = FailingConnection()
     monkeypatch.setattr(engine._registry, "_connection", connection)
-    custom = _UnprintableParameter()
+    secret = 4242424242
     secret_values: tuple[tuple[object, tuple[str, ...]], ...] = (
-        ("<redacted>", ("<redacted>",)),
-        (b"secret-bytes", ("secret-bytes", "b'secret-bytes'")),
-        (
-            {"secret-key": "secret-value"},
-            (
-                "secret-key",
-                "secret-value",
-                "{'secret-key': 'secret-value'}",
-                "mappingproxy({'secret-key': 'secret-value'})",
-            ),
-        ),
-        (True, ("True",)),
-        (1.0, ("1.0",)),
-        (
-            10**100,
-            (
-                "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            ),
-        ),
-        (
-            "x' OR 1=1 -- \\ metachar",
-            ("x' OR 1=1 -- \\ metachar", "x' OR 1=1 -- \\\\ metachar"),
-        ),
-        (custom, (_UNPRINTABLE_STR_ERROR, _UNPRINTABLE_REPR_ERROR)),
+        (secret, (str(secret),)),
+        ([secret], (str(secret), f"[{secret}]", f"({secret},)")),
+        ((secret, secret), (str(secret), f"({secret}, {secret})")),
     )
-    for secret, leak_sentinels in secret_values:
+    for secret_value, leak_sentinels in secret_values:
         with pytest.raises(QueryExecutionError) as caught:
-            engine.query(["gross_margin"], filters={"stock": secret})
+            engine.query(["gross_margin"], filters={"stock": secret_value})
         error = caught.value
         assert connection.sql is not None
         formatted = "".join(__import__("traceback").format_exception(error))
@@ -357,8 +311,6 @@ def test_parameterized_errors_never_format_values_or_driver_messages(
         assert "SQL:" not in error.message
         assert error.__cause__ is None
         assert error.__context__ is None
-        assert custom.str_calls == 0
-        assert custom.repr_calls == 0
 
 
 def test_parameterized_errors_use_generic_category_for_unknown_driver_error(
@@ -387,7 +339,7 @@ def test_parameterized_errors_use_generic_category_for_unknown_driver_error(
     connection = FailingConnection()
     monkeypatch.setattr(engine._registry, "_connection", connection)
     with pytest.raises(QueryExecutionError) as caught:
-        engine.query(["gross_margin"], filters={"stock": "secret"})
+        engine.query(["gross_margin"], filters={"stock": 1})
     error = caught.value
     assert connection.sql is not None
     formatted = "".join(__import__("traceback").format_exception(error))

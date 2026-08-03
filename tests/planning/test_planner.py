@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, date, datetime
+from decimal import Decimal
 
 import pytest
 
@@ -515,13 +517,13 @@ def test_equivalent_filter_mappings_have_deterministic_order(
     first = plan_query(
         layer,
         QueryRequest(
-            ("gross_margin",), filters={"extra": (1, 2), "product_category": "x"}
+            ("gross_margin",), filters={"extra": ("a", "z"), "product_category": "x"}
         ),
     )
     second = plan_query(
         layer,
         QueryRequest(
-            ("gross_margin",), filters={"product_category": "x", "extra": (1, 2)}
+            ("gross_margin",), filters={"product_category": "x", "extra": ("a", "z")}
         ),
     )
     assert first == second
@@ -537,10 +539,18 @@ def test_filter_only_join_deduplication_order_and_stability(valid_catalog_path) 
         "order_path", "order_items", "orders", "one_to_one", "order_id", "id"
     )
     joined_layer = _layer_with_dimension(layer, "orders", relationships=(order_path,))
+    order_window = (
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2024, 1, 2, tzinfo=UTC),
+    )
     second = plan_query(
         joined_layer,
         QueryRequest(
-            ("gross_margin",), filters={"product_category": "x", "order_date": (1, 2)}
+            ("gross_margin",),
+            filters={  # type: ignore[arg-type]
+                "product_category": "x",
+                "order_date": order_window,
+            },
         ),
     )
     assert [join.relationship_id for join in first.joins] == ["product_order_items"]
@@ -552,3 +562,177 @@ def test_filter_only_join_deduplication_order_and_stability(valid_catalog_path) 
             layer, QueryRequest(("gross_margin",), filters={"product_category": "x"})
         ).joins
     )
+
+
+# One reachable dimension per supported semantic data_type, each on a source
+# (``products``) reachable from the ``order_items`` anchor so planning can
+# resolve the filter without tripping a relationship-path error.
+_TYPED_DIMENSIONS = {
+    "string": "dim_string",
+    "integer": "dim_integer",
+    "decimal": "dim_decimal",
+    "float": "dim_float",
+    "double": "dim_double",
+    "boolean": "dim_boolean",
+    "date": "dim_date",
+    "timestamp": "dim_timestamp",
+}
+
+# A concrete value whose runtime type never matches its data_type. These are
+# the leak sentinels: the planner must reject them without ever formatting the
+# value or its type repr.
+_WRONG_VALUE_FOR_TYPE = {
+    "string": 42,
+    "integer": "not-an-int",
+    "decimal": "not-a-number",
+    "float": "not-a-number",
+    "double": "not-a-number",
+    "boolean": "not-a-bool",
+    "date": "2024-01-01",
+    "timestamp": "2024-01-01",
+}
+
+
+def _layer_with_all_data_types(valid_catalog_path) -> SemanticLayer:  # type: ignore[no-untyped-def]
+    layer = SemanticLayer.load(valid_catalog_path)
+    dimensions = {
+        **layer.dimensions,
+        "dim_string": Dimension("dim_string", "products", "category", "string"),
+        "dim_integer": Dimension("dim_integer", "products", "in_stock", "integer"),
+        "dim_decimal": Dimension("dim_decimal", "products", "cost", "decimal"),
+        "dim_float": Dimension("dim_float", "products", "base_price", "float"),
+        "dim_double": Dimension("dim_double", "products", "base_price", "double"),
+        "dim_boolean": Dimension("dim_boolean", "products", "is_active", "boolean"),
+        "dim_date": Dimension("dim_date", "products", "created_at", "date"),
+        "dim_timestamp": Dimension(
+            "dim_timestamp", "products", "created_at", "timestamp"
+        ),
+    }
+    return replace(layer, dimensions=dimensions)
+
+
+@pytest.mark.parametrize(
+    ("dimension", "value"),
+    [
+        ("product_category", 42),
+        ("order_date", "2026-01-01"),
+    ],
+)
+def test_planner_rejects_filter_value_type(
+    valid_catalog_path, dimension, value
+) -> None:  # type: ignore[no-untyped-def]
+    layer = SemanticLayer.load(valid_catalog_path)
+    with pytest.raises(QueryPlanningError) as raised:
+        plan_query(layer, QueryRequest(["gross_margin"], filters={dimension: value}))
+    assert raised.value.code == "invalid_filter_type"
+    assert repr(value) not in str(raised.value)
+    assert str(value) not in str(raised.value)
+
+
+@pytest.mark.parametrize("data_type", sorted(_TYPED_DIMENSIONS))
+@pytest.mark.parametrize("shape", ["scalar", "list", "range"])
+def test_planner_rejects_filter_value_type_for_every_data_type(
+    valid_catalog_path, data_type, shape
+) -> None:  # type: ignore[no-untyped-def]
+    layer = _layer_with_all_data_types(valid_catalog_path)
+    wrong = _WRONG_VALUE_FOR_TYPE[data_type]
+    if shape == "scalar":
+        value = wrong
+    elif shape == "list":
+        value = [wrong]
+    else:  # range
+        value = (wrong, wrong)
+    dimension = _TYPED_DIMENSIONS[data_type]
+    with pytest.raises(QueryPlanningError) as raised:
+        plan_query(layer, QueryRequest(["gross_margin"], filters={dimension: value}))
+    assert raised.value.code == "invalid_filter_type"
+    assert repr(value) not in str(raised.value)
+    assert str(value) not in str(raised.value)
+    assert repr(wrong) not in str(raised.value)
+    assert str(wrong) not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("dimension", "value"),
+    [
+        ("product_category", "Books"),
+        ("dim_string", "Books"),
+        ("dim_integer", 5),
+        ("dim_decimal", Decimal("1.5")),
+        ("dim_float", 1.5),
+        ("dim_double", 1.5),
+        ("dim_boolean", True),
+        ("dim_date", date(2024, 1, 1)),
+        ("dim_timestamp", datetime(2024, 1, 1, tzinfo=UTC)),
+    ],
+)
+def test_planner_accepts_correctly_typed_filter_values(
+    valid_catalog_path, dimension, value
+) -> None:  # type: ignore[no-untyped-def]
+    layer = _layer_with_all_data_types(valid_catalog_path)
+    plan = plan_query(layer, QueryRequest(["gross_margin"], filters={dimension: value}))
+    assert [item.id for item in plan.filters] == [dimension]
+
+
+def test_planner_invalid_filter_type_message_names_dimension_and_type_only(
+    valid_catalog_path,
+) -> None:  # type: ignore[no-untyped-def]
+    layer = SemanticLayer.load(valid_catalog_path)
+    with pytest.raises(QueryPlanningError) as raised:
+        plan_query(
+            layer,
+            QueryRequest(["gross_margin"], filters={"product_category": 42}),
+        )
+    error = raised.value
+    assert error.code == "invalid_filter_type"
+    assert "product_category" in error.message
+    assert "string" in error.message
+    assert "42" not in error.message
+    assert "42" not in str(error)
+
+
+class _UnprintableFilterValue:
+    """A value that fails its ``__str__``/``__repr__`` if either is invoked."""
+
+    def __init__(self) -> None:
+        self.str_calls = 0
+        self.repr_calls = 0
+
+    def __str__(self) -> str:
+        self.str_calls += 1
+        raise AssertionError("value __str__ must not be called")
+
+    def __repr__(self) -> str:
+        self.repr_calls += 1
+        raise AssertionError("value __repr__ must not be called")
+
+
+@pytest.mark.parametrize("shape", ["scalar", "list", "range"])
+def test_planner_rejects_filter_value_without_formatting_it(
+    valid_catalog_path, shape
+) -> None:  # type: ignore[no-untyped-def]
+    layer = SemanticLayer.load(valid_catalog_path)
+    members = [_UnprintableFilterValue() for _ in range(2)]
+    if shape == "scalar":
+        value = members[0]
+        unprintables = [members[0]]
+    elif shape == "list":
+        value = members
+        unprintables = members
+    else:  # range
+        value = (members[0], members[1])
+        unprintables = members
+    with pytest.raises(QueryPlanningError) as raised:
+        plan_query(
+            layer,
+            QueryRequest(
+                ["gross_margin"],
+                filters={  # type: ignore[arg-type]
+                    "product_category": value,
+                },
+            ),
+        )
+    assert raised.value.code == "invalid_filter_type"
+    for item in unprintables:
+        assert item.str_calls == 0
+        assert item.repr_calls == 0

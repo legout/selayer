@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from datetime import date, datetime
+from decimal import Decimal
 from types import MappingProxyType
 
 from selayer.expressions.validation import references
 from selayer.model import Relationship, SemanticLayer
 from selayer.planning.types import (
     JoinStep,
+    ListFilter,
     PlannedDimension,
     PlannedFilter,
     PlannedMeasure,
@@ -15,6 +18,8 @@ from selayer.planning.types import (
     QueryPlan,
     QueryPlanningError,
     QueryRequest,
+    RangeFilter,
+    ScalarFilter,
 )
 
 
@@ -130,6 +135,58 @@ def _reachable(anchor: str, adjacency: dict[str, list[tuple[str, str]]]) -> set[
     return reachable
 
 
+def _matches_data_type(data_type: str, value: object) -> bool:
+    """Return whether ``value``'s exact runtime type satisfies ``data_type``.
+
+    Exact-type comparison is deliberate: ``bool`` is not ``int`` (so a boolean
+    is rejected for an integer dimension), and a ``datetime`` is not a ``date``.
+    ``None`` is handled by the caller as a null wildcard and never reaches here.
+    An unrecognised ``data_type`` rejects every concrete value.
+    """
+    if data_type == "string":
+        return type(value) is str
+    if data_type == "integer":
+        return type(value) is int
+    if data_type in {"decimal", "float", "double"}:
+        return type(value) in {int, float, Decimal}
+    if data_type == "boolean":
+        return type(value) is bool
+    if data_type == "date":
+        return type(value) is date
+    if data_type == "timestamp":
+        return type(value) is datetime
+    return False
+
+
+def _validate_filter_value_type(
+    dimension_id: str, data_type: str, value: object
+) -> None:
+    """Reject filter values whose runtime type does not match ``data_type``.
+
+    Each scalar, list member, and non-``None`` range bound is checked against
+    the dimension's declared data type. ``None`` (an open null sentinel in any
+    position) is always accepted. The raised message names only the dimension
+    and its data type: the value and its type repr are never formatted, so a
+    secret-bearing value cannot leak through the planning error.
+    """
+    if isinstance(value, ScalarFilter):
+        members: tuple[object, ...] = (value.value,)
+    elif isinstance(value, ListFilter):
+        members = value.values
+    elif isinstance(value, RangeFilter):
+        members = (value.start, value.end)
+    else:  # pragma: no cover - QueryRequest normalises to the three filter types
+        return
+    if any(
+        member is not None and not _matches_data_type(data_type, member)
+        for member in members
+    ):
+        raise QueryPlanningError(
+            "invalid_filter_type",
+            f"filter for dimension {dimension_id!r} requires {data_type}",
+        )
+
+
 def plan_query(layer: SemanticLayer, request: QueryRequest) -> QueryPlan:
     if not request.metrics:
         raise QueryPlanningError("unknown_metric", "at least one metric is required")
@@ -212,6 +269,7 @@ def plan_query(layer: SemanticLayer, request: QueryRequest) -> QueryPlan:
     for dimension_id in sorted(request.filters):
         raw_value = request.filters[dimension_id]
         dimension = layer.dimensions[dimension_id]
+        _validate_filter_value_type(dimension_id, dimension.data_type, raw_value)
         filters.append(PlannedFilter(dimension_id, dimension, raw_value))
         require_source(dimension.source)
     for planned in measures:

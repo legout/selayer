@@ -6,7 +6,7 @@ from uuid import uuid4
 import duckdb
 import polars as pl
 
-from selayer.catalog import SemanticLayer
+from selayer.catalog import CatalogIssue, CatalogValidationError, SemanticLayer
 from selayer.compilation import CompiledQuery, compile_duckdb
 from selayer.errors import QueryExecutionError
 from selayer.planning import QueryPlan, QueryRequest, plan_query
@@ -18,6 +18,7 @@ from selayer.sources.profiles import (
     RuntimeProfileResolver,
 )
 from selayer.sources.registry import SourceRegistry
+from selayer.verification import StaticCheck, verify
 
 _DUCKDB_DIAGNOSTIC_CATEGORIES = (
     "Conversion Error",
@@ -70,6 +71,20 @@ class QueryEngine:
         profiles: RuntimeProfileResolver | None = None,
         arrow_providers: ArrowProviderResolver | None = None,
     ) -> None:
+        # Validate the declaration rules before any resource is opened so a
+        # structurally invalid layer never reaches DuckDB or a connector. The
+        # static check surfaces the catalog's stable issue codes; its
+        # ``CatalogValidationError`` is propagated unchanged (never caught) so
+        # callers observe the same typed failure the loader raises.
+        report = verify(semantic_layer, StaticCheck())
+        if not report.passed:
+            raise CatalogValidationError(
+                tuple(
+                    CatalogIssue(item.path, item.message, item.code)
+                    for item in report.diagnostics
+                    if item.severity == "error"
+                )
+            )
         self.semantic_layer = semantic_layer
         self._connection = duckdb.connect(":memory:")
         self._registry = SourceRegistry.create(
