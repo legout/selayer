@@ -422,3 +422,93 @@ def test_valid_evidence_serialises_strict_json() -> None:
     )
     report = VerificationReport(1, "shopfloor", "physical", True, (outcome,), ())
     json.dumps(report.to_dict(), allow_nan=False)
+
+
+def test_outcome_rejects_unsupported_value_types() -> None:
+    # Unsupported / aliasing leaves (bytes, bytearray, arbitrary objects, and
+    # other non-JSON types) break strict json.dumps(allow_nan=False) or violate
+    # deep immutability, so they are rejected at construction with ValueError.
+    for bad in (b"raw", bytearray(b"raw"), object(), complex(1, 2)):
+        with pytest.raises(ValueError):
+            VerificationOutcome(
+                check_id="c",
+                status="passed",
+                scope="declaration",
+                path="p",
+                evidence={"value": bad},  # type: ignore[arg-type]
+                diagnostics=(),
+            )
+
+
+def test_outcome_rejects_nested_unsupported_value_types() -> None:
+    # Unsupported values are rejected wherever they appear: nested in mappings,
+    # sequences, and sets.
+    bad = b"raw"
+    with pytest.raises(ValueError):
+        VerificationOutcome(
+            check_id="c",
+            status="passed",
+            scope="declaration",
+            path="p",
+            evidence={"summary": {"value": bad}},  # type: ignore[arg-type]
+            diagnostics=(),
+        )
+    with pytest.raises(ValueError):
+        VerificationOutcome(
+            check_id="c",
+            status="passed",
+            scope="declaration",
+            path="p",
+            evidence={"rows": [bad]},  # type: ignore[arg-type]
+            diagnostics=(),
+        )
+    with pytest.raises(ValueError):
+        VerificationOutcome(
+            check_id="c",
+            status="passed",
+            scope="declaration",
+            path="p",
+            evidence={"vals": {bad}},  # type: ignore[arg-type]
+            diagnostics=(),
+        )
+
+
+def test_outcome_rejects_non_string_mapping_keys() -> None:
+    # Mapping keys must be plain strings: bool/int/float/None keys are silently
+    # JSON-coerced (lossy, non-deterministic), and tuple/bytes keys are
+    # unserialisable or aliasing. All non-string keys are rejected.
+    for key in (1, 1.5, True, None, (1, 2), b"k"):
+        with pytest.raises(ValueError):
+            VerificationOutcome(
+                check_id="c",
+                status="passed",
+                scope="declaration",
+                path="p",
+                evidence={key: "v"},  # type: ignore[dict-item]
+                diagnostics=(),
+            )
+
+
+def test_full_valid_evidence_tree_is_strict_json_safe() -> None:
+    # A full evidence tree using every supported leaf and container type
+    # round-trips through strict JSON (allow_nan=False) and is byte-stable.
+    outcome = VerificationOutcome(
+        check_id="source.orders.grain",
+        status="passed",
+        scope="full_scan",
+        path="data_sources.orders.grain",
+        evidence={  # type: ignore[arg-type]
+            "count": 3,
+            "ratio": 0.5,
+            "name": "orders",
+            "flag": True,
+            "missing": None,
+            "rows": [1, 2, 3],
+            "summary": {"min": 1, "max": 9},
+            "tags": {"a", "b"},
+        },
+        diagnostics=(),
+    )
+    report = VerificationReport(1, "shopfloor", "physical", True, (outcome,), ())
+    encoded = json.dumps(report.to_dict(), allow_nan=False)
+    assert json.loads(encoded)["outcomes"][0]["evidence"]["tags"] == ["a", "b"]

@@ -1,4 +1,5 @@
 # src/selayer/verification/model.py
+# ruff: noqa: TRY004
 from __future__ import annotations
 
 import math
@@ -104,13 +105,15 @@ def _evidence_to_plain(value: object) -> object:
 
 
 def _validate_evidence_json_safe(value: object) -> None:
-    """Reject accepted evidence values that strict JSON cannot emit.
+    """Recursively enforce the runtime evidence contract.
 
-    ``json.dumps(..., allow_nan=False)`` raises on ``nan``/``inf``/``-inf``, so
-    a non-finite float is rejected here, at construction time. Every other
-    accepted scalar (``bool``/``int``/finite ``float``/``str``/``None``) is
-    strict-JSON-safe and is retained. Collections are validated recursively,
-    including mapping keys.
+    Supported leaves are ``bool``/``int``/``float``/``str``/``None`` (finite
+    floats only); supported containers are mappings plus ``list``/``tuple``/
+    ``set``/``frozenset``. Mapping keys must be ``str``. Anything else —
+    ``bytes``/``bytearray``, arbitrary/aliasing objects, non-string mapping
+    keys, non-finite floats — is rejected with ``ValueError`` before freezing,
+    so the frozen evidence is always deeply immutable and its serialised form
+    is always strict-JSON-safe (``json.dumps(..., allow_nan=False)``).
     """
     # ``bool`` is a subclass of ``int``; this single check covers
     # ``None``/``bool``/``int``/``str``.
@@ -122,13 +125,30 @@ def _validate_evidence_json_safe(value: object) -> None:
         return
     if isinstance(value, Mapping):
         for key, item in value.items():
-            _validate_evidence_json_safe(key)
+            # Mapping keys must be plain ``str``: ``bool``/``int``/``float``/
+            # ``None`` keys are silently JSON-coerced (lossy, non-deterministic),
+            # and tuple/bytes/object keys are unserialisable or aliasing.
+            if not isinstance(key, str):
+                raise ValueError(
+                    "evidence mapping keys must be strings, "
+                    f"got {type(key).__name__}: {key!r}"
+                )
             _validate_evidence_json_safe(item)
         return
     if isinstance(value, (list, tuple, set, frozenset)):
         for item in value:
             _validate_evidence_json_safe(item)
         return
+    # Unsupported / aliasing values (``bytes``, ``bytearray``, arbitrary
+    # objects, ...): they break strict ``json.dumps(allow_nan=False)`` or
+    # violate the deep-immutability contract. Reject before freezing. Ruff's
+    # TRY004 suggests TypeError for a wrong type, but ValueError is used
+    # deliberately for API consistency: every evidence/schema-contract
+    # rejection in this module raises ValueError so callers catch one type.
+    raise ValueError(
+        "evidence contains unsupported value of type "
+        f"{type(value).__name__}: {value!r}"
+    )
 
 
 def _validate_schema_version(schema_version: object) -> None:
