@@ -21,12 +21,15 @@ ever escape.  Truly-internal programmer errors (a malformed grain column)
 propagate unchanged, and any unavailable source makes the report incomplete.
 
 After the source-grain pass, every declared relationship is audited for
-cardinality with the same aggregate-only, secret-safe contract: both sides
-are bound and materialized under the registry lock, then a cardinality-
-sspecific scan counts null keys, duplicate groups, referential orphans, and
-child multiplicity without ever selecting a key value.  Each relationship
-yields one ``relationship.<name>.cardinality`` outcome; an unavailable bound
-source makes that outcome ``unavailable`` and the report incomplete.
+cardinality with the same aggregate-only, secret-safe contract: each distinct
+relationship source is bound and materialized once under the registry lock
+(both sides are then derived from those re-readable temp tables, so a
+single-pass query-scoped source — including a self-relationship's single
+source — is read exactly once), then a cardinality-specific scan counts null
+keys, duplicate groups, referential orphans, and child multiplicity without
+ever selecting a key value.  Each relationship yields one
+``relationship.<name>.cardinality`` outcome; an unavailable bound source
+makes that outcome ``unavailable`` and the report incomplete.
 """
 
 from __future__ import annotations
@@ -290,6 +293,14 @@ _REL_MANY = "__selayer_rel_many"
 _REL_LEFT = "__selayer_rel_left"
 _REL_RIGHT = "__selayer_rel_right"
 
+#: Per-distinct-source temp-table names.  Each distinct relationship source is
+#: pulled exactly once (all columns its sides need) into one of these tables;
+#: the per-side single-column tables are then derived from them, never from the
+#: bound (single-pass) relation directly.  A relationship has at most two
+#: distinct sources, so two names suffice; like the side tables they are
+#: dropped in a ``finally`` after every relationship.
+_REL_SOURCES = ("__selayer_rel_source0", "__selayer_rel_source1")
+
 #: Positional alias for the single join column in every materialized temp
 #: table — generated, never derived from a source value, so a column whose
 #: name carries a secret can never surface as an alias.
@@ -382,19 +393,28 @@ def _materialize_relationship(
     registry: SourceRegistry,
     temp_specs: tuple[tuple[str, str, str], ...],
 ) -> Iterator[None]:
-    """Bind both relationship sources and materialize each side once.
+    """Bind each distinct relationship source once and materialize it once.
 
     Each ``temp_specs`` entry is ``(temp_name, source_id, column)``.  The
     distinct sources are bound together under one
     :meth:`~SourceRegistry.bind_requirements` call (the registry lock spans the
-    whole audit), and each side is materialized into a private temp table
-    holding only its join column under the fixed alias :data:`_REL_KEY`.  A
-    self-relationship (``source == target``) binds the source once and
-    materializes two temp tables from it, so the two sides never collide.  The
-    temp tables are dropped in a ``finally`` so only one relationship's tables
-    ever exist.
+    whole audit), and each distinct source is pulled *exactly once* into a
+    private temp table holding every column its sides need.  The per-side
+    single-column temp tables are then derived from those re-readable source
+    temp tables — never from the bound relation directly.
+
+    Single-pass query-scoped readers (PyIceberg scans, programmatic Arrow
+    readers) cannot be re-scanned within one query, so a self-relationship
+    (``source == target``) would otherwise consume its reader on the first
+    side's materialization and scan empty for the second, false-unmatching a
+    valid one-to-one or zeroing the other cardinality's informational counts.
+    Deriving both sides from one materialized temp table reads the source once
+    and keeps the two sides consistent.  Every temp table is dropped in a
+    ``finally`` so only one relationship's tables ever exist.
     """
 
+    # Distinct sources and the columns each needs, preserving first-seen
+    # order so the source-temp-table names are deterministic.
     needed: dict[str, list[str]] = {}
     for _temp_name, source_id, column in temp_specs:
         needed.setdefault(source_id, []).append(column)
@@ -404,16 +424,38 @@ def _materialize_relationship(
         )
         for source_id, columns in needed.items()
     }
+    # One stable temp-table name per distinct source, in first-seen order.  A
+    # relationship has at most two distinct sources, so two names suffice.
+    source_temp = {
+        source_id: _REL_SOURCES[index]
+        for index, source_id in enumerate(needed)
+    }
     with registry.bind_requirements(requirements):
         created: list[str] = []
         try:
+            # Pull each distinct source exactly once into a temp table holding
+            # all the columns its sides need, under their re-validated names.
+            for source_id, columns in needed.items():
+                distinct_columns = tuple(dict.fromkeys(columns))
+                select_columns = ", ".join(
+                    _quote_identifier(column) for column in distinct_columns
+                )
+                registry.execute(
+                    "create or replace temp table "
+                    f"{_quote_identifier(source_temp[source_id])} as "
+                    f"select {select_columns} "
+                    f"from {_quote_identifier(source_id)}"
+                )
+                created.append(source_temp[source_id])
+            # Derive each side's single-column temp table from the re-readable
+            # source temp table, never from the bound (single-pass) relation.
             for temp_name, source_id, column in temp_specs:
                 registry.execute(
                     "create or replace temp table "
                     f"{_quote_identifier(temp_name)} as "
                     f"select {_quote_identifier(column)} as "
                     f"{_quote_identifier(_REL_KEY)} "
-                    f"from {_quote_identifier(source_id)}"
+                    f"from {_quote_identifier(source_temp[source_id])}"
                 )
                 created.append(temp_name)
             yield
@@ -433,10 +475,12 @@ def _directed_relationship_counts(
     Counts one-side null rows, one-side duplicate groups, many-side null
     rows, non-null many-side orphans (``not exists``), zero-child one-side
     rows (``not exists``), and the maximum children per one-side parent
-    (``left join`` + ``group by``).  No key value is ever selected.  The
-    argument to ``execute`` is a single string literal whose only
-    interpolated components are re-validated, double-quoted identifiers (the
-    same validated-identifier contract as the grain SQL), so it is not a
+    (``left join`` against *distinct* one-side keys + ``group by``).  The
+    one side is de-duplicated before the join so duplicate one-side parent
+    rows do not multiply the per-parent child count.  No key value is ever
+    selected.  The argument to ``execute`` is a single string literal whose
+    only interpolated components are re-validated, double-quoted identifiers
+    (the same validated-identifier contract as the grain SQL), so it is not a
     dynamic-SQL sink.
     """
 
@@ -462,8 +506,9 @@ def _directed_relationship_counts(
         ")) as zero_child_one_side_rows, "
         f"(select coalesce(max(child_count), 0) from ("
         f"select count(m.{key}) as child_count "
-        f"from {one} o left join {many} m "
-        f"on m.{key} = o.{key} group by o.{key}"
+        f"from (select distinct {key} from {one}) o "
+        f"left join {many} m on m.{key} = o.{key} "
+        f"group by o.{key}"
         ")) as maximum_child_multiplicity"
     ).fetchone()
     return (

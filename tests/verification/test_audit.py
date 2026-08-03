@@ -1356,3 +1356,207 @@ def test_relationship_unavailable_when_a_bound_source_is_missing(
     ]
     assert unavailable_diags
     assert unavailable_diags[0].severity == "error"
+
+
+# ---------------------------------------------------------------------------
+# Regression: self relationships on single-pass sources and duplicate-parent
+# multiplicity (Task 13 findings fix)
+# ---------------------------------------------------------------------------
+
+
+def _single_pass_reader(table: pa.Table) -> pa.RecordBatchReader:
+    """A one-shot reader over ``table``.
+
+    A ``pyarrow`` provider returning a :class:`pyarrow.RecordBatchReader` is
+    query-scoped and single-pass: within one binding context the registered
+    reader yields its rows exactly once, so a second scan of the bound source
+    returns empty.  This mirrors a true single-pass reader (PyIceberg scan,
+    programmatic generator) and is the failure mode the self-relationship fix
+    guards against.
+    """
+
+    return pa.RecordBatchReader.from_batches(
+        table.schema, list(table.to_batches())
+    )
+
+
+def test_self_one_to_one_on_single_pass_source_passes() -> None:
+    """A self one-to-one on a single-pass source reads the source once.
+
+    The ``nodes`` source is a query-scoped ``RecordBatchReader`` (single-pass):
+    within one binding context a second scan of the bound source returns
+    empty.  A valid self one-to-one must materialize the source once (under the
+    registry lock) and derive both sides from that re-readable temp table, so
+    the cardinality never false-unmatches (which would otherwise report every
+    key as unmatched on one side because the other side scanned empty).
+    """
+
+    table = pa.table({"id": pa.array([1, 2, 3], pa.int64())})
+
+    def _provider() -> pa.RecordBatchReader:
+        return _single_pass_reader(table)
+
+    schema = TableSchema((FieldSchema("id", ScalarType("int64"), True),))
+    layer = _relationship_layer(
+        "self_oto_single_pass",
+        {"nodes": DataSource("nodes", PyArrowConfig("nodes"), schema, ("id",))},
+        {
+            "nodes_self": Relationship(
+                "nodes_self",
+                "nodes",
+                "nodes",
+                "one_to_one",
+                "id",
+                "id",
+            )
+        },
+    )
+    report = verify(
+        layer,
+        PhysicalCheck(
+            arrow_providers=MappingArrowProviderResolver({"nodes": _provider})
+        ),
+    )
+    outcome = _relationship_outcome(report, "nodes_self")
+    assert outcome.status == "passed"
+    assert outcome.evidence == {
+        "source_null_rows": 0,
+        "source_duplicate_groups": 0,
+        "target_null_rows": 0,
+        "target_duplicate_groups": 0,
+        "source_unmatched_non_null_rows": 0,
+        "target_unmatched_non_null_rows": 0,
+    }
+    assert outcome.diagnostics == ()
+
+
+def test_self_one_to_many_on_single_pass_source_counts_children() -> None:
+    """A self one-to-many on a single-pass source counts children exactly.
+
+    The ``nodes`` source is a single-pass ``RecordBatchReader``.  The tree has
+    ``id`` in {1, 2, 3} with ``parent_id`` {NULL, 1, 1}: node 1 is the one-side
+    parent of two children (2 and 3); nodes 2 and 3 are childless roots'
+    children.  Materializing the source once and deriving both sides keeps the
+    informational multiplicity (2) and zero-child (2) counts exact rather than
+    zeroed out by a reader consumed by the first side's materialization.
+    """
+
+    table = pa.table(
+        {
+            "id": pa.array([1, 2, 3], pa.int64()),
+            "parent_id": pa.array([None, 1, 1], pa.int64()),
+        }
+    )
+
+    def _provider() -> pa.RecordBatchReader:
+        return _single_pass_reader(table)
+
+    schema = TableSchema(
+        (
+            FieldSchema("id", ScalarType("int64"), True),
+            FieldSchema("parent_id", ScalarType("int64"), True),
+        )
+    )
+    layer = _relationship_layer(
+        "self_otm_single_pass",
+        {"nodes": DataSource("nodes", PyArrowConfig("nodes"), schema, ("id",))},
+        {
+            # source (id) is the one side; target (parent_id) is the many side.
+            "tree": Relationship(
+                "tree",
+                "nodes",
+                "nodes",
+                "one_to_many",
+                "id",
+                "parent_id",
+            )
+        },
+    )
+    report = verify(
+        layer,
+        PhysicalCheck(
+            arrow_providers=MappingArrowProviderResolver({"nodes": _provider})
+        ),
+    )
+    outcome = _relationship_outcome(report, "tree")
+    # One side (id) is unique; node 1's null parent_id is an informational
+    # nullable many-side key (not an orphan); nodes 2 and 3 are valid children
+    # of node 1.  The relationship passes and the informational counts are
+    # exact, not zeroed by a consumed single-pass reader.
+    assert outcome.status == "passed"
+    assert outcome.evidence["one_side_duplicate_groups"] == 0
+    assert outcome.evidence["orphan_non_null_rows"] == 0
+    assert outcome.evidence["many_side_null_rows"] == 1
+    assert outcome.evidence["maximum_child_multiplicity"] == 2
+    assert outcome.evidence["zero_child_one_side_rows"] == 2
+    assert outcome.diagnostics == ()
+
+
+def test_maximum_child_multiplicity_not_inflated_by_duplicate_one_side_keys(
+    tmp_path: Path,
+) -> None:
+    """``maximum_child_multiplicity`` ignores duplicate one-side parent rows.
+
+    When the one side repeats a parent key, the maximum children per parent
+    must be computed against distinct one-side keys so the duplicate parent
+    rows do not multiply the child count.  ``o1`` has two children regardless
+    of appearing twice on the one side; a naive ``left join ... group by``
+    against the un-deduplicated one side would report 4 (2 x 2).
+    """
+
+    orders_path = tmp_path / "orders.parquet"
+    _write_parquet(
+        orders_path,
+        pa.table(
+            {
+                # ``o1`` is duplicated on the one side.
+                "order_id": pa.array(["o1", "o1", "o2"], pa.utf8()),
+            }
+        ),
+    )
+    items_path = tmp_path / "items.parquet"
+    _write_parquet(
+        items_path,
+        pa.table(
+            {
+                "item_id": pa.array(["i1", "i2", "i3"], pa.utf8()),
+                # ``o1`` has two children, ``o2`` has one.
+                "order_id": pa.array(["o1", "o1", "o2"], pa.utf8()),
+            }
+        ),
+    )
+    layer = _relationship_layer(
+        "dup_parent",
+        {
+            "orders": DataSource(
+                "orders",
+                ParquetConfig(str(orders_path)),
+                _order_id_schema(),
+                ("order_id",),
+            ),
+            "items": DataSource(
+                "items",
+                ParquetConfig(str(items_path)),
+                _items_schema(),
+                ("item_id",),
+            ),
+        },
+        {
+            "orders_items": Relationship(
+                "orders_items",
+                "orders",
+                "items",
+                "one_to_many",
+                "order_id",
+                "order_id",
+            )
+        },
+    )
+    report = verify(layer, PhysicalCheck())
+    outcome = _relationship_outcome(report, "orders_items")
+    # The duplicate one-side key fails the relationship, but the informational
+    # multiplicity must still reflect the true per-parent child count (2), not
+    # the join-multiplied count (4).
+    assert outcome.status == "failed"
+    assert outcome.evidence["one_side_duplicate_groups"] == 1
+    assert outcome.evidence["maximum_child_multiplicity"] == 2
