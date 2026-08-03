@@ -209,15 +209,21 @@ value, key, location, or credential is ever selected or echoed.
 
 The optional `--profiles FILE` loads a version-1 profile document whose named
 profiles resolve runtime values from `env` (an environment variable read at
-load time, accepted only as a string) or `literal` (an inline boolean). The
-audit command does **not** initialize an arrow-provider resolver from
-configuration: it is a credential-free, exact full scan, and a `pyarrow`
-source audits as `unavailable` (an incomplete, non-passing report) rather than
-reading caller-supplied objects. Profile values are resolved into an opaque,
-defensively-copied profile and are never written to the report, logs, reprs,
-statuses, or errors; a missing environment variable, a malformed profile
-document, or an unreadable profile file exits `1` with a fixed, secret-safe
-JSON failure on standard error.
+load time, accepted only as a string) or `literal` (an inline boolean).
+**Without `--profiles`, the audit is credential-free**: it performs no
+arrow-provider configuration and scans local data sources directly with no
+runtime connection configuration. **With `--profiles`, resolved values may
+supply runtime DSNs or credentials that a connector uses for its physical
+scan** — for example an `env`-backed warehouse DSN — but the audit never
+emits them. In both modes the audit does **not** initialize an arrow-provider
+resolver from configuration and always performs an exact full scan; a
+`pyarrow` source audits as `unavailable` (an incomplete, non-passing report)
+rather than reading caller-supplied objects. Profile values are resolved into
+an opaque, defensively-copied profile and are never written to the report,
+logs, reprs, statuses, or errors — whether or not they are used for the scan;
+a missing environment variable, a malformed profile document, or an
+unreadable profile file exits `1` with a fixed, secret-safe JSON failure on
+standard error.
 
 ## Advisory OKF context
 
