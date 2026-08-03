@@ -36,6 +36,17 @@ after the ``except``/``finally`` completes; a missing/unreadable file, or one
 that is not valid UTF-8, is captured and the raw ``OSError`` or
 ``UnicodeDecodeError`` discarded the same way).
 
+Duplicate and merge keys are detected during node-tree composition, *before*
+construction.  Duplicate keys are compared by their **constructed semantic**
+value (what PyYAML would build and use as a Python mapping key), not their raw
+spelling, so spellings that collapse to one key -- ``true`` and ``True``, or
+``1``, ``1.0`` and ``true`` -- are rejected before construction silently
+overwrites one with another.  The composition walk is bounded: a path-based
+visited set rejects cyclic aliases, a depth limit and a node budget bound
+deep/huge documents, and any escaping ``RecursionError`` (from the walker or
+from PyYAML's own compose/construct) is converted to the sanitized
+``source.profile.too_complex`` error -- never a raw traceback.
+
 Runtime resolver failures (an unknown profile *name* at resolve time) remain
 the responsibility of :class:`~selayer.sources.errors.SourceProfileError`, which
 is unchanged here.
@@ -60,6 +71,9 @@ __all__ = ["ProfileFileValidationError", "load_profile_file"]
 # no resolved value, environment value, or raw YAML key surfaces.
 _CODE_MESSAGES: dict[str, str] = {
     "source.profile.malformed": "the profile document is not valid YAML",
+    "source.profile.too_complex": (
+        "the profile document is too complex or recursive to load safely"
+    ),
     "source.profile.file_missing": "the profile file does not exist",
     "source.profile.file_unreadable": "the profile file could not be read",
     "source.profile.invalid_utf8": "the profile file is not valid UTF-8",
@@ -120,6 +134,15 @@ _ROOT_PATH = "<document>"
 _UNKNOWN_KEY_PATH = "top_level"
 _REDACTED_KEY = "<key>"
 _FILE_PATH = "<file>"
+
+# Bounds for the duplicate/merge node-tree walker.  A path-based visited set
+# rejects cyclic aliases the instant they revisit a node on the current
+# descent; a depth limit and a total-node budget bound deeply nested or huge
+# documents.  Any escaping ``RecursionError`` (from the walker or from PyYAML's
+# own compose/construct of a pathological document) is converted to a
+# sanitized ``source.profile.too_complex`` error, never a raw traceback.
+_MAX_DEPTH = 200
+_MAX_NODES = 100_000
 
 
 class ProfileFileValidationError(Exception):
@@ -255,7 +278,7 @@ def _compose_without_duplicate_keys(path: Path) -> object:
             # propagates straight through ``except yaml.YAMLError``; being
             # raised inside the ``try`` (not an ``except``) leaves
             # ``__context__`` None.
-            _reject_duplicate_and_merge_keys(node)
+            _reject_duplicate_and_merge_keys(node, loader)
             data = loader.construct_document(node)
     except yaml.YAMLError:
         # Capture only the constant code; discard the raw PyYAML exception and
@@ -263,6 +286,15 @@ def _compose_without_duplicate_keys(path: Path) -> object:
         # sanitized error is raised below, outside any active ``except`` scope.
         parse_error = ProfileFileValidationError(
             "source.profile.malformed", _ROOT_PATH
+        )
+    except RecursionError:
+        # A pathologically deep or recursive document can exhaust the stack
+        # inside PyYAML's own compose/construct (a cyclic alias the walker has
+        # not yet reached, or nesting beyond Python's recursion limit).  The
+        # raw ``RecursionError`` is captured and discarded; the sanitized error
+        # is raised below, outside any active ``except`` scope.
+        parse_error = ProfileFileValidationError(
+            "source.profile.too_complex", _ROOT_PATH
         )
     finally:
         loader.dispose()
@@ -273,42 +305,156 @@ def _compose_without_duplicate_keys(path: Path) -> object:
     return data
 
 
-def _reject_duplicate_and_merge_keys(node: yaml.Node) -> None:
-    """Walk a YAML node tree raising on the first merge or duplicate key."""
+class _NodeBudget:
+    """Counts nodes visited by the duplicate/merge walker, capping the total.
 
-    _walk_for_duplicate_and_merge_keys(node, "")
+    Exceeding ``_MAX_NODES`` (a pathologically large document) raises a
+    sanitized :class:`ProfileFileValidationError` rather than letting the walk
+    consume unbounded memory or time.
+    """
+
+    __slots__ = ("count",)
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    def tick(self) -> None:
+        self.count += 1
+        if self.count > _MAX_NODES:
+            raise ProfileFileValidationError(
+                "source.profile.too_complex", _ROOT_PATH
+            )
 
 
-def _walk_for_duplicate_and_merge_keys(node: yaml.Node, path: str) -> None:
+def _reject_duplicate_and_merge_keys(
+    node: yaml.Node, loader: yaml.SafeLoader
+) -> None:
+    """Walk a YAML node tree raising on the first merge or duplicate key.
+
+    The walk is bounded so a cyclic alias or a pathologically deep/huge
+    document can never exhaust the stack silently:
+
+    * a *path-based* visited set (``on_path``) rejects a cyclic alias the moment
+      it revisits a node already on the current descent;
+    * a *global* visited set skips a subtree that was already validated, so a
+      shared alias cannot re-walk (or exponentially expand) the same subtree;
+    * a depth limit (``_MAX_DEPTH``) bounds deeply nested documents;
+    * a total-node budget (``_MAX_NODES``) bounds huge documents.
+
+    Any escaping :class:`RecursionError` is captured and converted to a
+    sanitized :class:`ProfileFileValidationError`, raised *after* the
+    ``except`` so no raw traceback, ``__cause__``, or ``__context__`` is
+    retained.
+    """
+    budget = _NodeBudget()
+    on_path: set[int] = set()
+    visited: set[int] = set()
+    too_complex: ProfileFileValidationError | None = None
+    try:
+        _walk_for_duplicate_and_merge_keys(
+            node, loader, 0, budget, "", on_path, visited
+        )
+    except RecursionError:
+        # Capture-only: raise after the ``except`` so __cause__/__context__ are
+        # None and the traceback carries no raw recursion frames.
+        too_complex = ProfileFileValidationError(
+            "source.profile.too_complex", _ROOT_PATH
+        )
+    if too_complex is not None:
+        raise too_complex
+
+
+def _walk_for_duplicate_and_merge_keys(
+    node: yaml.Node,
+    loader: yaml.SafeLoader,
+    depth: int,
+    budget: _NodeBudget,
+    path: str,
+    on_path: set[int],
+    visited: set[int],
+) -> None:
+    budget.tick()
+    if depth > _MAX_DEPTH:
+        raise ProfileFileValidationError("source.profile.too_complex", _ROOT_PATH)
     if isinstance(node, yaml.MappingNode):
-        seen: set[str] = set()
-        for key_node, value_node in node.value:
-            if isinstance(key_node, yaml.ScalarNode):
-                key = key_node.value
-                # A merge key is an unsupported construct anywhere in the
-                # document; reject it before construction can flatten it.
-                if key == "<<":
-                    raise ProfileFileValidationError(
-                        "source.profile.merge_key", path or _ROOT_PATH
+        nid = id(node)
+        if nid in on_path:
+            # A cyclic alias points back into the current descent.
+            raise ProfileFileValidationError("source.profile.too_complex", _ROOT_PATH)
+        if nid in visited:
+            # This exact subtree was already validated; do not re-walk it.
+            return
+        visited.add(nid)
+        on_path.add(nid)
+        try:
+            seen: set[object] = set()
+            for key_node, value_node in node.value:
+                if isinstance(key_node, yaml.ScalarNode):
+                    key = key_node.value
+                    # A merge key is an unsupported construct anywhere in the
+                    # document; reject it before construction can flatten it.
+                    if isinstance(key, str) and key == "<<":
+                        raise ProfileFileValidationError(
+                            "source.profile.merge_key", path or _ROOT_PATH
+                        )
+                    # Compare the *constructed semantic* key value (what PyYAML
+                    # would build and use as a Python mapping key), not the raw
+                    # spelling, so YAML spellings that collapse to one key --
+                    # ``true`` and ``True`` (both ``bool True``), or ``1``,
+                    # ``1.0`` and ``true`` (all equal as mapping keys) -- are
+                    # rejected before construction silently overwrites one with
+                    # another.  A hostile key is still redacted in the path.
+                    semantic_key = loader.construct_object(key_node)
+                    token = (
+                        _safe_key_token(key)
+                        if isinstance(key, str)
+                        else _REDACTED_KEY
                     )
-                if isinstance(key, str):
-                    # The error path renders only a validated identifier token;
-                    # a hostile key is redacted.  Duplicate detection compares
-                    # the raw key (never rendered) so two hostile keys that
-                    # redact identically are still distinguished internally.
-                    safe = _safe_key_token(key)
-                    child_path = f"{path}.{safe}" if path else safe
-                    if key in seen:
+                    child_path = f"{path}.{token}" if path else token
+                    if semantic_key in seen:
                         raise ProfileFileValidationError(
                             "source.profile.duplicate_key", child_path
                         )
-                    seen.add(key)
-                    _walk_for_duplicate_and_merge_keys(value_node, child_path)
+                    seen.add(semantic_key)
+                    _walk_for_duplicate_and_merge_keys(
+                        value_node,
+                        loader,
+                        depth + 1,
+                        budget,
+                        child_path,
+                        on_path,
+                        visited,
+                    )
                     continue
-            _walk_for_duplicate_and_merge_keys(value_node, path)
+                # A non-scalar mapping key (a nested mapping/sequence) is not
+                # tracked for duplication; only descend into its value.
+                _walk_for_duplicate_and_merge_keys(
+                    value_node, loader, depth + 1, budget, path, on_path, visited
+                )
+        finally:
+            on_path.discard(nid)
     elif isinstance(node, yaml.SequenceNode):
-        for index, item in enumerate(node.value):
-            _walk_for_duplicate_and_merge_keys(item, f"{path}[{index}]")
+        nid = id(node)
+        if nid in on_path:
+            raise ProfileFileValidationError("source.profile.too_complex", _ROOT_PATH)
+        if nid in visited:
+            return
+        visited.add(nid)
+        on_path.add(nid)
+        try:
+            for index, item in enumerate(node.value):
+                _walk_for_duplicate_and_merge_keys(
+                    item,
+                    loader,
+                    depth + 1,
+                    budget,
+                    f"{path}[{index}]",
+                    on_path,
+                    visited,
+                )
+        finally:
+            on_path.discard(nid)
+    # ScalarNode (and any resolved alias leaf): nothing to validate or descend.
 
 
 def _validate_document_shape(

@@ -399,6 +399,123 @@ def test_profile_file_malformed_yaml_rejected(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Semantic duplicate-key detection and recursion bounding
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("true", "True"),
+        ("1", "1.0"),
+        ("True", "1"),
+        ("yes", "True"),
+    ],
+    ids=["bool_true_True", "int_float", "bool_int", "yaml_yes_true"],
+)
+def test_profile_file_rejects_semantic_duplicate_keys(
+    tmp_path: Path, first: str, second: str
+) -> None:
+    # Two entry keys whose raw spellings differ but which collapse to a single
+    # Python mapping key after YAML construction -- ``true``/``True`` (both
+    # ``bool True``), ``1``/``1.0`` (int/float, equal as keys), ``1``/``true``
+    # (int/bool, equal as keys), ``yes``/``True`` (YAML's bool spellings) --
+    # must be rejected as duplicates before construction silently overwrites
+    # one with the other.  The duplicate is compared by *constructed value*,
+    # not raw spelling.
+    body = (
+        "version: 1\nprofiles:\n  warehouse:\n"
+        f"    {first}:\n      env: A\n"
+        f"    {second}:\n      env: B\n"
+    )
+    path = _write(tmp_path, body)
+    with pytest.raises(ProfileFileValidationError) as caught:
+        load_profile_file(path, environ={"A": "a", "B": "b"})
+    error = caught.value
+    assert error.code == "source.profile.duplicate_key"
+    # The duplicate's raw spelling is never rendered: a numeric/bool/uppercase
+    # key redacts to the fixed ``<key>`` token; the path never carries a value.
+    assert error.path.startswith("profiles.warehouse.")
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+def test_profile_file_cyclic_sequence_alias_rejected(tmp_path: Path) -> None:
+    # ``&a [*a]`` composes to a sequence that contains itself.  Without a
+    # path-based cycle guard the duplicate/merge walker would recurse forever
+    # and a raw ``RecursionError`` (with its traceback) would escape.
+    path = _write(tmp_path, "&a [*a]\n")
+    with pytest.raises(ProfileFileValidationError) as caught:
+        load_profile_file(path, environ={})
+    error = caught.value
+    assert error.code == "source.profile.too_complex"
+    assert error.path == "<document>"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+def test_profile_file_cyclic_mapping_alias_rejected(tmp_path: Path) -> None:
+    # ``&a`` anchors the root mapping and ``*a`` aliases it from within, so the
+    # composed mapping points back to itself.
+    path = _write(tmp_path, "&a\nb: *a\n")
+    with pytest.raises(ProfileFileValidationError) as caught:
+        load_profile_file(path, environ={})
+    error = caught.value
+    assert error.code == "source.profile.too_complex"
+    assert error.path == "<document>"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+def test_profile_file_cyclic_alias_does_not_leak_document_text(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A recursive document is reported with a fixed safe path token; neither
+    # the document text nor a raw recursion traceback may reach any surface.
+    body = f"&a\n# {_SECRET}\nb: *a\n"
+    path = _write(tmp_path, body)
+    with pytest.raises(ProfileFileValidationError) as caught:
+        load_profile_file(path, environ={})
+    error = caught.value
+    assert error.code == "source.profile.too_complex"
+    assert error.path == "<document>"
+    _assert_secret_absent(error, _SECRET, capsys)
+
+
+def test_profile_file_deeply_nested_document_rejected(tmp_path: Path) -> None:
+    # A pathologically deep document exceeds the composition walk's depth/node
+    # budget (or, past PyYAML's own tolerance, Python's recursion limit during
+    # compose/construct).  Either way it must surface as the sanitized
+    # ``too_complex`` error, never a raw ``RecursionError`` traceback.
+    depth = 300
+    body = "[" * depth + "1" + "]" * depth + "\n"
+    path = tmp_path / "profiles.yaml"
+    path.write_text(body, encoding="utf-8")
+    with pytest.raises(ProfileFileValidationError) as caught:
+        load_profile_file(path, environ={})
+    error = caught.value
+    assert error.code == "source.profile.too_complex"
+    assert error.path == "<document>"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+def test_profile_file_non_cyclic_shared_alias_loads(tmp_path: Path) -> None:
+    # A non-cyclic alias shared between two entries is valid and must not be
+    # mis-flagged as a cycle by the walker's visited-set bounding.
+    path = _write(
+        tmp_path,
+        "version: 1\nprofiles:\n  warehouse:\n"
+        "    one: &src\n      env: SHARED\n"
+        "    two: *src\n",
+    )
+    resolver = load_profile_file(path, environ={"SHARED": "v"})
+    profile = resolver.resolve("warehouse", source_id="orders")
+    assert profile.value("one") == "v"
+    assert profile.value("two") == "v"
+
+
+# ---------------------------------------------------------------------------
 # Error attribute contract
 # ---------------------------------------------------------------------------
 
