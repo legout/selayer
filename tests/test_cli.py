@@ -18,8 +18,7 @@ _SECRET_SENTINEL = "AKIAIOSFODNN7EXAMPLE-TOKEN-SENTINEL-9f3a"
 
 #: Authored Reference document and overlay mirrored from the composition suite.
 _AUTHORED_REFERENCE = (
-    "---\ntype: Reference\ntitle: Guide\nstatus: stable\n---\n\n"
-    "# Guidance\nText.\n"
+    "---\ntype: Reference\ntitle: Guide\nstatus: stable\n---\n\n# Guidance\nText.\n"
 )
 _AUTHORED_OVERLAY = (
     "---\nselayer_id: metric.gross_margin\n---\n\n"
@@ -124,7 +123,8 @@ def test_unexpected_programmer_errors_propagate(
 
 
 def test_unified_and_legacy_okf_validate_match(
-    generated_bundle: Path, capsys,  # type: ignore[no-untyped-def]
+    generated_bundle: Path,
+    capsys,  # type: ignore[no-untyped-def]
 ) -> None:
     assert unified_main(["okf", "validate", str(generated_bundle)]) == 0
     unified = capsys.readouterr()
@@ -142,18 +142,21 @@ def test_okf_build_accepts_reference_and_overlay_directories(
 ) -> None:
     references, overlays = authored_inputs
     output = tmp_path / "knowledge"
-    assert unified_main(
-        [
-            "okf",
-            "build",
-            str(valid_catalog_path),
-            str(output),
-            "--references",
-            str(references),
-            "--overlays",
-            str(overlays),
-        ]
-    ) == 0
+    assert (
+        unified_main(
+            [
+                "okf",
+                "build",
+                str(valid_catalog_path),
+                str(output),
+                "--references",
+                str(references),
+                "--overlays",
+                str(overlays),
+            ]
+        )
+        == 0
+    )
     payload = json.loads(capsys.readouterr().out)
     assert payload["command"] == "build"
     # Deterministic concept and diagnostic counts are reported.
@@ -183,10 +186,7 @@ def test_unified_okf_build_envelope_is_secret_safe(
     monkeypatch.setattr(cli.OkfBundle, "build", boom)
     destination = tmp_path / "knowledge"
     assert (
-        unified_main(
-            ["okf", "build", str(valid_catalog_path), str(destination)]
-        )
-        == 1
+        unified_main(["okf", "build", str(valid_catalog_path), str(destination)]) == 1
     )
     captured = capsys.readouterr()
     payload = json.loads(captured.err)
@@ -392,3 +392,150 @@ def test_catalog_compatibility_missing_catalog_is_secret_safe(
     assert str(missing) not in captured.out
     assert "Traceback" not in captured.err
     assert captured.out == ""
+
+
+# ---------------------------------------------------------------------------
+# Review findings: query-case JSON field/shape validation (no traceback)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("payload", "sentinel"),
+    [
+        # A bare-string selector would be character-iterated into single-letter
+        # "selectors" by QueryRequest; it must be rejected as a bad shape.
+        ({"metrics": "gross_margin"}, "gross_margin"),
+        # A non-string selector element is a bad shape.
+        ({"metrics": [123]}, "123"),
+        # A non-mapping ``filters`` value must not reach QueryRequest.__init__
+        # (which would call ``.items()`` on it and raise AttributeError).
+        ({"metrics": ["gross_margin"], "filters": [1, 2, 3]}, "AttributeError"),
+        # A filter value that is neither scalar, list, nor range is rejected.
+        (
+            {
+                "metrics": ["gross_margin"],
+                "filters": {"product_category": {"weird": 1}},
+            },
+            "weird",
+        ),
+        # A range filter missing a bound is rejected.
+        (
+            {
+                "metrics": ["gross_margin"],
+                "filters": {"product_category": {"start": "a"}},
+            },
+            "start",
+        ),
+    ],
+)
+def test_catalog_compatibility_query_cases_reject_bad_shape_secret_safe(
+    valid_catalog_path: Path,
+    tmp_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
+    payload: dict[str, object],
+    sentinel: str,
+) -> None:
+    """Malformed query-case shapes are rejected without a traceback or leak.
+
+    Every invalid field shape is caught before QueryRequest construction, so
+    the secret-safe envelope is emitted (never an AttributeError/traceback) and
+    the offending bytes never reach stdout or stderr.
+    """
+    cases = tmp_path / "cases.json"
+    cases.write_text(json.dumps([payload]), encoding="utf-8")
+    assert (
+        main(
+            [
+                "catalog",
+                "compatibility",
+                str(valid_catalog_path),
+                "--query-cases",
+                str(cases),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    body = json.loads(captured.err)
+    assert set(body) == {"error"}
+    assert body["error"]  # non-empty fixed message
+    # No traceback and no echo of the offending bytes or the file path.
+    assert "Traceback" not in captured.err
+    assert sentinel not in captured.err
+    assert sentinel not in captured.out
+    assert str(cases) not in captured.err
+    assert captured.out == ""
+
+
+def test_catalog_compatibility_query_cases_accept_range_filter(
+    valid_catalog_path: Path,
+    tmp_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    """The range filter form ``{"start": s, "end": e}`` is accepted and planned."""
+    cases = tmp_path / "cases.json"
+    cases.write_text(
+        json.dumps(
+            [
+                {
+                    "metrics": ["gross_margin"],
+                    "filters": {"product_category": {"start": "a", "end": "z"}},
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        main(
+            [
+                "catalog",
+                "compatibility",
+                str(valid_catalog_path),
+                "--metric",
+                "gross_margin",
+                "--query-cases",
+                str(cases),
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    check_ids = {outcome["check_id"] for outcome in payload["outcomes"]}
+    assert "compatibility.explicit.0000" in check_ids
+
+
+@pytest.mark.parametrize("dimensions", [None, []])
+def test_catalog_compatibility_query_cases_metric_alone_allows_no_dimensions(
+    valid_catalog_path: Path,
+    tmp_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
+    dimensions: object,
+) -> None:
+    """A metric-alone case may omit dimensions or pass an empty list."""
+    entry: dict[str, object] = {"metrics": ["gross_margin"]}
+    if dimensions is not None:
+        entry["dimensions"] = dimensions
+    cases = tmp_path / "cases.json"
+    cases.write_text(json.dumps([entry]), encoding="utf-8")
+    assert (
+        main(
+            [
+                "catalog",
+                "compatibility",
+                str(valid_catalog_path),
+                "--metric",
+                "gross_margin",
+                "--query-cases",
+                str(cases),
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    explicit = next(
+        outcome
+        for outcome in payload["outcomes"]
+        if outcome["check_id"] == "compatibility.explicit.0000"
+    )
+    assert explicit["evidence"]["compatible"] is True
+    assert explicit["evidence"]["selected_dimensions"] == ""

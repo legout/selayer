@@ -40,7 +40,7 @@ from pathlib import Path
 from selayer.catalog import SemanticLayer
 from selayer.okf import OkfBundle
 from selayer.okf.cli import add_okf_commands, execute_okf
-from selayer.planning.types import QueryRequest
+from selayer.planning.types import FilterInput, QueryRequest, RangeFilter
 from selayer.verification import CompatibilityCheck, verify
 from selayer.verification.static import validate_catalog
 
@@ -75,6 +75,11 @@ _COMPAT_FAILURE_MESSAGE = "could not run compatibility check"
 #: than forwarding arbitrary keys) enforces "do not accept SQL or expression
 #: text": a ``sql``/``expression``/``where`` key is rejected up front.
 _ALLOWED_QUERY_CASE_KEYS = frozenset({"metrics", "dimensions", "filters"})
+
+#: JSON scalar types accepted as a filter value (or list/range member). A
+#: filter value may carry a secret, so only these primitive JSON shapes are
+#: permitted; everything else is rejected before construction.
+_FILTER_SCALAR_TYPES = (str, int, float, bool, type(None))
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -147,26 +152,93 @@ def main(argv: Sequence[str] | None = None) -> int:
     raise AssertionError("unhandled command")
 
 
+def _selector_list(value: object, field: str) -> list[str]:
+    """Validate that ``value`` is a list of selector strings.
+
+    Omitted (``None``) is allowed and yields an empty list, so a metric-alone
+    query case may omit ``dimensions``. A bare string is rejected: it would
+    otherwise be character-iterated into single-letter "selectors" by
+    :class:`QueryRequest`. ``ValueError`` (not ``TypeError``) is raised so the
+    caller's secret-safe ``(OSError, ValueError)`` envelope masks it.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"query case {field} must be a list")  # noqa: TRY004
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError(f"query case {field} entries must be strings")  # noqa: TRY004
+    return value
+
+
+def _normalise_filter_value(value: object) -> FilterInput:
+    """Validate and normalise one JSON filter value for :class:`QueryRequest`.
+
+    Accepts exactly the three JSON-expressible filter forms and rejects
+    everything else, so a malformed value (for example a non-mapping
+    ``filters`` object) can never reach ``QueryRequest`` and trigger an
+    ``AttributeError``/traceback:
+
+    * a scalar (``str``/``int``/``float``/``bool``/``null``) is passed through
+      and normalised to a :class:`~selayer.planning.types.ScalarFilter`;
+    * a list of scalars is passed through and normalised to a ``ListFilter``;
+    * a range object ``{"start": scalar, "end": scalar}`` becomes a
+      :class:`~selayer.planning.types.RangeFilter`.
+    """
+    if isinstance(value, _FILTER_SCALAR_TYPES):
+        return value
+    if isinstance(value, list):
+        scalars: list[str | int | float | bool | None] = []
+        for item in value:
+            if not isinstance(item, _FILTER_SCALAR_TYPES):
+                raise ValueError("query case filter list values must be scalars")  # noqa: TRY004
+            scalars.append(item)
+        return scalars
+    if isinstance(value, dict):
+        if set(value) != {"start", "end"}:
+            raise ValueError("query case range filter must have start and end")
+        start = value["start"]
+        end = value["end"]
+        if not isinstance(start, _FILTER_SCALAR_TYPES) or not isinstance(
+            end, _FILTER_SCALAR_TYPES
+        ):
+            raise ValueError("query case range filter bounds must be scalars")  # noqa: TRY004
+        return RangeFilter(start, end)
+    raise ValueError("query case filter value has an unsupported shape")
+
+
 def _query_request_from_json(entry: object) -> QueryRequest:
     """Build a :class:`QueryRequest` from one query-cases JSON object.
 
-    Only ``metrics``/``dimensions``/``filters`` are accepted: any other key
-    (``sql``/``expression``/``where``/...) is rejected so SQL or expression
-    text can never reach the planner through this path.
+    Every field's shape is validated *before* construction so a malformed
+    query-cases file can never trigger an ``AttributeError``/traceback (for
+    example a non-mapping ``filters`` value) and selector names are never
+    silently character-iterated. Only ``metrics``/``dimensions``/``filters``
+    are accepted: any other key (``sql``/``expression``/``where``/...) is
+    rejected so SQL or expression text can never reach the planner. ``filters``
+    must be a mapping whose values are scalar, list, or range forms. Invalid
+    shapes raise ``ValueError`` for the caller's secret-safe envelope.
     """
     if not isinstance(entry, dict):
         raise ValueError("query case must be a JSON object")  # noqa: TRY004
     unknown = set(entry) - _ALLOWED_QUERY_CASE_KEYS
     if unknown:
         raise ValueError("query case has unknown keys")
-    metrics = entry.get("metrics") or ()
-    dimensions = entry.get("dimensions") or ()
-    if not isinstance(metrics, list) or not isinstance(dimensions, list):
-        # ValueError (not TypeError) is deliberate: these are domain errors
-        # from a user-supplied JSON file and must be caught by the secret-safe
-        # ``(OSError, ValueError)`` envelope below.
-        raise ValueError("query case metrics and dimensions must be lists")  # noqa: TRY004
-    return QueryRequest(metrics, dimensions, entry.get("filters"))
+    metrics = _selector_list(entry.get("metrics"), "metrics")
+    dimensions = _selector_list(entry.get("dimensions"), "dimensions")
+    raw_filters = entry.get("filters")
+    if raw_filters is None:
+        normalised_filters: dict[str, FilterInput] = {}
+    elif not isinstance(raw_filters, dict):
+        # A non-mapping ``filters`` value would reach ``QueryRequest.__init__``
+        # and call ``.items()`` on it, raising ``AttributeError``. Reject the
+        # shape here so the secret-safe envelope handles it cleanly.
+        raise ValueError("query case filters must be a JSON object")
+    else:
+        normalised_filters = {
+            key: _normalise_filter_value(item) for key, item in raw_filters.items()
+        }
+    return QueryRequest(metrics, dimensions, normalised_filters)
 
 
 def _load_query_cases(paths: Sequence[str]) -> tuple[QueryRequest, ...]:

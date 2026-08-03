@@ -11,6 +11,7 @@ completed; ``status="failed"`` is reserved for invalid selectors.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from selayer.model import SemanticLayer
@@ -269,3 +270,148 @@ def test_explicit_multi_dimension_case_records_planner_failure(
     assert outcome.status == "passed"
     assert outcome.evidence["compatible"] is False
     assert outcome.evidence["planner_code"] == "no_relationship_path"
+
+
+# ---------------------------------------------------------------------------
+# Review findings: explicit query-case errors never echo selector names
+# ---------------------------------------------------------------------------
+
+
+def test_explicit_case_planner_failure_does_not_echo_source_names(
+    valid_layer: SemanticLayer,
+) -> None:
+    """A planner failure for an explicit case records a fixed safe message.
+
+    ``no_relationship_path`` normally names the anchor and goal sources in its
+    message; the adapted outcome must keep only the stable ``planner_code`` and
+    a fixed message, never echoing the source names to the report.
+    """
+    # order_date lives on ``orders`` (no path from the order_items anchor).
+    cases = (QueryRequest(["gross_margin"], ["order_date"]),)
+    report = verify(
+        valid_layer,
+        CompatibilityCheck(metrics=("gross_margin",), dimensions=(), query_cases=cases),
+    )
+    outcome = next(
+        item
+        for item in report.outcomes
+        if item.check_id == "compatibility.explicit.0000"
+    )
+    assert outcome.status == "passed"
+    assert outcome.evidence["compatible"] is False
+    assert outcome.evidence["planner_code"] == "no_relationship_path"
+    message = outcome.evidence.get("message", "")
+    assert isinstance(message, str)
+    # The planner's raw message names the anchor/goal sources; neither reaches
+    # the adapted outcome's evidence or diagnostics.
+    assert "order_items" not in message
+    assert "orders" not in message
+    assert all(
+        "order_items" not in d.message and "orders" not in d.message
+        for d in outcome.diagnostics
+    )
+
+
+def test_explicit_case_unknown_filter_dimension_not_echoed(
+    valid_layer: SemanticLayer,
+) -> None:
+    """An unknown filter dimension is a planner failure whose name is scrubbed.
+
+    The planner reports ``unknown_filter_dimension`` naming the dimension; the
+    adapted outcome keeps the stable code but never echoes the dimension name
+    (which is user-supplied) to the report.
+    """
+    cases = (QueryRequest(["gross_margin"], filters={"secret_filter_dim": "x"}),)
+    report = verify(
+        valid_layer,
+        CompatibilityCheck(metrics=("gross_margin",), dimensions=(), query_cases=cases),
+    )
+    outcome = next(
+        item
+        for item in report.outcomes
+        if item.check_id == "compatibility.explicit.0000"
+    )
+    assert outcome.status == "passed"
+    assert outcome.evidence["planner_code"] == "unknown_filter_dimension"
+    blob = json.dumps(report.to_dict())
+    assert "secret_filter_dim" not in blob
+
+
+# ---------------------------------------------------------------------------
+# Review findings: unknown selectors inside explicit query_cases are
+# declaration failures, not passed planner failures
+# ---------------------------------------------------------------------------
+
+
+def test_explicit_case_unknown_metric_is_declaration_failure(
+    valid_layer: SemanticLayer,
+) -> None:
+    cases = (QueryRequest(["gross_margin", "ghost_metric"]),)
+    report = verify(valid_layer, CompatibilityCheck(query_cases=cases))
+    outcome = next(
+        item
+        for item in report.outcomes
+        if item.check_id == "compatibility.explicit.0000"
+    )
+    assert outcome.status == "failed"
+    assert outcome.scope == "declaration"
+    codes = {d.code for d in outcome.diagnostics}
+    assert "unknown_metric" in codes
+    # A declaration failure is never a passed planner failure.
+    assert "planner_code" not in outcome.evidence
+    assert not report.passed
+    # The offending selector name must never reach the report.
+    blob = json.dumps(report.to_dict())
+    assert "ghost_metric" not in blob
+
+
+def test_explicit_case_unknown_dimension_is_declaration_failure(
+    valid_layer: SemanticLayer,
+) -> None:
+    cases = (QueryRequest(["gross_margin"], ["ghost_dimension"]),)
+    report = verify(valid_layer, CompatibilityCheck(query_cases=cases))
+    outcome = next(
+        item
+        for item in report.outcomes
+        if item.check_id == "compatibility.explicit.0000"
+    )
+    assert outcome.status == "failed"
+    assert outcome.scope == "declaration"
+    codes = {d.code for d in outcome.diagnostics}
+    assert "unknown_dimension" in codes
+    assert "planner_code" not in outcome.evidence
+    assert not report.passed
+    blob = json.dumps(report.to_dict())
+    assert "ghost_dimension" not in blob
+
+
+def test_explicit_case_unknown_selector_outcome_uses_indexed_check_id(
+    valid_layer: SemanticLayer,
+) -> None:
+    """The declaration-failure outcome is keyed by case index, not selector name."""
+    cases = (
+        QueryRequest(["gross_margin"], ["product_category"]),
+        QueryRequest(["gross_margin", "ghost"]),
+    )
+    report = verify(valid_layer, CompatibilityCheck(query_cases=cases))
+    by_id = {item.check_id: item for item in report.outcomes}
+    # The valid case still plans; the unknown-selector case is a declaration failure.
+    assert by_id["compatibility.explicit.0000"].status == "passed"
+    assert by_id["compatibility.explicit.0001"].status == "failed"
+    assert "ghost" not in json.dumps(report.to_dict())
+
+
+def test_metric_alone_explicit_case_with_no_dimensions_is_compatible(
+    valid_layer: SemanticLayer,
+) -> None:
+    """An explicit metric-alone case (no dimensions) plans successfully."""
+    cases = (QueryRequest(["gross_margin"]),)
+    report = verify(valid_layer, CompatibilityCheck(query_cases=cases))
+    outcome = next(
+        item
+        for item in report.outcomes
+        if item.check_id == "compatibility.explicit.0000"
+    )
+    assert outcome.status == "passed"
+    assert outcome.evidence["compatible"] is True
+    assert outcome.evidence["selected_dimensions"] == ""
