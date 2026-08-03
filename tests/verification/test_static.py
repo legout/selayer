@@ -11,12 +11,14 @@ failed outcome whose diagnostics carry the catalog's stable issue codes. The
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from selayer import TableSchema
 from selayer.catalog import CatalogIssue
-from selayer.verification import validate_catalog
+from selayer.verification import StaticCheck, validate_catalog, verify
 
 
 def test_catalog_issue_keeps_old_positional_construction() -> None:
@@ -113,3 +115,85 @@ def test_validate_catalog_malformed_yaml_never_leaks_source_secrets(
 
     # The diagnostic carries a fixed domain message, not raw YAML text.
     assert diagnostics[0].message == "catalog file is not valid YAML"
+
+
+# ---------------------------------------------------------------------------
+# Declaration-rule parity between programmatic layers and loaded catalogs
+# ---------------------------------------------------------------------------
+
+
+def test_static_check_rejects_duplicate_grain(valid_layer) -> None:  # type: ignore[no-untyped-def]
+    source = valid_layer.data_sources["orders"]
+    bad = replace(
+        valid_layer,
+        data_sources={
+            **valid_layer.data_sources,
+            "orders": replace(source, grain=(source.grain[0], source.grain[0])),
+        },
+    )
+    report = verify(bad, StaticCheck())
+    assert "catalog.grain.duplicate_column" in {
+        item.code for item in report.diagnostics
+    }
+
+
+def test_static_check_rejects_nullable_grain(valid_layer) -> None:  # type: ignore[no-untyped-def]
+    source = valid_layer.data_sources["orders"]
+    grain_column = source.grain[0]
+    fields = tuple(
+        replace(field, nullable=True) if field.name == grain_column else field
+        for field in source.schema.fields
+    )
+    bad = replace(
+        valid_layer,
+        data_sources={
+            **valid_layer.data_sources,
+            "orders": replace(source, schema=TableSchema(fields)),
+        },
+    )
+    report = verify(bad, StaticCheck())
+    assert "catalog.grain.nullable_column" in {item.code for item in report.diagnostics}
+
+
+def test_static_check_rejects_relationship_type_mismatch(valid_layer) -> None:  # type: ignore[no-untyped-def]
+    relationship = valid_layer.relationships["product_order_items"]
+    bad = replace(
+        valid_layer,
+        relationships={
+            **valid_layer.relationships,
+            "product_order_items": replace(
+                relationship,
+                target_column="quantity",
+            ),
+        },
+    )
+    report = verify(bad, StaticCheck())
+    assert "catalog.relationship.join_type_mismatch" in {
+        item.code for item in report.diagnostics
+    }
+
+
+def test_static_check_rejects_sum_of_string_fact(valid_layer) -> None:  # type: ignore[no-untyped-def]
+    fact = valid_layer.facts["item_revenue"]
+    bad = replace(
+        valid_layer,
+        facts={
+            **valid_layer.facts,
+            "item_revenue": replace(fact, data_type="string"),
+        },
+    )
+    report = verify(bad, StaticCheck())
+    assert "catalog.measure.invalid_aggregation_type" in {
+        item.code for item in report.diagnostics
+    }
+
+
+def test_static_check_passes_clean_layer(valid_layer) -> None:  # type: ignore[no-untyped-def]
+    report = verify(valid_layer, StaticCheck())
+    assert report.passed
+    assert report.diagnostics == ()
+
+
+def test_verify_rejects_unknown_check(valid_layer) -> None:  # type: ignore[no-untyped-def]
+    with pytest.raises(TypeError, match="unsupported verification check"):
+        verify(valid_layer, object())  # type: ignore[arg-type]

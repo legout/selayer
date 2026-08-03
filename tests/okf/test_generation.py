@@ -92,7 +92,7 @@ def test_projection_contains_every_semantic_object(
     assert "Connector: parquet" in source_content
     assert "Schema fingerprint:" in source_content
     assert "Grain: order_id, product_id" in source_content
-    assert "- order_id: utf8 (nullable)" in source_content
+    assert "- order_id: utf8 (required)" in source_content
     assert "- quantity: int64 (nullable)" in source_content
     # The old ``path``/``location``/profile shape is gone from the rendered
     # catalog definition — only the connector category, schema fingerprint,
@@ -144,7 +144,7 @@ def test_source_definition_carries_bounded_catalog_authoritative_schema_summary(
     assert "Schema fingerprint:" in content
     assert "Grain: order_id, product_id" in content
     # Each declared field surfaces its logical type and nullability.
-    assert "order_id: utf8 (nullable)" in content
+    assert "order_id: utf8 (required)" in content
     assert "quantity: int64 (nullable)" in content
     assert "total: float64 (nullable)" in content
     # The summary is catalog-authoritative: no locations, profile names,

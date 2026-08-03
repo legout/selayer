@@ -50,7 +50,7 @@ def root(tmp_path: Path) -> Path:
         data / "orders.parquet",
         pa.schema(
             [
-                pa.field("id", pa.string()),
+                pa.field("id", pa.string(), nullable=False),
                 pa.field("customer_id", pa.string()),
                 pa.field("created_at", pa.timestamp("ns")),
                 pa.field("status", pa.string()),
@@ -87,8 +87,8 @@ def root(tmp_path: Path) -> Path:
         data / "order_items.parquet",
         pa.schema(
             [
-                pa.field("order_id", pa.string()),
-                pa.field("product_id", pa.string()),
+                pa.field("order_id", pa.string(), nullable=False),
+                pa.field("product_id", pa.string(), nullable=False),
                 pa.field("quantity", pa.int64()),
                 pa.field("price", pa.float64()),
                 pa.field("total", pa.float64()),
@@ -106,7 +106,7 @@ def root(tmp_path: Path) -> Path:
         data / "products.parquet",
         pa.schema(
             [
-                pa.field("id", pa.string()),
+                pa.field("id", pa.string(), nullable=False),
                 pa.field("name", pa.string()),
                 pa.field("category", pa.string()),
                 pa.field("subcategory", pa.string()),
@@ -139,7 +139,7 @@ def root(tmp_path: Path) -> Path:
         data / "customers.parquet",
         pa.schema(
             [
-                pa.field("id", pa.string()),
+                pa.field("id", pa.string(), nullable=False),
                 pa.field("email", pa.string()),
                 pa.field("name", pa.string()),
                 pa.field("segment", pa.string()),

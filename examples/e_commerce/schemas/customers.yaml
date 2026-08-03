@@ -1,5 +1,5 @@
 fields:
-  - {name: id, type: utf8, nullable: true}
+  - {name: id, type: utf8, nullable: false}
   - {name: email, type: utf8, nullable: true}
   - {name: name, type: utf8, nullable: true}
   - {name: segment, type: utf8, nullable: true}

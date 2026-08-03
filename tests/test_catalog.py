@@ -1048,3 +1048,78 @@ def test_catalog_loading_is_deterministic(valid_catalog_path: Path) -> None:
     first = SemanticLayer.load(valid_catalog_path)
     second = SemanticLayer.load(valid_catalog_path)
     assert first == second
+
+
+# ---------------------------------------------------------------------------
+# Model-invariant rules: loaded catalogs emit the same code as verify_static
+# ---------------------------------------------------------------------------
+
+
+def test_catalog_rejects_duplicate_grain_columns(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        "version: 1\nname: ecommerce\ndata_sources:\n"
+        "  orders:\n    type: parquet\n    location: x\n    grain: [id, id]\n"
+        "    schema:\n      fields:\n"
+        "        - {name: id, type: utf8, nullable: false}\n",
+    )
+    with pytest.raises(CatalogValidationError) as caught:
+        SemanticLayer.load(path)
+    assert "catalog.grain.duplicate_column" in {
+        issue.code for issue in caught.value.issues
+    }
+
+
+def test_catalog_rejects_nullable_grain_column(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        "version: 1\nname: ecommerce\ndata_sources:\n"
+        "  orders:\n    type: parquet\n    location: x\n    grain: [id]\n"
+        "    schema:\n      fields:\n"
+        "        - {name: id, type: utf8, nullable: true}\n",
+    )
+    with pytest.raises(CatalogValidationError) as caught:
+        SemanticLayer.load(path)
+    assert "catalog.grain.nullable_column" in {
+        issue.code for issue in caught.value.issues
+    }
+
+
+def test_catalog_rejects_relationship_join_type_mismatch(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        "version: 1\nname: ecommerce\ndata_sources:\n"
+        "  orders:\n    type: parquet\n    location: x\n    grain: [id]\n"
+        "    schema:\n      fields:\n"
+        "        - {name: id, type: utf8, nullable: false}\n"
+        "        - {name: qty, type: int64, nullable: true}\n"
+        "  products:\n    type: parquet\n    location: y\n    grain: [id]\n"
+        "    schema:\n      fields:\n"
+        "        - {name: id, type: utf8, nullable: false}\n"
+        "relationships:\n  rel:\n    source: products\n    target: orders\n"
+        "    type: one_to_many\n    source_column: id\n    target_column: qty\n",
+    )
+    with pytest.raises(CatalogValidationError) as caught:
+        SemanticLayer.load(path)
+    assert "catalog.relationship.join_type_mismatch" in {
+        issue.code for issue in caught.value.issues
+    }
+
+
+def test_catalog_rejects_measure_sum_of_string_fact(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        "version: 1\nname: ecommerce\ndata_sources:\n"
+        "  orders:\n    type: parquet\n    location: x\n    grain: [id]\n"
+        "    schema:\n      fields:\n"
+        "        - {name: id, type: utf8, nullable: false}\n"
+        "        - {name: status, type: utf8, nullable: true}\n"
+        "facts:\n  status:\n    source: orders\n    expression: orders.status\n"
+        "    data_type: string\n"
+        "measures:\n  total:\n    fact: status\n    aggregation: sum\n",
+    )
+    with pytest.raises(CatalogValidationError) as caught:
+        SemanticLayer.load(path)
+    assert "catalog.measure.invalid_aggregation_type" in {
+        issue.code for issue in caught.value.issues
+    }

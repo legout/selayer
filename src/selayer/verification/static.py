@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from selayer.catalog import CatalogValidationError
+from selayer.catalog import CatalogValidationError, collect_model_issues
 from selayer.model import SemanticLayer
 from selayer.verification.model import (
     CatalogValidationResult,
@@ -54,13 +54,33 @@ def validate_catalog(path: str | Path) -> CatalogValidationResult:
             None,
             VerificationReport(1, subject, "static", True, (outcome,), diagnostics),
         )
-    outcome = VerificationOutcome(
-        _CHECK_ID, "passed", "declaration", "catalog", {}, ()
-    )
+    outcome = VerificationOutcome(_CHECK_ID, "passed", "declaration", "catalog", {}, ())
     return CatalogValidationResult(
         layer,
         VerificationReport(1, layer.name, "static", True, (outcome,), ()),
     )
 
 
-__all__ = ["validate_catalog"]
+def verify_static(layer: SemanticLayer) -> VerificationReport:
+    """Run declaration-rule validation on a typed layer.
+
+    Maps :func:`collect_model_issues` onto an immutable verification report:
+    a clean layer yields a passed ``catalog.static`` outcome, while every
+    catalog issue becomes an error diagnostic carrying the catalog's stable
+    code. The typed model validators and the raw YAML loader share the same
+    rule implementations, so a loaded catalog and an equivalent programmatic
+    layer produce identical diagnostics.
+    """
+    issues = collect_model_issues(layer)
+    diagnostics = tuple(
+        VerificationDiagnostic(issue.code, "error", issue.path, issue.message)
+        for issue in issues
+    )
+    status = "passed" if not diagnostics else "failed"
+    outcome = VerificationOutcome(
+        _CHECK_ID, status, "declaration", "catalog", {}, diagnostics
+    )
+    return VerificationReport(1, layer.name, "static", True, (outcome,), diagnostics)
+
+
+__all__ = ["validate_catalog", "verify_static"]

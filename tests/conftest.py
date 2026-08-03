@@ -22,7 +22,7 @@ data_sources:
     grain: [id]
     schema:
       fields:
-        - {name: id, type: utf8, nullable: true}
+        - {name: id, type: utf8, nullable: false}
         - {name: customer_id, type: utf8, nullable: true}
         - name: created_at
           type:
@@ -43,8 +43,8 @@ data_sources:
     grain: [order_id, product_id]
     schema:
       fields:
-        - {name: order_id, type: utf8, nullable: true}
-        - {name: product_id, type: utf8, nullable: true}
+        - {name: order_id, type: utf8, nullable: false}
+        - {name: product_id, type: utf8, nullable: false}
         - {name: quantity, type: int64, nullable: true}
         - {name: price, type: float64, nullable: true}
         - {name: total, type: float64, nullable: true}
@@ -54,7 +54,7 @@ data_sources:
     grain: [id]
     schema:
       fields:
-        - {name: id, type: utf8, nullable: true}
+        - {name: id, type: utf8, nullable: false}
         - {name: name, type: utf8, nullable: true}
         - {name: category, type: utf8, nullable: true}
         - {name: subcategory, type: utf8, nullable: true}

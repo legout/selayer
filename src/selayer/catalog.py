@@ -24,7 +24,7 @@ Validation pipeline:
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -112,6 +112,128 @@ def _data_type_compatible(data_type: str, logical: LogicalType) -> bool:
     if compatible is None:
         return False
     return _logical_type_kind(logical) in compatible
+
+
+_NUMERIC_DATA_TYPES = frozenset({"integer", "decimal", "float", "double"})
+_ORDERABLE_DATA_TYPES = frozenset(
+    {"string", "integer", "decimal", "float", "double", "boolean", "timestamp", "date"}
+)
+
+# Logical scalar names that share the integer join-equivalence family.
+_INTEGER_KINDS = frozenset(
+    {
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+    }
+)
+# Logical scalar names that share the floating-point join-equivalence family
+# (``decimal`` carries scale/precision but is join-equivalent to floats).
+_FLOAT_KINDS = frozenset({"float16", "float32", "float64", "decimal"})
+
+
+def _logical_kind_join_group(kind: str) -> str:
+    """Return the coarse join-equivalence group for a logical type kind.
+
+    Integer and floating-point families collapse to a single group so a join
+    between, e.g., ``int32`` and ``int64`` columns is accepted, while a join
+    between unrelated kinds (``utf8`` and ``int64``) is rejected. No coercion
+    is performed: the comparison is by group membership only.
+    """
+    if kind in _INTEGER_KINDS:
+        return "integer"
+    if kind in _FLOAT_KINDS:
+        return "float"
+    return kind
+
+
+def _join_type_compatible(source_type: LogicalType, target_type: LogicalType) -> bool:
+    """Return whether two relationship join columns have equivalent types."""
+    return _logical_kind_join_group(
+        _logical_type_kind(source_type)
+    ) == _logical_kind_join_group(_logical_type_kind(target_type))
+
+
+def _validate_grain_columns(
+    source_name: str,
+    grain: tuple[str, ...],
+    schema: TableSchema,
+    collector: _Collector,
+) -> None:
+    """Validate grain uniqueness, column existence, and non-nullability.
+
+    Shared by the raw loader (over a parsed source schema) and the typed
+    model validator so both report identical grain codes.
+    """
+    path = f"data_sources.{source_name}.grain"
+    if len(grain) != len(set(grain)):
+        collector.add(
+            path, "grain columns must be unique", "catalog.grain.duplicate_column"
+        )
+    schema_columns = {field.name for field in schema.fields}
+    for column in grain:
+        if column not in schema_columns:
+            collector.add(
+                path,
+                f"grain column {column!r} is not declared in the source schema",
+            )
+            continue
+        if schema.field(column).nullable:
+            collector.add(
+                path,
+                f"grain column {column!r} must be non-nullable",
+                "catalog.grain.nullable_column",
+            )
+
+
+def _validate_measure_aggregation(
+    measure_name: str,
+    aggregation: str,
+    fact_data_type: str | None,
+    collector: _Collector,
+) -> None:
+    """Flag sum/avg over non-numeric facts and min/max over non-orderable ones."""
+    if fact_data_type is None:
+        return
+    if aggregation in {"sum", "avg"} and fact_data_type not in _NUMERIC_DATA_TYPES:
+        collector.add(
+            f"measures.{measure_name}.aggregation",
+            "sum and avg require a numeric fact",
+            "catalog.measure.invalid_aggregation_type",
+        )
+    if aggregation in {"min", "max"} and fact_data_type not in _ORDERABLE_DATA_TYPES:
+        collector.add(
+            f"measures.{measure_name}.aggregation",
+            "min and max require an orderable fact",
+            "catalog.measure.invalid_aggregation_type",
+        )
+
+
+def _validate_relationship_join(
+    name: str,
+    source: str,
+    target: str,
+    source_column: str,
+    target_column: str,
+    source_schemas: Mapping[str, TableSchema],
+    collector: _Collector,
+) -> None:
+    """Flag relationship joins whose endpoint columns have incompatible types."""
+    source_field = _schema_field(source_schemas, source, source_column)
+    target_field = _schema_field(source_schemas, target, target_column)
+    if source_field is None or target_field is None:
+        return
+    if not _join_type_compatible(source_field.type, target_field.type):
+        collector.add(
+            f"relationships.{name}",
+            "relationship join columns must have compatible types",
+            "catalog.relationship.join_type_mismatch",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,15 +446,8 @@ def _validate_data_sources(
         parsed = parse_source_declarations(sources, catalog_path)
     except Exception:  # noqa: BLE001 - parse only runs after validation
         return {}
-    # Grain columns must exist in the declared schema.
     for name, source in parsed.items():
-        schema_columns = {field.name for field in source.schema.fields}
-        for column in source.grain:
-            if column not in schema_columns:
-                collector.add(
-                    f"data_sources.{name}.grain",
-                    f"grain column {column!r} is not declared in the source schema",
-                )
+        _validate_grain_columns(name, source.grain, source.schema, collector)
     return dict(parsed)
 
 
@@ -428,8 +543,9 @@ def _validate_facts(
 
 
 def _validate_measures(
-    measures: Mapping[str, Any], known_facts: frozenset[str], collector: _Collector
+    measures: Mapping[str, Any], facts: Mapping[str, Any], collector: _Collector
 ) -> None:
+    known_facts = frozenset(facts)
     for key, raw in measures.items():
         base = f"measures.{key}"
         _validate_identifier_key(key, base, "measure", collector)
@@ -449,6 +565,15 @@ def _validate_measures(
             collector.add(
                 f"{base}.aggregation", f"unsupported aggregation '{aggregation}'"
             )
+        fact_data_type: str | None = None
+        if isinstance(fact, str) and fact in known_facts:
+            raw_fact = facts.get(fact)
+            if isinstance(raw_fact, Mapping):
+                data_type = raw_fact.get("data_type")
+                if isinstance(data_type, str):
+                    fact_data_type = data_type
+        if isinstance(aggregation, str) and fact_data_type is not None:
+            _validate_measure_aggregation(key, aggregation, fact_data_type, collector)
 
 
 def _validate_metrics(
@@ -532,6 +657,15 @@ def _validate_relationships(
                 f"{base}.target_column",
                 collector,
             )
+        _validate_relationship_join(
+            key,
+            source if isinstance(source, str) else "",
+            target if isinstance(target, str) else "",
+            str(raw.get("source_column")),
+            str(raw.get("target_column")),
+            source_schemas,
+            collector,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -665,23 +799,22 @@ def _parse_and_validate_metric(
 # ---------------------------------------------------------------------------
 
 
-def _safe_relationship_graph(
-    relationships: Mapping[str, Any], known_sources: frozenset[str]
+def _safe_relationship_edges(
+    edges: Iterable[tuple[object, object, object]],
+    known_sources: frozenset[str],
 ) -> dict[str, tuple[str, ...]]:
-    """Return directed grain-preserving source traversal edges.
+    """Build directed grain-preserving source-traversal edges from triples.
 
-    Cardinality is interpreted from the relationship's declared source to
-    target: one-to-many is safe only from target (many) to source (one), while
-    many-to-one is safe only from source (many) to target (one). Many-to-many
-    contributes no edges.
+    ``edges`` is an iterable of ``(source, target, cardinality)`` triples
+    shared by the raw YAML loader and the typed model validators, so both
+    paths use one implementation of the safe-traversal rule. Cardinality is
+    interpreted from the relationship's declared source to target:
+    one-to-many is safe only from target (many) to source (one), many-to-one
+    only from source (many) to target (one); many-to-many contributes no
+    edges.
     """
     graph: dict[str, list[str]] = {}
-    for raw in relationships.values():
-        if not isinstance(raw, Mapping):
-            continue
-        source = raw.get("source")
-        target = raw.get("target")
-        cardinality = raw.get("type")
+    for source, target, cardinality in edges:
         if (
             not isinstance(source, str)
             or not isinstance(target, str)
@@ -697,6 +830,20 @@ def _safe_relationship_graph(
         elif cardinality == "many_to_one":
             graph.setdefault(source, []).append(target)
     return {source: tuple(sorted(targets)) for source, targets in graph.items()}
+
+
+def _safe_relationship_graph(
+    relationships: Mapping[str, Any], known_sources: frozenset[str]
+) -> dict[str, tuple[str, ...]]:
+    """Build the safe-traversal graph from raw relationship mappings."""
+    return _safe_relationship_edges(
+        (
+            (raw.get("source"), raw.get("target"), raw.get("type"))
+            for raw in relationships.values()
+            if isinstance(raw, Mapping)
+        ),
+        known_sources,
+    )
 
 
 def _has_safe_path(graph: Mapping[str, tuple[str, ...]], start: str, goal: str) -> bool:
@@ -724,13 +871,33 @@ def _validate_fact_expression_reachability(
     collector: _Collector,
 ) -> None:
     graph = _safe_relationship_graph(relationships, known_sources)
-    reported: set[tuple[str, str]] = set()
+    entries: list[tuple[str, object, Expression]] = []
     for fact_name, expression in parsed.items():
         raw = facts.get(fact_name)
         if not isinstance(raw, Mapping):
             continue
         anchor = raw.get("source")
         if not isinstance(anchor, str) or anchor not in sources:
+            continue
+        entries.append((fact_name, anchor, expression))
+    _fact_reachability_issues(entries, graph, known_sources, collector)
+
+
+def _fact_reachability_issues(
+    facts: Iterable[tuple[str, object, Expression]],
+    graph: Mapping[str, tuple[str, ...]],
+    known_sources: frozenset[str],
+    collector: _Collector,
+) -> None:
+    """Flag facts whose expression references an unreachable source.
+
+    ``facts`` is an iterable of ``(name, anchor_source, expression)`` triples
+    shared by the raw and typed validators, so the reachability rule has one
+    implementation.
+    """
+    reported: set[tuple[str, str]] = set()
+    for fact_name, anchor, expression in facts:
+        if not isinstance(anchor, str) or anchor not in known_sources:
             continue
         for reference in references(expression):
             if len(reference.parts) != 2:
@@ -750,6 +917,24 @@ def _validate_fact_expression_reachability(
                 )
 
 
+def _metric_grain_issues(
+    metric_grains: Iterable[tuple[str, list[tuple[str, tuple[str, ...]]]]],
+    collector: _Collector,
+) -> None:
+    """Flag metrics whose declared measures disagree on anchor or grain.
+
+    ``metric_grains`` is an iterable of ``(name, resolved)`` pairs where
+    ``resolved`` is a list of ``(anchor, grain)`` tuples, shared by the raw
+    and typed validators, so the grain rule has one implementation.
+    """
+    for metric_name, resolved in metric_grains:
+        if len(resolved) > 1 and any(item != resolved[0] for item in resolved[1:]):
+            collector.add(
+                f"metrics.{metric_name}.measures",
+                "declared measures must share exactly the same anchor source and grain",
+            )
+
+
 def _validate_metric_grains(
     metrics: Mapping[str, Any],
     measures: Mapping[str, Any],
@@ -757,14 +942,16 @@ def _validate_metric_grains(
     sources: Mapping[str, Any],
     collector: _Collector,
 ) -> None:
-    for metric_name, raw_metric in metrics.items():
-        if not isinstance(raw_metric, Mapping):
-            continue
+    """Validate metric grain consistency over raw mappings via the shared core."""
+
+    def resolved_grains(
+        raw_metric: Mapping[str, Any],
+    ) -> list[tuple[str, tuple[str, ...]]]:
         declared = raw_metric.get("measures")
         if not isinstance(declared, list) or not all(
             isinstance(measure_id, str) for measure_id in declared
         ):
-            continue
+            return []
         resolved: list[tuple[str, tuple[str, ...]]] = []
         for measure_id in declared:
             raw_measure = measures.get(measure_id)
@@ -781,11 +968,291 @@ def _validate_metric_grains(
                 and all(isinstance(column, str) for column in grain)
             ):
                 resolved.append((anchor, tuple(grain)))
-        if len(resolved) > 1 and any(item != resolved[0] for item in resolved[1:]):
+        return resolved
+
+    metric_grains = (
+        (metric_name, resolved_grains(raw_metric))
+        for metric_name, raw_metric in metrics.items()
+        if isinstance(raw_metric, Mapping)
+    )
+    _metric_grain_issues(metric_grains, collector)
+
+
+# ---------------------------------------------------------------------------
+# Model-oriented rule helpers (operate on typed SemanticLayer values)
+# ---------------------------------------------------------------------------
+
+
+def _validate_layer_identity_model(layer: SemanticLayer, collector: _Collector) -> None:
+    """Validate the layer's schema version and name identifier."""
+    if type(layer.version) is not int or layer.version != 1:
+        collector.add(
+            "version", "expected schema version 1", "catalog.version.unsupported"
+        )
+    if not _is_valid_identifier(layer.name):
+        collector.add("name", "name must match [a-z][a-z0-9_]*")
+
+
+def _validate_named_models(
+    section: str,
+    mapping: Mapping[str, Any],
+    model_type: type,
+    collector: _Collector,
+) -> None:
+    """Validate that each collection key is an identifier of the right type."""
+    singular = section.removesuffix("s")
+    for key, value in mapping.items():
+        if not _is_valid_identifier(key):
             collector.add(
-                f"metrics.{metric_name}.measures",
-                "declared measures must share exactly the same anchor source and grain",
+                f"{section}.{key}",
+                f"{singular} key '{key}' must match [a-z][a-z0-9_]*",
             )
+        if not isinstance(value, model_type):
+            collector.add(
+                f"{section}.{key}",
+                f"{singular} must be a {model_type.__name__}",
+            )
+
+
+def _validate_source_model(source: DataSource, collector: _Collector) -> None:
+    """Validate a typed data source's grain declarations."""
+    _validate_grain_columns(source.name, source.grain, source.schema, collector)
+
+
+def _validate_dimension_model(
+    dimension: Dimension,
+    data_sources: Mapping[str, DataSource],
+    collector: _Collector,
+) -> None:
+    """Validate a typed dimension's source, column, and declared data_type."""
+    base = f"dimensions.{dimension.name}"
+    if dimension.source not in data_sources:
+        collector.add(
+            f"{base}.source",
+            f"source '{dimension.source}' is not a known data source",
+        )
+        return
+    source_schemas = {name: src.schema for name, src in data_sources.items()}
+    field = _schema_field(source_schemas, dimension.source, dimension.column)
+    if field is None:
+        collector.add(
+            f"{base}.column",
+            f"column {dimension.column!r} is not declared in source "
+            f"{dimension.source!r} schema",
+        )
+        return
+    if not _data_type_compatible(dimension.data_type, field.type):
+        collector.add(
+            f"{base}.data_type",
+            f"data_type {dimension.data_type!r} is not compatible with column "
+            f"{dimension.column!r} type",
+        )
+
+
+def _validate_fact_model(
+    fact: Fact, layer: SemanticLayer, collector: _Collector
+) -> None:
+    """Validate a typed fact's source and expression references/types."""
+    base = f"facts.{fact.name}"
+    if fact.source not in layer.data_sources:
+        collector.add(
+            f"{base}.source",
+            f"source '{fact.source}' is not a known data source",
+        )
+        return
+    source_schemas = {name: src.schema for name, src in layer.data_sources.items()}
+    ref_columns: list[tuple[str, str]] = []
+    for reference in references(fact.expression):
+        if len(reference.parts) != 2:
+            continue
+        ref_source, ref_column = reference.parts
+        if ref_source not in layer.data_sources:
+            continue
+        if _schema_field(source_schemas, ref_source, ref_column) is None:
+            collector.add(
+                f"{base}.expression",
+                f"column {ref_column!r} is not declared in source "
+                f"{ref_source!r} schema",
+            )
+        ref_columns.append((ref_source, ref_column))
+    if len(ref_columns) == 1:
+        ref_source, ref_column = ref_columns[0]
+        field = _schema_field(source_schemas, ref_source, ref_column)
+        if field is not None and not _data_type_compatible(fact.data_type, field.type):
+            collector.add(
+                f"{base}.data_type",
+                f"data_type {fact.data_type!r} is not compatible with column "
+                f"{ref_column!r} type",
+            )
+
+
+def _validate_measure_model(
+    measure: Measure,
+    facts: Mapping[str, Fact],
+    collector: _Collector,
+) -> None:
+    """Validate a typed measure's fact reference and aggregation type."""
+    base = f"measures.{measure.name}"
+    fact = facts.get(measure.fact)
+    if measure.fact not in facts:
+        collector.add(f"{base}.fact", f"fact '{measure.fact}' is not a known fact")
+    if measure.aggregation not in _AGGREGATIONS:
+        collector.add(
+            f"{base}.aggregation",
+            f"unsupported aggregation '{measure.aggregation}'",
+        )
+    if fact is not None:
+        _validate_measure_aggregation(
+            measure.name, measure.aggregation, fact.data_type, collector
+        )
+
+
+def _validate_metric_model(
+    metric: Metric, layer: SemanticLayer, collector: _Collector
+) -> None:
+    """Validate a typed metric's declared measures and expression."""
+    base = f"metrics.{metric.name}"
+    for measure_id in metric.measures:
+        if measure_id not in layer.measures:
+            collector.add(
+                f"{base}.measures",
+                f"measure '{measure_id}' is not a known measure",
+            )
+    declared = frozenset(metric.measures)
+    for message in validate_metric_expression(metric.expression, declared):
+        collector.add(f"{base}.expression", message)
+
+
+def _validate_relationship_model(
+    relationship: Relationship,
+    data_sources: Mapping[str, DataSource],
+    collector: _Collector,
+) -> None:
+    """Validate a typed relationship's endpoints, columns, and join types."""
+    base = f"relationships.{relationship.name}"
+    source_schemas = {name: src.schema for name, src in data_sources.items()}
+    if relationship.source not in data_sources:
+        collector.add(
+            f"{base}.source",
+            f"source '{relationship.source}' is not a known data source",
+        )
+    if relationship.target not in data_sources:
+        collector.add(
+            f"{base}.target",
+            f"source '{relationship.target}' is not a known data source",
+        )
+    if relationship.type not in _CARDINALITIES:
+        collector.add(f"{base}.type", f"unsupported cardinality '{relationship.type}'")
+    if (
+        relationship.source in data_sources
+        and _schema_field(
+            source_schemas, relationship.source, relationship.source_column
+        )
+        is None
+    ):
+        collector.add(
+            f"{base}.source_column",
+            f"column {relationship.source_column!r} is not declared in source "
+            f"{relationship.source!r} schema",
+        )
+    if (
+        relationship.target in data_sources
+        and _schema_field(
+            source_schemas, relationship.target, relationship.target_column
+        )
+        is None
+    ):
+        collector.add(
+            f"{base}.target_column",
+            f"column {relationship.target_column!r} is not declared in source "
+            f"{relationship.target!r} schema",
+        )
+    _validate_relationship_join(
+        relationship.name,
+        relationship.source,
+        relationship.target,
+        relationship.source_column,
+        relationship.target_column,
+        source_schemas,
+        collector,
+    )
+
+
+def _validate_fact_reachability_model(
+    layer: SemanticLayer, collector: _Collector
+) -> None:
+    """Validate typed fact-expression reachability over the safe graph."""
+    known_sources = frozenset(layer.data_sources)
+    graph = _safe_relationship_edges(
+        (
+            (relationship.source, relationship.target, relationship.type)
+            for relationship in layer.relationships.values()
+        ),
+        known_sources,
+    )
+    facts = ((fact.name, fact.source, fact.expression) for fact in layer.facts.values())
+    _fact_reachability_issues(facts, graph, known_sources, collector)
+
+
+def _validate_metric_grains_model(layer: SemanticLayer, collector: _Collector) -> None:
+    """Validate typed metric grain consistency across declared measures."""
+
+    def resolved_grains(metric: Metric) -> list[tuple[str, tuple[str, ...]]]:
+        resolved: list[tuple[str, tuple[str, ...]]] = []
+        for measure_id in metric.measures:
+            measure = layer.measures.get(measure_id)
+            if measure is None:
+                continue
+            fact = layer.facts.get(measure.fact)
+            if fact is None:
+                continue
+            source = layer.data_sources.get(fact.source)
+            if source is None:
+                continue
+            resolved.append((fact.source, source.grain))
+        return resolved
+
+    metric_grains = (
+        (metric.name, resolved_grains(metric)) for metric in layer.metrics.values()
+    )
+    _metric_grain_issues(metric_grains, collector)
+
+
+def collect_model_issues(layer: SemanticLayer) -> tuple[CatalogIssue, ...]:
+    """Return every declaration-rule issue for a typed ``SemanticLayer``.
+
+    Mirrors the raw loader's validation on typed model values so both
+    programmatic layers (used by :func:`verify_static`) and loaded catalogs
+    report the same codes. Issues are sorted by ``(path, message)`` and the
+    ``code`` is intentionally excluded from the sort key to match the loader.
+    """
+    collector = _Collector()
+    _validate_layer_identity_model(layer, collector)
+    _validate_named_models("data_sources", layer.data_sources, DataSource, collector)
+    _validate_named_models("dimensions", layer.dimensions, Dimension, collector)
+    _validate_named_models("facts", layer.facts, Fact, collector)
+    _validate_named_models("measures", layer.measures, Measure, collector)
+    _validate_named_models("metrics", layer.metrics, Metric, collector)
+    _validate_named_models(
+        "relationships", layer.relationships, Relationship, collector
+    )
+    for source in layer.data_sources.values():
+        _validate_source_model(source, collector)
+    for dimension in layer.dimensions.values():
+        _validate_dimension_model(dimension, layer.data_sources, collector)
+    for fact in layer.facts.values():
+        _validate_fact_model(fact, layer, collector)
+    for measure in layer.measures.values():
+        _validate_measure_model(measure, layer.facts, collector)
+    for metric in layer.metrics.values():
+        _validate_metric_model(metric, layer, collector)
+    for relationship in layer.relationships.values():
+        _validate_relationship_model(relationship, layer.data_sources, collector)
+    _validate_fact_reachability_model(layer, collector)
+    _validate_metric_grains_model(layer, collector)
+    return tuple(
+        sorted(collector.issues, key=lambda issue: (issue.path, issue.message))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -930,7 +1397,6 @@ def load(path: str | Path) -> SemanticLayer:
     relationships = _collection(catalog, "relationships")
 
     known_sources = frozenset(sources)
-    known_facts = frozenset(facts)
     known_measures = frozenset(measures)
 
     fact_expressions: dict[str, Expression] = {}
@@ -943,7 +1409,7 @@ def load(path: str | Path) -> SemanticLayer:
 
     _validate_dimensions(dimensions, known_sources, source_schemas, collector)
     _validate_facts(facts, known_sources, source_schemas, collector, fact_expressions)
-    _validate_measures(measures, known_facts, collector)
+    _validate_measures(measures, facts, collector)
     _validate_metrics(metrics, known_measures, collector, metric_expressions)
     _validate_relationships(relationships, known_sources, source_schemas, collector)
     _validate_metric_grains(metrics, measures, facts, sources, collector)

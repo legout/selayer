@@ -1,5 +1,5 @@
 fields:
-  - {name: id, type: utf8, nullable: true}
+  - {name: id, type: utf8, nullable: false}
   - {name: name, type: utf8, nullable: true}
   - {name: category, type: utf8, nullable: true}
   - {name: subcategory, type: utf8, nullable: true}

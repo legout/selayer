@@ -6,6 +6,8 @@ from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from faker import Faker
 
 # Initialize Faker for generating realistic data
@@ -466,6 +468,35 @@ def generate_inventory_snapshots(products_df, num_days=90):
     return pd.DataFrame(snapshots)
 
 
+def _write_parquet(df, path, *, non_nullable=()):
+    """Write ``df`` to parquet, marking grain columns non-nullable.
+
+    Pandas writes every column as nullable and encodes strings as
+    ``large_string``. The catalog's grain rule requires grain columns to be
+    non-nullable, and the declared schemas use ``utf8`` (``string``), so the
+    table is written through an explicit Arrow schema: string columns become
+    ``string`` and the named ``non_nullable`` grain columns become
+    ``nullable=False``. Values are never coerced.
+    """
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    fields = []
+    for field in table.schema:
+        if field.type == pa.large_string():
+            fields.append(
+                pa.field(
+                    field.name,
+                    pa.string(),
+                    nullable=False if field.name in non_nullable else field.nullable,
+                )
+            )
+        elif field.name in non_nullable:
+            fields.append(pa.field(field.name, field.type, nullable=False))
+        else:
+            fields.append(field)
+    table = table.cast(pa.schema(fields))
+    pq.write_table(table, path)
+
+
 def main():
     print("Generating sample data...")
 
@@ -500,10 +531,16 @@ def main():
 
     # Save datasets
     print("Saving datasets...")
-    customers.to_parquet("data/customers.parquet", index=False)
-    products.to_parquet("data/products.parquet", index=False)
-    orders.to_parquet("data/orders.parquet", index=False)
-    order_items.to_parquet("data/order_items.parquet", index=False)
+    # Grain columns identify a row and must be non-nullable to satisfy the
+    # catalog grain rule; the other datasets are not part of the catalog.
+    _write_parquet(customers, "data/customers.parquet", non_nullable={"id"})
+    _write_parquet(products, "data/products.parquet", non_nullable={"id"})
+    _write_parquet(orders, "data/orders.parquet", non_nullable={"id"})
+    _write_parquet(
+        order_items,
+        "data/order_items.parquet",
+        non_nullable={"order_id", "product_id"},
+    )
     campaigns.to_parquet("data/campaigns.parquet", index=False)
     marketing_touches.to_parquet("data/marketing_touches.parquet", index=False)
     website_visits.to_parquet("data/website_visits.parquet", index=False)

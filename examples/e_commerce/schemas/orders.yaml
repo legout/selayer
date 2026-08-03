@@ -1,5 +1,5 @@
 fields:
-  - {name: id, type: utf8, nullable: true}
+  - {name: id, type: utf8, nullable: false}
   - {name: customer_id, type: utf8, nullable: true}
   - name: created_at
     type:
