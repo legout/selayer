@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from selayer import SemanticLayer
@@ -18,7 +21,7 @@ description: Semantic model for the example store
 data_sources:
   orders:
     type: parquet
-    location: data/orders.parquet
+    location: examples/e_commerce/data/orders.parquet
     grain: [id]
     schema:
       fields:
@@ -39,7 +42,7 @@ data_sources:
         - {name: total_amount, type: float64, nullable: true}
   order_items:
     type: parquet
-    location: data/order_items.parquet
+    location: examples/e_commerce/data/order_items.parquet
     grain: [order_id, product_id]
     schema:
       fields:
@@ -50,7 +53,7 @@ data_sources:
         - {name: total, type: float64, nullable: true}
   products:
     type: parquet
-    location: data/products.parquet
+    location: examples/e_commerce/data/products.parquet
     grain: [id]
     schema:
       fields:
@@ -114,6 +117,103 @@ relationships:
 """
 
 
+def _write_valid_query_sources(data_dir: Path) -> None:
+    data_dir.mkdir()
+    pq.write_table(
+        pa.Table.from_pydict(
+            {
+                "id": ["O1", "O2"],
+                "customer_id": ["C1", "C2"],
+                "created_at": [
+                    datetime(2025, 1, 1, tzinfo=UTC),
+                    datetime(2025, 1, 2, tzinfo=UTC),
+                ],
+                "status": ["completed", "processing"],
+                "payment_method": ["card", "cash"],
+                "shipping_cost": [10.0, 5.0],
+                "discount_code": [None, "SAVE"],
+                "discount_amount": [5.0, 0.0],
+                "reason": [None, None],
+                "is_first_purchase": [True, False],
+                "amount": [100.0, 50.0],
+                "total_amount": [105.0, 50.0],
+            },
+            schema=pa.schema(
+                [
+                    pa.field("id", pa.string(), nullable=False),
+                    pa.field("customer_id", pa.string()),
+                    pa.field("created_at", pa.timestamp("ns")),
+                    pa.field("status", pa.string()),
+                    pa.field("payment_method", pa.string()),
+                    pa.field("shipping_cost", pa.float64()),
+                    pa.field("discount_code", pa.string()),
+                    pa.field("discount_amount", pa.float64()),
+                    pa.field("reason", pa.string()),
+                    pa.field("is_first_purchase", pa.bool_()),
+                    pa.field("amount", pa.float64()),
+                    pa.field("total_amount", pa.float64()),
+                ]
+            ),
+        ),
+        data_dir / "orders.parquet",
+    )
+    pq.write_table(
+        pa.Table.from_pydict(
+            {
+                "order_id": ["O1", "O1", "O2"],
+                "product_id": ["P1", "P2", "P1"],
+                "quantity": [2, 1, 1],
+                "price": [50.0, 20.0, 50.0],
+                "total": [100.0, 20.0, 50.0],
+            },
+            schema=pa.schema(
+                [
+                    pa.field("order_id", pa.string(), nullable=False),
+                    pa.field("product_id", pa.string(), nullable=False),
+                    pa.field("quantity", pa.int64()),
+                    pa.field("price", pa.float64()),
+                    pa.field("total", pa.float64()),
+                ]
+            ),
+        ),
+        data_dir / "order_items.parquet",
+    )
+    pq.write_table(
+        pa.Table.from_pydict(
+            {
+                "id": ["P1", "P2"],
+                "name": ["Book", "Headphones"],
+                "category": ["Books", "Electronics"],
+                "subcategory": ["Fiction", "Audio"],
+                "base_price": [50.0, 20.0],
+                "cost": [30.0, 10.0],
+                "in_stock": [10, 20],
+                "supplier_id": [1, 2],
+                "created_at": [
+                    datetime(2025, 1, 1, tzinfo=UTC),
+                    datetime(2025, 1, 2, tzinfo=UTC),
+                ],
+                "is_active": [True, True],
+            },
+            schema=pa.schema(
+                [
+                    pa.field("id", pa.string(), nullable=False),
+                    pa.field("name", pa.string()),
+                    pa.field("category", pa.string()),
+                    pa.field("subcategory", pa.string()),
+                    pa.field("base_price", pa.float64()),
+                    pa.field("cost", pa.float64()),
+                    pa.field("in_stock", pa.int64()),
+                    pa.field("supplier_id", pa.int64()),
+                    pa.field("created_at", pa.timestamp("ns")),
+                    pa.field("is_active", pa.bool_()),
+                ]
+            ),
+        ),
+        data_dir / "products.parquet",
+    )
+
+
 @pytest.fixture
 def root() -> Path:
     """Return the repository root for integration fixtures."""
@@ -123,8 +223,16 @@ def root() -> Path:
 @pytest.fixture
 def valid_catalog_path(tmp_path: Path) -> Path:
     """A path to a fully valid schema-version-1 catalog file."""
+    data_dir = tmp_path / "data"
+    _write_valid_query_sources(data_dir)
+    catalog = VALID_CATALOG_YAML
+    for source_name in ("orders", "order_items", "products"):
+        catalog = catalog.replace(
+            f"location: examples/e_commerce/data/{source_name}.parquet",
+            f"location: {data_dir / f'{source_name}.parquet'}",
+        )
     path = tmp_path / "layer.yaml"
-    path.write_text(VALID_CATALOG_YAML, encoding="utf-8")
+    path.write_text(catalog, encoding="utf-8")
     return path
 
 
