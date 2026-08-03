@@ -538,7 +538,37 @@ def _heading_slug(heading: str) -> str:
 
 
 def _section_slugs(concept: OkfConcept) -> frozenset[str]:
-    return frozenset(_heading_slug(section.title) for section in concept.sections)
+    """GitHub-style anchors with duplicate-heading suffix disambiguation.
+
+    The first occurrence of a heading keeps the bare lowercase hyphenated
+    slug; subsequent duplicates gain an incrementing suffix (``foo``,
+    ``foo-1``, ``foo-2``). A suffix that would collide with a distinct heading
+    that already produced the same slug is skipped past, matching GitHub.
+    """
+    emitted: set[str] = set()
+    counts: dict[str, int] = {}
+    for section in concept.sections:
+        base = _heading_slug(section.title)
+        candidate = base
+        if base in emitted:
+            counts[base] = counts.get(base, 0) + 1
+            candidate = f"{base}-{counts[base]}"
+            while candidate in emitted:
+                counts[base] += 1
+                candidate = f"{base}-{counts[base]}"
+        emitted.add(candidate)
+    return frozenset(emitted)
+
+
+def _link_issue(
+    concept: OkfConcept, message: str, *, code: str = "okf.invalid"
+) -> OkfIssue:
+    return OkfIssue(
+        path=f"{concept.relative_path.as_posix()}.links",
+        message=message,
+        severity="warning",
+        code=code,
+    )
 
 
 def _resolve_link_concept(
@@ -568,7 +598,13 @@ def validate_links(
     root: Path,
     concepts: Mapping[str, OkfConcept],
 ) -> tuple[OkfIssue, ...]:
-    """Return warnings for internal links with absent targets or stale fragments."""
+    """Return warnings for internal links with absent targets or stale fragments.
+
+    Same-document fragment links (``#heading``) resolve against the source
+    concept's own section slugs; cross-document links resolve the file target
+    first, then the fragment against the resolved concept's slugs. External
+    URLs are out of scope and fragments are URL-decoded before comparison.
+    """
     resolved_root = root.resolve()
     concepts_by_path = {
         concept.relative_path: concept for concept in concepts.values()
@@ -576,12 +612,22 @@ def validate_links(
     issues: list[OkfIssue] = []
     for concept in concepts.values():
         source = root / Path(concept.relative_path.as_posix())
+        source_slugs = _section_slugs(concept)
         for link in concept.links:
             split = urlsplit(link)
-            if split.scheme or split.netloc or (not split.path and split.fragment):
+            if split.scheme or split.netloc:
                 continue
             path_text = unquote(split.path)
+            fragment = unquote(split.fragment) if split.fragment else ""
             if not path_text:
+                if fragment and fragment not in source_slugs:
+                    issues.append(
+                        _link_issue(
+                            concept,
+                            f"link '{link}' fragment heading not found",
+                            code="okf.link.missing_fragment",
+                        )
+                    )
                 continue
             target = (
                 root / path_text.lstrip("/")
@@ -589,15 +635,8 @@ def validate_links(
                 else source.parent / path_text
             ).resolve()
             if not target.is_relative_to(resolved_root) or not target.exists():
-                issues.append(
-                    OkfIssue(
-                        path=f"{concept.relative_path.as_posix()}.links",
-                        message=f"broken internal link '{link}'",
-                        severity="warning",
-                    )
-                )
+                issues.append(_link_issue(concept, f"broken internal link '{link}'"))
                 continue
-            fragment = unquote(split.fragment) if split.fragment else ""
             if not fragment:
                 continue
             target_concept = _resolve_link_concept(concept, link, concepts_by_path)
@@ -605,10 +644,9 @@ def validate_links(
                 target_concept
             ):
                 issues.append(
-                    OkfIssue(
-                        path=f"{concept.relative_path.as_posix()}.links",
-                        message=f"link '{link}' fragment heading not found",
-                        severity="warning",
+                    _link_issue(
+                        concept,
+                        f"link '{link}' fragment heading not found",
                         code="okf.link.missing_fragment",
                     )
                 )
@@ -719,16 +757,36 @@ def validate_generated_integrity(
 
     if has_generated:
         for concept_id, expected_concept in expected.items():
-            if concept_id not in concepts:
+            semantic_id = expected_concept.frontmatter["selayer_id"]
+            relative = expected_concept.relative_path.as_posix()
+            loaded = concepts.get(concept_id)
+            if loaded is None:
                 issues.append(
                     OkfIssue(
-                        path=expected_concept.relative_path.as_posix(),
-                        message=(
-                            f"missing generated concept "
-                            f"'{expected_concept.frontmatter['selayer_id']}'"
-                        ),
+                        path=relative,
+                        message=f"missing generated concept '{semantic_id}'",
                         severity=severity,
                         code="okf.generated.missing_concept",
+                    )
+                )
+                continue
+            # The document is present at the expected path; require it to
+            # retain the generator-owned metadata and the selayer_id binding
+            # rather than only checking that the file exists.
+            generated_metadata = loaded.frontmatter.get("generated")
+            binding = loaded.frontmatter.get("selayer_id")
+            if not isinstance(generated_metadata, Mapping) or not _is_nonempty_string(
+                binding
+            ):
+                issues.append(
+                    OkfIssue(
+                        path=relative,
+                        message=(
+                            f"generated concept '{semantic_id}' is missing "
+                            f"required generated metadata or selayer_id"
+                        ),
+                        severity=severity,
+                        code="okf.generated.missing_metadata",
                     )
                 )
 
@@ -804,7 +862,22 @@ def validate_generated_integrity(
             if isinstance(generated, Mapping)
             else None
         )
-        if isinstance(stored_fingerprint, str):
+        if (
+            not isinstance(stored_fingerprint, str)
+            or _SHA256_HEX.fullmatch(stored_fingerprint) is None
+        ):
+            issues.append(
+                OkfIssue(
+                    path=concept.relative_path.as_posix(),
+                    message=(
+                        f"generated concept '{semantic_id}' is missing a valid "
+                        f"generated.fingerprint"
+                    ),
+                    severity=severity,
+                    code="okf.generated.fingerprint_missing",
+                )
+            )
+        else:
             recomputed = generated_fingerprint(concept.frontmatter, loaded_definition)
             if stored_fingerprint.lower() != recomputed:
                 issues.append(

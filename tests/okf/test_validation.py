@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -927,3 +928,218 @@ def test_internal_link_fragment_heading_is_valid_when_present(
     assert "okf.link.missing_fragment" not in {
         issue.code for issue in bundle.diagnostics
     }
+
+
+def _deep_thaw(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _deep_thaw(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_deep_thaw(item) for item in value]
+    return value
+
+
+def _render_with_frontmatter(
+    concept: OkfConcept, frontmatter: dict[str, object]
+) -> OkfConcept:
+    return OkfConcept.create(
+        concept_id=concept.concept_id,
+        relative_path=concept.relative_path,
+        frontmatter=frontmatter,
+        preamble=concept.preamble,
+        sections=concept.sections,
+    )
+
+
+def _drop_frontmatter_key(root: Path, relative: str, key: str) -> None:
+    from selayer.okf.document import parse_concept, render_concept
+
+    path = root / relative
+    concept = parse_concept(path, root)
+    frontmatter = _deep_thaw(concept.frontmatter)
+    assert isinstance(frontmatter, dict)
+    frontmatter.pop(key, None)
+    path.write_text(
+        render_concept(_render_with_frontmatter(concept, frontmatter)),
+        encoding="utf-8",
+    )
+
+
+def _drop_generated_fingerprint(root: Path, relative: str) -> None:
+    from selayer.okf.document import parse_concept, render_concept
+
+    path = root / relative
+    concept = parse_concept(path, root)
+    frontmatter = _deep_thaw(concept.frontmatter)
+    assert isinstance(frontmatter, dict)
+    generated = frontmatter.get("generated")
+    assert isinstance(generated, dict)
+    generated.pop("fingerprint", None)
+    path.write_text(
+        render_concept(_render_with_frontmatter(concept, frontmatter)),
+        encoding="utf-8",
+    )
+
+
+# --- High 1: generated-concept completeness is not path-only ---
+
+
+def test_catalog_aware_load_rejects_generated_document_without_generated_metadata(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    _drop_frontmatter_key(root, "metrics/gross_margin.md", "generated")
+
+    with pytest.raises(OkfValidationError) as raised:
+        OkfBundle.load(root, layer=valid_layer)
+
+    codes = {issue.code for issue in raised.value.issues}
+    assert "okf.generated.missing_metadata" in codes
+    assert any(
+        issue.path == "metrics/gross_margin.md" for issue in raised.value.issues
+    )
+
+
+def test_catalog_aware_load_rejects_generated_document_without_selayer_id(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    _drop_frontmatter_key(root, "metrics/gross_margin.md", "selayer_id")
+
+    with pytest.raises(OkfValidationError) as raised:
+        OkfBundle.load(root, layer=valid_layer)
+
+    assert "okf.generated.missing_metadata" in {
+        issue.code for issue in raised.value.issues
+    }
+
+
+# --- High 2: a missing generated.fingerprint must fail under catalog-aware integrity ---
+
+
+def test_catalog_aware_load_rejects_generated_document_without_fingerprint(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    _drop_generated_fingerprint(root, "metrics/gross_margin.md")
+
+    with pytest.raises(OkfValidationError) as raised:
+        OkfBundle.load(root, layer=valid_layer)
+
+    codes = {issue.code for issue in raised.value.issues}
+    assert "okf.generated.fingerprint_missing" in codes
+    # A missing digest is distinct from a digest that no longer matches.
+    assert "okf.generated.fingerprint_mismatch" not in codes
+
+
+def test_lenient_catalog_aware_load_exposes_missing_fingerprint_as_a_warning(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    _drop_generated_fingerprint(root, "metrics/gross_margin.md")
+
+    bundle = OkfBundle.load(root, layer=valid_layer, strict=False)
+
+    codes = {issue.code for issue in bundle.diagnostics}
+    assert "okf.generated.fingerprint_missing" in codes
+    assert all(issue.severity == "warning" for issue in bundle.diagnostics)
+
+
+# --- Medium: same-document fragment links and GitHub duplicate-heading slugs ---
+
+
+def test_section_slugs_disambiguate_duplicate_headings() -> None:
+    from selayer.okf.model import OkfSection
+    from selayer.okf.validation import _heading_slug, _section_slugs
+
+    concept = OkfConcept.create(
+        concept_id="concept",
+        relative_path=PurePosixPath("concept.md"),
+        frontmatter={"type": "Metric"},
+        sections=(
+            OkfSection("Catalog Definition", "body"),
+            OkfSection("Examples", "first"),
+            OkfSection("Usage Guidance", "curated"),
+            OkfSection("Examples", "second"),
+        ),
+    )
+    assert _section_slugs(concept) == frozenset(
+        {"catalog-definition", "examples", "usage-guidance", "examples-1"}
+    )
+    assert _heading_slug("Catalog Definition") == "catalog-definition"
+
+
+def test_same_document_fragment_link_with_missing_heading_is_a_warning(
+    tmp_path: Path,
+) -> None:
+    _write_concept(
+        tmp_path,
+        "type: Metric",
+        "\n# Related\n\n[missing section](#nonexistent)\n",
+    )
+
+    bundle = OkfBundle.load(tmp_path)
+
+    fragment_issues = [
+        issue
+        for issue in bundle.diagnostics
+        if issue.code == "okf.link.missing_fragment"
+    ]
+    assert len(fragment_issues) == 1
+    assert fragment_issues[0].severity == "warning"
+    assert fragment_issues[0].path == "concept.md.links"
+    assert "nonexistent" in fragment_issues[0].message
+
+
+def test_same_document_fragment_link_with_present_heading_is_valid(
+    tmp_path: Path,
+) -> None:
+    _write_concept(
+        tmp_path,
+        "type: Metric",
+        "\n# Related\n\n[related](#related)\n",
+    )
+
+    assert "okf.link.missing_fragment" not in {
+        issue.code for issue in OkfBundle.load(tmp_path).diagnostics
+    }
+
+
+def test_same_document_fragment_link_decodes_percent_encoding(
+    tmp_path: Path,
+) -> None:
+    _write_concept(
+        tmp_path,
+        "type: Metric",
+        "\n# Foo Bar Baz\n\n[link](#foo-bar%2Dbaz)\n",
+    )
+
+    assert "okf.link.missing_fragment" not in {
+        issue.code for issue in OkfBundle.load(tmp_path).diagnostics
+    }
+
+
+def test_duplicate_heading_suffix_slugs_resolve_within_a_document(
+    tmp_path: Path,
+) -> None:
+    _write_concept(
+        tmp_path,
+        "type: Metric",
+        "\n# Catalog Definition\n\ntop\n\n# Examples\n\nfirst\n\n"
+        "# Usage Guidance\n\ncurated\n\n# Examples\n\nsecond\n\n"
+        "# Related\n\n[first](#examples) [second](#examples-1) "
+        "[missing](#examples-2)\n",
+    )
+
+    bundle = OkfBundle.load(tmp_path)
+
+    fragment_issues = [
+        issue
+        for issue in bundle.diagnostics
+        if issue.code == "okf.link.missing_fragment"
+    ]
+    assert len(fragment_issues) == 1
+    assert "examples-2" in fragment_issues[0].message
