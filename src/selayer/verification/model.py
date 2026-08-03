@@ -104,40 +104,70 @@ def _evidence_to_plain(value: object) -> object:
     return value
 
 
-def _validate_evidence_json_safe(value: object) -> None:
-    """Recursively enforce the runtime evidence contract.
+def _validate_evidence_json_safe(
+    value: object, *, _path: set[int] | None = None
+) -> None:
+    """Recursively enforce the runtime evidence contract and reject cycles.
 
-    Supported leaves are ``bool``/``int``/``float``/``str``/``None`` (finite
-    floats only); supported containers are mappings plus ``list``/``tuple``/
-    ``set``/``frozenset``. Mapping keys must be ``str``. Anything else —
+    Supported leaves are *exactly* the built-in ``bool``/``int``/``float``
+    (finite only)/``str``/``None``; scalar *subclasses* are rejected because
+    :func:`_freeze_evidence` returns them verbatim, which would retain a
+    mutable/aliasing instance inside the frozen evidence. Supported containers
+    are mappings plus ``list``/``tuple``/``set``/``frozenset``. Mapping keys
+    must be ``str``. Cyclic containers (a mapping/list/set that transitively
+    contains itself) are rejected with ``ValueError`` via the recursion
+    ``_path`` (the set of ancestor container ids on the current path) rather
+    than a global visited set, so a shared but non-cyclic sub-structure
+    referenced from two parents is still allowed. Anything else —
     ``bytes``/``bytearray``, arbitrary/aliasing objects, non-string mapping
     keys, non-finite floats — is rejected with ``ValueError`` before freezing,
     so the frozen evidence is always deeply immutable and its serialised form
-    is always strict-JSON-safe (``json.dumps(..., allow_nan=False)``).
+    is always strict-JSON-safe (``json.dumps(..., allow_nan=False)``). Cycle
+    detection here gates :func:`_freeze_evidence`, which only ever receives
+    already-validated (acyclic) input.
     """
-    # ``bool`` is a subclass of ``int``; this single check covers
-    # ``None``/``bool``/``int``/``str``.
-    if value is None or isinstance(value, (bool, int, str)):
+    # Exact built-in scalar leaves only: subclasses (e.g. a mutable ``str``
+    # subclass) are rejected because _freeze_evidence returns them verbatim,
+    # leaking a mutable alias into the frozen evidence. ``bool`` is a subclass
+    # of ``int`` but ``type(True) is bool`` (not ``int``), so each built-in is
+    # matched on its exact type. A ``float`` subclass is not narrowed here and
+    # falls through to the terminal rejection below.
+    if value is None:
         return
-    if isinstance(value, float):
+    if type(value) is bool or type(value) is int or type(value) is str:
+        return
+    if type(value) is float:
         if not math.isfinite(value):
             raise ValueError(f"evidence contains non-finite float: {value!r}")
         return
+    # Containers: mappings plus list/tuple/set/frozenset. Subclasses are
+    # allowed here because _freeze_evidence deep-copies them into fresh
+    # MappingProxyType/tuple, breaking any external alias. Cycles are detected
+    # on the current recursion path (ancestors) so a shared, non-cyclic
+    # sub-structure is still permitted.
     if isinstance(value, Mapping):
+        if _path is not None and id(value) in _path:
+            raise ValueError("evidence contains a cyclic reference")
+        path = {id(value)} if _path is None else _path | {id(value)}
         for key, item in value.items():
-            # Mapping keys must be plain ``str``: ``bool``/``int``/``float``/
-            # ``None`` keys are silently JSON-coerced (lossy, non-deterministic),
-            # and tuple/bytes/object keys are unserialisable or aliasing.
-            if not isinstance(key, str):
+            # Mapping keys must be exact ``str``: subclasses are retained
+            # verbatim by _freeze_evidence (alias leak), and
+            # ``bool``/``int``/``float``/``None`` keys are silently JSON-coerced
+            # (lossy, non-deterministic), while tuple/bytes/object keys are
+            # unserialisable or aliasing.
+            if type(key) is not str:
                 raise ValueError(
                     "evidence mapping keys must be strings, "
                     f"got {type(key).__name__}: {key!r}"
                 )
-            _validate_evidence_json_safe(item)
+            _validate_evidence_json_safe(item, _path=path)
         return
     if isinstance(value, (list, tuple, set, frozenset)):
+        if _path is not None and id(value) in _path:
+            raise ValueError("evidence contains a cyclic reference")
+        path = {id(value)} if _path is None else _path | {id(value)}
         for item in value:
-            _validate_evidence_json_safe(item)
+            _validate_evidence_json_safe(item, _path=path)
         return
     # Unsupported / aliasing values (``bytes``, ``bytearray``, arbitrary
     # objects, ...): they break strict ``json.dumps(allow_nan=False)`` or
@@ -211,6 +241,15 @@ class VerificationOutcome:
     diagnostics: tuple[VerificationDiagnostic, ...]
 
     def __post_init__(self) -> None:
+        # The top-level ``evidence`` must be a ``Mapping[str, EvidenceValue]``:
+        # without this guard a non-mapping (e.g. a ``list``) would be accepted
+        # by _validate_evidence_json_safe (lists are valid nested containers)
+        # and frozen into a ``tuple``, emitting the wrong public shape.
+        if not isinstance(self.evidence, Mapping):
+            raise ValueError(
+                "evidence must be a Mapping[str, EvidenceValue], "
+                f"got {type(self.evidence).__name__}: {self.evidence!r}"
+            )
         _validate_evidence_json_safe(self.evidence)
         object.__setattr__(self, "evidence", _freeze_evidence(self.evidence))
         object.__setattr__(self, "diagnostics", tuple(sorted(self.diagnostics)))

@@ -512,3 +512,159 @@ def test_full_valid_evidence_tree_is_strict_json_safe() -> None:
     report = VerificationReport(1, "shopfloor", "physical", True, (outcome,), ())
     encoded = json.dumps(report.to_dict(), allow_nan=False)
     assert json.loads(encoded)["outcomes"][0]["evidence"]["tags"] == ["a", "b"]
+
+
+# --- Finding 1: cyclic supported containers must not recurse into RecursionError ---
+
+
+def test_outcome_rejects_cyclic_mapping_evidence() -> None:
+    # A mapping that transitively contains itself must be rejected with a
+    # controlled ValueError instead of recursing into RecursionError.
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+    with pytest.raises(ValueError):
+        VerificationOutcome(
+            check_id="c",
+            status="passed",
+            scope="declaration",
+            path="p",
+            evidence=cyclic,  # type: ignore[arg-type]
+            diagnostics=(),
+        )
+
+
+def test_outcome_rejects_cyclic_list_evidence() -> None:
+    # A self-referential list nested under the top-level mapping must be
+    # rejected rather than recursing until RecursionError.
+    cyclic: list[object] = []
+    cyclic.append(cyclic)
+    with pytest.raises(ValueError):
+        VerificationOutcome(
+            check_id="c",
+            status="passed",
+            scope="declaration",
+            path="p",
+            evidence={"rows": cyclic},  # type: ignore[arg-type]
+            diagnostics=(),
+        )
+
+
+def test_outcome_rejects_mixed_cycle_evidence() -> None:
+    # A cycle that crosses container kinds (mapping -> list -> mapping) is
+    # detected on the recursion path and rejected.
+    outer: dict[str, object] = {"value": 1}
+    middle: list[object] = [outer]
+    outer["back"] = middle
+    with pytest.raises(ValueError):
+        VerificationOutcome(
+            check_id="c",
+            status="passed",
+            scope="declaration",
+            path="p",
+            evidence={"root": outer},  # type: ignore[arg-type]
+            diagnostics=(),
+        )
+
+
+def test_outcome_accepts_shared_non_cyclic_evidence_without_alias() -> None:
+    # A shared (non-cyclic) sub-structure referenced from two parents is
+    # permitted. The deep freeze breaks the external alias, so mutating the
+    # caller's original object afterwards cannot reach the frozen evidence.
+    shared = {"count": 1}
+    outcome = VerificationOutcome(
+        check_id="c",
+        status="passed",
+        scope="declaration",
+        path="p",
+        evidence={"a": shared, "b": shared},  # type: ignore[arg-type]
+        diagnostics=(),
+    )
+    shared["count"] = 99
+    assert outcome.evidence["a"] == MappingProxyType({"count": 1})
+    assert outcome.evidence["b"] == MappingProxyType({"count": 1})
+    # Each frozen branch is an independent copy (no surviving shared alias).
+    assert outcome.evidence["a"] is not outcome.evidence["b"]
+
+
+# --- Finding 2: top-level evidence must be a Mapping[str, EvidenceValue] ---
+
+
+def test_outcome_rejects_non_mapping_top_level_evidence() -> None:
+    # The declared type is Mapping[str, EvidenceValue]; a non-mapping
+    # top-level evidence (list/tuple/set or any scalar) must be rejected at
+    # construction rather than frozen into a wrong public shape.
+    for bad in ([1, 2], (1, 2), {1, 2}, "scalar", 3, 1.5, True, None):
+        with pytest.raises(ValueError):
+            VerificationOutcome(
+                check_id="c",
+                status="passed",
+                scope="declaration",
+                path="p",
+                evidence=bad,  # type: ignore[arg-type]
+                diagnostics=(),
+            )
+
+
+# --- Finding 3: scalar leaves must be exact built-ins (no mutable subclasses) ---
+
+
+class _StrSub(str):
+    pass
+
+
+class _IntSub(int):
+    pass
+
+
+class _FloatSub(float):
+    pass
+
+
+def test_outcome_rejects_scalar_subclass_evidence() -> None:
+    # str/int/float subclasses may carry mutable state and are retained
+    # verbatim by _freeze_evidence (a scalar alias leak), so they are rejected.
+    for bad in (_StrSub("x"), _IntSub(3), _FloatSub(1.5)):
+        with pytest.raises(ValueError):
+            VerificationOutcome(
+                check_id="c",
+                status="passed",
+                scope="declaration",
+                path="p",
+                evidence={"value": bad},  # type: ignore[arg-type]
+                diagnostics=(),
+            )
+
+
+def test_outcome_rejects_scalar_subclass_mapping_keys() -> None:
+    # A str-subclass key is retained verbatim by _freeze_evidence (alias
+    # leak), so only exact ``str`` keys are accepted.
+    with pytest.raises(ValueError):
+        VerificationOutcome(
+            check_id="c",
+            status="passed",
+            scope="declaration",
+            path="p",
+            evidence={_StrSub("k"): "v"},  # type: ignore[dict-item]
+            diagnostics=(),
+        )
+
+
+def test_outcome_accepts_exact_builtin_scalars_without_alias() -> None:
+    # Exact built-in scalar leaves are accepted and retained as exact types,
+    # so no mutable subclass instance can leak into the frozen evidence.
+    outcome = VerificationOutcome(
+        check_id="c",
+        status="passed",
+        scope="declaration",
+        path="p",
+        evidence={"b": True, "i": 3, "f": 1.5, "s": "x", "n": None},
+        diagnostics=(),
+    )
+    assert outcome.evidence["b"] is True
+    assert type(outcome.evidence["i"]) is int
+    assert outcome.evidence["i"] == 3
+    assert type(outcome.evidence["f"]) is float
+    assert outcome.evidence["f"] == 1.5
+    assert type(outcome.evidence["s"]) is str
+    assert outcome.evidence["s"] == "x"
+    assert outcome.evidence["n"] is None
