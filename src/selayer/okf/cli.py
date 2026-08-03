@@ -15,16 +15,21 @@ from .bundle import OkfBundle
 from .model import ContextResult, OkfIssue, SyncReport
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="selayer-okf",
-        description="Generate, sync, validate, and retrieve advisory OKF context.",
-    )
-    commands = parser.add_subparsers(dest="command", required=True)
-
+def _add_commands(
+    commands: argparse._SubParsersAction[argparse.ArgumentParser],
+    *,
+    include_build: bool,
+) -> None:
     generate = commands.add_parser("generate", help="create a new bundle")
     generate.add_argument("catalog", type=Path)
     generate.add_argument("destination", type=Path)
+
+    if include_build:
+        build = commands.add_parser("build", help="compose a fresh bundle")
+        build.add_argument("catalog", type=Path)
+        build.add_argument("destination", type=Path)
+        build.add_argument("--references", type=Path)
+        build.add_argument("--overlays", type=Path)
 
     sync = commands.add_parser("sync", help="sync catalog definitions into a bundle")
     sync.add_argument("catalog", type=Path)
@@ -42,7 +47,29 @@ def _parser() -> argparse.ArgumentParser:
     retrieve.add_argument("--no-linked", action="store_true")
     retrieve.add_argument("--max-chars", type=int, default=12_000)
     retrieve.add_argument("--max-depth", type=int, default=1)
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="selayer-okf",
+        description="Generate, sync, validate, and retrieve advisory OKF context.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    _add_commands(commands, include_build=False)
     return parser
+
+
+def add_okf_commands(
+    subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    """Attach the unified ``okf`` area (with ``build``) to a parent parser."""
+    okf = subparsers.add_parser("okf")
+    _add_commands(okf.add_subparsers(dest="command", required=True), include_build=True)
+
+
+def execute_okf(arguments: argparse.Namespace) -> int:
+    """Run an OKF command resolved by the unified parser via the shared handler."""
+    return _execute(arguments)
 
 
 def _issue(issue: OkfIssue) -> dict[str, str]:

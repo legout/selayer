@@ -28,7 +28,10 @@ import json
 import sys
 from collections.abc import Sequence
 
-from selayer.verification import validate_catalog
+from selayer.catalog import SemanticLayer
+from selayer.okf import OkfBundle
+from selayer.okf.cli import add_okf_commands, execute_okf
+from selayer.verification.static import validate_catalog
 
 #: Fixed, secret-safe failure emitted for the expected I/O error (a missing
 #: or unreadable catalog). The exception text is intentionally never
@@ -46,6 +49,7 @@ def _parser() -> argparse.ArgumentParser:
     catalog_commands = catalog.add_subparsers(dest="command", required=True)
     validate = catalog_commands.add_parser("validate")
     validate.add_argument("catalog")
+    add_okf_commands(commands)
     return parser
 
 
@@ -74,7 +78,43 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         print(json.dumps(result.report.to_dict(), sort_keys=True))
         return 0 if result.report.passed else 1
+    if args.area == "okf":
+        # The unified ``okf`` area reuses the legacy command handler for
+        # generate/sync/validate/retrieve so parity (stdout/stderr/exit) is
+        # exact, and handles the unified-only ``build`` command itself. Domain
+        # and I/O errors map to ``error: <message>`` on stderr with exit 1,
+        # mirroring ``selayer.okf.cli.main``.
+        try:
+            if args.command == "build":
+                return _run_okf_build(args)
+            return execute_okf(args)
+        except (OSError, LookupError, ValueError) as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
     raise AssertionError("unhandled command")
+
+
+def _run_okf_build(arguments: argparse.Namespace) -> int:
+    """Compose a fresh bundle via ``OkfBundle.build`` and report counts."""
+    layer = SemanticLayer.load(arguments.catalog)
+    bundle = OkfBundle.build(
+        layer,
+        arguments.destination,
+        references_dir=arguments.references,
+        overlays_dir=arguments.overlays,
+    )
+    print(
+        json.dumps(
+            {
+                "command": "build",
+                "concepts": len(bundle.concepts),
+                "destination": str(arguments.destination),
+                "diagnostics": len(bundle.diagnostics),
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
 
 
 def run() -> None:

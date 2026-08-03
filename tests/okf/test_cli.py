@@ -22,6 +22,19 @@ def test_console_script_points_to_dependency_free_cli(root: Path) -> None:
     assert '[project.scripts]\nselayer-okf = "selayer.okf.cli:run"' in project
 
 
+def test_legacy_parser_rejects_build_command(
+    tmp_path: Path,
+    valid_catalog_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The legacy ``selayer-okf`` keeps exactly its four commands; build is unified-only."""
+    output = tmp_path / "knowledge"
+    with pytest.raises(SystemExit) as raised:
+        main(["build", str(valid_catalog_path), str(output)])
+    assert raised.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
+
+
 def test_generate_creates_a_bundle_and_reports_json(
     tmp_path: Path,
     valid_catalog_path: Path,
