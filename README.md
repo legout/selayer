@@ -169,8 +169,11 @@ grain-aware planner (compatibility) or the physical data state (audit). Both
 produce one sorted JSON object on standard output: a stable verification
 report keyed by `schema_version`, `subject`, `check_kind`, `complete`,
 `passed`, `outcomes`, and `diagnostics`. A passing report exits `0`; any
-failure, an incomplete audit, or a planner rejection exits `1`; invalid
-command-line usage exits `2`.
+data-quality failure, an incomplete audit, an invalid catalog, or an invalid
+(unknown) metric/dimension selector exits `1`; invalid command-line usage
+exits `2`. Planner-rejected metric/dimension combinations surfaced by
+`compatibility` are completed advisory outcomes — they keep `passed` `true`
+and the command exits `0` — not failures.
 
 The unified `selayer` console script exposes three catalog subcommands:
 

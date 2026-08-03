@@ -171,9 +171,12 @@ class _FailingRegisterConnection:
 def _events_schema() -> TableSchema:
     return TableSchema(
         (
-            FieldSchema("id", ScalarType("int64"), True),
+            # The grain (``id``) must be non-nullable: the static boundary
+            # rejects a nullable grain column, and a non-nullable declaration
+            # must be satisfied by a non-nullable physical field.
+            FieldSchema("id", ScalarType("int64"), False),
             FieldSchema("category", ScalarType("utf8"), True),
-            FieldSchema("value", ScalarType("int64"), True),
+            FieldSchema("value", ScalarType("float64"), True),
         )
     )
 
@@ -195,11 +198,17 @@ def _iceberg_layer() -> SemanticLayer:
     }
     dimensions = {
         "category": Dimension("category", "events", "category", "string"),
-        "value": Dimension("value", "events", "value", "integer"),
+        "value": Dimension("value", "events", "value", "float"),
     }
     facts = {
+        # ``data_type`` is a supported semantic type, not the scalar name
+        # (``int64``).  The ``value`` column is a float64 measure, so ``float``
+        # both satisfies the static compatibility check and is numeric, keeping
+        # the sum measure valid.  A float dimension also lets the
+        # nonfinite-float residual test apply NaN/infinity filters here: the
+        # planner rejects a float filter on an ``integer`` dimension.
         "event_value": Fact.from_expression(
-            "event_value", "events", "events.value", "int64"
+            "event_value", "events", "events.value", "float"
         ),
     }
     measures = {
@@ -245,14 +254,17 @@ def _create_iceberg_table(tmp_path: Path) -> object:
     catalog.create_namespace("default")
     schema = pa.schema(
         [
-            ("id", pa.int64()),
+            pa.field("id", pa.int64(), nullable=False),
             ("category", pa.string()),
-            ("value", pa.int64()),
+            ("value", pa.float64()),
         ]
     )
     table: object = catalog.create_table(("default", "events"), schema=schema)
     table.append(  # type: ignore[attr-defined]
-        pa.table({"id": [1, 2, 3], "category": ["A", "A", "B"], "value": [4, 6, 5]})
+        pa.table(
+            {"id": [1, 2, 3], "category": ["A", "A", "B"], "value": [4, 6, 5]},
+            schema=schema,
+        )
     )
     return table
 
@@ -292,7 +304,10 @@ def iceberg_table_fixture(
 
     def append_snapshot() -> None:
         table.append(  # type: ignore[attr-defined]
-            pa.table({"id": [4], "category": ["A"], "value": [20]})
+            pa.table(
+                {"id": [4], "category": ["A"], "value": [20]},
+                schema=table.schema().as_arrow(),  # type: ignore[attr-defined]
+            )
         )
 
     return _IcebergFixture(
@@ -301,6 +316,35 @@ def iceberg_table_fixture(
         append_snapshot=append_snapshot,
         recording=recording,
     )
+
+
+# ---------------------------------------------------------------------------
+# Fixture model integrity
+# ---------------------------------------------------------------------------
+
+
+def test_fixture_layer_passes_the_required_static_boundary() -> None:
+    """The fixture's direct SemanticLayer model passes the required static check.
+
+    The Iceberg fixture builds a :class:`SemanticLayer` programmatically rather
+    than through the validating loader, so an invalid declaration is only caught
+    by the static boundary that :class:`QueryEngine` runs in ``__init__`` (the
+    same ``StaticCheck`` the loader applies). The grain must be non-nullable and
+    the fact ``data_type`` must be a supported semantic type (e.g. ``float``, not
+    the scalar name ``int64``); otherwise every connector test fails at static
+    validation before the adapter is ever exercised. Assert the declaration
+    passes so the 12 connector tests drive the adapter, not the validator.
+    """
+
+    from selayer.verification import StaticCheck, verify
+
+    report = verify(_iceberg_layer(), StaticCheck())
+    errors = [
+        f"{item.path}: {item.message}"
+        for item in report.diagnostics
+        if item.severity == "error"
+    ]
+    assert report.passed, errors
 
 
 # ---------------------------------------------------------------------------
@@ -499,7 +543,7 @@ def test_iceberg_range_filter_translation(
 ) -> None:
     """An inclusive range filter on a numeric dimension is pushed down and matches.
 
-    The ``value`` integer dimension receives an inclusive range.  PyIceberg gets
+    The ``value`` float dimension receives an inclusive range.  PyIceberg gets
     ``value >= 5 AND value <= 10`` so it scans only the matching rows, while the
     compiled DuckDB query still evaluates ``value BETWEEN ? AND ?`` as a
     residual.  The recorded projection carries the grain (``id``), the dimension
@@ -593,8 +637,8 @@ def test_iceberg_schema_mismatch_preserves_snapshot(
 ) -> None:
     """A schema mismatch during reload preserves the old registration.
 
-    We swap the registry's declared schema for a drifted one (value as float64
-    instead of int64), then reload.  The old handle must remain queryable with
+    We swap the registry's declared schema for a drifted one (value as int64
+    instead of float64), then reload.  The old handle must remain queryable with
     its snapshot and generation unchanged.
     """
 
@@ -615,7 +659,7 @@ def test_iceberg_schema_mismatch_preserves_snapshot(
             (
                 FieldSchema("id", ScalarType("int64"), True),
                 FieldSchema("category", ScalarType("utf8"), True),
-                FieldSchema("value", ScalarType("float64"), True),
+                FieldSchema("value", ScalarType("int64"), True),
             )
         )
         engine._registry._sources = MappingProxyType(  # type: ignore[attr-defined]
