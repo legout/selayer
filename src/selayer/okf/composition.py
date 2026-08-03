@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import os
 import posixpath
+import secrets
+import shutil
 import stat as stat_module
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import unquote
 
 import yaml
@@ -33,7 +35,9 @@ from .document import (
     _FRONTMATTER,
     _LINK,
     OkfDocumentError,
+    parse_concept,
     parse_concept_text,
+    render_concept,
     split_sections,
 )
 from .generation import concept_path, display_title
@@ -51,7 +55,11 @@ from .validation import (
     _is_nonempty_string,
     _safe_urlsplit,
     validate_concept,
+    validate_links,
 )
+
+if TYPE_CHECKING:
+    from .bundle import OkfBundle
 
 _ALLOWED_OVERLAY_FIELDS = frozenset({"selayer_id", "sources", "stale_after"})
 _ALLOWED_OVERLAY_SECTIONS = (
@@ -984,4 +992,199 @@ def _report_duplicate_ids(
                 )
 
 
-__all__ = ["OkfOverlay", "load_overlays", "load_references"]
+# ---------------------------------------------------------------------------
+# Fresh atomic composition (Task 8)
+# ---------------------------------------------------------------------------
+
+# Authored overlay frontmatter that a fresh build merges into the generated
+# concept. ``selayer_id`` is generator-owned (it already matches the binding),
+# so only advisory provenance fields are merged.
+_OVERLAY_MERGE_FRONTMATTER = ("sources", "stale_after")
+
+
+def _sibling_staging_path(destination: Path) -> Path:
+    """Return a unique sibling staging directory for ``destination``.
+
+    The staging directory sits next to ``destination`` in its parent so the
+    final publish is a single same-filesystem ``rename`` (atomic on POSIX).
+    A random suffix avoids collisions with a leaked staging directory from a
+    crashed earlier build or a concurrent build of the same destination.
+    """
+    return (
+        destination.parent
+        / f".{destination.name}.okf-build-{secrets.token_hex(8)}"
+    )
+
+
+def _preflight_empty_destination(destination: Path) -> None:
+    """Reject a populated or symlink-bearing destination before any staging.
+
+    A destination that is a file, contains any file, or contains a symlink is
+    rejected so a fresh build never silently clobbers authored content (an
+    existing bundle is updated via ``sync``). A missing or empty directory is
+    accepted. The symlink preflight reuses the bundle mutation guard so the
+    destination tree is never resolved through a symlink.
+    """
+    from .bundle import _preflight_mutation_path
+
+    _preflight_mutation_path(destination)
+    if destination.is_file():
+        raise FileExistsError(f"destination '{destination}' is a file")
+    if destination.exists() and any(
+        candidate.is_file() for candidate in destination.rglob("*")
+    ):
+        raise FileExistsError(
+            f"destination '{destination}' contains files; use sync"
+        )
+
+
+def _write_references(
+    staging: Path, references: Mapping[str, OkfConcept]
+) -> None:
+    """Render authored Reference concepts into the staging tree."""
+    for relative, concept in references.items():
+        path = staging / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(render_concept(concept), encoding="utf-8", newline="\n")
+
+
+def _merge_overlay(generated: OkfConcept, overlay: OkfOverlay) -> OkfConcept:
+    """Merge a curated overlay into a generated concept without owning it.
+
+    Only the allowed curated frontmatter (``sources``, ``stale_after``) and the
+    allowed curated sections are merged; the generated ``Catalog Definition``
+    section and the controlled frontmatter (including ``generated`` and its
+    fingerprint) are carried through untouched. The fingerprint is *not*
+    recomputed because the curated fields are outside its controlled input.
+    The result is a fresh immutable :class:`OkfConcept`.
+    """
+    merged_frontmatter: dict[str, Any] = dict(generated.frontmatter)
+    for key in _OVERLAY_MERGE_FRONTMATTER:
+        if key in overlay.frontmatter:
+            merged_frontmatter[key] = overlay.frontmatter[key]
+    overlay_sections = {section.title: section for section in overlay.sections}
+    merged_sections: list[OkfSection] = [
+        overlay_sections.get(section.title, section)
+        for section in generated.sections
+    ]
+    links = tuple(
+        link
+        for section in merged_sections
+        for link in _LINK.findall(section.content)
+    )
+    return OkfConcept.create(
+        concept_id=generated.concept_id,
+        relative_path=generated.relative_path,
+        frontmatter=merged_frontmatter,
+        sections=tuple(merged_sections),
+        links=links,
+    )
+
+
+def _apply_overlays(staging: Path, overlays: tuple[OkfOverlay, ...]) -> None:
+    """Merge every overlay into its generated concept on disk in staging."""
+    for overlay in overlays:
+        target = staging / overlay.relative_path
+        generated_text = target.read_text(encoding="utf-8")
+        generated = parse_concept_text(generated_text, target, staging)
+        merged = _merge_overlay(generated, overlay)
+        target.write_text(render_concept(merged), encoding="utf-8", newline="\n")
+
+
+def _load_composed_concepts(staging: Path) -> dict[str, OkfConcept]:
+    """Parse every composed concept (generated, references, merged overlays)."""
+    concepts: dict[str, OkfConcept] = {}
+    for path in sorted(staging.rglob("*.md")):
+        if path.name == "index.md":
+            continue
+        if path == staging / "log.md":
+            continue
+        concept = parse_concept(path, staging)
+        concepts[concept.concept_id] = concept
+    return concepts
+
+
+def _validate_composed_links(
+    staging: Path,
+    generated: object,
+    references: Mapping[str, OkfConcept],
+    overlays: tuple[OkfOverlay, ...],
+) -> None:
+    """Validate every combined link now that all concept sets coexist.
+
+    The overlay loader defers cross-input link existence to composition: it
+    rejects only self-links, duplicates, and lexically escaping links. Here the
+    generated concepts, References, and merged overlays all exist on disk
+    together, so a deferred link that points at a missing target is caught and
+    fails the build. ``generated``/``references``/``overlays`` document the
+    composed inputs; the staging tree is the canonical source of truth.
+    """
+    del generated, references, overlays
+    concepts = _load_composed_concepts(staging)
+    issues = validate_links(staging, concepts)
+    if issues:
+        raise OkfValidationError(issues)
+
+
+def _publish_staging(staging: Path, destination: Path) -> None:
+    """Atomically publish the staging tree over the destination.
+
+    ``destination`` was preflighted as absent or empty, so a single
+    same-filesystem ``rename`` swaps the staging tree into place (on POSIX a
+    rename over an empty directory replaces it). The destination is not
+    modified before the rename, so a failed publish leaves it unchanged.
+    """
+    staging.replace(destination)
+
+
+def build_bundle(
+    layer: SemanticLayer,
+    output_dir: str | Path,
+    *,
+    references_dir: str | Path | None,
+    overlays_dir: str | Path | None,
+    include_descriptive: bool,
+) -> OkfBundle:
+    """Compose a fresh OKF bundle from generated, Reference, and overlay inputs.
+
+    The bundle is built entirely in a sibling staging directory and published
+    with a single atomic rename, so a destination is either untouched or fully
+    replaced. Authored inputs (References and overlays) are loaded and
+    validated before any staging directory is created. Overlays merge only
+    curated fields/sections into the generated concepts; generated ownership
+    (the ``Catalog Definition`` and the controlled frontmatter, including the
+    fingerprint) is preserved. Any failure -- a domain validation error, an
+    I/O error, or an interrupt -- cleans up the staging tree in a ``finally``
+    block without suppressing or wrapping the original exception.
+    """
+    from .bundle import OkfBundle
+
+    destination = Path(output_dir)
+    _preflight_empty_destination(destination)
+    references = load_references(Path(references_dir)) if references_dir else {}
+    overlays = load_overlays(Path(overlays_dir), layer) if overlays_dir else ()
+    staging = _sibling_staging_path(destination)
+    published = False
+    try:
+        generated = OkfBundle.from_layer(
+            layer, include_descriptive=include_descriptive
+        )
+        generated.write(staging)
+        _write_references(staging, references)
+        _apply_overlays(staging, overlays)
+        _validate_composed_links(staging, generated, references, overlays)
+        OkfBundle.load(staging, layer=layer, strict=True)
+        _publish_staging(staging, destination)
+        published = True
+        return OkfBundle.load(destination, layer=layer, strict=True)
+    finally:
+        if not published:
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+__all__ = [
+    "OkfOverlay",
+    "build_bundle",
+    "load_overlays",
+    "load_references",
+]

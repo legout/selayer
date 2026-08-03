@@ -11,10 +11,10 @@ from typing import cast
 import pytest
 
 from selayer.catalog import SemanticLayer
-from selayer.okf import composition
+from selayer.okf import OkfBundle, composition
 from selayer.okf.composition import load_overlays, load_references
 from selayer.okf.document import OkfDocumentError
-from selayer.okf.model import OkfIssue, OkfValidationError
+from selayer.okf.model import OkfConcept, OkfIssue, OkfSection, OkfValidationError
 
 REFERENCE = (
     "---\ntype: Reference\ntitle: Guide\nstatus: stable\n---\n\n"
@@ -1358,3 +1358,258 @@ def test_validate_bound_overlay_adapts_cyclic_sources_error(
     assert issues, "expected a controlled issue for cyclic sources"
     messages = " ".join(issue.message for issue in issues)
     assert "cyclic or malformed" in messages
+
+
+# ---------------------------------------------------------------------------
+# Task 8: fresh atomic composition via ``OkfBundle.build``.
+# ---------------------------------------------------------------------------
+
+
+def _authored_inputs(tmp_path: Path) -> tuple[Path, Path]:
+    """Write the valid Task 7 reference and overlay under ``tmp_path``."""
+    references = tmp_path / "references"
+    references.mkdir()
+    (references / "guide.md").write_text(REFERENCE, encoding="utf-8")
+    overlays = tmp_path / "overlays" / "metrics"
+    overlays.mkdir(parents=True)
+    (overlays / "gross_margin.md").write_text(OVERLAY, encoding="utf-8")
+    return references, tmp_path / "overlays"
+
+
+def _section(concept: OkfConcept, title: str) -> OkfSection:
+    return next(item for item in concept.sections if item.title == title)
+
+
+def _no_staging_remnants(parent: Path, dest_name: str = "knowledge") -> bool:
+    return not any(
+        entry.name.startswith(f".{dest_name}.okf-build")
+        for entry in parent.iterdir()
+    )
+
+
+def test_build_composes_reference_and_overlay(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    references, overlays = _authored_inputs(tmp_path)
+    output = tmp_path / "knowledge"
+
+    bundle = OkfBundle.build(
+        valid_layer,
+        output,
+        references_dir=references,
+        overlays_dir=overlays,
+    )
+
+    metric = bundle.concepts["metrics/gross_margin"]
+    assert _section(metric, "Usage Guidance").content == "Use at item grain."
+    assert _section(metric, "Caveats").content == "Do not mix grains."
+    # Generated ownership is preserved: the overlay merge leaves the generated
+    # Catalog Definition byte-for-byte equal to the fresh projection.
+    generated_metric = OkfBundle.from_layer(
+        valid_layer, include_descriptive=False
+    ).concepts["metrics/gross_margin"]
+    assert _section(metric, "Catalog Definition").content == _section(
+        generated_metric, "Catalog Definition"
+    ).content
+    assert (
+        metric.frontmatter["generated"]["fingerprint"]
+        == generated_metric.frontmatter["generated"]["fingerprint"]
+    )
+    assert "references/guide" in bundle.concepts
+    assert bundle.root == output
+    assert bundle.layer is valid_layer
+    # The published bundle reloads cleanly with no diagnostics at all.
+    assert OkfBundle.load(output, layer=valid_layer).diagnostics == ()
+    assert _no_staging_remnants(tmp_path)
+
+
+def test_build_without_authored_inputs_writes_a_clean_generated_bundle(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    output = tmp_path / "knowledge"
+
+    bundle = OkfBundle.build(valid_layer, output)
+
+    assert "metrics/gross_margin" in bundle.concepts
+    assert OkfBundle.load(output, layer=valid_layer).diagnostics == ()
+    assert _no_staging_remnants(tmp_path)
+
+
+def test_build_rejects_populated_destination_before_staging(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    output = tmp_path / "knowledge"
+    output.mkdir()
+    (output / "stale.md").write_text("pre-existing", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        OkfBundle.build(valid_layer, output)
+
+    # The pre-existing file is untouched and no staging directory is created.
+    assert (output / "stale.md").read_text() == "pre-existing"
+    assert _no_staging_remnants(tmp_path)
+
+
+def test_build_accepts_existing_empty_destination(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    references, overlays = _authored_inputs(tmp_path)
+    output = tmp_path / "knowledge"
+    output.mkdir()  # an existing but empty destination is accepted
+
+    bundle = OkfBundle.build(
+        valid_layer, output, references_dir=references, overlays_dir=overlays
+    )
+
+    assert bundle.root == output
+    assert (output / "metrics" / "gross_margin.md").is_file()
+    assert (output / "references" / "guide.md").is_file()
+    assert _no_staging_remnants(tmp_path)
+
+
+def test_build_overlay_failure_leaves_destination_untouched(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    references = tmp_path / "references"
+    references.mkdir()
+    (references / "guide.md").write_text(REFERENCE, encoding="utf-8")
+    overlays = tmp_path / "overlays" / "metrics"
+    overlays.mkdir(parents=True)
+    # An overlay binding an unknown selayer_id fails in the loader before any
+    # staging directory is created.
+    (overlays / "ghost.md").write_text(
+        "---\nselayer_id: metric.ghost\n---\n\n# Usage Guidance\nx\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "knowledge"
+
+    with pytest.raises(OkfValidationError):
+        OkfBundle.build(
+            valid_layer,
+            output,
+            references_dir=references,
+            overlays_dir=tmp_path / "overlays",
+        )
+
+    assert not output.exists()
+    assert _no_staging_remnants(tmp_path)
+
+
+def test_build_strict_load_failure_removes_staging(
+    tmp_path: Path,
+    valid_layer: SemanticLayer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    references, overlays = _authored_inputs(tmp_path)
+    output = tmp_path / "knowledge"
+    original_load = OkfBundle.load
+
+    def failing_load(
+        path: str | Path, *, layer: SemanticLayer | None = None, strict: bool = True
+    ) -> OkfBundle:
+        # Fail only the staging strict load (a sibling staging directory).
+        if Path(path).name.startswith("."):
+            raise OkfValidationError(
+                (OkfIssue("metrics/gross_margin.md", "injected integrity failure"),)
+            )
+        return original_load(path, layer=layer, strict=strict)
+
+    monkeypatch.setattr(OkfBundle, "load", failing_load)
+
+    with pytest.raises(OkfValidationError):
+        OkfBundle.build(
+            valid_layer, output, references_dir=references, overlays_dir=overlays
+        )
+
+    assert not output.exists()
+    assert _no_staging_remnants(tmp_path)
+
+
+def test_build_publish_failure_leaves_absent_destination_unchanged(
+    tmp_path: Path,
+    valid_layer: SemanticLayer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    references, overlays = _authored_inputs(tmp_path)
+    output = tmp_path / "knowledge"
+    original_replace = Path.replace
+
+    def fail_publish(self: Path, target: Path) -> Path:
+        if Path(target) == output:
+            raise OSError("injected publish failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_publish)
+
+    with pytest.raises(OSError, match="injected publish failure"):
+        OkfBundle.build(
+            valid_layer, output, references_dir=references, overlays_dir=overlays
+        )
+
+    # The destination was absent before the build and stays absent.
+    assert not output.exists()
+    assert _no_staging_remnants(tmp_path)
+
+
+def test_build_publish_failure_leaves_empty_destination_unchanged(
+    tmp_path: Path,
+    valid_layer: SemanticLayer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    references, overlays = _authored_inputs(tmp_path)
+    output = tmp_path / "knowledge"
+    output.mkdir()  # an existing empty destination
+    original_replace = Path.replace
+
+    def fail_publish(self: Path, target: Path) -> Path:
+        if Path(target) == output:
+            raise OSError("injected publish failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_publish)
+
+    with pytest.raises(OSError, match="injected publish failure"):
+        OkfBundle.build(
+            valid_layer, output, references_dir=references, overlays_dir=overlays
+        )
+
+    # The empty destination is preserved exactly.
+    assert output.is_dir()
+    assert list(output.iterdir()) == []
+    assert _no_staging_remnants(tmp_path)
+
+
+def test_build_leaves_no_staging_directory_on_success(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    references, overlays = _authored_inputs(tmp_path)
+    output = tmp_path / "knowledge"
+
+    OkfBundle.build(
+        valid_layer, output, references_dir=references, overlays_dir=overlays
+    )
+
+    assert output.is_dir()
+    assert _no_staging_remnants(tmp_path)
+
+
+def test_build_rejects_overlay_link_to_missing_concept(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    overlays = tmp_path / "overlays" / "metrics"
+    overlays.mkdir(parents=True)
+    # The loader accepts this path (it checks structure, not existence) and
+    # defers cross-input link existence to composition, where the combined
+    # link validation must reject the dangling reference.
+    (overlays / "gross_margin.md").write_text(
+        "---\nselayer_id: metric.gross_margin\n---\n\n"
+        "# Related Concepts\n- [ghost](../facts/ghost.md)\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "knowledge"
+
+    with pytest.raises(OkfValidationError):
+        OkfBundle.build(valid_layer, output, overlays_dir=tmp_path / "overlays")
+
+    assert not output.exists()
+    assert _no_staging_remnants(tmp_path)

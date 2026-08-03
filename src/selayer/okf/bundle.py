@@ -307,6 +307,33 @@ class OkfBundle:
         bundle.write(destination)
         return cls.load(destination, layer=layer)
 
+    @classmethod
+    def build(
+        cls,
+        layer: SemanticLayer,
+        output_dir: str | Path,
+        *,
+        references_dir: str | Path | None = None,
+        overlays_dir: str | Path | None = None,
+        include_descriptive: bool = False,
+    ) -> OkfBundle:
+        """Compose a fresh bundle from generated concepts plus authored inputs.
+
+        Authored Reference documents (``references_dir``) and concept overlays
+        (``overlays_dir``) are loaded, validated, and merged into the generated
+        projection in a sibling staging directory, then published with a single
+        atomic rename. See :func:`selayer.okf.composition.build_bundle`.
+        """
+        from .composition import build_bundle
+
+        return build_bundle(
+            layer,
+            output_dir,
+            references_dir=references_dir,
+            overlays_dir=overlays_dir,
+            include_descriptive=include_descriptive,
+        )
+
     def write(self, path: str | Path) -> None:
         from .generation import index_documents
 
