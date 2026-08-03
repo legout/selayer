@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+from selayer import cli
 from selayer.cli import main
 
 
@@ -47,3 +50,34 @@ def test_missing_catalog_emits_secret_safe_json_failure(
     assert "Traceback" not in captured.err
     # A report is never produced for an unreadable catalog.
     assert captured.out == ""
+
+
+@pytest.mark.parametrize(
+    "exception",
+    [
+        KeyError("programmer mistake"),
+        IndexError("programmer mistake"),
+        ValueError("programmer mistake"),
+        TypeError("programmer mistake"),
+    ],
+)
+def test_unexpected_programmer_errors_propagate(
+    monkeypatch: pytest.MonkeyPatch,
+    exception: Exception,
+) -> None:
+    """Programmer errors escaping validate_catalog must not be masked.
+
+    The catch clause must be narrow (``OSError`` only): ``validate_catalog``
+    already adapts the only legitimate ``ValueError`` subclass
+    (``CatalogValidationError``) into a failed report, so any ``ValueError`` or
+    ``LookupError`` (``KeyError``/``IndexError``) — and likewise ``TypeError`` —
+    reaching the CLI is a genuine bug that must propagate rather than be turned
+    into the secret-safe failure payload.
+    """
+
+    def boom(_catalog: object) -> None:
+        raise exception
+
+    monkeypatch.setattr(cli, "validate_catalog", boom)
+    with pytest.raises(type(exception)):
+        main(["catalog", "validate", "irrelevant.yaml"])

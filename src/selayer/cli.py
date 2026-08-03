@@ -7,11 +7,18 @@ only parses arguments, renders the report, and maps the boolean ``passed``
 flag onto an exit code.
 
 Expected failures are handled with a fixed, secret-safe JSON payload on
-stderr: only expected I/O and domain errors are caught, and their text is
+stderr: only the I/O error that can actually escape is caught, and its text is
 never interpolated, because it may echo secret-bearing source bytes (file
-paths, credentials, authenticated locations). Programmer mistakes such as
-``AssertionError`` (the unreachable "unhandled command" branch) and
-``TypeError`` propagate unchanged so they are not silently swallowed.
+paths, credentials, authenticated locations). Catalog-domain errors
+(``CatalogValidationError``) are already adapted into a *failed report* by
+:func:`validate_catalog`, so they surface as normal ``passed: false`` JSON on
+stdout rather than as exceptions here. The only exception that can escape
+``validate_catalog`` is ``OSError`` from ``Path.read_text`` (a missing or
+unreadable catalog); that alone is caught. Programmer mistakes such as
+``AssertionError`` (the unreachable "unhandled command" branch), ``TypeError``,
+and unexpected ``LookupError``/``ValueError`` (e.g. ``KeyError``/``IndexError``
+or a non-domain ``ValueError``) propagate unchanged so they are not silently
+swallowed.
 """
 
 from __future__ import annotations
@@ -23,10 +30,12 @@ from collections.abc import Sequence
 
 from selayer.verification import validate_catalog
 
-#: Fixed, secret-safe failure emitted for expected I/O and domain errors. The
-#: exception text is intentionally never interpolated: it can carry the
-#: catalog path or echoed source bytes that the loader has already scrubbed
-#: out of diagnostics, so echoing it here would re-leak those secrets.
+#: Fixed, secret-safe failure emitted for the expected I/O error (a missing
+#: or unreadable catalog). The exception text is intentionally never
+#: interpolated: it can carry the catalog path or echoed source bytes that the
+#: loader has already scrubbed out of diagnostics, so echoing it here would
+#: re-leak those secrets. Catalog-domain errors never reach this path: they
+#: are adapted into a failed report by ``validate_catalog``.
 _FAILURE_MESSAGE = "could not read or validate catalog"
 
 
@@ -46,14 +55,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.area == "catalog" and args.command == "validate":
         try:
             result = validate_catalog(args.catalog)
-        except (OSError, LookupError, ValueError):
-            # Expected I/O and domain errors only: a missing or unreadable
-            # catalog (OSError from ``read_text``), a failed key lookup
-            # (LookupError), or a domain error not already wrapped into a
-            # failed report by ``validate_catalog`` (ValueError, e.g.
-            # ``CatalogValidationError``). Programmer mistakes such as
-            # ``TypeError`` are deliberately not caught. Never echo the
-            # exception text: it may carry secrets.
+        except OSError:
+            # The only expected exception that can escape ``validate_catalog``:
+            # a missing or unreadable catalog (``OSError``/``FileNotFoundError``
+            # from ``Path.read_text``). Catalog-domain errors
+            # (``CatalogValidationError``) are already wrapped into a *failed
+            # report* by ``validate_catalog``, so they never reach this
+            # handler. Do NOT broaden this to ``LookupError``/``ValueError``:
+            # ``validate_catalog`` has already adapted the only legitimate
+            # ``ValueError`` subclass, so any ``ValueError`` or ``LookupError``
+            # (``KeyError``/``IndexError``) escaping here is a programmer mistake
+            # that must propagate rather than be silently masked. Never echo
+            # the exception text: it may carry secrets.
             print(
                 json.dumps({"error": _FAILURE_MESSAGE}, sort_keys=True),
                 file=sys.stderr,
