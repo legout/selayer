@@ -151,3 +151,134 @@ orders / order_items / products / customers grain non-nullable + string OK
   instead, at the cost of re-rolling the non-deterministic uuid-based ids.
 - `model.py` (Task 1) has a pre-existing `ruff format` deviation; left
   untouched to preserve Task 1's API as instructed.
+
+## Review follow-up (P1 + P2 fixes)
+
+A review of the Task 3 implementation surfaced two parity/robustness gaps in
+the typed `collect_model_issues(layer)` path, both fixed in this follow-up
+without changing the raw YAML loader or any previously-pinned message.
+
+### P1 — fact-expression parity with the YAML loader
+
+**Finding.** `_validate_fact_model()` validated the fact's references and
+`data_type` directly but never invoked the shared
+`validate_row_expression()` helper that the YAML loader uses in
+`_parse_and_validate_row()`. As a result, a directly-constructed typed layer
+silently accepted expressions that a loaded catalog rejects:
+
+- an unknown source symbol in a fact expression (`phantom.col`) produced no
+  "source 'X' is not known" diagnostic;
+- a row function with the wrong arity (`coalesce(x)` with one argument)
+  produced no "function 'X' expects N argument(s), got M" diagnostic.
+
+(Function-allowlist parity is structurally guaranteed: the parser's
+`_FUNCTION_NAMES` equals `expressions.validation.ROW_FUNCTIONS`, so no
+row-disallowed function is ever parseable.)
+
+**Fix** (`src/selayer/catalog.py`). `_validate_fact_model()` now calls
+`validate_row_expression(fact.expression, known_sources)` and forwards its
+messages to the collector, then reuses the loader's `_check_column_exists` /
+`_check_column_type` helpers for column-existence and `data_type`
+compatibility so the message text is byte-identical. The early `return` after
+an unknown *anchor* source was removed so the expression is still validated
+when the anchor is unknown (matching the loader, which validates the
+expression regardless of the anchor).
+
+**Evidence.** Before the fix a typed `phantom.col` / `coalesce(orders.total)`
+fact yielded `verify(...)` diagnostics `[]`; the equivalent YAML raised with
+`source 'phantom' is not known` and `function 'coalesce' expects 2
+argument(s), got 1`. After the fix the typed and loaded paths produce the
+identical `(path, message)` pairs — asserted directly by
+`test_static_fact_expression_diagnostics_match_yaml_loader`.
+
+### P2 — malformed typed collection entries no longer crash
+
+**Finding.** `_validate_named_models()` recorded a coded
+`"<singular> must be a <Type>"` issue for a malformed programmatic
+collection entry, but the subsequent per-object and cross-collection
+validators still dereferenced it (e.g. `_validate_source_model` accessed
+`source.name`, `_validate_dimension_model` built
+`{name: src.schema ...}` from `data_sources`). Any non-model value in any of
+the six collections therefore raised `AttributeError` instead of producing a
+report.
+
+Reproduced for every collection: a `str`/`int`/`None` entry in
+`data_sources`, `dimensions`, `facts`, `measures`, `metrics`, or
+`relationships` each raised
+`AttributeError: '<type>' object has no attribute 'name'`.
+
+**Fix** (`src/selayer/catalog.py`). Added `_typed_view(mapping, model_type)`,
+which returns only the well-typed entries. `collect_model_issues()` builds a
+clean view per collection and passes those views (rather than `layer`) to all
+validators, so malformed entries — already reported by
+`_validate_named_models` — are never dereferenced. To keep the validators
+type-checking cleanly without reaching back into `layer`, their signatures
+were narrowed to take only the mappings they consume:
+
+- `_validate_fact_model(fact, data_sources, collector)`
+- `_validate_metric_model(metric, measures, collector)`
+- `_validate_fact_reachability_model(facts, relationships, data_sources, collector)`
+- `_validate_metric_grains_model(metrics, measures, facts, data_sources, collector)`
+
+(`_validate_dimension_model`, `_validate_measure_model`, and
+`_validate_relationship_model` already took their cross-collection mappings
+as parameters and now simply receive the clean views.) A malformed entry now
+yields exactly the coded `"<singular> must be a <Type>"` diagnostic with no
+`AttributeError`.
+
+### Tests added (`tests/verification/test_static.py`)
+
+- `test_static_check_fact_expression_reports_unknown_source_symbol` — typed
+  fact referencing an unknown source symbol now reports
+  `source 'phantom' is not known`.
+- `test_static_check_fact_expression_reports_function_arity` — typed fact
+  with a wrong-arity row function now reports the arity message.
+- `test_static_fact_expression_diagnostics_match_yaml_loader` — builds one
+  minimal catalog (unknown source + wrong arity in one fact expression) in
+  both YAML and programmatic form and asserts the `(path, message)` pairs are
+  identical between `CatalogValidationError.issues` and
+  `verify(...).diagnostics`.
+- `test_static_check_malformed_collection_entry_is_coded_not_crash` —
+  parametrized over all six collections; a `"not-a-model"` entry must yield a
+  coded `must be a` diagnostic at `<section>.<key>` and never raise.
+
+### Commands & output (review follow-up)
+
+```
+uv run pytest tests/verification/test_static.py -q
+# 20 passed
+
+uv run pytest tests/verification/test_static.py tests/test_catalog.py -q
+# 125 passed
+
+uv run pytest tests/test_catalog.py tests/test_model.py tests/expressions tests/planning -q
+# 458 passed
+
+uv run pytest -q
+# 2 failed, 1275 passed, 19 skipped, 1 error
+# (failures + error are pre-existing, missing pyiceberg/boto3; identical to baseline)
+
+uv run ruff check src/selayer/catalog.py tests/verification/test_static.py
+# []
+uv run ruff format --check src/selayer/catalog.py tests/verification/test_static.py
+# 2 files already formatted
+
+uv run pyright src/selayer/catalog.py tests/verification/test_static.py
+# 0 errors, 0 warnings, 0 informations
+```
+
+### Files changed (review follow-up)
+
+- `src/selayer/catalog.py` — `_typed_view` helper; `_validate_fact_model`
+  parity via `validate_row_expression` + shared column/data_type helpers;
+  narrowed validator signatures; `collect_model_issues` uses clean typed
+  views.
+- `tests/verification/test_static.py` — 3 P1 parity tests + 1 parametrized
+  P2 malformed-entry test (6 cases).
+
+### Residual risks (review follow-up)
+
+- None. Both fixes are additive/parity-restoring; the raw loader, its pinned
+  messages, and all existing catalog/static tests are unchanged. All
+  validators are only invoked from `collect_model_issues`, so the narrowed
+  signatures have no external callers.

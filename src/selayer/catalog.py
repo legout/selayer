@@ -1014,6 +1014,19 @@ def _validate_named_models(
             )
 
 
+def _typed_view(mapping: Mapping[str, Any], model_type: type) -> dict[str, Any]:
+    """Return only entries whose values are instances of ``model_type``.
+
+    Excludes malformed programmatic collection entries (already reported by
+    :func:`_validate_named_models`) so the per-object and cross-collection
+    validators never dereference an unexpected value type and raise
+    ``AttributeError`` instead of a coded static diagnostic.
+    """
+    return {
+        key: value for key, value in mapping.items() if isinstance(value, model_type)
+    }
+
+
 def _validate_source_model(source: DataSource, collector: _Collector) -> None:
     """Validate a typed data source's grain declarations."""
     _validate_grain_columns(source.name, source.grain, source.schema, collector)
@@ -1050,40 +1063,56 @@ def _validate_dimension_model(
 
 
 def _validate_fact_model(
-    fact: Fact, layer: SemanticLayer, collector: _Collector
+    fact: Fact,
+    data_sources: Mapping[str, DataSource],
+    collector: _Collector,
 ) -> None:
-    """Validate a typed fact's source and expression references/types."""
+    """Validate a typed fact's source and expression references/types.
+
+    Mirrors the raw loader's :func:`_validate_facts` so loaded and
+    programmatic layers report identical diagnostics: the shared
+    :func:`~selayer.expressions.validation.validate_row_expression` flags
+    unknown source symbols and row-function arity mismatches, while the column
+    and data_type checks reuse ``_check_column_exists``/``_check_column_type``
+    exactly as the YAML path does.
+    """
     base = f"facts.{fact.name}"
-    if fact.source not in layer.data_sources:
+    if fact.source not in data_sources:
         collector.add(
             f"{base}.source",
             f"source '{fact.source}' is not a known data source",
         )
-        return
-    source_schemas = {name: src.schema for name, src in layer.data_sources.items()}
-    ref_columns: list[tuple[str, str]] = []
-    for reference in references(fact.expression):
-        if len(reference.parts) != 2:
-            continue
+    source_schemas = {name: src.schema for name, src in data_sources.items()}
+    known_sources = frozenset(data_sources)
+    # Symbol-environment parity with the raw loader: the same shared helper
+    # reports unknown sources and function arity mismatches in the expression.
+    for message in validate_row_expression(fact.expression, known_sources):
+        collector.add(f"{base}.expression", message)
+    # Every resolvable source.column reference must point at a declared column.
+    ref_columns = [r for r in references(fact.expression) if len(r.parts) == 2]
+    for reference in ref_columns:
         ref_source, ref_column = reference.parts
-        if ref_source not in layer.data_sources:
-            continue
-        if _schema_field(source_schemas, ref_source, ref_column) is None:
-            collector.add(
+        if ref_source in source_schemas:
+            _check_column_exists(
+                source_schemas,
+                ref_source,
+                ref_column,
                 f"{base}.expression",
-                f"column {ref_column!r} is not declared in source "
-                f"{ref_source!r} schema",
+                collector,
             )
-        ref_columns.append((ref_source, ref_column))
-    if len(ref_columns) == 1:
-        ref_source, ref_column = ref_columns[0]
-        field = _schema_field(source_schemas, ref_source, ref_column)
-        if field is not None and not _data_type_compatible(fact.data_type, field.type):
-            collector.add(
-                f"{base}.data_type",
-                f"data_type {fact.data_type!r} is not compatible with column "
-                f"{ref_column!r} type",
-            )
+    # A simple single-column fact's declared data_type must be compatible with
+    # the referenced column's logical type; arithmetic/function expressions
+    # have no single source column and are not type-checked here.
+    if len(ref_columns) == 1 and ref_columns[0].parts[0] in source_schemas:
+        ref_source, ref_column = ref_columns[0].parts
+        _check_column_type(
+            source_schemas,
+            ref_source,
+            ref_column,
+            fact.data_type,
+            f"{base}.data_type",
+            collector,
+        )
 
 
 def _validate_measure_model(
@@ -1108,12 +1137,14 @@ def _validate_measure_model(
 
 
 def _validate_metric_model(
-    metric: Metric, layer: SemanticLayer, collector: _Collector
+    metric: Metric,
+    measures: Mapping[str, Measure],
+    collector: _Collector,
 ) -> None:
     """Validate a typed metric's declared measures and expression."""
     base = f"metrics.{metric.name}"
     for measure_id in metric.measures:
-        if measure_id not in layer.measures:
+        if measure_id not in measures:
             collector.add(
                 f"{base}.measures",
                 f"measure '{measure_id}' is not a known measure",
@@ -1179,41 +1210,52 @@ def _validate_relationship_model(
 
 
 def _validate_fact_reachability_model(
-    layer: SemanticLayer, collector: _Collector
+    facts: Mapping[str, Fact],
+    relationships: Mapping[str, Relationship],
+    data_sources: Mapping[str, DataSource],
+    collector: _Collector,
 ) -> None:
     """Validate typed fact-expression reachability over the safe graph."""
-    known_sources = frozenset(layer.data_sources)
+    known_sources = frozenset(data_sources)
     graph = _safe_relationship_edges(
         (
             (relationship.source, relationship.target, relationship.type)
-            for relationship in layer.relationships.values()
+            for relationship in relationships.values()
         ),
         known_sources,
     )
-    facts = ((fact.name, fact.source, fact.expression) for fact in layer.facts.values())
-    _fact_reachability_issues(facts, graph, known_sources, collector)
+    fact_entries = (
+        (fact.name, fact.source, fact.expression) for fact in facts.values()
+    )
+    _fact_reachability_issues(fact_entries, graph, known_sources, collector)
 
 
-def _validate_metric_grains_model(layer: SemanticLayer, collector: _Collector) -> None:
+def _validate_metric_grains_model(
+    metrics: Mapping[str, Metric],
+    measures: Mapping[str, Measure],
+    facts: Mapping[str, Fact],
+    data_sources: Mapping[str, DataSource],
+    collector: _Collector,
+) -> None:
     """Validate typed metric grain consistency across declared measures."""
 
     def resolved_grains(metric: Metric) -> list[tuple[str, tuple[str, ...]]]:
         resolved: list[tuple[str, tuple[str, ...]]] = []
         for measure_id in metric.measures:
-            measure = layer.measures.get(measure_id)
+            measure = measures.get(measure_id)
             if measure is None:
                 continue
-            fact = layer.facts.get(measure.fact)
+            fact = facts.get(measure.fact)
             if fact is None:
                 continue
-            source = layer.data_sources.get(fact.source)
+            source = data_sources.get(fact.source)
             if source is None:
                 continue
             resolved.append((fact.source, source.grain))
         return resolved
 
     metric_grains = (
-        (metric.name, resolved_grains(metric)) for metric in layer.metrics.values()
+        (metric.name, resolved_grains(metric)) for metric in metrics.values()
     )
     _metric_grain_issues(metric_grains, collector)
 
@@ -1236,20 +1278,30 @@ def collect_model_issues(layer: SemanticLayer) -> tuple[CatalogIssue, ...]:
     _validate_named_models(
         "relationships", layer.relationships, Relationship, collector
     )
-    for source in layer.data_sources.values():
+    # Well-typed views exclude malformed programmatic collection entries
+    # (already reported by ``_validate_named_models``) so the per-object and
+    # cross-collection validators below never dereference an unexpected value
+    # type and raise ``AttributeError`` instead of a coded static diagnostic.
+    sources = _typed_view(layer.data_sources, DataSource)
+    dimensions = _typed_view(layer.dimensions, Dimension)
+    facts = _typed_view(layer.facts, Fact)
+    measures = _typed_view(layer.measures, Measure)
+    metrics = _typed_view(layer.metrics, Metric)
+    relationships = _typed_view(layer.relationships, Relationship)
+    for source in sources.values():
         _validate_source_model(source, collector)
-    for dimension in layer.dimensions.values():
-        _validate_dimension_model(dimension, layer.data_sources, collector)
-    for fact in layer.facts.values():
-        _validate_fact_model(fact, layer, collector)
-    for measure in layer.measures.values():
-        _validate_measure_model(measure, layer.facts, collector)
-    for metric in layer.metrics.values():
-        _validate_metric_model(metric, layer, collector)
-    for relationship in layer.relationships.values():
-        _validate_relationship_model(relationship, layer.data_sources, collector)
-    _validate_fact_reachability_model(layer, collector)
-    _validate_metric_grains_model(layer, collector)
+    for dimension in dimensions.values():
+        _validate_dimension_model(dimension, sources, collector)
+    for fact in facts.values():
+        _validate_fact_model(fact, sources, collector)
+    for measure in measures.values():
+        _validate_measure_model(measure, facts, collector)
+    for metric in metrics.values():
+        _validate_metric_model(metric, measures, collector)
+    for relationship in relationships.values():
+        _validate_relationship_model(relationship, sources, collector)
+    _validate_fact_reachability_model(facts, relationships, sources, collector)
+    _validate_metric_grains_model(metrics, measures, facts, sources, collector)
     return tuple(
         sorted(collector.issues, key=lambda issue: (issue.path, issue.message))
     )
