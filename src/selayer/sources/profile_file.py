@@ -27,12 +27,14 @@ exclusively of *validated* identifier tokens and fixed redaction tokens, and a
 key, value, or secret ever reaches ``repr``, ``str``, ``args``, ``path``,
 ``message``, the traceback, or ``__cause__``/``__context__``.  The
 caller-supplied filesystem path is never stored: a malformed document and any
-file I/O failure (a missing or unreadable file) use a fixed safe path token.
+file I/O failure (a missing or unreadable file, or one that is not valid
+UTF-8) use a fixed safe path token.
 Every error is constructed and raised *outside* an active ``except`` scope, so
 ``__cause__`` and ``__context__`` remain ``None`` (a YAML parse failure is
 captured, the raw PyYAML exception discarded, and the sanitized error raised
-after the ``except``/``finally`` completes; a missing/unreadable file is
-captured and the raw ``OSError`` discarded the same way).
+after the ``except``/``finally`` completes; a missing/unreadable file, or one
+that is not valid UTF-8, is captured and the raw ``OSError`` or
+``UnicodeDecodeError`` discarded the same way).
 
 Runtime resolver failures (an unknown profile *name* at resolve time) remain
 the responsibility of :class:`~selayer.sources.errors.SourceProfileError`, which
@@ -60,6 +62,7 @@ _CODE_MESSAGES: dict[str, str] = {
     "source.profile.malformed": "the profile document is not valid YAML",
     "source.profile.file_missing": "the profile file does not exist",
     "source.profile.file_unreadable": "the profile file could not be read",
+    "source.profile.invalid_utf8": "the profile file is not valid UTF-8",
     "source.profile.merge_key": "the profile document uses an unsupported merge key",
     "source.profile.duplicate_key": "the profile document contains a duplicate key",
     "source.profile.not_mapping": "the profile document root must be a mapping",
@@ -178,9 +181,10 @@ def load_profile_file(
 
     Each profile value is resolved from ``env`` (read from *environ*, accepted
     only as an exact builtin ``str``) or ``literal`` (an exact builtin ``bool``
-    copied verbatim).  Any missing/unreadable file, malformed document,
-    unresolvable value, or disallowed literal raises an immutable, sanitized
-    :class:`ProfileFileValidationError` outside any ``except`` scope; no
+    copied verbatim).  Any missing/unreadable/non-UTF-8 file, malformed
+    document, unresolvable value, or disallowed literal raises an immutable,
+    sanitized :class:`ProfileFileValidationError` outside any ``except``
+    scope; no
     resolved value, environment value, or raw YAML key is ever retained or
     rendered.
     """
@@ -199,8 +203,9 @@ def _compose_without_duplicate_keys(path: Path) -> object:
     shadowed or merged value can never reach resolution.  Returns the
     constructed document, or ``None`` for an empty/null document.
 
-    File-system failures (a missing or unreadable file) and syntactically
-    invalid documents are reported as constant-code validation errors.  In each
+    File-system failures (a missing or unreadable file, or a file that is not
+    valid UTF-8) and syntactically invalid documents are reported as
+    constant-code validation errors.  In each
     case the raw exception is captured inside the ``except`` and the sanitized
     error is raised *after* the ``except``/``finally`` completes — outside any
     active ``except`` scope — using a fixed safe path token (never the
@@ -208,11 +213,11 @@ def _compose_without_duplicate_keys(path: Path) -> object:
     raw exception reaches ``__cause__``, ``__context__``, the traceback,
     ``args``, ``path``, or ``message``.
     """
-    # Read the file first.  A missing or unreadable file is captured (never
-    # retained) and reported with the fixed safe path token; the caller-supplied
-    # filesystem path is never stored.  ``text`` is pre-bound so it is always a
-    # bound ``str`` even though the placeholder is never used (an I/O failure
-    # raises before it can be read).
+    # Read the file first.  A missing or unreadable file, or one that is not
+    # valid UTF-8, is captured (never retained) and reported with the fixed safe
+    # path token; the caller-supplied filesystem path is never stored.  ``text``
+    # is pre-bound so it is always a bound ``str`` even though the placeholder
+    # is never used (an I/O failure raises before it can be read).
     text = ""
     io_error: ProfileFileValidationError | None = None
     try:
@@ -224,6 +229,16 @@ def _compose_without_duplicate_keys(path: Path) -> object:
     except OSError:
         io_error = ProfileFileValidationError(
             "source.profile.file_unreadable", _FILE_PATH
+        )
+    except UnicodeDecodeError:
+        # ``UnicodeDecodeError`` is a ``ValueError`` (not an ``OSError``), so it
+        # is not caught by the ``except OSError`` above and must be matched
+        # explicitly.  The raw, undecodable bytes — which may carry a secret
+        # and which the default error renders via ``args``/``object`` — are
+        # captured and discarded, and the sanitized error is raised below
+        # outside any active ``except`` scope using the fixed safe path token.
+        io_error = ProfileFileValidationError(
+            "source.profile.invalid_utf8", _FILE_PATH
         )
     if io_error is not None:
         # Raised outside the ``except`` so __cause__/__context__ are None and

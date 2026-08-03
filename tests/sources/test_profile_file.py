@@ -626,6 +626,41 @@ def test_profile_file_unreadable_permission_denied_raises_sanitized_error(
     _assert_secret_absent(error, _SECRET, capsys)
 
 
+def test_profile_file_invalid_utf8_does_not_leak_raw_bytes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The sentinel is encoded into the file as valid UTF-8, then followed by
+    # undecodable bytes.  A raw ``UnicodeDecodeError`` (whose ``args``/``object``
+    # carry the raw bytes) is a ``ValueError``, not an ``OSError``, so without
+    # an explicit handler it would escape sanitization and leak the bytes.  It
+    # must be captured and discarded, and the sanitized error must use a fixed
+    # safe path token.
+    path = tmp_path / "profiles.yaml"
+    path.write_bytes(b"version: 1\n" + _SECRET.encode("utf-8") + b"\xff\xfe\n")
+    with pytest.raises(ProfileFileValidationError) as caught:
+        load_profile_file(path, environ={})
+    error = caught.value
+    assert error.code == "source.profile.invalid_utf8"
+    assert error.path == "<file>"
+    _assert_secret_absent(error, _SECRET, capsys)
+
+
+def test_profile_file_invalid_utf8_filename_does_not_leak(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A secret-bearing filename combined with invalid UTF-8 bytes: the raw
+    # ``UnicodeDecodeError`` is captured and the sanitized error uses the fixed
+    # safe path token, never the caller-supplied filesystem path.
+    path = tmp_path / f"{_SECRET}.yaml"
+    path.write_bytes(b"version: 1\n\xff\xfe\n")
+    with pytest.raises(ProfileFileValidationError) as caught:
+        load_profile_file(path, environ={})
+    error = caught.value
+    assert error.code == "source.profile.invalid_utf8"
+    assert error.path == "<file>"
+    _assert_secret_absent(error, _SECRET, capsys)
+
+
 # ---------------------------------------------------------------------------
 # Runtime resolver failures remain SourceProfileError (unchanged)
 # ---------------------------------------------------------------------------
