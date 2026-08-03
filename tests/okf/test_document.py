@@ -9,6 +9,7 @@ from typing import Any, cast
 import pytest
 import yaml
 
+from selayer import SemanticLayer
 from selayer.okf import OkfBundle
 from selayer.okf.document import parse_concept, render_concept
 
@@ -211,3 +212,27 @@ def test_parse_render_parse_round_trip_preserves_document_model(tmp_path: Path) 
     reparsed = parse_concept(path, tmp_path)
 
     assert reparsed == original
+
+
+def test_generated_fingerprint_round_trips_for_a_loaded_generated_concept(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    from selayer.okf.document import generated_fingerprint
+
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    concept = OkfBundle.load(root, layer=valid_layer).concepts[
+        "metrics/gross_margin"
+    ]
+    definition = next(
+        section.content
+        for section in concept.sections
+        if section.title == "Catalog Definition"
+    )
+
+    # The stored digest must equal a fresh recomputation from the controlled
+    # frontmatter and Catalog Definition body: this is the contract the
+    # catalog-aware integrity check relies on.
+    assert concept.frontmatter["generated"]["fingerprint"] == (
+        generated_fingerprint(concept.frontmatter, definition)
+    )

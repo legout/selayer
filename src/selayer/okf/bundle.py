@@ -39,6 +39,7 @@ from .validation import (
     _is_iso_datetime,
     validate_concept,
     validate_duplicate_bindings,
+    validate_generated_integrity,
     validate_index,
     validate_links,
     validate_log,
@@ -595,6 +596,8 @@ class OkfBundle:
             issues.extend(validate_concept(concept, layer, strict=strict))
         issues.extend(validate_duplicate_bindings(concepts))
         issues.extend(validate_links(root, concepts))
+        if layer is not None:
+            issues.extend(validate_generated_integrity(root, concepts, layer, strict=strict))
         ordered = tuple(sorted(issues, key=lambda issue: (issue.path, issue.message)))
         fatal = tuple(issue for issue in ordered if issue.severity == "error")
         if fatal:

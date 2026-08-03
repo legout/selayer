@@ -41,6 +41,7 @@ class OkfIssue:
     path: str
     message: str
     severity: Severity = "error"
+    code: str = "okf.invalid"
 
 
 class OkfValidationError(ValueError):

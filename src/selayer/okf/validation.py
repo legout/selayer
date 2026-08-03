@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import posixpath
 import re
 from collections import Counter
 from collections.abc import Mapping
 from datetime import date, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
 
 import yaml
@@ -15,6 +16,7 @@ from .model import OkfConcept, OkfIssue, Severity
 
 _STATUS = frozenset({"draft", "stable", "deprecated"})
 _COMPUTATION_SECTION = "Computation"
+_CATALOG_DEFINITION_SECTION = "Catalog Definition"
 _KIND_TYPES = {
     "source": "Selayer Data Source",
     "dimension": "Selayer Dimension",
@@ -30,11 +32,19 @@ _SELAYER_ID = re.compile(
 )
 _FRONTMATTER = re.compile(r"\A---\n(.*?)\n---(?:\n|\Z)", re.DOTALL)
 _LOG_HEADING = re.compile(r"^## (.+?)\s*$")
+_SLUG_STRIP = re.compile(r"[^\w\s-]+", re.UNICODE)
+_SLUG_COLLAPSE = re.compile(r"[\s_-]+")
 
 
-def _issue(concept: OkfConcept, field: str, message: str) -> OkfIssue:
+def _issue(
+    concept: OkfConcept,
+    field: str,
+    message: str,
+    *,
+    code: str = "okf.invalid",
+) -> OkfIssue:
     base = f"{concept.relative_path.as_posix()}.frontmatter"
-    return OkfIssue(f"{base}.{field}" if field else base, message)
+    return OkfIssue(f"{base}.{field}" if field else base, message, code=code)
 
 
 def _optional_issue(
@@ -42,9 +52,13 @@ def _optional_issue(
     field: str,
     message: str,
     severity: Severity,
+    *,
+    code: str = "okf.invalid",
 ) -> OkfIssue:
-    issue = _issue(concept, field, message)
-    return OkfIssue(path=issue.path, message=issue.message, severity=severity)
+    issue = _issue(concept, field, message, code=code)
+    return OkfIssue(
+        path=issue.path, message=issue.message, severity=severity, code=code
+    )
 
 
 def _is_nonempty_string(value: object) -> bool:
@@ -515,12 +529,50 @@ def validate_duplicate_bindings(
     return tuple(sorted(issues, key=lambda issue: (issue.path, issue.message)))
 
 
+def _heading_slug(heading: str) -> str:
+    """GitHub-style lowercase hyphenated anchor for a Markdown heading."""
+    text = heading.strip().lower()
+    text = _SLUG_STRIP.sub("", text)
+    text = _SLUG_COLLAPSE.sub("-", text)
+    return text.strip("-")
+
+
+def _section_slugs(concept: OkfConcept) -> frozenset[str]:
+    return frozenset(_heading_slug(section.title) for section in concept.sections)
+
+
+def _resolve_link_concept(
+    source: OkfConcept,
+    link: str,
+    concepts_by_path: Mapping[PurePosixPath, OkfConcept],
+) -> OkfConcept | None:
+    try:
+        split = urlsplit(link)
+    except ValueError:
+        return None
+    path_text = unquote(split.path)
+    if not path_text:
+        return None
+    if path_text.startswith("/"):
+        normalized = posixpath.normpath(path_text.lstrip("/"))
+    else:
+        normalized = posixpath.normpath(
+            posixpath.join(source.relative_path.parent.as_posix(), path_text)
+        )
+    if normalized == ".." or normalized.startswith("../"):
+        return None
+    return concepts_by_path.get(PurePosixPath(normalized))
+
+
 def validate_links(
     root: Path,
     concepts: Mapping[str, OkfConcept],
 ) -> tuple[OkfIssue, ...]:
-    """Return warnings for internal links whose filesystem targets are absent."""
+    """Return warnings for internal links with absent targets or stale fragments."""
     resolved_root = root.resolve()
+    concepts_by_path = {
+        concept.relative_path: concept for concept in concepts.values()
+    }
     issues: list[OkfIssue] = []
     for concept in concepts.values():
         source = root / Path(concept.relative_path.as_posix())
@@ -542,6 +594,22 @@ def validate_links(
                         path=f"{concept.relative_path.as_posix()}.links",
                         message=f"broken internal link '{link}'",
                         severity="warning",
+                    )
+                )
+                continue
+            fragment = unquote(split.fragment) if split.fragment else ""
+            if not fragment:
+                continue
+            target_concept = _resolve_link_concept(concept, link, concepts_by_path)
+            if target_concept is not None and fragment not in _section_slugs(
+                target_concept
+            ):
+                issues.append(
+                    OkfIssue(
+                        path=f"{concept.relative_path.as_posix()}.links",
+                        message=f"link '{link}' fragment heading not found",
+                        severity="warning",
+                        code="okf.link.missing_fragment",
                     )
                 )
     return tuple(sorted(issues, key=lambda issue: (issue.path, issue.message)))
@@ -589,9 +657,178 @@ def validate_log(path: Path, root: Path) -> tuple[OkfIssue, ...]:
     return ()
 
 
+def _validate_generated_indexes(
+    root: Path,
+    expected: Mapping[str, OkfConcept],
+    layer: SemanticLayer,
+    severity: Severity,
+) -> list[OkfIssue]:
+    from .generation import index_documents
+
+    issues: list[OkfIssue] = []
+    for relative_path, expected_text in index_documents(layer, expected).items():
+        relative = relative_path.as_posix()
+        index_file = root / Path(relative)
+        if not index_file.is_file():
+            issues.append(
+                OkfIssue(
+                    path=relative,
+                    message=f"missing generated index '{relative}'",
+                    severity=severity,
+                    code="okf.generated.index_mismatch",
+                )
+            )
+            continue
+        actual = index_file.read_text(encoding="utf-8")
+        if actual != expected_text:
+            issues.append(
+                OkfIssue(
+                    path=relative,
+                    message=(
+                        f"generated index '{relative}' does not match the catalog"
+                    ),
+                    severity=severity,
+                    code="okf.generated.index_mismatch",
+                )
+            )
+    return issues
+
+
+def validate_generated_integrity(
+    root: Path,
+    concepts: Mapping[str, OkfConcept],
+    layer: SemanticLayer,
+    *,
+    strict: bool = True,
+) -> tuple[OkfIssue, ...]:
+    """Compare a catalog-aware bundle against the fresh generated projection."""
+    from .document import generated_fingerprint
+    from .generation import concepts_from_layer
+
+    severity: Severity = "error" if strict else "warning"
+    expected = concepts_from_layer(layer, include_descriptive=False)
+    expected_by_selayer = {
+        concept.frontmatter["selayer_id"]: concept
+        for concept in expected.values()
+    }
+    issues: list[OkfIssue] = []
+    has_generated = any(
+        isinstance(concept.frontmatter.get("generated"), Mapping)
+        for concept in concepts.values()
+    )
+
+    if has_generated:
+        for concept_id, expected_concept in expected.items():
+            if concept_id not in concepts:
+                issues.append(
+                    OkfIssue(
+                        path=expected_concept.relative_path.as_posix(),
+                        message=(
+                            f"missing generated concept "
+                            f"'{expected_concept.frontmatter['selayer_id']}'"
+                        ),
+                        severity=severity,
+                        code="okf.generated.missing_concept",
+                    )
+                )
+
+    for concept in concepts.values():
+        if not isinstance(concept.frontmatter.get("generated"), Mapping):
+            continue
+        semantic_id = concept.frontmatter.get("selayer_id")
+        if not isinstance(semantic_id, str):
+            continue
+        expected_concept = expected_by_selayer.get(semantic_id)
+        if expected_concept is None:
+            issues.append(
+                OkfIssue(
+                    path=f"{concept.relative_path.as_posix()}.frontmatter.selayer_id",
+                    message=f"orphan generated selayer_id '{semantic_id}'",
+                    severity=severity,
+                    code="okf.generated.orphan_selayer_id",
+                )
+            )
+            continue
+        if concept.relative_path != expected_concept.relative_path:
+            issues.append(
+                OkfIssue(
+                    path=concept.relative_path.as_posix(),
+                    message=(
+                        f"generated concept '{semantic_id}' is in the wrong "
+                        f"semantic kind directory"
+                    ),
+                    severity=severity,
+                    code="okf.generated.path_mismatch",
+                )
+            )
+            continue
+        definitions = [
+            section
+            for section in concept.sections
+            if section.title == _CATALOG_DEFINITION_SECTION
+        ]
+        expected_definitions = [
+            section
+            for section in expected_concept.sections
+            if section.title == _CATALOG_DEFINITION_SECTION
+        ]
+        if len(definitions) != 1 or not expected_definitions:
+            issues.append(
+                OkfIssue(
+                    path=concept.relative_path.as_posix(),
+                    message=(
+                        f"generated concept '{semantic_id}' must have exactly "
+                        f"one Catalog Definition section"
+                    ),
+                    severity=severity,
+                    code="okf.generated.definition_mismatch",
+                )
+            )
+            continue
+        loaded_definition = definitions[0].content
+        if loaded_definition != expected_definitions[0].content:
+            issues.append(
+                OkfIssue(
+                    path=concept.relative_path.as_posix(),
+                    message=(
+                        f"generated concept '{semantic_id}' Catalog Definition "
+                        f"does not match the catalog"
+                    ),
+                    severity=severity,
+                    code="okf.generated.definition_mismatch",
+                )
+            )
+        generated = concept.frontmatter.get("generated")
+        stored_fingerprint = (
+            generated.get("fingerprint")
+            if isinstance(generated, Mapping)
+            else None
+        )
+        if isinstance(stored_fingerprint, str):
+            recomputed = generated_fingerprint(concept.frontmatter, loaded_definition)
+            if stored_fingerprint.lower() != recomputed:
+                issues.append(
+                    OkfIssue(
+                        path=concept.relative_path.as_posix(),
+                        message=(
+                            f"generated concept '{semantic_id}' fingerprint "
+                            f"does not match its content"
+                        ),
+                        severity=severity,
+                        code="okf.generated.fingerprint_mismatch",
+                    )
+                )
+
+    if has_generated:
+        issues.extend(_validate_generated_indexes(root, expected, layer, severity))
+
+    return tuple(sorted(issues, key=lambda issue: (issue.path, issue.message)))
+
+
 __all__ = [
     "validate_concept",
     "validate_duplicate_bindings",
+    "validate_generated_integrity",
     "validate_index",
     "validate_links",
     "validate_log",

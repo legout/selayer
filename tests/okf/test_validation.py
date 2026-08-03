@@ -678,3 +678,252 @@ def test_duplicate_bindings_remain_fatal_in_lenient_mode(
 
     with pytest.raises(OkfValidationError):
         OkfBundle.load(tmp_path, layer=layer, strict=False)
+
+
+def test_okf_issue_defaults_to_invalid_code() -> None:
+    from selayer.okf.model import OkfIssue
+
+    assert OkfIssue("a.md", "broken").code == "okf.invalid"
+    assert OkfIssue("a.md", "broken", severity="warning").code == "okf.invalid"
+    assert OkfIssue("a.md", "broken", "warning", "okf.link.missing_fragment").code == (
+        "okf.link.missing_fragment"
+    )
+
+
+def test_catalog_aware_load_accepts_a_freshly_generated_bundle(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+
+    bundle = OkfBundle.load(root, layer=valid_layer)
+
+    assert bundle.diagnostics == ()
+
+
+def test_catalog_aware_load_rejects_stale_valid_looking_fingerprint(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    path = root / "metrics" / "gross_margin.md"
+    text = path.read_text(encoding="utf-8")
+    path.write_text(
+        text.replace(
+            "Expression: `(total_item_revenue - total_item_cost)"
+            " / nullif(total_item_revenue, 0)`",
+            "Expression: `wrong`",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OkfValidationError) as raised:
+        OkfBundle.load(root, layer=valid_layer)
+
+    assert "okf.generated.fingerprint_mismatch" in {
+        issue.code for issue in raised.value.issues
+    }
+
+
+def test_catalog_aware_load_rejects_missing_generated_concept(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    (root / "metrics" / "gross_margin.md").unlink()
+
+    with pytest.raises(OkfValidationError) as raised:
+        OkfBundle.load(root, layer=valid_layer)
+
+    codes = {issue.code for issue in raised.value.issues}
+    assert "okf.generated.missing_concept" in codes
+    assert any(
+        issue.path == "metrics/gross_margin.md" for issue in raised.value.issues
+    )
+
+
+def test_catalog_aware_load_rejects_orphan_generated_selayer_id(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    (root / "metrics" / "unknown.md").write_text(
+        "---\n"
+        "type: Selayer Metric\n"
+        "title: Unknown\n"
+        "selayer_id: metric.unknown\n"
+        "generated:\n"
+        "  by: process:selayer-okf\n"
+        f"  fingerprint: {'a' * 64}\n"
+        "status: stable\n"
+        "---\n\n"
+        "# Catalog Definition\n\nSemantic ID: `metric.unknown`\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OkfValidationError) as raised:
+        OkfBundle.load(root, layer=valid_layer)
+
+    assert "okf.generated.orphan_selayer_id" in {
+        issue.code for issue in raised.value.issues
+    }
+
+
+def test_catalog_aware_load_rejects_wrong_semantic_kind_directory(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    original = root / "metrics" / "gross_margin.md"
+    misplaced = root / "relationships" / "gross_margin.md"
+    misplaced.write_text(original.read_text(encoding="utf-8"), encoding="utf-8")
+    original.unlink()
+
+    with pytest.raises(OkfValidationError) as raised:
+        OkfBundle.load(root, layer=valid_layer)
+
+    codes = {issue.code for issue in raised.value.issues}
+    assert "okf.generated.path_mismatch" in codes
+    assert "okf.generated.missing_concept" in codes
+
+
+def test_catalog_aware_load_rejects_definition_drift_from_catalog(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    from selayer.okf.document import generated_fingerprint, parse_concept
+
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    path = root / "sources" / "products.md"
+    text = path.read_text(encoding="utf-8")
+    # Tamper the Catalog Definition body, then re-stamp the fingerprint so the
+    # document is internally self-consistent while it no longer matches the
+    # catalog projection.
+    tampered = text.replace("Grain: id", "Grain: forged")
+    path.write_text(tampered, encoding="utf-8")
+    concept = parse_concept(path, root)
+    definition = next(
+        section.content
+        for section in concept.sections
+        if section.title == "Catalog Definition"
+    )
+    fresh = generated_fingerprint(concept.frontmatter, definition)
+    self_consistent = tampered.replace(
+        str(concept.frontmatter["generated"]["fingerprint"]), fresh
+    )
+    path.write_text(self_consistent, encoding="utf-8")
+
+    with pytest.raises(OkfValidationError) as raised:
+        OkfBundle.load(root, layer=valid_layer)
+
+    codes = {issue.code for issue in raised.value.issues}
+    assert "okf.generated.definition_mismatch" in codes
+    assert "okf.generated.fingerprint_mismatch" not in codes
+
+
+def test_catalog_aware_load_rejects_generated_index_missing_member(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    index_path = root / "metrics" / "index.md"
+    text = index_path.read_text(encoding="utf-8")
+    index_path.write_text(
+        text.replace("- [Gross margin](gross_margin.md)\n", ""), encoding="utf-8"
+    )
+
+    with pytest.raises(OkfValidationError) as raised:
+        OkfBundle.load(root, layer=valid_layer)
+
+    assert "okf.generated.index_mismatch" in {
+        issue.code for issue in raised.value.issues
+    }
+
+
+def test_catalog_aware_load_rejects_generated_index_with_wrong_title(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    index_path = root / "metrics" / "index.md"
+    text = index_path.read_text(encoding="utf-8")
+    index_path.write_text(
+        text.replace("[Gross margin]", "[Wrong title]"), encoding="utf-8"
+    )
+
+    with pytest.raises(OkfValidationError) as raised:
+        OkfBundle.load(root, layer=valid_layer)
+
+    assert "okf.generated.index_mismatch" in {
+        issue.code for issue in raised.value.issues
+    }
+
+
+def test_lenient_catalog_aware_load_exposes_integrity_as_diagnostics(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    path = root / "metrics" / "gross_margin.md"
+    text = path.read_text(encoding="utf-8")
+    path.write_text(
+        text.replace(
+            "Expression: `(total_item_revenue - total_item_cost)"
+            " / nullif(total_item_revenue, 0)`",
+            "Expression: `wrong`",
+        ),
+        encoding="utf-8",
+    )
+
+    bundle = OkfBundle.load(root, layer=valid_layer, strict=False)
+
+    codes = {issue.code for issue in bundle.diagnostics}
+    assert "okf.generated.fingerprint_mismatch" in codes
+    assert all(issue.severity == "warning" for issue in bundle.diagnostics)
+
+
+def test_internal_link_with_missing_fragment_heading_is_a_warning(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    metric_path = root / "metrics" / "gross_margin.md"
+    text = metric_path.read_text(encoding="utf-8")
+    text = text.replace(
+        "# Related Concepts",
+        "# Related Concepts\n\n"
+        "[Order items](../sources/order_items.md#nonexistent-heading)\n",
+    )
+    metric_path.write_text(text, encoding="utf-8")
+
+    bundle = OkfBundle.load(root, layer=valid_layer)
+
+    fragment_issues = [
+        issue
+        for issue in bundle.diagnostics
+        if issue.code == "okf.link.missing_fragment"
+    ]
+    assert len(fragment_issues) == 1
+    assert fragment_issues[0].severity == "warning"
+    assert fragment_issues[0].path == "metrics/gross_margin.md.links"
+
+
+def test_internal_link_fragment_heading_is_valid_when_present(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    metric_path = root / "metrics" / "gross_margin.md"
+    text = metric_path.read_text(encoding="utf-8")
+    text = text.replace(
+        "# Related Concepts",
+        "# Related Concepts\n\n"
+        "[Order items](../sources/order_items.md#catalog-definition)\n",
+    )
+    metric_path.write_text(text, encoding="utf-8")
+
+    bundle = OkfBundle.load(root, layer=valid_layer)
+
+    assert "okf.link.missing_fragment" not in {
+        issue.code for issue in bundle.diagnostics
+    }
