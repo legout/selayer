@@ -26,6 +26,7 @@ from examples.shopfloor.generate_data import (
     append_eol_retest,
     generate_shopfloor_data,
 )
+from examples.shopfloor.generate_data import main as generate_main
 from examples.shopfloor.run_example import run_walkthrough
 from selayer import QueryEngine, QueryPlanningError, SemanticLayer
 
@@ -75,6 +76,35 @@ def _temporary_shopfloor_catalog(tmp_path: Path, paths: ShopfloorDataPaths) -> P
         cast(str, yaml.safe_dump(catalog, sort_keys=False)), encoding="utf-8"
     )
     return catalog_path
+
+
+def _delta_row_count(delta_path: Path) -> int:
+    """Return the live row count of a generated Delta table."""
+    return DeltaTable(delta_path).to_pyarrow_table().num_rows
+
+
+def test_generate_data_cli_requires_output_dir(tmp_path: Path) -> None:
+    output = tmp_path / "shopfloor-data"
+    assert generate_main(["--output-dir", str(output)]) == 0
+    assert sorted(path.name for path in output.iterdir()) == [
+        "component_consumption.parquet",
+        "component_lot_inspections.parquet",
+        "customer_orders.csv",
+        "eol_test_runs.delta",
+        "machine_telemetry.parquet",
+        "operation_executions.parquet",
+        "production_orders.sqlite",
+        "shopfloor.duckdb",
+    ]
+
+
+def test_generate_data_cli_resets_an_existing_retest(tmp_path: Path) -> None:
+    output = tmp_path / "shopfloor-data"
+    assert generate_main(["--output-dir", str(output)]) == 0
+    append_eol_retest(output / "eol_test_runs.delta")
+    assert _delta_row_count(output / "eol_test_runs.delta") == 4
+    assert generate_main(["--output-dir", str(output)]) == 0
+    assert _delta_row_count(output / "eol_test_runs.delta") == 3
 
 
 def test_generate_shopfloor_data_writes_all_connector_inputs(tmp_path: Path) -> None:

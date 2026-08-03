@@ -24,10 +24,12 @@ catalog metrics in Task 2 resolve to their documented expected values.
 
 from __future__ import annotations
 
+import argparse
 import csv
 import shutil
 import sqlite3
-from collections.abc import Callable
+import sys
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -691,3 +693,30 @@ def append_eol_retest(delta_path: Path) -> None:
         ),
         mode="append",
     )
+
+
+# ---------------------------------------------------------------------------
+# Command-line entry point
+# ---------------------------------------------------------------------------
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Generate deterministic shop-floor connector inputs."
+    )
+    parser.add_argument("--output-dir", type=Path, required=True)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    arguments = _parser().parse_args(argv)
+    try:
+        generate_shopfloor_data(arguments.output_dir)
+    except DeltaDependencyError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
