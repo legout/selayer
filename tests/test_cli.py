@@ -365,6 +365,47 @@ def test_catalog_compatibility_query_cases_reject_unknown_keys_secret_safe(
     assert captured.out == ""
 
 
+def test_catalog_compatibility_unknown_selector_flags_are_secret_safe(
+    valid_catalog_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    """Unknown ``--metric``/``--dimension`` values never leak to any stream.
+
+    Top-level selector values are user-supplied and untrusted; an unknown
+    metric or dimension is a declaration failure whose indexed ``check_id``,
+    diagnostic path/message, and evidence must never echo the raw name. The
+    sentinel must be absent from the JSON report on stdout and from stderr.
+    """
+    metric_sentinel = "LEAK_METRIC_TOKEN_4f8a"
+    dimension_sentinel = "LEAK_DIMENSION_TOKEN_7c2b"
+    assert (
+        main(
+            [
+                "catalog",
+                "compatibility",
+                str(valid_catalog_path),
+                "--metric",
+                metric_sentinel,
+                "--dimension",
+                dimension_sentinel,
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["passed"] is False
+    check_ids = {outcome["check_id"] for outcome in payload["outcomes"]}
+    assert "compatibility.declaration.metric.0000" in check_ids
+    assert "compatibility.declaration.dimension.0000" in check_ids
+    # The sentinels must never reach stdout (report JSON) or stderr.
+    assert metric_sentinel not in captured.out
+    assert dimension_sentinel not in captured.out
+    assert metric_sentinel not in captured.err
+    assert dimension_sentinel not in captured.err
+    assert "Traceback" not in captured.err
+
+
 def test_catalog_compatibility_invalid_catalog_emits_static_failure(
     tmp_path: Path,
     capsys,  # type: ignore[no-untyped-def]

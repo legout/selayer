@@ -96,12 +96,16 @@ def test_unknown_metric_selector_fails_declaration(valid_layer: SemanticLayer) -
     unknown = next(
         item
         for item in report.outcomes
-        if item.check_id == "compatibility.declaration.metric.missing_metric"
+        if item.check_id == "compatibility.declaration.metric.0000"
     )
     assert unknown.status == "failed"
     assert unknown.scope == "declaration"
     assert unknown.diagnostics[0].code == "unknown_metric"
     assert not report.passed
+    # An untrusted top-level selector must never reach the report in any field:
+    # check_id, diagnostic path/message, or evidence.
+    blob = json.dumps(report.to_dict())
+    assert "missing_metric" not in blob
 
 
 def test_unknown_dimension_selector_fails_declaration(
@@ -117,22 +121,99 @@ def test_unknown_dimension_selector_fails_declaration(
     unknown = next(
         item
         for item in report.outcomes
-        if item.check_id == "compatibility.declaration.dimension.missing_dim"
+        if item.check_id == "compatibility.declaration.dimension.0000"
     )
     assert unknown.status == "failed"
     assert unknown.diagnostics[0].code == "unknown_dimension"
     assert not report.passed
+    blob = json.dumps(report.to_dict())
+    assert "missing_dim" not in blob
 
 
 def test_unknown_selector_is_reported_not_omitted(valid_layer: SemanticLayer) -> None:
     """An unknown metric is recorded as a failed declaration, not dropped."""
     report = verify(valid_layer, CompatibilityCheck(metrics=("gross_margin", "ghost")))
     check_ids = {item.check_id for item in report.outcomes}
-    assert "compatibility.declaration.metric.ghost" in check_ids
+    # The unknown metric is recorded under an indexed, selector-free check_id.
+    assert "compatibility.declaration.metric.0000" in check_ids
     # The valid metric is still planned.
     assert "compatibility.metric.gross_margin" in check_ids
     # The unknown metric is not planned as a request.
     assert "compatibility.metric.ghost" not in check_ids
+    # The untrusted selector name never reaches the report.
+    assert "ghost" not in json.dumps(report.to_dict())
+
+
+# ---------------------------------------------------------------------------
+# Top-level unknown selectors are secret-safe (no raw name anywhere)
+# ---------------------------------------------------------------------------
+
+
+def test_multiple_unknown_selectors_indexed_and_sorted(
+    valid_layer: SemanticLayer,
+) -> None:
+    """Several unknown selectors get distinct indexed, selector-free check_ids.
+
+    Indices are assigned over the sorted unknown selectors, so the outcome
+    set is deterministic (hash-seed independent) regardless of input order,
+    and no untrusted selector name reaches any report field.
+    """
+    forward = verify(
+        valid_layer,
+        CompatibilityCheck(
+            metrics=("zebra_unknown", "alpha_unknown", "gross_margin"),
+            dimensions=("omega_unknown", "beta_unknown"),
+        ),
+    )
+    reverse = verify(
+        valid_layer,
+        CompatibilityCheck(
+            metrics=("gross_margin", "alpha_unknown", "zebra_unknown"),
+            dimensions=("beta_unknown", "omega_unknown"),
+        ),
+    )
+    forward_ids = [item.check_id for item in forward.outcomes]
+    reverse_ids = [item.check_id for item in reverse.outcomes]
+    assert forward_ids == reverse_ids
+    # Distinct unknown metrics/dimensions get distinct indexed check_ids.
+    assert "compatibility.declaration.metric.0000" in forward_ids
+    assert "compatibility.declaration.metric.0001" in forward_ids
+    assert "compatibility.declaration.dimension.0000" in forward_ids
+    assert "compatibility.declaration.dimension.0001" in forward_ids
+    # The valid metric is still planned.
+    assert "compatibility.metric.gross_margin" in forward_ids
+    # Outcomes are sorted by (path, check_id); the indexed declarations sort
+    # before the planned metric outcome.
+    assert forward_ids == sorted(forward_ids)
+    # None of the untrusted selector names reach any report field.
+    blob = json.dumps(forward.to_dict())
+    for name in ("zebra_unknown", "alpha_unknown", "omega_unknown", "beta_unknown"):
+        assert name not in blob
+
+
+def test_unknown_selector_outcome_has_no_raw_name_in_evidence(
+    valid_layer: SemanticLayer,
+) -> None:
+    """The declaration outcome evidence, path, and message carry no raw name."""
+    report = verify(
+        valid_layer,
+        CompatibilityCheck(metrics=("gross_margin", "secret_metric_xyz")),
+    )
+    outcome = next(
+        item
+        for item in report.outcomes
+        if item.check_id == "compatibility.declaration.metric.0000"
+    )
+    assert outcome.status == "failed"
+    # No raw selector is echoed in evidence, check_id, or diagnostics.
+    assert "secret_metric_xyz" not in outcome.check_id
+    assert "secret_metric_xyz" not in outcome.evidence
+    assert all(
+        "secret_metric_xyz" not in diag.path and "secret_metric_xyz" not in diag.message
+        for diag in outcome.diagnostics
+    )
+    # The evidence still marks the declaration as an incompatible failure.
+    assert outcome.evidence["compatible"] is False
 
 
 # ---------------------------------------------------------------------------

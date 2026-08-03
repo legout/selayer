@@ -115,21 +115,32 @@ def compatibility_requests(
     return _build_requests(metrics, dimensions, check.query_cases)
 
 
-def _unknown_selector_outcome(kind: str, name: str) -> VerificationOutcome:
-    """A coded, declaration-level failed outcome for an unknown selector."""
+def _unknown_selector_outcome(kind: str, index: int) -> VerificationOutcome:
+    """A coded, declaration-level failed outcome for an unknown selector.
+
+    Top-level ``--metric``/``--dimension`` values are user-supplied and
+    therefore untrusted; an unknown selector's name must never reach the
+    report. The outcome is keyed by a zero-padded index over the *sorted*
+    unknown selectors (deterministic and selector-free), the diagnostic uses a
+    fixed path and a fixed message that names only the selector ``kind``
+    (``"metric"``/``"dimension"`` — a fixed value, not user-controlled), and
+    the evidence carries no raw name. This mirrors the secret-safe handling
+    already applied to unknown selectors inside explicit query cases.
+    """
     code = "unknown_metric" if kind == "metric" else "unknown_dimension"
+    check_id = f"compatibility.declaration.{kind}.{index:04d}"
     diagnostic = VerificationDiagnostic(
         code,
         "error",
-        f"{kind}s.{name}",
-        f"{kind} '{name}' is not known",
+        check_id,
+        f"an unknown {kind} was requested",
     )
     return VerificationOutcome(
-        check_id=f"compatibility.declaration.{kind}.{name}",
+        check_id=check_id,
         status="failed",
         scope="declaration",
         path=_PATH,
-        evidence={"selector": name, "kind": kind},
+        evidence={"compatible": False},
         diagnostics=(diagnostic,),
     )
 
@@ -227,12 +238,16 @@ def verify_compatibility(
     """Run planner-parity compatibility verification and return its report.
 
     Selectors are validated before request generation: an unknown requested
-    metric or dimension produces a coded, declaration-level ``failed`` outcome
-    rather than being silently omitted. Valid selectors drive the deterministic
-    request set, each planned once. Each explicit ``query_case`` is validated
-    the same way before planning: an unknown metric or dimension inside a case
-    produces a coded, declaration-level ``failed`` outcome (never echoing the
-    offending selector) rather than a passed planner failure.
+    metric or dimension produces a coded, declaration-level ``failed``
+    outcome rather than being silently omitted. Top-level selector values are
+    user-supplied and untrusted, so the outcome is keyed by a deterministic
+    index over the sorted unknown selectors and never echoes the raw name in
+    its ``check_id``, diagnostic path/message, or evidence. Valid selectors
+    drive the deterministic request set, each planned once. Each explicit
+    ``query_case`` is validated the same way before planning: an unknown
+    metric or dimension inside a case produces a coded, declaration-level
+    ``failed`` outcome (never echoing the offending selector) rather than a
+    passed planner failure.
     """
     requested_metrics = (
         sorted(check.metrics) if check.metrics else sorted(layer.metrics)
@@ -245,20 +260,27 @@ def verify_compatibility(
     diagnostics: list[VerificationDiagnostic] = []
 
     valid_metrics: list[str] = []
+    unknown_metric_index = 0
     for metric in requested_metrics:
         if metric in layer.metrics:
             valid_metrics.append(metric)
             continue
-        outcome = _unknown_selector_outcome("metric", metric)
+        # ``requested_metrics`` is sorted, so the index assigned over the
+        # unknown selectors is deterministic (hash-seed independent) without
+        # ever echoing the untrusted selector name.
+        outcome = _unknown_selector_outcome("metric", unknown_metric_index)
+        unknown_metric_index += 1
         outcomes.append(outcome)
         diagnostics.extend(outcome.diagnostics)
 
     valid_dimensions: list[str] = []
+    unknown_dimension_index = 0
     for dimension in requested_dimensions:
         if dimension in layer.dimensions:
             valid_dimensions.append(dimension)
             continue
-        outcome = _unknown_selector_outcome("dimension", dimension)
+        outcome = _unknown_selector_outcome("dimension", unknown_dimension_index)
+        unknown_dimension_index += 1
         outcomes.append(outcome)
         diagnostics.extend(outcome.diagnostics)
 
