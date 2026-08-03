@@ -14,6 +14,7 @@ dependencies = [
 
 [project.scripts]
 selayer-okf = "selayer.okf.cli:run"
+selayer = "selayer.cli:run"
 
 [build-system]
 requires = ["hatchling"]
