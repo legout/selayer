@@ -10,6 +10,7 @@ from .model import (
     VerificationOutcome,
     VerificationReport,
 )
+from .static import validate_catalog
 
 __all__ = [
     "CatalogValidationResult",
@@ -20,4 +21,5 @@ __all__ = [
     "VerificationDiagnostic",
     "VerificationOutcome",
     "VerificationReport",
+    "validate_catalog",
 ]

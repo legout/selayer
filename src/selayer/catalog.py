@@ -116,10 +116,17 @@ def _data_type_compatible(data_type: str, logical: LogicalType) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class CatalogIssue:
-    """A single catalog validation problem located at a field path."""
+    """A single catalog validation problem located at a field path.
+
+    ``code`` is a stable, machine-readable identifier for the rule that fired
+    (e.g. ``catalog.version.unsupported``); it defaults to ``catalog.invalid``
+    so the historical two-argument ``(path, message)`` construction keeps
+    working unchanged.
+    """
 
     path: str
     message: str
+    code: str = "catalog.invalid"
 
 
 class CatalogValidationError(ValueError):
@@ -141,16 +148,26 @@ class CatalogValidationError(ValueError):
         return "\n".join(lines)
 
 
-@dataclass(frozen=True, slots=True)
 class _Collector:
-    issues: list[CatalogIssue]
+    def __init__(self) -> None:
+        self.issues: list[CatalogIssue] = []
 
-    def add(self, path: str, message: str) -> None:
-        self.issues.append(CatalogIssue(path=path, message=message))
+    def add(
+        self,
+        path: str,
+        message: str,
+        code: str = "catalog.invalid",
+    ) -> None:
+        self.issues.append(CatalogIssue(path, message, code))
 
     def raise_if_any(self) -> None:
         if not self.issues:
             return
+        # Sort by ``(path, message)`` only: the ``code`` is intentionally
+        # excluded so adding codes does not change the existing deterministic
+        # message order. Two issues sharing a path+message but differing codes
+        # keep their relative insertion order, which is stable for a single
+        # load pass because each rule emits at most one issue per path.
         issues = tuple(
             sorted(self.issues, key=lambda issue: (issue.path, issue.message))
         )
@@ -255,7 +272,11 @@ def _collect_duplicate_keys(node: yaml.Node, path: str, collector: _Collector) -
 def _validate_top_level(data: Mapping[str, Any], collector: _Collector) -> None:
     version = data.get("version")
     if type(version) is not int or version != 1:
-        collector.add("version", "expected schema version 1")
+        collector.add(
+            "version",
+            "expected schema version 1",
+            "catalog.version.unsupported",
+        )
     name = data.get("name")
     if name is None:
         collector.add("name", "name is required")
@@ -869,7 +890,7 @@ def load(path: str | Path) -> SemanticLayer:
     :class:`CatalogValidationError` whose ``issues`` are sorted by
     ``(path, message)``.
     """
-    collector = _Collector(issues=[])
+    collector = _Collector()
     try:
         text = Path(path).read_text(encoding="utf-8")
         node, data = _compose_and_construct(text)

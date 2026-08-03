@@ -241,7 +241,11 @@ def test_catalog_rejects_non_int_schema_versions(tmp_path: Path) -> None:
         with pytest.raises(CatalogValidationError) as caught:
             SemanticLayer.load(path)
         assert caught.value.issues == (
-            CatalogIssue("version", "expected schema version 1"),
+            CatalogIssue(
+                "version",
+                "expected schema version 1",
+                "catalog.version.unsupported",
+            ),
         )
 
 
@@ -251,7 +255,11 @@ def test_catalog_requires_schema_version_one(tmp_path: Path) -> None:
     with pytest.raises(CatalogValidationError) as caught:
         SemanticLayer.load(path)
     assert caught.value.issues == (
-        CatalogIssue(path="version", message="expected schema version 1"),
+        CatalogIssue(
+            path="version",
+            message="expected schema version 1",
+            code="catalog.version.unsupported",
+        ),
     )
 
 
