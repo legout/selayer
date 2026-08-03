@@ -980,6 +980,43 @@ def _drop_generated_fingerprint(root: Path, relative: str) -> None:
     )
 
 
+def _to_legacy_generated_metadata(root: Path) -> None:
+    """Rewrite a generated bundle as a legacy one.
+
+    Drops the newer ``generated.descriptive`` flag and re-stamps each
+    fingerprint over the now-flag-less frontmatter, so the documents look like
+    they were produced by a generator that predated the ``descriptive`` flag:
+    internally self-consistent (digest matches content) but carrying no
+    ``descriptive`` key.
+    """
+    from selayer.okf.document import (
+        generated_fingerprint,
+        parse_concept,
+        render_concept,
+    )
+
+    for concept_path in sorted(root.rglob("*.md")):
+        if concept_path.name in {"index.md", "log.md"}:
+            continue
+        concept = parse_concept(concept_path, root)
+        frontmatter = _deep_thaw(concept.frontmatter)
+        assert isinstance(frontmatter, dict)
+        generated = frontmatter.get("generated")
+        if not isinstance(generated, dict):
+            continue
+        generated.pop("descriptive", None)
+        definition = next(
+            section.content
+            for section in concept.sections
+            if section.title == "Catalog Definition"
+        )
+        generated["fingerprint"] = generated_fingerprint(frontmatter, definition)
+        concept_path.write_text(
+            render_concept(_render_with_frontmatter(concept, frontmatter)),
+            encoding="utf-8",
+        )
+
+
 # --- High 1: generated-concept completeness is not path-only ---
 
 
@@ -1377,6 +1414,121 @@ def test_authored_bundle_with_root_index_is_not_misclassified_as_generated(
     # No generated per-directory indexes and no generated metadata: the bundle
     # is authored even though it carries a root ``index.md``, so catalog-aware
     # loading must not flag missing generated concepts or indexes.
+    bundle = OkfBundle.load(root, layer=valid_layer)
+
+    codes = {issue.code for issue in bundle.diagnostics}
+    assert "okf.generated.missing_concept" not in codes
+    assert "okf.generated.index_mismatch" not in codes
+    assert "okf.generated.missing_metadata" not in codes
+
+
+# --- Fourth re-review Finding 1: legacy generated bundles that predate the
+# generated.descriptive flag must remain accepted when their otherwise-
+# controlled metadata matches the legacy projection; the new descriptive flag
+# absent from loaded legacy metadata must not be compared, while current
+# bundles that carry the flag are still validated. ---
+
+
+def test_catalog_aware_load_accepts_legacy_non_descriptive_bundle(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)  # default include_descriptive=False
+    _to_legacy_generated_metadata(root)
+
+    bundle = OkfBundle.load(root, layer=valid_layer)
+
+    codes = {issue.code for issue in bundle.diagnostics}
+    assert "okf.generated.frontmatter_mismatch" not in codes
+    assert "okf.generated.fingerprint_mismatch" not in codes
+
+
+def test_catalog_aware_load_accepts_legacy_descriptive_bundle(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root, include_descriptive=True)
+    _to_legacy_generated_metadata(root)
+
+    bundle = OkfBundle.load(root, layer=valid_layer)
+
+    codes = {issue.code for issue in bundle.diagnostics}
+    assert "okf.generated.frontmatter_mismatch" not in codes
+    assert "okf.generated.fingerprint_mismatch" not in codes
+
+
+def test_current_descriptive_bundle_flag_value_is_still_validated(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    # Isolate the ``descriptive`` flag comparison for bundles that carry it.
+    # Generate a descriptive bundle, then flip only one concept's flag to
+    # ``false`` while keeping its description and re-stamping its fingerprint.
+    # The inferred mode stays ``descriptive`` (other concepts still carry
+    # ``true``), so the description matches; only the flag value disagrees and
+    # must be caught -- proving current bundles are still validated against the
+    # flag even though legacy bundles lacking it are accepted.
+    from selayer.okf.document import (
+        generated_fingerprint,
+        parse_concept,
+        render_concept,
+    )
+
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root, include_descriptive=True)
+    path = root / "metrics" / "gross_margin.md"
+    concept = parse_concept(path, root)
+    frontmatter = _deep_thaw(concept.frontmatter)
+    assert isinstance(frontmatter, dict)
+    generated = frontmatter["generated"]
+    assert isinstance(generated, dict)
+    assert generated["descriptive"] is True
+    generated["descriptive"] = False
+    definition = next(
+        section.content
+        for section in concept.sections
+        if section.title == "Catalog Definition"
+    )
+    generated["fingerprint"] = generated_fingerprint(frontmatter, definition)
+    path.write_text(
+        render_concept(_render_with_frontmatter(concept, frontmatter)),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OkfValidationError) as raised:
+        OkfBundle.load(root, layer=valid_layer)
+
+    codes = {issue.code for issue in raised.value.issues}
+    assert "okf.generated.frontmatter_mismatch" in codes
+    # The description still matches the descriptive projection, and the digest
+    # was re-stamped, so the flag value is the sole controlled-frontmatter
+    # disagreement -- not a fingerprint or definition drift.
+    assert "okf.generated.fingerprint_mismatch" not in codes
+    assert "okf.generated.definition_mismatch" not in codes
+
+
+# --- Fourth re-review Finding 2: an authored index.md inside a semantic-kind
+# directory must not, on its own, classify a bundle as generated; reliable
+# generated evidence (generated metadata or a generated per-directory index
+# whose content matches the generator output) is required, so authored nested
+# indexes loaded with a layer stay compatible while stripped-generated
+# detection is preserved. ---
+
+
+def test_authored_semantic_directory_index_is_not_misclassified_as_generated(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    root.mkdir()
+    (root / "metrics").mkdir()
+    # Authored index inside a semantic-kind directory. Its content is human
+    # prose rather than the generator's deterministic index, and there is no
+    # generated metadata anywhere and no concept files at the expected
+    # generated paths.
+    (root / "metrics" / "index.md").write_text(
+        "# Authored metrics notes\n\nCurated commentary only.\n",
+        encoding="utf-8",
+    )
+
     bundle = OkfBundle.load(root, layer=valid_layer)
 
     codes = {issue.code for issue in bundle.diagnostics}

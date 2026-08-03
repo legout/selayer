@@ -755,14 +755,11 @@ def validate_log(path: Path, root: Path) -> tuple[OkfIssue, ...]:
 
 def _validate_generated_indexes(
     root: Path,
-    expected: Mapping[str, OkfConcept],
-    layer: SemanticLayer,
+    expected_indexes: Mapping[PurePosixPath, str],
     severity: Severity,
 ) -> list[OkfIssue]:
-    from .generation import index_documents
-
     issues: list[OkfIssue] = []
-    for relative_path, expected_text in index_documents(layer, expected).items():
+    for relative_path, expected_text in expected_indexes.items():
         relative = relative_path.as_posix()
         index_file = root / Path(relative)
         if not index_file.is_file():
@@ -793,12 +790,23 @@ def _validate_generated_indexes(
 def _controlled_frontmatter_signature(
     frontmatter: Mapping[str, object],
     controlled_keys: tuple[str, ...],
+    *,
+    compare_generated_descriptive: bool = True,
 ) -> dict[str, object]:
     """Return controlled frontmatter with generated.fingerprint and .at removed.
 
     The digest and the generation timestamp are validated or tolerated
     separately, so both are excluded when comparing the generator-owned
     frontmatter against the fresh catalog projection.
+
+    ``generated.descriptive`` is a newer generation-metadata flag. Legacy
+    bundles generated before the flag existed carry no ``descriptive`` key, so
+    comparing it against a fresh projection (which always stamps the flag)
+    would reject otherwise-valid legacy bundles. When
+    ``compare_generated_descriptive`` is false the flag is dropped from the
+    generated sub-mapping on both sides of the comparison, so legacy bundles
+    are accepted while current bundles (whose loaded metadata declares the
+    flag, so the default ``True`` applies) are still validated against it.
     """
     signature: dict[str, object] = {}
     for key in controlled_keys:
@@ -807,7 +815,10 @@ def _controlled_frontmatter_signature(
         value = frontmatter[key]
         if key == "generated" and isinstance(value, Mapping):
             signature[key] = {
-                name: value[name] for name in value if name not in ("fingerprint", "at")
+                name: value[name]
+                for name in value
+                if name not in ("fingerprint", "at")
+                and (compare_generated_descriptive or name != "descriptive")
             }
         else:
             signature[key] = value
@@ -815,24 +826,35 @@ def _controlled_frontmatter_signature(
 
 
 def _has_generated_directory_indexes(
-    root: Path, expected_paths: Iterable[PurePosixPath]
+    root: Path, expected_indexes: Mapping[PurePosixPath, str]
 ) -> bool:
     """Return True when the bundle carries generated per-directory indexes.
 
     ``OkfBundle.generate`` always stamps a per-directory ``index.md`` for every
-    semantic kind that has at least one concept. That structural artifact is
-    not removed by the generated-metadata-stripping attack, so it reliably
-    marks a bundle as generated (even when every ``generated`` mapping was
-    stripped) while authored bundles — which carry no such indexes — stay
-    compatible. The root ``index.md`` is intentionally excluded: an authored
-    bundle may legitimately carry one (``okf_version`` is an allowed optional
-    field), so it cannot distinguish generated from authored bundles and must
-    not be used as a marker on its own.
+    semantic kind that has at least one concept. That artifact is not removed
+    by the generated-metadata-stripping attack, so matching it reliably marks a
+    bundle as generated (even when every ``generated`` mapping was stripped)
+    while authored bundles stay compatible. Mere file *existence* is not
+    enough: an authored bundle may legitimately carry an authored ``index.md``
+    inside a semantic-kind directory, so a directory index counts only when its
+    on-disk content matches the generator's deterministic output for that
+    directory. The root ``index.md`` is excluded: an authored bundle may carry
+    one (``okf_version`` is an allowed optional field), so it cannot
+    distinguish generated from authored bundles on its own.
     """
-    directories = sorted(
-        {path.parts[0] for path in expected_paths if len(path.parts) > 1}
-    )
-    return any((root / directory / "index.md").is_file() for directory in directories)
+    for relative_path, expected_text in expected_indexes.items():
+        if len(relative_path.parts) < 2:
+            continue  # root index.md is not a reliable generated marker
+        index_file = root / Path(relative_path.as_posix())
+        if not index_file.is_file():
+            continue
+        try:
+            actual = index_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if actual == expected_text:
+            return True
+    return False
 
 
 def validate_generated_integrity(
@@ -844,7 +866,7 @@ def validate_generated_integrity(
 ) -> tuple[OkfIssue, ...]:
     """Compare a catalog-aware bundle against the fresh generated projection."""
     from .document import CONTROLLED_FRONTMATTER_KEYS, generated_fingerprint
-    from .generation import concepts_from_layer
+    from .generation import concepts_from_layer, index_documents
 
     severity: Severity = "error" if strict else "warning"
     has_generated = any(
@@ -875,14 +897,19 @@ def validate_generated_integrity(
         concept.frontmatter["selayer_id"]: concept
         for concept in expected.values()
     }
-    expected_paths = {concept.relative_path for concept in expected.values()}
     controlled_keys = CONTROLLED_FRONTMATTER_KEYS
-    # Detect generated bundles from generated artifacts (per-directory indexes
-    # the generator always stamps, plus any surviving generated metadata)
-    # rather than the root index marker alone, so authored bundles that happen
-    # to carry a root ``index.md`` are not misclassified.
+    # The expected per-directory index documents are deterministic for the
+    # layer (their content depends only on concept titles, not on descriptive
+    # mode or any curated curation), so compute them once for both
+    # generated-bundle detection and the index-integrity check.
+    expected_indexes = index_documents(layer, expected)
+    # Detect generated bundles from reliable generated evidence (any surviving
+    # per-concept generated metadata, or a per-directory index whose content
+    # matches the generator output) rather than the mere presence of an index
+    # file, so authored bundles that happen to carry a nested ``index.md`` are
+    # not misclassified.
     is_generated_bundle = has_generated or _has_generated_directory_indexes(
-        root, expected_paths
+        root, expected_indexes
     )
     issues: list[OkfIssue] = []
 
@@ -990,10 +1017,21 @@ def validate_generated_integrity(
         # Compare the controlled frontmatter against the fresh catalog
         # projection so a forged controlled field is detected even when the
         # stored fingerprint was recomputed to stay internally self-consistent.
+        # ``generated.descriptive`` is a newer flag: only compare it when the
+        # loaded metadata actually declares it, so legacy bundles generated
+        # before the flag are not rejected merely for lacking it.
+        loaded_generated = concept.frontmatter.get("generated")
+        loaded_declares_descriptive = isinstance(
+            loaded_generated, Mapping
+        ) and isinstance(loaded_generated.get("descriptive"), bool)
         if _controlled_frontmatter_signature(
-            concept.frontmatter, controlled_keys
+            concept.frontmatter,
+            controlled_keys,
+            compare_generated_descriptive=loaded_declares_descriptive,
         ) != _controlled_frontmatter_signature(
-            expected_concept.frontmatter, controlled_keys
+            expected_concept.frontmatter,
+            controlled_keys,
+            compare_generated_descriptive=loaded_declares_descriptive,
         ):
             issues.append(
                 OkfIssue(
@@ -1062,7 +1100,7 @@ def validate_generated_integrity(
                     )
 
     if is_generated_bundle:
-        issues.extend(_validate_generated_indexes(root, expected, layer, severity))
+        issues.extend(_validate_generated_indexes(root, expected_indexes, severity))
 
     return tuple(sorted(issues, key=lambda issue: (issue.path, issue.message)))
 
