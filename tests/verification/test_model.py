@@ -1,3 +1,4 @@
+import json
 from types import MappingProxyType
 
 import pytest
@@ -119,3 +120,72 @@ def test_report_to_dict_emits_plain_nested_evidence() -> None:
     # Serialised evidence is plain JSON-friendly structure, not frozen proxies.
     assert isinstance(evidence["summary"], dict)
     assert isinstance(evidence["rows"], list)
+
+
+def test_report_rejects_bool_and_float_schema_version() -> None:
+    outcome = VerificationOutcome(
+        "catalog.static", "passed", "declaration", "catalog", {}, ()
+    )
+    # ``True`` (bool) and ``1.0`` (float) compare equal to ``1`` under Python
+    # numeric equality, but only an exact ``int`` value of ``1`` is accepted.
+    for bad in (True, 1.0):
+        with pytest.raises(ValueError):
+            VerificationReport(
+                bad,  # type: ignore[arg-type]
+                "shopfloor",
+                "static",
+                True,
+                (outcome,),
+                (),
+            )
+    report = VerificationReport(1, "shopfloor", "static", True, (outcome,), ())
+    assert report.schema_version == 1
+    assert type(report.schema_version) is int
+
+
+def test_outcome_freezes_nested_set_evidence() -> None:
+    violations = {"a", "b", "c"}
+    outcome = VerificationOutcome(
+        check_id="source.orders.grain",
+        status="passed",
+        scope="full_scan",
+        path="data_sources.orders.grain",
+        evidence={"violations": violations},  # type: ignore[arg-type]
+        diagnostics=(),
+    )
+    # The set is frozen into a deterministically ordered tuple; mutating the
+    # caller's original set does not leak into the outcome.
+    violations.add("d")
+
+    frozen = outcome.evidence["violations"]
+    assert isinstance(frozen, tuple)
+    assert frozen == ("a", "b", "c")
+    # The frozen set-backed sequence is itself immutable.
+    with pytest.raises(TypeError):
+        frozen[0] = "z"  # type: ignore[index]
+
+
+def test_report_to_dict_emits_deterministic_set_evidence() -> None:
+    outcome = VerificationOutcome(
+        check_id="source.orders.grain",
+        status="passed",
+        scope="full_scan",
+        path="data_sources.orders.grain",
+        evidence={"violations": {"c", "a", "b"}},  # type: ignore[arg-type]
+        diagnostics=(),
+    )
+    report = VerificationReport(1, "shopfloor", "physical", True, (outcome,), ())
+
+    outcomes = report.to_dict()["outcomes"]
+    assert isinstance(outcomes, list)
+    first = outcomes[0]
+    assert isinstance(first, dict)
+    evidence = first["evidence"]
+    assert isinstance(evidence, dict)
+    violations = evidence["violations"]
+    # Sets serialise as a deterministically ordered plain list.
+    assert isinstance(violations, list)
+    assert violations == ["a", "b", "c"]
+    # The whole payload round-trips through JSON (sets are not JSON-serialisable,
+    # so this confirms determinism + serialisability of the serialised form).
+    json.dumps(report.to_dict())
