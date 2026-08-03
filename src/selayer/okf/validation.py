@@ -6,7 +6,7 @@ from collections import Counter
 from collections.abc import Iterable, Mapping
 from datetime import date, datetime
 from pathlib import Path, PurePosixPath
-from urllib.parse import unquote, urlsplit
+from urllib.parse import SplitResult, unquote, urlsplit
 
 import yaml
 
@@ -609,11 +609,35 @@ def _broken_link_message(normalized: PurePosixPath | None) -> str:
     return f"broken internal link to '{_bounded_label(normalized.as_posix())}'"
 
 
+def _malformed_link_message() -> str:
+    """Fixed, secret-safe message for a link that could not be parsed.
+
+    The raw link is never echoed: a malformed URL may carry a secret in its
+    scheme/userinfo/query/fragment, and ``urllib.parse.urlsplit`` fails before
+    those components can be separated, so the diagnostic is a fixed string.
+    The issue code and path still identify the source document.
+    """
+    return "link could not be parsed"
+
+
+def _safe_urlsplit(link: str) -> SplitResult | None:
+    """Parse a link URL, returning None when it is malformed.
+
+    ``urllib.parse.urlsplit`` raises ``ValueError`` for some malformed inputs
+    (e.g. an unterminated IPv6 literal such as ``http://[``). A validator must
+    never crash on attacker-controlled link text, so a parse failure is
+    surfaced as a coded, secret-safe diagnostic instead.
+    """
+    try:
+        return urlsplit(link)
+    except ValueError:
+        return None
+
+
 def _normalized_link_path(source: OkfConcept, link: str) -> PurePosixPath | None:
     """Return the normalized bundle-relative path for an internal link, or None."""
-    try:
-        split = urlsplit(link)
-    except ValueError:
+    split = _safe_urlsplit(link)
+    if split is None:
         return None
     path_text = unquote(split.path)
     if not path_text:
@@ -673,7 +697,16 @@ def validate_links(
             concept.relative_path, _section_slugs(concept)
         )
         for link in concept.links:
-            split = urlsplit(link)
+            split = _safe_urlsplit(link)
+            if split is None:
+                issues.append(
+                    _link_issue(
+                        concept,
+                        _malformed_link_message(),
+                        code="okf.link.malformed",
+                    )
+                )
+                continue
             if split.scheme or split.netloc:
                 continue
             path_text = unquote(split.path)
@@ -830,33 +863,41 @@ def _controlled_frontmatter_signature(
 def _has_generated_directory_indexes(
     root: Path, expected_indexes: Mapping[PurePosixPath, str]
 ) -> bool:
-    """Return True when the bundle carries generated per-directory indexes.
+    """Return True when the bundle carries the *coherent* generated index set.
 
     ``OkfBundle.generate`` always stamps a per-directory ``index.md`` for every
-    semantic kind that has at least one concept. That artifact is not removed
-    by the generated-metadata-stripping attack, so matching it reliably marks a
-    bundle as generated (even when every ``generated`` mapping was stripped)
-    while authored bundles stay compatible. Mere file *existence* is not
-    enough: an authored bundle may legitimately carry an authored ``index.md``
-    inside a semantic-kind directory, so a directory index counts only when its
-    on-disk content matches the generator's deterministic output for that
-    directory. The root ``index.md`` is excluded: an authored bundle may carry
-    one (``okf_version`` is an allowed optional field), so it cannot
+    semantic kind that has at least one concept, so a genuine (or
+    metadata-stripped) generated bundle carries the whole set. That artifact is
+    not removed by the generated-metadata-stripping attack, so the complete set
+    is a reliable marker that still audits a bundle whose every ``generated``
+    mapping was stripped. A single nested ``index.md`` that merely *happens* to
+    byte-match the generator's deterministic output for one directory is not,
+    on its own, generated evidence: an authored bundle could coincidentally
+    carry one. Detection therefore requires the *complete* expected
+    per-directory index set to be present and to match the generator output —
+    the whole set is a coherent marker that a coincidental authored index is
+    not accompanied by. The root ``index.md`` is excluded: an authored bundle
+    may carry one (``okf_version`` is an allowed optional field), so it cannot
     distinguish generated from authored bundles on its own.
     """
-    for relative_path, expected_text in expected_indexes.items():
-        if len(relative_path.parts) < 2:
-            continue  # root index.md is not a reliable generated marker
+    expected_dir_indexes = {
+        relative_path: expected_text
+        for relative_path, expected_text in expected_indexes.items()
+        if len(relative_path.parts) >= 2  # per-directory index, not the root
+    }
+    if not expected_dir_indexes:
+        return False
+    for relative_path, expected_text in expected_dir_indexes.items():
         index_file = root / Path(relative_path.as_posix())
         if not index_file.is_file():
-            continue
+            return False
         try:
             actual = index_file.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
-            continue
-        if actual == expected_text:
-            return True
-    return False
+            return False
+        if actual != expected_text:
+            return False
+    return True
 
 
 def validate_generated_integrity(

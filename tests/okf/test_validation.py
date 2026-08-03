@@ -1742,3 +1742,94 @@ def test_malformed_controlled_frontmatter_yields_coded_issue_not_typeerror(
 
     codes = {issue.code for issue in raised.value.issues}
     assert "okf.generated.fingerprint_invalid" in codes
+
+
+# --- Sixth re-review Medium 1: an authored nested index.md that happens to
+# byte-match the generator's deterministic output for one directory must not,
+# on its own, classify an authored-only bundle as generated. Reliable generated
+# evidence (generated metadata, or the *coherent* generated index set) is
+# required, so a single coincidental match stays compatible while
+# stripped-generated auditing (which leaves the whole index set intact) is
+# preserved. ---
+
+
+def test_authored_nested_index_byte_matching_generated_content_is_not_generated(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    generated_root = tmp_path / "generated"
+    OkfBundle.generate(valid_layer, generated_root)
+    # The exact bytes the generator stamps for the metrics directory index.
+    matching_index = (generated_root / "metrics" / "index.md").read_text(
+        encoding="utf-8"
+    )
+
+    root = tmp_path / "knowledge"
+    (root / "metrics").mkdir(parents=True)
+    # Authored-only bundle: a nested index.md that coincidentally byte-matches
+    # the generated metrics index, but no generated metadata, no concept files,
+    # and no other per-directory indexes. A single match must not count.
+    (root / "metrics" / "index.md").write_text(matching_index, encoding="utf-8")
+
+    bundle = OkfBundle.load(root, layer=valid_layer)
+
+    codes = {issue.code for issue in bundle.diagnostics}
+    assert "okf.generated.missing_concept" not in codes
+    assert "okf.generated.index_mismatch" not in codes
+    assert "okf.generated.missing_metadata" not in codes
+
+
+def test_stripped_generated_bundle_is_still_detected_after_stronger_index_evidence(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    # Regression guard for the stripped-generated attack once generated-bundle
+    # detection requires the coherent index set rather than a single index:
+    # stripping every ``generated`` mapping leaves the whole per-directory index
+    # set intact, so the bundle must still be audited.
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root)
+    for concept_path in sorted(root.rglob("*.md")):
+        if concept_path.name in {"index.md", "log.md"}:
+            continue
+        _drop_frontmatter_key(
+            root,
+            concept_path.relative_to(root).as_posix(),
+            "generated",
+        )
+
+    with pytest.raises(OkfValidationError) as raised:
+        OkfBundle.load(root, layer=valid_layer)
+
+    codes = {issue.code for issue in raised.value.issues}
+    assert "okf.generated.missing_metadata" in codes
+
+
+# --- Sixth re-review Medium 2: a malformed link URL (e.g. an unterminated
+# IPv6 literal such as ``http://[``) makes ``urllib.parse.urlsplit`` raise
+# ``ValueError``. The validator must emit a safe, coded broken-link diagnostic
+# instead of crashing, and must never echo the raw link (which may carry a
+# secret). ---
+
+
+def test_malformed_link_url_yields_coded_diagnostic_not_valueerror(
+    tmp_path: Path,
+) -> None:
+    _write_concept(
+        tmp_path,
+        "type: Metric",
+        "\n# Related\n\n[broken](http://[?token=SHOULD-NOT-LEAK)\n",
+    )
+
+    bundle = OkfBundle.load(tmp_path)
+
+    malformed = [
+        issue
+        for issue in bundle.diagnostics
+        if issue.code == "okf.link.malformed"
+    ]
+    assert len(malformed) == 1
+    assert malformed[0].severity == "warning"
+    assert malformed[0].path == "concept.md.links"
+    for issue in bundle.diagnostics:
+        assert "SHOULD-NOT-LEAK" not in issue.message
+        assert "token=" not in issue.message
+        assert "http://[" not in issue.message
