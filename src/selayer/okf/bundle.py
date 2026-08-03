@@ -47,21 +47,33 @@ from .validation import (
 
 
 def _preflight_mutation_path(destination: Path) -> None:
-    """Reject symlinks in a mutation path without resolving through them."""
-    cursor = Path(destination.anchor) if destination.is_absolute() else Path.cwd()
-    parts = destination.parts[1:] if destination.is_absolute() else destination.parts
-    symlink: Path | None = cursor if cursor.is_symlink() else None
-    for part in parts:
-        if symlink is not None:
-            break
-        if part in ("", "."):
-            continue
-        if part == "..":
-            cursor = cursor.parent
-            continue
-        cursor /= part
-        if cursor.is_symlink():
-            symlink = cursor
+    """Reject mutation-redirecting symlinks while allowing canonical ancestors.
+
+    A generate/write/sync/build mutation must never silently follow a symlink
+    into an unintended location, so symlinks are rejected at the mutation
+    boundary: the destination component itself and its immediate parent (the
+    directory a staging tree is built in and an atomic rename happens within),
+    and anywhere inside an existing destination tree. Writing through a symlink
+    at the destination or its parent redirects the whole mutation, and a
+    symlink already inside the destination redirects an individual write.
+
+    Higher ancestor components are *allowed* to be symlinks. Every supported
+    platform exposes the system temporary root through a canonical symlink
+    (``/var -> /private/var`` on macOS, the lexical root of ``$TMPDIR`` that
+    ``mktemp -d`` returns), and the documented ``TMP_ROOT=$(mktemp -d)`` smoke
+    builds into exactly such a path. ``Path.is_symlink`` follows ancestor
+    components to reach the boundary and only ``lstat``s the final one, so a
+    canonical ancestor is never mistaken for a boundary symlink; the real
+    destination parent is still the intended one. The preflight remains a
+    best-effort guard (the actual writes use atomic renames), matching the
+    prior contract; path-escape rejection for authored inputs lives in the
+    composition input loaders.
+    """
+    symlink: Path | None = None
+    if destination.is_symlink():
+        symlink = destination
+    elif destination.parent.is_symlink():
+        symlink = destination.parent
 
     if symlink is None and destination.exists():
         symlink = next(
@@ -624,7 +636,9 @@ class OkfBundle:
         issues.extend(validate_duplicate_bindings(concepts))
         issues.extend(validate_links(root, concepts))
         if layer is not None:
-            issues.extend(validate_generated_integrity(root, concepts, layer, strict=strict))
+            issues.extend(
+                validate_generated_integrity(root, concepts, layer, strict=strict)
+            )
         ordered = tuple(sorted(issues, key=lambda issue: (issue.path, issue.message)))
         fatal = tuple(issue for issue in ordered if issue.severity == "error")
         if fatal:

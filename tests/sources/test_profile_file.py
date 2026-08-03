@@ -136,9 +136,7 @@ def test_profile_file_resolver_returns_runtime_profile(tmp_path: Path) -> None:
     ],
     ids=["string", "int", "float", "null", "list", "mapping", "quoted_string"],
 )
-def test_profile_file_rejects_non_boolean_literals(
-    tmp_path: Path, body: str
-) -> None:
+def test_profile_file_rejects_non_boolean_literals(tmp_path: Path, body: str) -> None:
     path = _write(tmp_path, body)
     with pytest.raises(ProfileFileValidationError) as caught:
         load_profile_file(path, environ={})
@@ -299,10 +297,7 @@ def test_profile_file_rejects_non_string_entry_key(
     # null) must be rejected *before* resolution, never str-coerced.  The old
     # code coerced it with ``str(key)``, which let a non-string key reach the
     # resolved profile under its stringified spelling.
-    body = (
-        "version: 1\nprofiles:\n  warehouse:\n"
-        f"    {key_literal}:\n      env: A\n"
-    )
+    body = f"version: 1\nprofiles:\n  warehouse:\n    {key_literal}:\n      env: A\n"
     path = _write(tmp_path, body)
     with pytest.raises(ProfileFileValidationError) as caught:
         load_profile_file(path, environ={"A": "v"})
@@ -352,8 +347,7 @@ def test_profile_file_single_string_numeric_key_still_loads(tmp_path: Path) -> N
 def test_profile_file_unknown_source_field_rejected(tmp_path: Path) -> None:
     path = _write(
         tmp_path,
-        "version: 1\nprofiles:\n  warehouse:\n"
-        "    dsn:\n      env: X\n      extra: y\n",
+        "version: 1\nprofiles:\n  warehouse:\n    dsn:\n      env: X\n      extra: y\n",
     )
     with pytest.raises(ProfileFileValidationError) as caught:
         load_profile_file(path, environ={"X": "v"})
@@ -423,10 +417,7 @@ def test_profile_file_neither_source_rejected(tmp_path: Path) -> None:
 def test_profile_file_invalid_environment_name_rejected(
     tmp_path: Path, env_value: str
 ) -> None:
-    body = (
-        "version: 1\nprofiles:\n  warehouse:\n"
-        f"    dsn:\n      env: {env_value}\n"
-    )
+    body = f"version: 1\nprofiles:\n  warehouse:\n    dsn:\n      env: {env_value}\n"
     path = _write(tmp_path, body)
     with pytest.raises(ProfileFileValidationError) as caught:
         load_profile_file(path, environ={})

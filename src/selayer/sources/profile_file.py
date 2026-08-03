@@ -303,9 +303,7 @@ def _compose_without_duplicate_keys(path: Path) -> object:
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        io_error = ProfileFileValidationError(
-            "source.profile.file_missing", _FILE_PATH
-        )
+        io_error = ProfileFileValidationError("source.profile.file_missing", _FILE_PATH)
     except OSError:
         io_error = ProfileFileValidationError(
             "source.profile.file_unreadable", _FILE_PATH
@@ -317,9 +315,7 @@ def _compose_without_duplicate_keys(path: Path) -> object:
         # and which the default error renders via ``args``/``object`` — are
         # captured and discarded, and the sanitized error is raised below
         # outside any active ``except`` scope using the fixed safe path token.
-        io_error = ProfileFileValidationError(
-            "source.profile.invalid_utf8", _FILE_PATH
-        )
+        io_error = ProfileFileValidationError("source.profile.invalid_utf8", _FILE_PATH)
     except UnicodeEncodeError:
         # ``UnicodeEncodeError`` is a ``ValueError`` (not an ``OSError``): it is
         # raised by ``os.fsencode`` — reached via ``open()`` inside
@@ -330,9 +326,7 @@ def _compose_without_duplicate_keys(path: Path) -> object:
         # is captured and discarded, and the sanitized error is raised below
         # outside any active ``except`` scope using the fixed safe path token
         # (never the caller-supplied path).
-        io_error = ProfileFileValidationError(
-            "source.profile.invalid_path", _FILE_PATH
-        )
+        io_error = ProfileFileValidationError("source.profile.invalid_path", _FILE_PATH)
     except ValueError:
         # A plain ``ValueError`` — e.g. an embedded NUL (``\x00``) in the
         # caller-supplied filesystem path raised by ``open``/``os.stat`` — is
@@ -342,9 +336,7 @@ def _compose_without_duplicate_keys(path: Path) -> object:
         # traceback.  It is captured and reported with the fixed safe path
         # token (never the caller-supplied path, which may itself carry a
         # secret).
-        io_error = ProfileFileValidationError(
-            "source.profile.invalid_path", _FILE_PATH
-        )
+        io_error = ProfileFileValidationError("source.profile.invalid_path", _FILE_PATH)
     if io_error is not None:
         # Raised outside the ``except`` so __cause__/__context__ are None and
         # the traceback carries no raw OSError frames.
@@ -366,9 +358,7 @@ def _compose_without_duplicate_keys(path: Path) -> object:
         # Capture only the constant code; discard the raw PyYAML exception and
         # use the fixed safe path token (never the filesystem path).  The
         # sanitized error is raised below, outside any active ``except`` scope.
-        parse_error = ProfileFileValidationError(
-            "source.profile.malformed", _ROOT_PATH
-        )
+        parse_error = ProfileFileValidationError("source.profile.malformed", _ROOT_PATH)
     except RecursionError:
         # A pathologically deep or recursive document can exhaust the stack
         # inside PyYAML's own compose/construct (a cyclic alias the walker has
@@ -403,14 +393,10 @@ class _NodeBudget:
     def tick(self) -> None:
         self.count += 1
         if self.count > _MAX_NODES:
-            raise ProfileFileValidationError(
-                "source.profile.too_complex", _ROOT_PATH
-            )
+            raise ProfileFileValidationError("source.profile.too_complex", _ROOT_PATH)
 
 
-def _reject_duplicate_and_merge_keys(
-    node: yaml.Node, loader: yaml.SafeLoader
-) -> None:
+def _reject_duplicate_and_merge_keys(node: yaml.Node, loader: yaml.SafeLoader) -> None:
     """Walk a YAML node tree raising on the first merge or duplicate key.
 
     The walk is bounded so a cyclic alias or a pathologically deep/huge
@@ -488,9 +474,7 @@ def _walk_for_duplicate_and_merge_keys(
                     # another.  A hostile key is still redacted in the path.
                     semantic_key = loader.construct_object(key_node)
                     token = (
-                        _safe_key_token(key)
-                        if isinstance(key, str)
-                        else _REDACTED_KEY
+                        _safe_key_token(key) if isinstance(key, str) else _REDACTED_KEY
                     )
                     child_path = f"{path}.{token}" if path else token
                     if semantic_key in seen:
@@ -570,9 +554,7 @@ def _validate_document_shape(
             "source.profile.profiles_not_mapping", "profiles"
         )
     if not raw_profiles:
-        raise ProfileFileValidationError(
-            "source.profile.profiles_empty", "profiles"
-        )
+        raise ProfileFileValidationError("source.profile.profiles_empty", "profiles")
     profiles: dict[str, Mapping[str, object]] = {}
     for name in raw_profiles:
         if not (type(name) is str and _IDENTIFIER_RE.fullmatch(name)):
@@ -645,9 +627,7 @@ def _resolve_entry(
     key_name = key
     entry_path = f"profiles.{name}.{_safe_key_token(key)}"
     if not isinstance(source, Mapping):
-        raise ProfileFileValidationError(
-            "source.profile.entry_not_mapping", entry_path
-        )
+        raise ProfileFileValidationError("source.profile.entry_not_mapping", entry_path)
     # An entry may declare only ``env`` and/or ``literal``; any other field is
     # rejected (merge keys are already rejected during composition).
     if not set(source) <= _SOURCE_FIELDS:
@@ -657,9 +637,7 @@ def _resolve_entry(
     has_env = "env" in source
     has_literal = "literal" in source
     if has_env and has_literal:
-        raise ProfileFileValidationError(
-            "source.profile.ambiguous_source", entry_path
-        )
+        raise ProfileFileValidationError("source.profile.ambiguous_source", entry_path)
     if not has_env and not has_literal:
         raise ProfileFileValidationError("source.profile.missing_source", entry_path)
     if has_env:

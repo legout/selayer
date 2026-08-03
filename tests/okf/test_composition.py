@@ -18,8 +18,7 @@ from selayer.okf.document import OkfDocumentError
 from selayer.okf.model import OkfConcept, OkfIssue, OkfSection, OkfValidationError
 
 REFERENCE = (
-    "---\ntype: Reference\ntitle: Guide\nstatus: stable\n---\n\n"
-    "# Guidance\nText.\n"
+    "---\ntype: Reference\ntitle: Guide\nstatus: stable\n---\n\n# Guidance\nText.\n"
 )
 OVERLAY = (
     "---\nselayer_id: metric.gross_margin\n---\n\n"
@@ -118,9 +117,7 @@ def test_overlays_sorted_by_relative_path(
     ]
 
 
-def test_empty_inputs_load_cleanly(
-    tmp_path: Path, valid_layer: SemanticLayer
-) -> None:
+def test_empty_inputs_load_cleanly(tmp_path: Path, valid_layer: SemanticLayer) -> None:
     references = _references(tmp_path)
     overlays = _overlays_root(tmp_path)
     assert dict(load_references(references)) == {}
@@ -584,8 +581,7 @@ def test_reference_yaml_error_message_is_safe(tmp_path: Path) -> None:
     references = _references(tmp_path)
     _write(
         references / "guide.md",
-        "---\ntype: Reference\ntitle: Guide\nsecret: [hunter2\n"
-        "---\n\n# Guidance\n",
+        "---\ntype: Reference\ntitle: Guide\nsecret: [hunter2\n---\n\n# Guidance\n",
     )
     with pytest.raises(OkfValidationError) as exc:
         load_references(references)
@@ -852,9 +848,7 @@ def test_safe_read_text_pins_root_against_symlink_swap(tmp_path: Path) -> None:
     (root / "guide.md").write_text("original-content", encoding="utf-8")
     secret_dir = tmp_path / "secret"
     secret_dir.mkdir()
-    (secret_dir / "guide.md").write_text(
-        "SECRET-VALUE-DO-NOT-LEAK", encoding="utf-8"
-    )
+    (secret_dir / "guide.md").write_text("SECRET-VALUE-DO-NOT-LEAK", encoding="utf-8")
     root_fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         shutil.move(str(root), str(tmp_path / "moved"))
@@ -1198,9 +1192,7 @@ def test_reference_cyclic_frontmatter_via_alias_is_rejected(tmp_path: Path) -> N
     )
     with pytest.raises(OkfValidationError) as exc:
         load_references(references)
-    assert any(
-        "cyclic YAML structure" in issue.message for issue in exc.value.issues
-    )
+    assert any("cyclic YAML structure" in issue.message for issue in exc.value.issues)
 
 
 def test_overlay_alias_expansion_dag_is_rejected(
@@ -1383,8 +1375,7 @@ def _section(concept: OkfConcept, title: str) -> OkfSection:
 
 def _no_staging_remnants(parent: Path, dest_name: str = "knowledge") -> bool:
     return not any(
-        entry.name.startswith(f".{dest_name}.okf-build")
-        for entry in parent.iterdir()
+        entry.name.startswith(f".{dest_name}.okf-build") for entry in parent.iterdir()
     )
 
 
@@ -1409,9 +1400,10 @@ def test_build_composes_reference_and_overlay(
     generated_metric = OkfBundle.from_layer(
         valid_layer, include_descriptive=False
     ).concepts["metrics/gross_margin"]
-    assert _section(metric, "Catalog Definition").content == _section(
-        generated_metric, "Catalog Definition"
-    ).content
+    assert (
+        _section(metric, "Catalog Definition").content
+        == _section(generated_metric, "Catalog Definition").content
+    )
     assert (
         metric.frontmatter["generated"]["fingerprint"]
         == generated_metric.frontmatter["generated"]["fingerprint"]
@@ -1660,3 +1652,32 @@ def test_build_rejects_non_directory_destination(
     assert output.exists()
     assert not output.is_dir()
     assert _no_staging_remnants(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Final-fix regression: a canonical system ancestor symlink (e.g. macOS
+# ``/var -> /private/var``, the lexical root of ``$TMPDIR`` that ``mktemp -d``
+# returns) sits ABOVE the destination's immediate parent. The build mutation
+# boundary (destination component + its parent) stays symlink-free, so the
+# atomic fresh build must succeed and publish under the resolved real parent.
+# A strict lexical-ancestor walk previously rejected this exact shape.
+# ---------------------------------------------------------------------------
+
+
+def test_build_allows_canonical_symlinked_ancestor(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    real_root = tmp_path / "private-root"
+    real_root.mkdir()
+    (real_root / "work").mkdir()
+    canonical = tmp_path / "canonical"  # stands in for /var -> /private/var
+    canonical.symlink_to(real_root, target_is_directory=True)
+    output = canonical / "work" / "knowledge"  # parent is the real "work"
+
+    bundle = OkfBundle.build(valid_layer, output)
+
+    assert (output / "metrics" / "gross_margin.md").is_file()
+    assert bundle.root == output
+    # The published bytes land under the real ancestor the symlink resolves to.
+    assert (real_root / "work" / "knowledge" / "metrics" / "gross_margin.md").is_file()
+    assert _no_staging_remnants(canonical / "work")

@@ -169,9 +169,7 @@ def _open_root(root: Path) -> int:
         try:
             info = root.lstat()
         except OSError:
-            raise FileNotFoundError(
-                f"input root does not exist: '{root}'"
-            ) from error
+            raise FileNotFoundError(f"input root does not exist: '{root}'") from error
         if stat_module.S_ISLNK(info.st_mode):
             raise FileExistsError(f"input root is a symbolic link: '{root}'") from error
         raise NotADirectoryError(f"input root is not a directory: '{root}'") from error
@@ -271,9 +269,7 @@ def _walk_inputs(root: Path) -> tuple[list[Path], int]:
                 raise OkfDocumentError(f"more than {_MAX_FILES} input files")
             total += size
             if total > _MAX_TOTAL_BYTES:
-                raise OkfDocumentError(
-                    f"total input exceeds {_MAX_TOTAL_BYTES} bytes"
-                )
+                raise OkfDocumentError(f"total input exceeds {_MAX_TOTAL_BYTES} bytes")
             accepted.append(path)
         return accepted, root_fd
     except BaseException:
@@ -289,9 +285,7 @@ def _walk_inputs(root: Path) -> tuple[list[Path], int]:
 # ---------------------------------------------------------------------------
 
 
-def _reject_duplicate_keys(
-    node: yaml.Node, _visited: set[int] | None = None
-) -> None:
+def _reject_duplicate_keys(node: yaml.Node, _visited: set[int] | None = None) -> None:
     """Recursively reject duplicate scalar keys and merge keys.
 
     The walk descends into nested mappings and sequences so a duplicate buried
@@ -530,9 +524,7 @@ def _safe_read_text(
         # that fits the per-file cap but exhausts the budget is rejected here.
         effective_cap = min(_MAX_FILE_BYTES, byte_budget)
         if info.st_size > effective_cap:
-            raise OkfDocumentError(
-                f"total input exceeds {_MAX_TOTAL_BYTES} bytes"
-            )
+            raise OkfDocumentError(f"total input exceeds {_MAX_TOTAL_BYTES} bytes")
         chunks: list[bytes] = []
         remaining = effective_cap
         while remaining > 0:
@@ -556,9 +548,7 @@ def _safe_read_text(
                 f"file exceeds {_MAX_FILE_BYTES} bytes: '{relative}'"
             )
         if final_size > byte_budget:
-            raise OkfDocumentError(
-                f"total input exceeds {_MAX_TOTAL_BYTES} bytes"
-            )
+            raise OkfDocumentError(f"total input exceeds {_MAX_TOTAL_BYTES} bytes")
         try:
             return (
                 b"".join(chunks).decode("utf-8").replace("\r\n", "\n"),
@@ -605,7 +595,9 @@ def load_references(root: Path) -> Mapping[str, OkfConcept]:
             relative_posix = relative.as_posix()
             if path.name in _RESERVED_NAMES:
                 issues.append(
-                    _issue(relative_posix, f"reserved path '{path.name}' is not allowed")
+                    _issue(
+                        relative_posix, f"reserved path '{path.name}' is not allowed"
+                    )
                 )
                 continue
             # Read once from the pinned root fd (TOCTOU-safe: every component
@@ -623,9 +615,7 @@ def load_references(root: Path) -> Mapping[str, OkfConcept]:
             # post-read check is belt-and-suspenders against growth.
             total_read += consumed
             if total_read > _MAX_TOTAL_BYTES:
-                raise OkfDocumentError(
-                    f"total input exceeds {_MAX_TOTAL_BYTES} bytes"
-                )
+                raise OkfDocumentError(f"total input exceeds {_MAX_TOTAL_BYTES} bytes")
             # Duplicate-key-safe composition before parsing, so malformed or
             # duplicate-keyed frontmatter is reported with a fixed, secret-safe
             # message and never reaches parse_concept_text's source-bearing path
@@ -658,13 +648,17 @@ def load_references(root: Path) -> Mapping[str, OkfConcept]:
             if not _is_nonempty_string(frontmatter.get("type")):
                 issues.append(
                     _frontmatter_issue(
-                        relative_posix, "type", "reference must declare a non-empty type"
+                        relative_posix,
+                        "type",
+                        "reference must declare a non-empty type",
                     )
                 )
             if not _is_nonempty_string(frontmatter.get("title")):
                 issues.append(
                     _frontmatter_issue(
-                        relative_posix, "title", "reference must declare a non-empty title"
+                        relative_posix,
+                        "title",
+                        "reference must declare a non-empty title",
                     )
                 )
             issues.extend(validate_concept(concept, None, strict=True))
@@ -683,7 +677,9 @@ def load_references(root: Path) -> Mapping[str, OkfConcept]:
 # ---------------------------------------------------------------------------
 
 
-def _parse_overlay(text: str) -> tuple[dict[str, Any], str, tuple[OkfSection, ...], list[str]]:
+def _parse_overlay(
+    text: str,
+) -> tuple[dict[str, Any], str, tuple[OkfSection, ...], list[str]]:
     match = _FRONTMATTER.match(text)
     if match is None:
         raise OkfDocumentError("missing YAML frontmatter")
@@ -783,7 +779,9 @@ def load_overlays(root: Path, layer: SemanticLayer) -> tuple[OkfOverlay, ...]:
             relative_posix = relative.as_posix()
             if path.name in _RESERVED_NAMES:
                 issues.append(
-                    _issue(relative_posix, f"reserved path '{path.name}' is not allowed")
+                    _issue(
+                        relative_posix, f"reserved path '{path.name}' is not allowed"
+                    )
                 )
                 continue
             budget = _MAX_TOTAL_BYTES - total_read
@@ -796,9 +794,7 @@ def load_overlays(root: Path, layer: SemanticLayer) -> tuple[OkfOverlay, ...]:
             # post-read check is belt-and-suspenders against growth.
             total_read += consumed
             if total_read > _MAX_TOTAL_BYTES:
-                raise OkfDocumentError(
-                    f"total input exceeds {_MAX_TOTAL_BYTES} bytes"
-                )
+                raise OkfDocumentError(f"total input exceeds {_MAX_TOTAL_BYTES} bytes")
             try:
                 frontmatter, preamble, sections, links = _parse_overlay(text)
             except OkfDocumentError as error:
@@ -825,7 +821,9 @@ def load_overlays(root: Path, layer: SemanticLayer) -> tuple[OkfOverlay, ...]:
             if not _is_nonempty_string(selayer_id):
                 issues.append(
                     _frontmatter_issue(
-                        relative_posix, "selayer_id", "overlay must declare a selayer_id"
+                        relative_posix,
+                        "selayer_id",
+                        "overlay must declare a selayer_id",
                     )
                 )
             elif _SELAYER_ID.fullmatch(cast(str, selayer_id)) is None:
@@ -855,7 +853,9 @@ def load_overlays(root: Path, layer: SemanticLayer) -> tuple[OkfOverlay, ...]:
 
             if preamble:
                 issues.append(
-                    _issue(relative_posix, "text before the first section is not allowed")
+                    _issue(
+                        relative_posix, "text before the first section is not allowed"
+                    )
                 )
 
             seen_titles: set[str] = set()
@@ -895,9 +895,7 @@ def load_overlays(root: Path, layer: SemanticLayer) -> tuple[OkfOverlay, ...]:
 
     _report_duplicate_ids(all_ids, issues)
     _raise_if_errors(issues)
-    return tuple(
-        sorted(overlays, key=lambda overlay: overlay.relative_path.as_posix())
-    )
+    return tuple(sorted(overlays, key=lambda overlay: overlay.relative_path.as_posix()))
 
 
 def _validate_bound_overlay(
@@ -1010,10 +1008,7 @@ def _sibling_staging_path(destination: Path) -> Path:
     A random suffix avoids collisions with a leaked staging directory from a
     crashed earlier build or a concurrent build of the same destination.
     """
-    return (
-        destination.parent
-        / f".{destination.name}.okf-build-{secrets.token_hex(8)}"
-    )
+    return destination.parent / f".{destination.name}.okf-build-{secrets.token_hex(8)}"
 
 
 def _preflight_empty_destination(destination: Path) -> None:
@@ -1035,9 +1030,7 @@ def _preflight_empty_destination(destination: Path) -> None:
     if not destination.exists():
         return
     if not destination.is_dir():
-        raise FileExistsError(
-            f"destination '{destination}' is not an empty directory"
-        )
+        raise FileExistsError(f"destination '{destination}' is not an empty directory")
     # Reject any entry at all -- including an empty subdirectory, which the
     # previous file-only check silently allowed: iterdir is safe here because
     # is_dir above confirmed this is a directory, and a single check is O(1)
@@ -1046,9 +1039,7 @@ def _preflight_empty_destination(destination: Path) -> None:
         raise FileExistsError(f"destination '{destination}' is not empty; use sync")
 
 
-def _write_references(
-    staging: Path, references: Mapping[str, OkfConcept]
-) -> None:
+def _write_references(staging: Path, references: Mapping[str, OkfConcept]) -> None:
     """Render authored Reference concepts into the staging tree."""
     for relative, concept in references.items():
         path = staging / relative
@@ -1072,13 +1063,10 @@ def _merge_overlay(generated: OkfConcept, overlay: OkfOverlay) -> OkfConcept:
             merged_frontmatter[key] = overlay.frontmatter[key]
     overlay_sections = {section.title: section for section in overlay.sections}
     merged_sections: list[OkfSection] = [
-        overlay_sections.get(section.title, section)
-        for section in generated.sections
+        overlay_sections.get(section.title, section) for section in generated.sections
     ]
     links = tuple(
-        link
-        for section in merged_sections
-        for link in _LINK.findall(section.content)
+        link for section in merged_sections for link in _LINK.findall(section.content)
     )
     return OkfConcept.create(
         concept_id=generated.concept_id,
@@ -1174,9 +1162,7 @@ def build_bundle(
     staging = _sibling_staging_path(destination)
     published = False
     try:
-        generated = OkfBundle.from_layer(
-            layer, include_descriptive=include_descriptive
-        )
+        generated = OkfBundle.from_layer(layer, include_descriptive=include_descriptive)
         generated.write(staging)
         _write_references(staging, references)
         _apply_overlays(staging, overlays)

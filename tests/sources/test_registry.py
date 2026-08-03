@@ -1661,12 +1661,8 @@ def test_bind_requirements_binds_query_scoped_sources_in_sorted_order() -> None:
             "beta": SourceScanRequirement(columns=("machine_id", "recorded_at")),
         }
         with registry.bind_requirements(requirements):
-            alpha_count = registry.execute(
-                'select count(*) from "alpha"'
-            ).fetchone()
-            beta_count = registry.execute(
-                'select count(*) from "beta"'
-            ).fetchone()
+            alpha_count = registry.execute('select count(*) from "alpha"').fetchone()
+            beta_count = registry.execute('select count(*) from "beta"').fetchone()
         assert alpha_count == (2,)
         assert beta_count == (2,)
         # Bindings visited in sorted ID order.

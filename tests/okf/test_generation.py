@@ -419,6 +419,38 @@ def test_new_bundle_refuses_broken_symlink_without_writing(
     assert list(destination.iterdir()) == [broken]
 
 
+@pytest.mark.parametrize("operation", ["generate", "write"])
+def test_bundle_mutation_allows_canonical_symlinked_ancestor(
+    tmp_path: Path,
+    ecommerce_layer: SemanticLayer,
+    operation: str,
+) -> None:
+    # A canonical system ancestor symlink (e.g. macOS ``/var -> /private/var``,
+    # the lexical root of ``$TMPDIR`` that ``mktemp -d`` returns) sits ABOVE
+    # the destination's immediate parent, which stays a real directory. The
+    # mutation boundary -- the destination component and its parent -- is
+    # symlink-free, so generate/write succeed. This is the condition the
+    # documented ``TMP_ROOT=$(mktemp -d)`` smoke relies on and that a strict
+    # lexical-ancestor walk rejected. ``real_root``/``work`` stand in for
+    # ``/private/var``/``$TMPDIR``; ``canonical`` stands in for ``/var``.
+    real_root = tmp_path / "private-root"
+    real_root.mkdir()
+    (real_root / "work").mkdir()
+    canonical = tmp_path / "canonical"
+    canonical.symlink_to(real_root, target_is_directory=True)
+    destination = canonical / "work" / "knowledge"  # parent is the real "work"
+
+    if operation == "generate":
+        OkfBundle.generate(ecommerce_layer, destination)
+    else:
+        OkfBundle.from_layer(ecommerce_layer).write(destination)
+
+    metric = destination / "metrics" / "gross_margin.md"
+    assert metric.is_file()
+    # The bytes land under the real ancestor the symlink resolves to.
+    assert (real_root / "work" / "knowledge" / "metrics" / "gross_margin.md").is_file()
+
+
 def test_generate_maps_descriptions_only_when_requested(
     tmp_path: Path,
     ecommerce_layer: SemanticLayer,

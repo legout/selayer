@@ -738,9 +738,7 @@ def test_catalog_aware_load_rejects_missing_generated_concept(
 
     codes = {issue.code for issue in raised.value.issues}
     assert "okf.generated.missing_concept" in codes
-    assert any(
-        issue.path == "metrics/gross_margin.md" for issue in raised.value.issues
-    )
+    assert any(issue.path == "metrics/gross_margin.md" for issue in raised.value.issues)
 
 
 def test_catalog_aware_load_rejects_orphan_generated_selayer_id(
@@ -1065,9 +1063,7 @@ def test_catalog_aware_load_rejects_generated_document_without_generated_metadat
 
     codes = {issue.code for issue in raised.value.issues}
     assert "okf.generated.missing_metadata" in codes
-    assert any(
-        issue.path == "metrics/gross_margin.md" for issue in raised.value.issues
-    )
+    assert any(issue.path == "metrics/gross_margin.md" for issue in raised.value.issues)
 
 
 def test_catalog_aware_load_rejects_generated_document_without_selayer_id(
@@ -1632,8 +1628,7 @@ def test_fragment_diagnostic_does_not_echo_raw_link_or_query_secret(
     _write_concept(
         tmp_path,
         "type: Metric",
-        "\n# Related\n\n"
-        "[secret](other.md?token=SHOULD-NOT-LEAK#missing-heading)\n",
+        "\n# Related\n\n[secret](other.md?token=SHOULD-NOT-LEAK#missing-heading)\n",
     )
     (tmp_path / "other.md").write_text(
         "---\ntype: Reference\n---\n\n# Real\n",
@@ -1658,14 +1653,15 @@ def test_fragment_diagnostic_does_not_echo_raw_link_or_query_secret(
     assert "other.md" not in message
 
 
-def test_missing_fragment_diagnostic_does_not_echo_fragment_secret(tmp_path: Path) -> None:
+def test_missing_fragment_diagnostic_does_not_echo_fragment_secret(
+    tmp_path: Path,
+) -> None:
     # A secret placed in the *fragment* (rather than the query) must not be
     # echoed by the missing-fragment diagnostic.
     _write_concept(
         tmp_path,
         "type: Metric",
-        "\n# Related\n\n"
-        "[secret](other.md?token=Q#token=FRAG-SECRET)\n",
+        "\n# Related\n\n[secret](other.md?token=Q#token=FRAG-SECRET)\n",
     )
     (tmp_path / "other.md").write_text(
         "---\ntype: Reference\n---\n\n# Real\n",
@@ -1700,9 +1696,7 @@ def test_broken_link_diagnostic_does_not_echo_query_secret(
 
     bundle = OkfBundle.load(tmp_path)
 
-    broken = [
-        issue for issue in bundle.diagnostics if issue.path == "concept.md.links"
-    ]
+    broken = [issue for issue in bundle.diagnostics if issue.path == "concept.md.links"]
     assert len(broken) == 1
     message = broken[0].message
     assert "SHOULD-NOT-LEAK" not in message
@@ -1822,9 +1816,7 @@ def test_malformed_link_url_yields_coded_diagnostic_not_valueerror(
     bundle = OkfBundle.load(tmp_path)
 
     malformed = [
-        issue
-        for issue in bundle.diagnostics
-        if issue.code == "okf.link.malformed"
+        issue for issue in bundle.diagnostics if issue.code == "okf.link.malformed"
     ]
     assert len(malformed) == 1
     assert malformed[0].severity == "warning"
@@ -1966,9 +1958,7 @@ def test_null_byte_link_path_yields_coded_diagnostic_not_valueerror(
     bundle = OkfBundle.load(tmp_path)
 
     malformed = [
-        issue
-        for issue in bundle.diagnostics
-        if issue.code == "okf.link.malformed"
+        issue for issue in bundle.diagnostics if issue.code == "okf.link.malformed"
     ]
     assert len(malformed) == 1
     assert malformed[0].severity == "warning"
@@ -1990,9 +1980,7 @@ def test_oversized_link_path_yields_coded_diagnostic_not_oserror(
     bundle = OkfBundle.load(tmp_path)
 
     malformed = [
-        issue
-        for issue in bundle.diagnostics
-        if issue.code == "okf.link.malformed"
+        issue for issue in bundle.diagnostics if issue.code == "okf.link.malformed"
     ]
     assert len(malformed) == 1
     assert malformed[0].severity == "warning"

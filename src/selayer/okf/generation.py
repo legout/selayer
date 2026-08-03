@@ -274,7 +274,9 @@ def concepts_from_layer(
         if include_descriptive and isinstance(description, str) and description:
             frontmatter["description"] = description
         definition = catalog_definition(semantic_id, value)
-        generated = _generated_metadata(generated_at, include_descriptive=include_descriptive)
+        generated = _generated_metadata(
+            generated_at, include_descriptive=include_descriptive
+        )
         frontmatter.update(
             {
                 "selayer_id": semantic_id,

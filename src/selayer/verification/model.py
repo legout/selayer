@@ -75,9 +75,7 @@ def _freeze_evidence(value: object) -> object:
     up front by :func:`_validate_evidence_json_safe`.
     """
     if isinstance(value, Mapping):
-        ordered_items = sorted(
-            value.items(), key=lambda kv: _canonical_sort_key(kv[0])
-        )
+        ordered_items = sorted(value.items(), key=lambda kv: _canonical_sort_key(kv[0]))
         return MappingProxyType(
             {key: _freeze_evidence(item) for key, item in ordered_items}
         )
@@ -85,8 +83,7 @@ def _freeze_evidence(value: object) -> object:
         return tuple(_freeze_evidence(item) for item in value)
     if isinstance(value, (set, frozenset)):
         return tuple(
-            _freeze_evidence(item)
-            for item in sorted(value, key=_canonical_sort_key)
+            _freeze_evidence(item) for item in sorted(value, key=_canonical_sort_key)
         )
     return value
 
@@ -176,8 +173,7 @@ def _validate_evidence_json_safe(
     # deliberately for API consistency: every evidence/schema-contract
     # rejection in this module raises ValueError so callers catch one type.
     raise ValueError(
-        "evidence contains unsupported value of type "
-        f"{type(value).__name__}: {value!r}"
+        f"evidence contains unsupported value of type {type(value).__name__}: {value!r}"
     )
 
 
@@ -190,8 +186,7 @@ def _validate_schema_version(schema_version: object) -> None:
     """
     if type(schema_version) is not int or schema_version != _SCHEMA_VERSION:
         raise ValueError(
-            f"schema_version must be {_SCHEMA_VERSION} (int), "
-            f"got {schema_version!r}"
+            f"schema_version must be {_SCHEMA_VERSION} (int), got {schema_version!r}"
         )
 
 

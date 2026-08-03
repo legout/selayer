@@ -123,8 +123,7 @@ def _grain_sql(source_id: str, grain: tuple[str, ...]) -> str:
     quoted_grain = [_quote_identifier(column) for column in grain]
     null_filter = " or ".join(f"{column} is null" for column in quoted_grain)
     pack = ", ".join(
-        f"g{index} := {column}"
-        for index, column in enumerate(quoted_grain, start=1)
+        f"g{index} := {column}" for index, column in enumerate(quoted_grain, start=1)
     )
     distinct_expr = f"count(distinct struct_pack({pack}))"
     group_columns = ", ".join(quoted_grain)
@@ -309,19 +308,13 @@ _REL_KEY = "k"
 #: Constant diagnostic messages (never key values) for relationship outcomes.
 _REL_ONE_SIDE_NULL_MSG = "the one side of the relationship has null keys"
 _REL_ONE_SIDE_DUP_MSG = "the one side of the relationship has duplicate keys"
-_REL_MANY_SIDE_ORPHAN_MSG = (
-    "the many side has non-null keys with no one-side match"
-)
+_REL_MANY_SIDE_ORPHAN_MSG = "the many side has non-null keys with no one-side match"
 _REL_SOURCE_NULL_MSG = "the source side of the relationship has null keys"
 _REL_SOURCE_DUP_MSG = "the source side of the relationship has duplicate keys"
 _REL_TARGET_NULL_MSG = "the target side of the relationship has null keys"
 _REL_TARGET_DUP_MSG = "the target side of the relationship has duplicate keys"
-_REL_SOURCE_UNMATCHED_MSG = (
-    "the source side has non-null keys with no target match"
-)
-_REL_TARGET_UNMATCHED_MSG = (
-    "the target side has non-null keys with no source match"
-)
+_REL_SOURCE_UNMATCHED_MSG = "the source side has non-null keys with no target match"
+_REL_TARGET_UNMATCHED_MSG = "the target side has non-null keys with no source match"
 _REL_NO_SAFE_TRAVERSAL_MSG = (
     "a many-to-many relationship does not claim uniqueness or safe traversal"
 )
@@ -419,16 +412,13 @@ def _materialize_relationship(
     for _temp_name, source_id, column in temp_specs:
         needed.setdefault(source_id, []).append(column)
     requirements = {
-        source_id: SourceScanRequirement(
-            columns=tuple(dict.fromkeys(columns))
-        )
+        source_id: SourceScanRequirement(columns=tuple(dict.fromkeys(columns)))
         for source_id, columns in needed.items()
     }
     # One stable temp-table name per distinct source, in first-seen order.  A
     # relationship has at most two distinct sources, so two names suffice.
     source_temp = {
-        source_id: _REL_SOURCES[index]
-        for index, source_id in enumerate(needed)
+        source_id: _REL_SOURCES[index] for index, source_id in enumerate(needed)
     }
     with registry.bind_requirements(requirements):
         created: list[str] = []
@@ -461,10 +451,7 @@ def _materialize_relationship(
             yield
         finally:
             for temp_name in created:
-                registry.execute(
-                    "drop table if exists "
-                    f"{_quote_identifier(temp_name)}"
-                )
+                registry.execute(f"drop table if exists {_quote_identifier(temp_name)}")
 
 
 def _directed_relationship_counts(
@@ -888,9 +875,7 @@ def _report(
     # incomplete and is flagged by a single stable diagnostic so consumers can
     # treat the report as "not fully verified".  Failed outcomes (a data
     # quality issue the scan did observe) keep the report complete.
-    unavailable = any(
-        outcome.status == "unavailable" for outcome in outcomes
-    )
+    unavailable = any(outcome.status == "unavailable" for outcome in outcomes)
     diagnostics: tuple[VerificationDiagnostic, ...] = ()
     if unavailable:
         diagnostics = (
@@ -1000,16 +985,12 @@ def verify_physical(layer: SemanticLayer, check: PhysicalCheck) -> VerificationR
                             source_id, "scan_failed", "the source scan failed"
                         )
                     )
-                    outcomes.append(
-                        _unavailable_outcome(source_id, sanitized, status)
-                    )
+                    outcomes.append(_unavailable_outcome(source_id, sanitized, status))
                 else:
                     outcomes.append(_grain_outcome(source_id, status, counts))
             for relationship_id in sorted(layer.relationships):
                 outcomes.append(
-                    _audit_relationship(
-                        registry, layer.relationships[relationship_id]
-                    )
+                    _audit_relationship(registry, layer.relationships[relationship_id])
                 )
         finally:
             registry.close()

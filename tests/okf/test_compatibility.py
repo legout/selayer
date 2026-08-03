@@ -228,6 +228,5 @@ def test_legacy_timestamp_and_citations_survive_load_write_load(
     # unchanged (Task 4 contract), so the round-tripped value is a date.
     assert effective_generated_at(reloaded.concepts["concept"]) == date(2026, 1, 1)
     assert [
-        source["resource"]
-        for source in effective_sources(reloaded.concepts["concept"])
+        source["resource"] for source in effective_sources(reloaded.concepts["concept"])
     ] == ["https://example.com/policy"]

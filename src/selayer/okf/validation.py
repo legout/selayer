@@ -580,11 +580,7 @@ def _link_issue(
 
 def _bounded_label(value: str) -> str:
     """Truncate a diagnostic label so a hostile link cannot bloat messages."""
-    return (
-        value
-        if len(value) <= _MAX_LINK_LABEL
-        else value[:_MAX_LINK_LABEL] + "..."
-    )
+    return value if len(value) <= _MAX_LINK_LABEL else value[:_MAX_LINK_LABEL] + "..."
 
 
 def _fragment_link_message() -> str:
@@ -715,8 +711,7 @@ def validate_links(
     """
     resolved_root = root.resolve()
     slugs_by_path: dict[PurePosixPath, frozenset[str]] = {
-        concept.relative_path: _section_slugs(concept)
-        for concept in concepts.values()
+        concept.relative_path: _section_slugs(concept) for concept in concepts.values()
     }
     for index_path in _index_markdown_paths(root):
         relative = PurePosixPath(index_path.relative_to(root).as_posix())
@@ -724,9 +719,7 @@ def validate_links(
     issues: list[OkfIssue] = []
     for concept in concepts.values():
         source = root / Path(concept.relative_path.as_posix())
-        source_slugs = slugs_by_path.get(
-            concept.relative_path, _section_slugs(concept)
-        )
+        source_slugs = slugs_by_path.get(concept.relative_path, _section_slugs(concept))
         for link in concept.links:
             split = _safe_urlsplit(link)
             if split is None:
@@ -963,8 +956,7 @@ def _has_generated_concept_structure(
     ambiguity is out of scope.)
     """
     expected_paths = {
-        PurePosixPath(concept.relative_path.as_posix())
-        for concept in expected.values()
+        PurePosixPath(concept.relative_path.as_posix()) for concept in expected.values()
     }
     if not expected_paths:
         return False
@@ -1010,8 +1002,7 @@ def validate_generated_integrity(
         )
     expected = concepts_from_layer(layer, include_descriptive=descriptive)
     expected_by_selayer = {
-        concept.frontmatter["selayer_id"]: concept
-        for concept in expected.values()
+        concept.frontmatter["selayer_id"]: concept for concept in expected.values()
     }
     controlled_keys = CONTROLLED_FRONTMATTER_KEYS
     # The expected per-directory index documents are deterministic for the
@@ -1188,9 +1179,7 @@ def validate_generated_integrity(
             )
         generated = concept.frontmatter.get("generated")
         stored_fingerprint = (
-            generated.get("fingerprint")
-            if isinstance(generated, Mapping)
-            else None
+            generated.get("fingerprint") if isinstance(generated, Mapping) else None
         )
         if (
             not isinstance(stored_fingerprint, str)

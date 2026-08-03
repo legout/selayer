@@ -774,11 +774,7 @@ def profile_file(tmp_path: Path) -> Path:
     """A version-1 profile document resolving a DSN from ``WAREHOUSE_DSN``."""
     path = tmp_path / "profiles.yaml"
     path.write_text(
-        "version: 1\n"
-        "profiles:\n"
-        "  warehouse:\n"
-        "    dsn:\n"
-        "      env: WAREHOUSE_DSN\n",
+        "version: 1\nprofiles:\n  warehouse:\n    dsn:\n      env: WAREHOUSE_DSN\n",
         encoding="utf-8",
     )
     return path
@@ -791,10 +787,15 @@ def test_catalog_audit_uses_profile_file_without_leaking_values(
     capsys,  # type: ignore[no-untyped-def]
 ) -> None:
     monkeypatch.setenv("WAREHOUSE_DSN", "sentinel-secret-dsn")
-    code = main([
-        "catalog", "audit", str(local_catalog_path),
-        "--profiles", str(profile_file),
-    ])
+    code = main(
+        [
+            "catalog",
+            "audit",
+            str(local_catalog_path),
+            "--profiles",
+            str(profile_file),
+        ]
+    )
     captured = capsys.readouterr()
     assert code in {0, 1}
     assert "sentinel-secret-dsn" not in captured.out
@@ -843,10 +844,15 @@ def test_catalog_audit_missing_profile_environment_exits_one(
     """
     monkeypatch.delenv("WAREHOUSE_DSN", raising=False)
     assert (
-        main([
-            "catalog", "audit", str(local_catalog_path),
-            "--profiles", str(profile_file),
-        ])
+        main(
+            [
+                "catalog",
+                "audit",
+                str(local_catalog_path),
+                "--profiles",
+                str(profile_file),
+            ]
+        )
         == 1
     )
     captured = capsys.readouterr()

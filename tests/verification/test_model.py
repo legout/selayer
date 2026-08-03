@@ -52,7 +52,9 @@ def test_report_error_diagnostic_prevents_pass() -> None:
     outcome = VerificationOutcome(
         "catalog.static", "failed", "declaration", "catalog", {}, (diagnostic,)
     )
-    report = VerificationReport(1, "shopfloor", "static", True, (outcome,), (diagnostic,))
+    report = VerificationReport(
+        1, "shopfloor", "static", True, (outcome,), (diagnostic,)
+    )
     assert not report.passed
     assert report.to_dict()["schema_version"] == 1
 
@@ -276,7 +278,9 @@ def test_unordered_nested_evidence_is_hash_seed_independent() -> None:
             check=True,
         )
         outputs.add(result.stdout.strip())
-    assert len(outputs) == 1, f"non-deterministic across hash seeds: {sorted(outputs)!r}"
+    assert len(outputs) == 1, (
+        f"non-deterministic across hash seeds: {sorted(outputs)!r}"
+    )
     parsed = json.loads(next(iter(outputs)))
     assert parsed == [
         ["alpha", "beta"],

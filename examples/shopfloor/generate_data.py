@@ -674,17 +674,19 @@ def append_eol_retest(delta_path: Path) -> None:
     _delta_writer()(
         delta_path,
         pa.Table.from_pylist(
-            [{
-                "eol_test_run_id": "EOL-004",
-                "serial_number": "DRV-003",
-                "station_id": "EOL-1",
-                "attempt": 2,
-                "result": "pass",
-                "is_first_pass": False,
-                "input_voltage_v": 400.0,
-                "output_voltage_v": 400.2,
-                "power_w": 752.0,
-            }],
+            [
+                {
+                    "eol_test_run_id": "EOL-004",
+                    "serial_number": "DRV-003",
+                    "station_id": "EOL-1",
+                    "attempt": 2,
+                    "result": "pass",
+                    "is_first_pass": False,
+                    "input_voltage_v": 400.0,
+                    "output_voltage_v": 400.2,
+                    "power_w": 752.0,
+                }
+            ],
             schema=_EOL_SCHEMA,
         ),
         mode="append",

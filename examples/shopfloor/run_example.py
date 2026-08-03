@@ -29,15 +29,38 @@ def run_walkthrough(engine: QueryEngine, eol_test_runs: Path) -> None:
     print("Customer fulfilment:")
     print(engine.query(["shipped_unit_count"], ["customer_region", "product_model"]))
     print("Component genealogy for DRV-003:")
-    print(engine.query(["component_count"], ["component_lot_id"], {"drive_serial_number": "DRV-003"}))
+    print(
+        engine.query(
+            ["component_count"],
+            ["component_lot_id"],
+            {"drive_serial_number": "DRV-003"},
+        )
+    )
     print("Incoming component quality:")
-    print(engine.query(["incoming_acceptance_rate"], ["supplier_name", "component_type"]))
+    print(
+        engine.query(["incoming_acceptance_rate"], ["supplier_name", "component_type"])
+    )
     print("Operation performance:")
-    print(engine.query(["average_cycle_seconds", "rework_rate", "energy_per_operation_kwh"], ["line_id", "machine_id", "shift", "operation_name"]))
+    print(
+        engine.query(
+            ["average_cycle_seconds", "rework_rate", "energy_per_operation_kwh"],
+            ["line_id", "machine_id", "shift", "operation_name"],
+        )
+    )
     print("EOL quality before Delta reload:")
-    print(engine.query(["eol_attempt_pass_rate", "first_pass_yield"], ["station_id", "product_model", "firmware_revision"]))
+    print(
+        engine.query(
+            ["eol_attempt_pass_rate", "first_pass_yield"],
+            ["station_id", "product_model", "firmware_revision"],
+        )
+    )
     print("Raw machine health:")
-    print(engine.query(["alarm_event_count", "average_temperature_c"], ["telemetry_line_id", "machine_state"]))
+    print(
+        engine.query(
+            ["alarm_event_count", "average_temperature_c"],
+            ["telemetry_line_id", "machine_state"],
+        )
+    )
 
     try:
         engine.plan(["average_cycle_seconds", "eol_attempt_pass_rate"])

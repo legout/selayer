@@ -172,13 +172,9 @@ def test_bind_requirements_binds_exact_grain_columns_and_cleans_up() -> None:
         adapters=MappingProxyType({"pyarrow": adapter}),
     )
     try:
-        requirement = SourceScanRequirement(
-            columns=("machine_id", "recorded_at")
-        )
+        requirement = SourceScanRequirement(columns=("machine_id", "recorded_at"))
         with registry.bind_requirements({"events": requirement}):
-            count = registry.execute(
-                'select count(*) from "events"'
-            ).fetchone()
+            count = registry.execute('select count(*) from "events"').fetchone()
         assert count == (2,)
         assert adapter.bind_calls == [requirement]
         assert adapter.cleanup_calls == 1
@@ -399,7 +395,10 @@ def test_report_is_secret_safe_for_location_credentials(tmp_path: Path) -> None:
     path = tmp_path / "orders.parquet"
     pq.write_table(
         pa.table(
-            {"id": pa.array([1, 2, 3], pa.int64()), "value": pa.array([1, 2, 3], pa.int64())}
+            {
+                "id": pa.array([1, 2, 3], pa.int64()),
+                "value": pa.array([1, 2, 3], pa.int64()),
+            }
         ),
         path,
     )
@@ -536,7 +535,10 @@ def test_audit_pyarrow_table_source(tmp_path: Path) -> None:
     """A programmatic PyArrow table source audits as ``pyarrow``."""
 
     table = pa.table(
-        {"id": pa.array([1, 2, 3], pa.int64()), "value": pa.array([1, 2, 3], pa.int64())}
+        {
+            "id": pa.array([1, 2, 3], pa.int64()),
+            "value": pa.array([1, 2, 3], pa.int64()),
+        }
     )
     arrow_providers = MappingArrowProviderResolver({"events": lambda: table})
     layer = _single_source_layer(
@@ -604,8 +606,8 @@ def test_audit_duckdb_source(tmp_path: Path) -> None:
     path = tmp_path / "facts.duckdb"
     with duckdb.connect(str(path)) as connection:
         connection.execute(
-            'create table facts as select * from '
-            '(values (1::bigint, 10::bigint), (2::bigint, 20::bigint)) '
+            "create table facts as select * from "
+            "(values (1::bigint, 10::bigint), (2::bigint, 20::bigint)) "
             'as t(id, "value")'
         )
     layer = _single_source_layer(
@@ -697,7 +699,8 @@ def test_unavailable_outcome_marks_report_incomplete(tmp_path: Path) -> None:
     assert clean_report.complete is True
     assert clean_report.passed is True
     assert not [
-        diag for diag in clean_report.diagnostics
+        diag
+        for diag in clean_report.diagnostics
         if diag.code == "source.audit.unavailable"
     ]
 
@@ -879,9 +882,7 @@ def _relationship_layer(
     sources: dict[str, DataSource],
     relationships: dict[str, Relationship],
 ) -> SemanticLayer:
-    return SemanticLayer(
-        1, name, "", "", sources, {}, {}, {}, {}, relationships
-    )
+    return SemanticLayer(1, name, "", "", sources, {}, {}, {}, {}, relationships)
 
 
 def _orders_schema() -> TableSchema:
@@ -930,9 +931,7 @@ def directed_sources(tmp_path: Path) -> _DirectedSources:
         orders_path,
         pa.table(
             {
-                "order_id": pa.array(
-                    ["o1", "o2", "secret-order-key"], pa.utf8()
-                ),
+                "order_id": pa.array(["o1", "o2", "secret-order-key"], pa.utf8()),
                 "amount": pa.array([10, 20, 30], pa.int64()),
             }
         ),
@@ -1000,9 +999,7 @@ def test_one_to_many_passes_with_nullable_many_side_and_zero_child(
     assert outcome.diagnostics == ()
     # The report also carries the source-grain outcomes alongside the
     # relationship outcome.
-    assert any(
-        item.check_id == "source.orders.grain" for item in report.outcomes
-    )
+    assert any(item.check_id == "source.orders.grain" for item in report.outcomes)
     rendered = repr(report.to_dict())
     assert "secret" not in rendered.lower()
 
@@ -1167,21 +1164,13 @@ def _key_sources(
     right_keys: list[int | None],
 ) -> tuple[DataSource, DataSource]:
     left_path = tmp_path / "left.parquet"
-    _write_parquet(
-        left_path, pa.table({"key": pa.array(left_keys, pa.int64())})
-    )
+    _write_parquet(left_path, pa.table({"key": pa.array(left_keys, pa.int64())}))
     right_path = tmp_path / "right.parquet"
-    _write_parquet(
-        right_path, pa.table({"key": pa.array(right_keys, pa.int64())})
-    )
+    _write_parquet(right_path, pa.table({"key": pa.array(right_keys, pa.int64())}))
     schema = _key_schema()
     return (
-        DataSource(
-            "left_src", ParquetConfig(str(left_path)), schema, ("key",)
-        ),
-        DataSource(
-            "right_src", ParquetConfig(str(right_path)), schema, ("key",)
-        ),
+        DataSource("left_src", ParquetConfig(str(left_path)), schema, ("key",)),
+        DataSource("right_src", ParquetConfig(str(right_path)), schema, ("key",)),
     )
 
 
@@ -1202,9 +1191,7 @@ def _one_to_one_layer(left: DataSource, right: DataSource) -> SemanticLayer:
     )
 
 
-def _many_to_many_layer(
-    left: DataSource, right: DataSource
-) -> SemanticLayer:
+def _many_to_many_layer(left: DataSource, right: DataSource) -> SemanticLayer:
     return _relationship_layer(
         "mtm",
         {"left_src": left, "right_src": right},
@@ -1375,9 +1362,7 @@ def _single_pass_reader(table: pa.Table) -> pa.RecordBatchReader:
     guards against.
     """
 
-    return pa.RecordBatchReader.from_batches(
-        table.schema, list(table.to_batches())
-    )
+    return pa.RecordBatchReader.from_batches(table.schema, list(table.to_batches()))
 
 
 def test_self_one_to_one_on_single_pass_source_passes() -> None:

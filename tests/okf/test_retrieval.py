@@ -600,9 +600,11 @@ def test_retrieval_surfaces_legacy_citations_as_sources(tmp_path: Path) -> None:
         "* urn:warehouse:margin\n",
     )
 
-    item = OkfBundle.load(tmp_path).context_for(
-        ["metric.margin"], include_linked=False
-    ).items[0]
+    item = (
+        OkfBundle.load(tmp_path)
+        .context_for(["metric.margin"], include_linked=False)
+        .items[0]
+    )
 
     assert item.sources == (
         "https://example.com/policy",
@@ -643,9 +645,11 @@ def test_retrieval_without_sources_or_citations_has_no_sources_section(
         "\n# Definition\n\nNo citations.\n",
     )
 
-    item = OkfBundle.load(tmp_path).context_for(
-        ["metric.margin"], include_linked=False
-    ).items[0]
+    item = (
+        OkfBundle.load(tmp_path)
+        .context_for(["metric.margin"], include_linked=False)
+        .items[0]
+    )
 
     assert item.sources == ()
     assert "## Sources" not in item.content

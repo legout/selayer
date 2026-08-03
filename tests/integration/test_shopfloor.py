@@ -60,7 +60,9 @@ def _temporary_shopfloor_catalog(tmp_path: Path, paths: ShopfloorDataPaths) -> P
         dict[str, Any],
         yaml.safe_load(_CATALOG.read_text(encoding="utf-8")),
     )
-    for name, source in cast(dict[str, dict[str, Any]], catalog["data_sources"]).items():
+    for name, source in cast(
+        dict[str, dict[str, Any]], catalog["data_sources"]
+    ).items():
         source["location"] = str(getattr(paths, _LOCATION_ATTRS[name]))
         schema_ref = cast(str, source.pop("schema_ref"))
         source["schema"] = yaml.safe_load(
@@ -111,12 +113,12 @@ def test_shopfloor_catalog_answers_documented_questions(tmp_path: Path) -> None:
         assert engine.query(["operation_count", "rework_rate"]).row(0) == pytest.approx(
             (7, 1 / 7)
         )
-        assert engine.query(
-            ["eol_attempt_pass_rate", "first_pass_yield"]
-        ).row(0) == pytest.approx((2 / 3, 2 / 3))
-        assert engine.query(
-            ["alarm_event_count", "average_temperature_c"]
-        ).row(0) == pytest.approx((1, 48.5))
+        assert engine.query(["eol_attempt_pass_rate", "first_pass_yield"]).row(
+            0
+        ) == pytest.approx((2 / 3, 2 / 3))
+        assert engine.query(["alarm_event_count", "average_temperature_c"]).row(
+            0
+        ) == pytest.approx((1, 48.5))
 
         trace = engine.query(
             ["component_count"],
@@ -211,7 +213,9 @@ def test_main_prints_delta_setup_instruction(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_shopfloor_docs_match_the_runnable_contract() -> None:
     repo = Path(__file__).parents[2]
-    shopfloor_readme = (repo / "examples/shopfloor/README.md").read_text(encoding="utf-8")
+    shopfloor_readme = (repo / "examples/shopfloor/README.md").read_text(
+        encoding="utf-8"
+    )
     root_readme = (repo / "README.md").read_text(encoding="utf-8")
 
     assert "uv sync --extra delta" in shopfloor_readme

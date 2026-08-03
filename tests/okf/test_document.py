@@ -221,9 +221,7 @@ def test_generated_fingerprint_round_trips_for_a_loaded_generated_concept(
 
     root = tmp_path / "knowledge"
     OkfBundle.generate(valid_layer, root)
-    concept = OkfBundle.load(root, layer=valid_layer).concepts[
-        "metrics/gross_margin"
-    ]
+    concept = OkfBundle.load(root, layer=valid_layer).concepts["metrics/gross_margin"]
     definition = next(
         section.content
         for section in concept.sections
