@@ -680,12 +680,26 @@ class SourceRegistry:
         driver-derived detail — authenticated locations, credentials, opaque
         handles — can ever surface, and ``__cause__``/``__context__`` remain
         ``None``.
+
+        Cleanup (every binding's ``QueryBinding.cleanup`` plus the prepared
+        fallback resources) runs in reverse and is hardened the same way: a
+        connector cleanup exception is never allowed to escape raw, never
+        aborts the remaining cleanups, and never skips the registry lock
+        release.  The first failing binding is recorded and surfaced as a
+        sanitized :class:`~selayer.sources.errors.SourceConnectionError`
+        (code ``cleanup_failed``), again raised *outside* the active
+        ``except`` scope; a binding failure (if any) still takes priority as
+        the reported error.  The success path stays silent when cleanup
+        succeeds; the audit path stays secret-safe (a cleanup failure adapts
+        to an ``unavailable`` outcome via the audit's existing ``SourceError``
+        handler) when it does not.
         """
 
         self._lock.acquire()
         prepared: list[tuple[SourceAdapter, SourceHandle, str]] = []
         bindings: list[QueryBinding] = []
         bind_failed_source: str | None = None
+        cleanup_failed_source: str | None = None
         try:
             for source_id in sorted(requirements):
                 registration = self._registrations.get(source_id)
@@ -716,8 +730,23 @@ class SourceRegistry:
             if bind_failed_source is None:
                 yield
         finally:
+            # Cleanup runs in reverse and must never let a connector cleanup
+            # exception escape raw, never abort the remaining cleanups, and
+            # never skip the lock release.  The first failing binding's source
+            # is recorded (outside this except scope) so a sanitized
+            # ``cleanup_failed`` error can be raised below with
+            # ``__cause__``/``__context__`` left ``None``; a binding failure
+            # (if any) still takes priority as the reported error.  The
+            # prepared-resource cleanup already runs through the quiet helpers
+            # (``unregister_quietly``/``close_quietly``) which suppress per the
+            # established cleanup convention, so it cannot abort the lock
+            # release either.
             for binding in reversed(bindings):
-                binding.cleanup()
+                try:
+                    binding.cleanup()
+                except Exception:  # noqa: BLE001
+                    if cleanup_failed_source is None:
+                        cleanup_failed_source = binding.source_id
             for adapter, fresh, source_id in reversed(prepared):
                 unregister_quietly(self._connection, source_id)
                 close_quietly(adapter, fresh)
@@ -731,6 +760,19 @@ class SourceRegistry:
                 bind_failed_source,
                 "bind_failed",
                 "the source could not be bound for the query",
+            )
+        if cleanup_failed_source is not None:
+            # Constructed and raised outside the active ``except`` scope so
+            # ``__cause__`` and ``__context__`` remain ``None`` and the constant
+            # message (looked up from the allowlisted ``cleanup_failed`` code)
+            # never echoes driver text.  A binding failure (handled above)
+            # takes priority; this path only fires on the otherwise-successful
+            # query path, where a connector cleanup error would otherwise
+            # escape raw.
+            raise SourceConnectionError(
+                cleanup_failed_source,
+                "cleanup_failed",
+                "the source could not be cleaned up after the query",
             )
 
     @contextmanager

@@ -1519,6 +1519,7 @@ class _QueryScopedRecordingAdapter:
         self.bind_calls: list[SourceScanRequirement] = []
         self.cleanup_calls: int = 0
         self.fail_source: str | None = None
+        self.fail_cleanup_source: str | None = None
 
     def prepare(
         self,
@@ -1556,17 +1557,23 @@ class _QueryScopedRecordingAdapter:
         reader = handle.resource.select(list(requirement.columns))  # type: ignore[union-attr]
         connection.register(handle.source_id, reader)  # type: ignore[attr-defined]
         outer = self
+        source_id = handle.source_id
 
         def _cleanup() -> None:
             outer.cleanup_calls += 1
+            if (
+                outer.fail_cleanup_source is not None
+                and source_id == outer.fail_cleanup_source
+            ):
+                raise RuntimeError("s3://user:secret@example/private")
             try:
-                connection.unregister(handle.source_id)  # type: ignore[attr-defined]
+                connection.unregister(source_id)  # type: ignore[attr-defined]
             except Exception:  # noqa: BLE001, S110
                 pass
 
         return QueryBinding(
-            source_id=handle.source_id,
-            stable_name=handle.source_id,
+            source_id=source_id,
+            stable_name=source_id,
             cleanup=_cleanup,
         )
 
@@ -1689,6 +1696,56 @@ def test_bind_requirements_sanitizes_binding_failure() -> None:
         # The first (already-bound) binding was cleaned up before the error.
         assert adapter.cleanup_calls == 1
         # The lock is released even on the failure path.
+        assert registry._lock.acquire(blocking=False)
+        registry._lock.release()
+    finally:
+        registry.close()
+
+
+def test_bind_requirements_sanitizes_cleanup_failure_and_preserves_cleanup() -> None:
+    """A raw binding-cleanup failure never escapes raw and never blocks cleanup.
+
+    A ``RuntimeError`` carrying a fake credential is injected into the second
+    source's binding cleanup (the first cleanup in reverse order).  The query
+    body still runs (the success path is preserved up to cleanup), every
+    binding is cleaned up anyway (reverse order continues past the failure),
+    the registry lock is released, and the failure surfaces as a sanitized
+    ``SourceConnectionError`` (code ``cleanup_failed``) raised outside the
+    except scope (``__cause__``/``__context__`` ``None``) with no driver text.
+    """
+
+    adapter = _QueryScopedRecordingAdapter(pa.table({}))
+    adapter.fail_cleanup_source = "beta"
+    registry = _build_query_scoped_registry(adapter, ("alpha", "beta"))
+    try:
+        credential = "s3://user:secret@example/private"
+        requirements = {
+            "alpha": SourceScanRequirement(columns=("machine_id", "recorded_at")),
+            "beta": SourceScanRequirement(columns=("machine_id", "recorded_at")),
+        }
+        body_ran = False
+        with (
+            pytest.raises(SourceConnectionError) as caught,
+            registry.bind_requirements(requirements),
+        ):
+            # The success path is preserved: the body runs before cleanup.
+            registry.execute('select count(*) from "alpha"')
+            registry.execute('select count(*) from "beta"')
+            body_ran = True
+        # A cleanup failure (not a bind failure) is surfaced sanitized.
+        assert caught.value.code == "cleanup_failed"
+        assert caught.value.source_id == "beta"
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        assert credential not in str(caught.value)
+        assert credential not in repr(caught.value)
+        assert "secret" not in str(caught.value)
+        assert "secret" not in repr(caught.value)
+        assert body_ran
+        # Every binding was cleaned up in reverse order despite the failure:
+        # ``beta`` failed first (recorded), then ``alpha`` still ran.
+        assert adapter.cleanup_calls == 2
+        # The lock is released even on the cleanup-failure path.
         assert registry._lock.acquire(blocking=False)
         registry._lock.release()
     finally:

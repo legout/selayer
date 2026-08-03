@@ -60,6 +60,7 @@ _CODE_MESSAGES: dict[str, str] = {
     "missing_arrow_provider": "a required arrow provider handle is not configured",
     "connect_failed": "the source connection could not be established",
     "bind_failed": "the source could not be bound for the query",
+    "cleanup_failed": "the source could not be cleaned up after the query",
     "scan_failed": "the source could not be scanned",
     "schema_mismatch": "the observed schema does not match the declared schema",
     "reload_failed": "the source could not be reloaded",
