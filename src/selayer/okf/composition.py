@@ -1017,25 +1017,33 @@ def _sibling_staging_path(destination: Path) -> Path:
 
 
 def _preflight_empty_destination(destination: Path) -> None:
-    """Reject a populated or symlink-bearing destination before any staging.
+    """Reject a populated or non-directory destination before any staging.
 
-    A destination that is a file, contains any file, or contains a symlink is
-    rejected so a fresh build never silently clobbers authored content (an
-    existing bundle is updated via ``sync``). A missing or empty directory is
-    accepted. The symlink preflight reuses the bundle mutation guard so the
+    A destination is valid only if it is absent or an actually empty
+    directory. A destination that is any non-directory filesystem object (a
+    file, FIFO, socket, or device), or a directory that contains any entry at
+    all -- including an empty subdirectory -- is rejected so a fresh build
+    never silently clobbers authored content and so the single-rename publish
+    is guaranteed to succeed (POSIX ``rename`` over the destination only
+    replaces an absent or empty directory). An existing bundle is updated via
+    ``sync``. The symlink preflight reuses the bundle mutation guard so the
     destination tree is never resolved through a symlink.
     """
     from .bundle import _preflight_mutation_path
 
     _preflight_mutation_path(destination)
-    if destination.is_file():
-        raise FileExistsError(f"destination '{destination}' is a file")
-    if destination.exists() and any(
-        candidate.is_file() for candidate in destination.rglob("*")
-    ):
+    if not destination.exists():
+        return
+    if not destination.is_dir():
         raise FileExistsError(
-            f"destination '{destination}' contains files; use sync"
+            f"destination '{destination}' is not an empty directory"
         )
+    # Reject any entry at all -- including an empty subdirectory, which the
+    # previous file-only check silently allowed: iterdir is safe here because
+    # is_dir above confirmed this is a directory, and a single check is O(1)
+    # rather than walking the whole tree.
+    if next(destination.iterdir(), None) is not None:
+        raise FileExistsError(f"destination '{destination}' is not empty; use sync")
 
 
 def _write_references(

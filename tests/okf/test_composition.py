@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from collections.abc import Callable
 from datetime import date
 from pathlib import Path, PurePosixPath
 from typing import cast
@@ -1612,4 +1613,50 @@ def test_build_rejects_overlay_link_to_missing_concept(
         OkfBundle.build(valid_layer, output, overlays_dir=tmp_path / "overlays")
 
     assert not output.exists()
+    assert _no_staging_remnants(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Task 8 review fix: a destination is valid only if it is an actually empty
+# directory. Reject any non-directory filesystem object and any directory that
+# contains any entry at all -- including an empty subdirectory -- before any
+# staging directory is created.
+# ---------------------------------------------------------------------------
+
+
+def test_build_rejects_destination_with_empty_subdirectory(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    output = tmp_path / "knowledge"
+    output.mkdir()
+    (output / "metrics").mkdir()  # an empty subdirectory, not a file
+
+    with pytest.raises(FileExistsError):
+        OkfBundle.build(valid_layer, output)
+
+    # The empty subdirectory is untouched and no staging directory is created.
+    assert (output / "metrics").is_dir()
+    assert list(output.iterdir()) == [output / "metrics"]
+    assert _no_staging_remnants(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        pytest.param(lambda path: path.write_text("not a directory"), id="file"),
+        pytest.param(lambda path: os.mkfifo(path), id="special-file"),
+    ],
+)
+def test_build_rejects_non_directory_destination(
+    tmp_path: Path, valid_layer: SemanticLayer, make: Callable[[Path], object]
+) -> None:
+    output = tmp_path / "knowledge"
+    make(output)
+
+    with pytest.raises(FileExistsError):
+        OkfBundle.build(valid_layer, output)
+
+    # The non-directory object is untouched and no staging directory is created.
+    assert output.exists()
+    assert not output.is_dir()
     assert _no_staging_remnants(tmp_path)
