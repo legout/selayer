@@ -12,6 +12,10 @@ from selayer.cli import main as unified_main
 from selayer.okf import OkfBundle
 from selayer.okf.cli import main as legacy_main
 
+#: A credential sentinel embedded in fake driver/IO error messages to prove the
+#: unified ``okf`` envelope never leaks raw exception text to stderr.
+_SECRET_SENTINEL = "AKIAIOSFODNN7EXAMPLE-TOKEN-SENTINEL-9f3a"
+
 #: Authored Reference document and overlay mirrored from the composition suite.
 _AUTHORED_REFERENCE = (
     "---\ntype: Reference\ntitle: Guide\nstatus: stable\n---\n\n"
@@ -155,3 +159,94 @@ def test_okf_build_accepts_reference_and_overlay_directories(
     # Deterministic concept and diagnostic counts are reported.
     assert payload["concepts"] >= 1
     assert payload["diagnostics"] == 0
+
+
+def test_unified_okf_build_envelope_is_secret_safe(
+    monkeypatch: pytest.MonkeyPatch,
+    valid_catalog_path: Path,
+    tmp_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    """Unified ``okf build`` must not leak raw exception text to stderr.
+
+    An ``OSError`` escaping ``OkfBundle.build`` can echo credentials,
+    authenticated locations, paths, or raw driver text. The unified envelope
+    must emit a fixed JSON failure with none of that, and keep exit code 1.
+    """
+
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError(
+            f"parquet driver failed: token={_SECRET_SENTINEL} "
+            f"at /home/runner/.aws/credentials"
+        )
+
+    monkeypatch.setattr(cli.OkfBundle, "build", boom)
+    destination = tmp_path / "knowledge"
+    assert (
+        unified_main(
+            ["okf", "build", str(valid_catalog_path), str(destination)]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.err)
+    assert set(payload) == {"error"}
+    assert payload["error"]  # non-empty fixed message
+    # The credential/path/driver text must never reach either stream.
+    assert _SECRET_SENTINEL not in captured.err
+    assert _SECRET_SENTINEL not in captured.out
+    assert "/home/runner/.aws/credentials" not in captured.err
+    assert "Traceback" not in captured.err
+    # No partial success report is produced.
+    assert captured.out == ""
+
+
+def test_unified_okf_shared_command_envelope_is_secret_safe(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    """Unified shared OKF commands must not leak raw exception text.
+
+    A ``ValueError`` from the shared handler (e.g. an authenticated URL in a
+    raw driver message) must surface only as a fixed JSON failure on stderr.
+    """
+
+    def boom(_arguments: object) -> int:
+        raise ValueError(
+            f"s3://access:{_SECRET_SENTINEL}@bucket.example.com/data/orders"
+        )
+
+    monkeypatch.setattr(cli, "execute_okf", boom)
+    bundle = tmp_path / "knowledge"
+    assert unified_main(["okf", "validate", str(bundle)]) == 1
+    captured = capsys.readouterr()
+    payload = json.loads(captured.err)
+    assert set(payload) == {"error"}
+    assert payload["error"]  # non-empty fixed message
+    assert _SECRET_SENTINEL not in captured.err
+    assert _SECRET_SENTINEL not in captured.out
+    assert "bucket.example.com" not in captured.err
+    assert "Traceback" not in captured.err
+    assert captured.out == ""
+
+
+def test_legacy_okf_still_echoes_exception_text(
+    tmp_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    """Legacy ``selayer-okf`` preserves its ``error: <message>`` envelope.
+
+    The unified area is hardened to a fixed JSON payload, but the legacy CLI
+    keeps its original behavior (interpolating the message) and exit code 1,
+    so existing scripts and the legacy error contract are unchanged.
+    """
+    bundle = tmp_path / "knowledge"
+    bundle.mkdir()
+    (bundle / "bad.md").write_text("---\ntitle: Bad\n---\n", encoding="utf-8")
+    assert legacy_main(["validate", str(bundle)]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    # The legacy envelope still interpolates the message (contrast with the
+    # unified secret-safe JSON failure above).
+    assert captured.err.startswith("error: bad.md.frontmatter.type:")

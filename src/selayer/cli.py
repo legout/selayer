@@ -14,7 +14,15 @@ paths, credentials, authenticated locations). Catalog-domain errors
 :func:`validate_catalog`, so they surface as normal ``passed: false`` JSON on
 stdout rather than as exceptions here. The only exception that can escape
 ``validate_catalog`` is ``OSError`` from ``Path.read_text`` (a missing or
-unreadable catalog); that alone is caught. Programmer mistakes such as
+unreadable catalog); that alone is caught. The unified ``okf`` area (``generate``/``sync``/``validate``/``retrieve``
+plus unified-only ``build``) wraps its handlers in the same
+``except (OSError, LookupError, ValueError)`` envelope, but emits a fixed,
+secret-safe JSON payload on stderr and never interpolates the exception:
+those errors can carry credentials, authenticated locations, paths, or raw
+driver text. The legacy ``selayer-okf`` CLI keeps its own
+``error: <message>`` envelope; only the unified path is hardened.
+
+Programmer mistakes such as
 ``AssertionError`` (the unreachable "unhandled command" branch), ``TypeError``,
 and unexpected ``LookupError``/``ValueError`` (e.g. ``KeyError``/``IndexError``
 or a non-domain ``ValueError``) propagate unchanged so they are not silently
@@ -40,6 +48,16 @@ from selayer.verification.static import validate_catalog
 #: re-leak those secrets. Catalog-domain errors never reach this path: they
 #: are adapted into a failed report by ``validate_catalog``.
 _FAILURE_MESSAGE = "could not read or validate catalog"
+
+#: Fixed, secret-safe failure emitted for the unified ``okf`` area when a
+#: domain or I/O error escapes ``OkfBundle.build`` or the shared OKF
+#: ``_execute`` handler. The exception text is never interpolated: an
+#: ``OSError``/``ValueError``/``LookupError`` can carry a catalog path,
+#: credentials, authenticated locations, or raw driver errors, so echoing it
+#: would re-leak secrets the loaders already scrubbed. The legacy
+#: ``selayer-okf`` CLI keeps its own ``error: <message>`` envelope and exit
+#: code; only the unified ``okf`` area is hardened here.
+_OKF_FAILURE_MESSAGE = "okf command failed"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -80,16 +98,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0 if result.report.passed else 1
     if args.area == "okf":
         # The unified ``okf`` area reuses the legacy command handler for
-        # generate/sync/validate/retrieve so parity (stdout/stderr/exit) is
-        # exact, and handles the unified-only ``build`` command itself. Domain
-        # and I/O errors map to ``error: <message>`` on stderr with exit 1,
-        # mirroring ``selayer.okf.cli.main``.
+        # generate/sync/validate/retrieve so parity (stdout/exit) is exact on
+        # success, and handles the unified-only ``build`` command itself. The
+        # success path delegates to the shared ``_execute`` handler; on the
+        # failure path the unified area emits a fixed, secret-safe JSON
+        # envelope (no exception text), unlike the legacy ``selayer-okf`` CLI,
+        # which keeps its ``error: <message>`` form. Exit code (1) is preserved.
         try:
             if args.command == "build":
                 return _run_okf_build(args)
             return execute_okf(args)
-        except (OSError, LookupError, ValueError) as error:
-            print(f"error: {error}", file=sys.stderr)
+        except (OSError, LookupError, ValueError):
+            # Secret-safe failure for the unified ``okf`` area: never echo the
+            # exception, whose text can carry credentials, authenticated
+            # locations, paths, or raw driver errors. The legacy
+            # ``selayer-okf`` CLI keeps its own ``error: <message>`` envelope
+            # and exit code; only the unified path is hardened here.
+            print(
+                json.dumps({"error": _OKF_FAILURE_MESSAGE}, sort_keys=True),
+                file=sys.stderr,
+            )
             return 1
     raise AssertionError("unhandled command")
 
