@@ -12,6 +12,7 @@ environment value, or a raw YAML key/value.
 
 from __future__ import annotations
 
+import os
 import traceback
 from pathlib import Path
 
@@ -546,6 +547,82 @@ def test_profile_file_malformed_yaml_does_not_leak_document_text(
         load_profile_file(path, environ={})
     error = caught.value
     assert error.code == "source.profile.malformed"
+    _assert_secret_absent(error, _SECRET, capsys)
+
+
+# ---------------------------------------------------------------------------
+# File I/O failures and secret-bearing filesystem paths
+# ---------------------------------------------------------------------------
+
+
+def test_profile_file_malformed_yaml_filename_does_not_leak(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The secret is embedded in the *filename* (not the document text).  The
+    # malformed error must use a fixed safe path token, never the caller-
+    # supplied filesystem path, so the secret cannot reach ``error.path`` or
+    # any other error surface.
+    path = tmp_path / f"{_SECRET}.yaml"
+    path.write_text("version: 1\nprofiles: {unterminated\n", encoding="utf-8")
+    with pytest.raises(ProfileFileValidationError) as caught:
+        load_profile_file(path, environ={})
+    error = caught.value
+    assert error.code == "source.profile.malformed"
+    assert error.path == "<document>"
+    _assert_secret_absent(error, _SECRET, capsys)
+
+
+def test_profile_file_missing_file_raises_sanitized_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A secret-bearing filename must never surface: the raw
+    # ``FileNotFoundError`` (whose message carries the path) is captured and
+    # discarded, and the sanitized error uses a fixed safe path token.
+    path = tmp_path / f"{_SECRET}.yaml"
+    assert not path.exists()
+    with pytest.raises(ProfileFileValidationError) as caught:
+        load_profile_file(path, environ={})
+    error = caught.value
+    assert error.code == "source.profile.file_missing"
+    assert error.path == "<file>"
+    _assert_secret_absent(error, _SECRET, capsys)
+
+
+def test_profile_file_unreadable_directory_raises_sanitized_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Reading a directory raises ``IsADirectoryError`` (an ``OSError``): it is
+    # captured and reported with a fixed safe path token, never the filesystem
+    # path (which here carries the secret).
+    path = tmp_path / _SECRET
+    path.mkdir()
+    with pytest.raises(ProfileFileValidationError) as caught:
+        load_profile_file(path, environ={})
+    error = caught.value
+    assert error.code == "source.profile.file_unreadable"
+    assert error.path == "<file>"
+    _assert_secret_absent(error, _SECRET, capsys)
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="chmod 000 cannot deny reads when running as root",
+)
+def test_profile_file_unreadable_permission_denied_raises_sanitized_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / f"{_SECRET}.yaml"
+    path.write_text("version: 1\nprofiles: {}\n", encoding="utf-8")
+    path.chmod(0o000)
+    try:
+        with pytest.raises(ProfileFileValidationError) as caught:
+            load_profile_file(path, environ={})
+    finally:
+        # Restore writability so the tmp_path teardown can remove the file.
+        path.chmod(0o600)
+    error = caught.value
+    assert error.code == "source.profile.file_unreadable"
+    assert error.path == "<file>"
     _assert_secret_absent(error, _SECRET, capsys)
 
 

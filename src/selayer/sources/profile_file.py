@@ -25,11 +25,14 @@ carrying only a stable ``code``, a structural document ``path`` composed
 exclusively of *validated* identifier tokens and fixed redaction tokens, and a
 *constant* message looked up from a fixed code-to-message mapping.  No raw YAML
 key, value, or secret ever reaches ``repr``, ``str``, ``args``, ``path``,
-``message``, the traceback, or ``__cause__``/``__context__``.  Every error is
-constructed and raised *outside* an active ``except`` scope, so ``__cause__``
-and ``__context__`` remain ``None`` (a YAML parse failure is captured, the raw
-PyYAML exception discarded, and the sanitized error raised after the
-``except``/``finally`` completes).
+``message``, the traceback, or ``__cause__``/``__context__``.  The
+caller-supplied filesystem path is never stored: a malformed document and any
+file I/O failure (a missing or unreadable file) use a fixed safe path token.
+Every error is constructed and raised *outside* an active ``except`` scope, so
+``__cause__`` and ``__context__`` remain ``None`` (a YAML parse failure is
+captured, the raw PyYAML exception discarded, and the sanitized error raised
+after the ``except``/``finally`` completes; a missing/unreadable file is
+captured and the raw ``OSError`` discarded the same way).
 
 Runtime resolver failures (an unknown profile *name* at resolve time) remain
 the responsibility of :class:`~selayer.sources.errors.SourceProfileError`, which
@@ -55,6 +58,8 @@ __all__ = ["ProfileFileValidationError", "load_profile_file"]
 # no resolved value, environment value, or raw YAML key surfaces.
 _CODE_MESSAGES: dict[str, str] = {
     "source.profile.malformed": "the profile document is not valid YAML",
+    "source.profile.file_missing": "the profile file does not exist",
+    "source.profile.file_unreadable": "the profile file could not be read",
     "source.profile.merge_key": "the profile document uses an unsupported merge key",
     "source.profile.duplicate_key": "the profile document contains a duplicate key",
     "source.profile.not_mapping": "the profile document root must be a mapping",
@@ -111,6 +116,7 @@ _SOURCE_FIELDS = frozenset({"env", "literal"})
 _ROOT_PATH = "<document>"
 _UNKNOWN_KEY_PATH = "top_level"
 _REDACTED_KEY = "<key>"
+_FILE_PATH = "<file>"
 
 
 class ProfileFileValidationError(Exception):
@@ -172,8 +178,8 @@ def load_profile_file(
 
     Each profile value is resolved from ``env`` (read from *environ*, accepted
     only as an exact builtin ``str``) or ``literal`` (an exact builtin ``bool``
-    copied verbatim).  Any malformed document, unresolvable value, or
-    disallowed literal raises an immutable, sanitized
+    copied verbatim).  Any missing/unreadable file, malformed document,
+    unresolvable value, or disallowed literal raises an immutable, sanitized
     :class:`ProfileFileValidationError` outside any ``except`` scope; no
     resolved value, environment value, or raw YAML key is ever retained or
     rendered.
@@ -193,13 +199,37 @@ def _compose_without_duplicate_keys(path: Path) -> object:
     shadowed or merged value can never reach resolution.  Returns the
     constructed document, or ``None`` for an empty/null document.
 
-    A syntactically invalid document is reported as a constant-code validation
-    error: the PyYAML exception (whose message may quote document text) is
-    captured inside the ``except`` and the sanitized error is raised *after*
-    the ``except``/``finally`` completes, so no raw exception reaches
-    ``__cause__``, ``__context__``, the traceback, or ``args``.
+    File-system failures (a missing or unreadable file) and syntactically
+    invalid documents are reported as constant-code validation errors.  In each
+    case the raw exception is captured inside the ``except`` and the sanitized
+    error is raised *after* the ``except``/``finally`` completes — outside any
+    active ``except`` scope — using a fixed safe path token (never the
+    caller-supplied filesystem path, which may itself carry a secret), so no
+    raw exception reaches ``__cause__``, ``__context__``, the traceback,
+    ``args``, ``path``, or ``message``.
     """
-    text = path.read_text(encoding="utf-8")
+    # Read the file first.  A missing or unreadable file is captured (never
+    # retained) and reported with the fixed safe path token; the caller-supplied
+    # filesystem path is never stored.  ``text`` is pre-bound so it is always a
+    # bound ``str`` even though the placeholder is never used (an I/O failure
+    # raises before it can be read).
+    text = ""
+    io_error: ProfileFileValidationError | None = None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        io_error = ProfileFileValidationError(
+            "source.profile.file_missing", _FILE_PATH
+        )
+    except OSError:
+        io_error = ProfileFileValidationError(
+            "source.profile.file_unreadable", _FILE_PATH
+        )
+    if io_error is not None:
+        # Raised outside the ``except`` so __cause__/__context__ are None and
+        # the traceback carries no raw OSError frames.
+        raise io_error
+
     loader = yaml.SafeLoader(text)
     parse_error: ProfileFileValidationError | None = None
     data: object = None
@@ -213,10 +243,11 @@ def _compose_without_duplicate_keys(path: Path) -> object:
             _reject_duplicate_and_merge_keys(node)
             data = loader.construct_document(node)
     except yaml.YAMLError:
-        # Capture only the constant code; discard the raw PyYAML exception.  The
+        # Capture only the constant code; discard the raw PyYAML exception and
+        # use the fixed safe path token (never the filesystem path).  The
         # sanitized error is raised below, outside any active ``except`` scope.
         parse_error = ProfileFileValidationError(
-            "source.profile.malformed", str(path)
+            "source.profile.malformed", _ROOT_PATH
         )
     finally:
         loader.dispose()
