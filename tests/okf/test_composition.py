@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 from datetime import date
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import cast
 
 import pytest
@@ -14,7 +14,7 @@ from selayer.catalog import SemanticLayer
 from selayer.okf import composition
 from selayer.okf.composition import load_overlays, load_references
 from selayer.okf.document import OkfDocumentError
-from selayer.okf.model import OkfValidationError
+from selayer.okf.model import OkfIssue, OkfValidationError
 
 REFERENCE = (
     "---\ntype: Reference\ntitle: Guide\nstatus: stable\n---\n\n"
@@ -1162,3 +1162,199 @@ def test_aggregate_budget_caps_read_prospectively(
     with pytest.raises(OkfDocumentError) as exc:
         load_references(references)
     assert "total input exceeds" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Hardening: bound YAML alias expansion / depth / node count, reject cyclic
+# alias graphs, so a small frontmatter blob cannot force the downstream freeze
+# (which copies every alias reference) into unbounded or exponential work.
+# ---------------------------------------------------------------------------
+
+
+def test_overlay_cyclic_sources_via_alias_is_rejected(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    # A self-referential alias makes ``sources`` a cycle; the freeze that
+    # OkfConcept.create runs would recurse without bound, so the composed node
+    # graph must be rejected before construction with a fixed, safe message.
+    overlays = _overlays_root(tmp_path)
+    _write(
+        overlays / "metrics" / "gross_margin.md",
+        "---\nselayer_id: metric.gross_margin\nsources: &s [*s]\n"
+        "---\n\n# Usage Guidance\nx\n",
+    )
+    with pytest.raises(OkfValidationError) as exc:
+        load_overlays(overlays, valid_layer)
+    messages = " ".join(issue.message for issue in exc.value.issues)
+    assert "cyclic YAML structure" in messages
+
+
+def test_reference_cyclic_frontmatter_via_alias_is_rejected(tmp_path: Path) -> None:
+    references = _references(tmp_path)
+    _write(
+        references / "guide.md",
+        "---\ntype: Reference\ntitle: Guide\nloop: &l [*l]\n---\n\n# Guidance\n",
+    )
+    with pytest.raises(OkfValidationError) as exc:
+        load_references(references)
+    assert any(
+        "cyclic YAML structure" in issue.message for issue in exc.value.issues
+    )
+
+
+def test_overlay_alias_expansion_dag_is_rejected(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    # A compact fan-out alias DAG: each level aliases the previous twice, so a
+    # few hundred bytes unfold into an exponentially large tree (2^k freeze
+    # calls). The expansion budget must reject it before construction/freeze.
+    overlays = _overlays_root(tmp_path)
+    lines = ["---", "selayer_id: metric.gross_margin", "a: &a 'x'"]
+    prev = "a"
+    # 14 doubling levels -> 2^15 - 1 (~32k) > _MAX_YAML_EXPANSION (10_000).
+    for index in range(14):
+        name = f"n{index}"
+        lines.append(f"{name}: &{name} [*{prev}, *{prev}]")
+        prev = name
+    lines += ["---", "", "# Usage Guidance", "x"]
+    _write(overlays / "metrics" / "gross_margin.md", "\n".join(lines) + "\n")
+    with pytest.raises(OkfValidationError) as exc:
+        load_overlays(overlays, valid_layer)
+    messages = " ".join(issue.message for issue in exc.value.issues)
+    assert "too complex" in messages
+
+
+def test_deeply_nested_yaml_frontmatter_is_rejected(tmp_path: Path) -> None:
+    # A document nested far past _MAX_YAML_DEPTH can overflow the stack during
+    # composition; the rejection must be a fixed, secret-safe message rather
+    # than an uncaught RecursionError.
+    references = _references(tmp_path)
+    nested = "nested: " + "[" * 5000 + "1" + "]" * 5000
+    _write(
+        references / "guide.md",
+        f"---\ntype: Reference\ntitle: Guide\n{nested}\n---\n\n# Guidance\n",
+    )
+    with pytest.raises(OkfValidationError) as exc:
+        load_references(references)
+    messages = " ".join(issue.message for issue in exc.value.issues)
+    assert "invalid YAML frontmatter" in messages
+
+
+def test_reference_small_alias_dag_is_accepted(tmp_path: Path) -> None:
+    # A small, non-cyclic alias DAG (a scalar referenced twice) is legitimate
+    # and must be accepted, not rejected by the expansion/complexity bound.
+    references = _references(tmp_path)
+    _write(
+        references / "guide.md",
+        "---\ntype: Reference\ntitle: Guide\nshared: &s value\ncopy: *s\n"
+        "---\n\n# Guidance\n",
+    )
+    guide = load_references(references)["references/guide.md"]
+    assert guide.frontmatter["copy"] == "value"
+    assert guide.frontmatter["shared"] == "value"
+
+
+# ---------------------------------------------------------------------------
+# Hardening: a file that grows *during* the bounded read must be rejected by
+# the post-read fstat so a capped read never returns truncated content. Per-file
+# precedence over the aggregate budget is preserved.
+# ---------------------------------------------------------------------------
+
+
+def test_safe_read_text_post_read_per_file_growth_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The file fits both pre-read caps, then grows past _MAX_FILE_BYTES during
+    # the read. The post-read fstat must reject it, and the per-file message
+    # wins precedence over the (also-exhausted) aggregate budget.
+    monkeypatch.setattr(composition, "_MAX_FILE_BYTES", 50)
+    monkeypatch.setattr(composition, "_MAX_TOTAL_BYTES", 30)
+    references = _references(tmp_path)
+    guide = references / "guide.md"
+    _write(guide, "b" * 20)  # 20 bytes: passes both pre-read caps
+    root_fd = os.open(str(references), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    real_read = os.read
+    grew = {"done": False}
+
+    def growing_read(fd: int, n: int) -> bytes:
+        data = real_read(fd, n)
+        if data and not grew["done"]:
+            grew["done"] = True
+            with open(guide, "a", encoding="utf-8") as handle:
+                handle.write("z" * 200)
+        return data
+
+    monkeypatch.setattr(os, "read", growing_read)
+    try:
+        with pytest.raises(OkfDocumentError) as exc:
+            composition._safe_read_text(guide, references, root_fd, "guide.md", 30)
+        assert "exceeds" in str(exc.value)
+        assert "total input exceeds" not in str(exc.value)
+    finally:
+        os.close(root_fd)
+
+
+def test_safe_read_text_post_read_aggregate_growth_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Growth during the read past the remaining aggregate budget (but under the
+    # per-file cap) must be rejected by the post-read fstat as a total overflow
+    # rather than accepted as truncated content.
+    monkeypatch.setattr(composition, "_MAX_FILE_BYTES", 1000)
+    monkeypatch.setattr(composition, "_MAX_TOTAL_BYTES", 80)
+    references = _references(tmp_path)
+    guide = references / "guide.md"
+    _write(guide, "b" * 20)  # 20 bytes; budget 30 -> pre-read passes
+    root_fd = os.open(str(references), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    real_read = os.read
+    grew = {"done": False}
+
+    def growing_read(fd: int, n: int) -> bytes:
+        data = real_read(fd, n)
+        if data and not grew["done"]:
+            grew["done"] = True
+            with open(guide, "a", encoding="utf-8") as handle:
+                handle.write("z" * 200)
+        return data
+
+    monkeypatch.setattr(os, "read", growing_read)
+    try:
+        with pytest.raises(OkfDocumentError) as exc:
+            composition._safe_read_text(guide, references, root_fd, "guide.md", 30)
+        assert "total input exceeds" in str(exc.value)
+    finally:
+        os.close(root_fd)
+
+
+# ---------------------------------------------------------------------------
+# Hardening: a cyclic or malformed overlay sources/stale_after value must be
+# adapted into a controlled domain error, never a raw OkfMetadataError.
+# ---------------------------------------------------------------------------
+
+
+def test_validate_bound_overlay_adapts_cyclic_sources_error(
+    valid_layer: SemanticLayer,
+) -> None:
+    # A cyclic sources value would surface a raw OkfMetadataError from the
+    # freeze inside OkfConcept.create. _validate_bound_overlay must adapt it
+    # into a controlled OkfIssue and never raise the raw exception.
+    cyclic: list[object] = []
+    cyclic.append(cyclic)
+    frontmatter: dict[str, object] = {
+        "selayer_id": "metric.gross_margin",
+        "sources": cyclic,
+    }
+    issues: list[OkfIssue] = []
+    result = composition._validate_bound_overlay(
+        "metric.gross_margin",
+        valid_layer,
+        PurePosixPath("metrics/gross_margin.md"),
+        "metrics/gross_margin.md",
+        frontmatter,
+        (),
+        issues,
+    )
+    assert result is False
+    assert issues, "expected a controlled issue for cyclic sources"
+    messages = " ".join(issue.message for issue in issues)
+    assert "cyclic or malformed" in messages

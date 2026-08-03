@@ -67,6 +67,20 @@ _MAX_FILES = 1_000
 _MAX_FILE_BYTES = 1_048_576
 _MAX_TOTAL_BYTES = 16_777_216
 _MAX_LINKS_PER_FILE = 1_000
+# Bounds applied to the composed YAML frontmatter node graph before it is
+# constructed (``safe_load``) or frozen. Aliases resolve by reference, so a
+# *small* cyclic alias graph makes the downstream freeze (which copies every
+# reference) recurse without bound, and a small *fan-out* alias DAG forces it
+# into exponential work (a few hundred bytes can cost tens of seconds). Depth
+# bounds the recursion so neither the validator nor PyYAML can overflow the
+# stack; the node count bounds distinct nodes (memory); the expansion budget
+# bounds the fully-unfolded tree size (the exact cost ``_freeze`` pays), so a
+# compact alias DAG cannot cause exponential memory/CPU. Generous enough that
+# any realistic overlay/reference frontmatter (nested sources/verified
+# mappings, depth ~3-4) is always accepted.
+_MAX_YAML_DEPTH = 100
+_MAX_YAML_NODES = 2_000
+_MAX_YAML_EXPANSION = 10_000
 # ``O_NOFOLLOW`` refuses to open a path that is a symlink at open time, closing
 # the lstat->open window. ``O_DIRECTORY`` fails the open early for a non-directory
 # (so opening a FIFO/special root cannot block), and ``O_NONBLOCK`` keeps any
@@ -309,26 +323,111 @@ def _reject_duplicate_keys(
             _reject_duplicate_keys(item, _visited)
 
 
-def _compose_frontmatter(text: str) -> dict[str, Any]:
-    """Compose YAML frontmatter with recursive duplicate-key detection.
+def _yaml_expansion(node: yaml.Node, cache: dict[int, int]) -> int:
+    """Return the number of recursive visits ``_freeze`` would perform.
 
-    All YAML parse and construction failures are wrapped into a single fixed,
-    secret-safe message: the underlying error text from PyYAML can include
-    source snippets, anchors, tags, or file paths, so it is never surfaced.
-    A top-level non-mapping and any duplicate or merge key is rejected.
+    Aliases share a node, so a small *fan-out* DAG (each level aliases the
+    previous twice) makes the non-memoized ``_freeze`` do exponential work --
+    a few hundred bytes can cost tens of seconds. This memoized count is the
+    exact size of the fully-unfolded tree the structure expands into (the cost
+    ``_freeze`` pays), computed in linear time over the (acyclic) graph so the
+    bound check itself cannot be the denial-of-service.
+    """
+    identity = id(node)
+    cached = cache.get(identity)
+    if cached is not None:
+        return cached
+    if not isinstance(node, yaml.CollectionNode):
+        cache[identity] = 1
+        return 1
+    total = 1
+    if isinstance(node, yaml.MappingNode):
+        for key_node, value_node in node.value:
+            total += _yaml_expansion(key_node, cache)
+            total += _yaml_expansion(value_node, cache)
+    else:  # SequenceNode
+        for item in node.value:
+            total += _yaml_expansion(item, cache)
+    cache[identity] = total
+    return total
+
+
+def _validate_yaml_structure(node: yaml.Node) -> None:
+    """Bound alias expansion, depth, and node count; reject cyclic graphs.
+
+    Runs on the composed node graph before construction (``safe_load``) and
+    before the downstream ``_freeze``, so a compact frontmatter blob cannot
+    exhaust memory or CPU. A cycle (a node that is its own ancestor) is
+    rejected outright -- it would make ``_freeze``/validation recurse without
+    bound; a non-cyclic shared sub-tree (DAG) that fits the bounds is accepted.
+    Depth keeps both this walk and PyYAML's own recursion off the stack; the
+    node count bounds distinct nodes; the expansion budget bounds the
+    ``_freeze`` cost. All diagnostics are fixed, secret-safe messages.
+    """
+    seen: set[int] = set()
+    on_path: set[int] = set()
+    node_count = 0
+
+    def walk(current: yaml.Node, depth: int) -> None:
+        nonlocal node_count
+        if depth > _MAX_YAML_DEPTH:
+            raise OkfDocumentError("YAML structure is too deeply nested")
+        identity = id(current)
+        if identity in on_path:
+            # Reaching a node already on the current root->leaf path is a true
+            # cycle (an alias that closes back on an ancestor).
+            raise OkfDocumentError("cyclic YAML structure is not supported")
+        if identity in seen:
+            # A non-cyclic shared sub-tree (DAG): already validated once.
+            return
+        node_count += 1
+        if node_count > _MAX_YAML_NODES:
+            raise OkfDocumentError("YAML structure is too complex")
+        if not isinstance(current, yaml.CollectionNode):
+            seen.add(identity)
+            return
+        on_path.add(identity)
+        if isinstance(current, yaml.MappingNode):
+            for key_node, value_node in current.value:
+                walk(key_node, depth + 1)
+                walk(value_node, depth + 1)
+        else:  # SequenceNode
+            for item in current.value:
+                walk(item, depth + 1)
+        on_path.discard(identity)
+        seen.add(identity)
+
+    walk(node, 0)
+    if _yaml_expansion(node, {}) > _MAX_YAML_EXPANSION:
+        raise OkfDocumentError("YAML structure is too complex")
+
+
+def _compose_frontmatter(text: str) -> dict[str, Any]:
+    """Compose YAML frontmatter that is bounded, acyclic, and duplicate-key-safe.
+
+    All YAML parse and construction failures -- including a pathologically deep
+    document that overflows the stack during composition -- are wrapped into a
+    single fixed, secret-safe message: the underlying error text from PyYAML
+    can include source snippets, anchors, tags, or file paths, so it is never
+    surfaced. Before construction the composed node graph is bounded in depth,
+    node count, and alias expansion, and cyclic alias graphs are rejected
+    outright, so a small frontmatter blob cannot force the downstream freeze
+    (which copies every alias reference) into unbounded or exponential work. A
+    top-level non-mapping and any duplicate or merge key is rejected.
     """
     try:
         node = yaml.compose(text, Loader=cast(type[yaml.Loader], yaml.SafeLoader))
-    except yaml.YAMLError:
+    except (yaml.YAMLError, RecursionError):
         raise OkfDocumentError("invalid YAML frontmatter")
     if node is None:
         return {}
     if not isinstance(node, yaml.MappingNode):
         raise OkfDocumentError("frontmatter must be a mapping")
+    _validate_yaml_structure(node)
     _reject_duplicate_keys(node)
     try:
         loaded = yaml.safe_load(text)
-    except yaml.YAMLError:
+    except (yaml.YAMLError, RecursionError):
         # A YAML that composes but fails construction (e.g. an explicit tag
         # SafeLoader cannot build) must not leak the constructor diagnostic.
         raise OkfDocumentError("invalid YAML frontmatter")
@@ -434,8 +533,12 @@ def _safe_read_text(
                 break
             chunks.append(chunk)
             remaining -= len(chunk)
-        # Re-check after reading: a file that grew past the per-file cap mid-read
-        # must be rejected even though the bounded read stopped at the limit.
+        # Re-check after reading: a file that grew during the bounded read must
+        # be rejected so a capped read never returns truncated content. Growth
+        # past the per-file cap is "file exceeds"; growth that exhausts the
+        # remaining aggregate budget (while staying under the per-file cap) is
+        # "total input exceeds". Per-file precedence is preserved exactly, mirroring
+        # the pre-read checks; both messages echo only the local input-relative path.
         try:
             final_size = os.fstat(fd).st_size
         except OSError as error:
@@ -443,6 +546,10 @@ def _safe_read_text(
         if final_size > _MAX_FILE_BYTES:
             raise OkfDocumentError(
                 f"file exceeds {_MAX_FILE_BYTES} bytes: '{relative}'"
+            )
+        if final_size > byte_budget:
+            raise OkfDocumentError(
+                f"total input exceeds {_MAX_TOTAL_BYTES} bytes"
             )
         try:
             return (
@@ -816,7 +923,11 @@ def _validate_bound_overlay(
         )
     # Reuse the existing OKF field validators for sources/stale_after by
     # constructing a temporary concept whose type/title/selayer_id are
-    # guaranteed valid, so only sources/stale_after defects surface.
+    # guaranteed valid, so only sources/stale_after defects surface. A cyclic or
+    # otherwise malformed sources/stale_after value surfaces as an
+    # OkfMetadataError during construction (the freeze that OkfConcept.create
+    # runs); adapt it into a controlled domain error so a raw OkfMetadataError
+    # (or any source-bearing text) never escapes the loader.
     temp_frontmatter: dict[str, Any] = {
         "type": _KIND_TYPES[kind],
         "title": display_title(name),
@@ -826,14 +937,24 @@ def _validate_bound_overlay(
         temp_frontmatter["sources"] = frontmatter["sources"]
     if "stale_after" in frontmatter:
         temp_frontmatter["stale_after"] = frontmatter["stale_after"]
-    temp_concept = OkfConcept.create(
-        concept_id=relative.with_suffix("").as_posix(),
-        relative_path=relative,
-        frontmatter=temp_frontmatter,
-        sections=sections,
-        links=(),
-    )
-    issues.extend(validate_concept(temp_concept, None, strict=True))
+    try:
+        temp_concept = OkfConcept.create(
+            concept_id=relative.with_suffix("").as_posix(),
+            relative_path=relative,
+            frontmatter=temp_frontmatter,
+            sections=sections,
+            links=(),
+        )
+        issues.extend(validate_concept(temp_concept, None, strict=True))
+    except OkfMetadataError:
+        issues.append(
+            _frontmatter_issue(
+                relative_posix,
+                "",
+                "sources or stale_after has cyclic or malformed metadata",
+            )
+        )
+        return False
     return True
 
 
