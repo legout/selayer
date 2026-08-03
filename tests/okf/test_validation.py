@@ -1017,6 +1017,39 @@ def _to_legacy_generated_metadata(root: Path) -> None:
         )
 
 
+def _set_generated_descriptive_non_boolean(root: Path, relative: str) -> None:
+    """Stamp ``generated.descriptive`` with a non-boolean value and re-stamp.
+
+    Produces a document that is internally self-consistent (its digest matches
+    its content) while carrying a present-but-non-boolean ``descriptive`` flag,
+    so a validation pass that only treats a *missing* flag as legacy cannot
+    accept it merely because the digest was re-stamped.
+    """
+    from selayer.okf.document import (
+        generated_fingerprint,
+        parse_concept,
+        render_concept,
+    )
+
+    path = root / relative
+    concept = parse_concept(path, root)
+    frontmatter = _deep_thaw(concept.frontmatter)
+    assert isinstance(frontmatter, dict)
+    generated = frontmatter.get("generated")
+    assert isinstance(generated, dict)
+    generated["descriptive"] = "SHOULD-NOT-LEAK"
+    definition = next(
+        section.content
+        for section in concept.sections
+        if section.title == "Catalog Definition"
+    )
+    generated["fingerprint"] = generated_fingerprint(frontmatter, definition)
+    path.write_text(
+        render_concept(_render_with_frontmatter(concept, frontmatter)),
+        encoding="utf-8",
+    )
+
+
 # --- High 1: generated-concept completeness is not path-only ---
 
 
@@ -1128,7 +1161,9 @@ def test_same_document_fragment_link_with_missing_heading_is_a_warning(
     assert len(fragment_issues) == 1
     assert fragment_issues[0].severity == "warning"
     assert fragment_issues[0].path == "concept.md.links"
-    assert "nonexistent" in fragment_issues[0].message
+    # The diagnostic is a fixed, secret-safe string: the fragment slug is never
+    # echoed (a fragment may itself carry a secret).
+    assert "nonexistent" not in fragment_issues[0].message
 
 
 def test_same_document_fragment_link_with_present_heading_is_valid(
@@ -1179,7 +1214,8 @@ def test_duplicate_heading_suffix_slugs_resolve_within_a_document(
         if issue.code == "okf.link.missing_fragment"
     ]
     assert len(fragment_issues) == 1
-    assert "examples-2" in fragment_issues[0].message
+    # The fragment slug is not echoed in the diagnostic.
+    assert "examples-2" not in fragment_issues[0].message
 
 
 # --- Re-review High 1: catalog-aware integrity must not be skipped when every
@@ -1306,7 +1342,8 @@ def test_internal_link_to_generated_index_with_missing_fragment_is_a_warning(
     assert len(fragment_issues) == 1
     assert fragment_issues[0].severity == "warning"
     assert fragment_issues[0].path == "metrics/gross_margin.md.links"
-    assert "nonexistent" in fragment_issues[0].message
+    # The fragment slug is not echoed in the diagnostic.
+    assert "nonexistent" not in fragment_issues[0].message
 
 
 def test_internal_link_to_generated_index_with_present_heading_is_valid(
@@ -1506,6 +1543,54 @@ def test_current_descriptive_bundle_flag_value_is_still_validated(
     assert "okf.generated.definition_mismatch" not in codes
 
 
+# --- Fifth re-review Finding 1 (High): a present-but-non-boolean
+# ``generated.descriptive`` must not be treated as a legacy absent flag. Only
+# an absent flag may use the legacy comparison; a present flag of the wrong
+# type is a controlled-frontmatter defect that survives a re-stamped
+# fingerprint, so it must emit a coded, safe issue and reject the bundle. ---
+
+
+def test_catalog_aware_load_rejects_non_boolean_descriptive_flag(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root, include_descriptive=True)
+    _set_generated_descriptive_non_boolean(root, "metrics/gross_margin.md")
+
+    with pytest.raises(OkfValidationError) as raised:
+        OkfBundle.load(root, layer=valid_layer)
+
+    codes = {issue.code for issue in raised.value.issues}
+    assert "okf.generated.frontmatter_mismatch" in codes
+    # The digest was re-stamped, so this is not a fingerprint problem: the
+    # rejection comes from the descriptive flag itself and survives re-stamping.
+    assert "okf.generated.fingerprint_mismatch" not in codes
+    assert "okf.generated.fingerprint_missing" not in codes
+    # The attacker-supplied flag value is never echoed in any message.
+    for issue in raised.value.issues:
+        assert "SHOULD-NOT-LEAK" not in issue.message
+
+
+def test_lenient_catalog_aware_load_exposes_non_boolean_descriptive_flag_as_a_warning(
+    tmp_path: Path, valid_layer: SemanticLayer
+) -> None:
+    root = tmp_path / "knowledge"
+    OkfBundle.generate(valid_layer, root, include_descriptive=True)
+    _set_generated_descriptive_non_boolean(root, "metrics/gross_margin.md")
+
+    bundle = OkfBundle.load(root, layer=valid_layer, strict=False)
+
+    flagged = [
+        issue
+        for issue in bundle.diagnostics
+        if issue.code == "okf.generated.frontmatter_mismatch"
+    ]
+    assert flagged
+    assert all(issue.severity == "warning" for issue in flagged)
+    for issue in flagged:
+        assert "SHOULD-NOT-LEAK" not in issue.message
+
+
 # --- Fourth re-review Finding 2: an authored index.md inside a semantic-kind
 # directory must not, on its own, classify a bundle as generated; reliable
 # generated evidence (generated metadata or a generated per-directory index
@@ -1566,8 +1651,42 @@ def test_fragment_diagnostic_does_not_echo_raw_link_or_query_secret(
     message = fragment_issues[0].message
     assert "SHOULD-NOT-LEAK" not in message
     assert "token=" not in message
-    # The fragment slug itself is safe and informative to surface.
-    assert "missing-heading" in message
+    # The fragment slug is never echoed either: a fragment may itself carry a
+    # secret, so the diagnostic is a fixed string that excludes path, query,
+    # and fragment while preserving the issue code and path.
+    assert "missing-heading" not in message
+    assert "other.md" not in message
+
+
+def test_missing_fragment_diagnostic_does_not_echo_fragment_secret(tmp_path: Path) -> None:
+    # A secret placed in the *fragment* (rather than the query) must not be
+    # echoed by the missing-fragment diagnostic.
+    _write_concept(
+        tmp_path,
+        "type: Metric",
+        "\n# Related\n\n"
+        "[secret](other.md?token=Q#token=FRAG-SECRET)\n",
+    )
+    (tmp_path / "other.md").write_text(
+        "---\ntype: Reference\n---\n\n# Real\n",
+        encoding="utf-8",
+    )
+
+    bundle = OkfBundle.load(tmp_path)
+
+    fragment_issues = [
+        issue
+        for issue in bundle.diagnostics
+        if issue.code == "okf.link.missing_fragment"
+    ]
+    assert len(fragment_issues) == 1
+    message = fragment_issues[0].message
+    assert "FRAG-SECRET" not in message
+    assert "token=" not in message
+    assert "other.md" not in message
+    # Code and path still identify the source document.
+    assert fragment_issues[0].code == "okf.link.missing_fragment"
+    assert fragment_issues[0].path == "concept.md.links"
 
 
 def test_broken_link_diagnostic_does_not_echo_query_secret(

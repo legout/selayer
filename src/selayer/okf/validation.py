@@ -587,13 +587,15 @@ def _bounded_label(value: str) -> str:
     )
 
 
-def _fragment_link_message(fragment: str) -> str:
-    """Message for a missing fragment heading that echoes only the fragment.
+def _fragment_link_message() -> str:
+    """Fixed, secret-safe message for a missing fragment heading.
 
-    The raw link (which may carry a ``?query=...`` secret) is never echoed;
-    only the already URL-decoded fragment slug is surfaced, bounded in length.
+    The raw link, the path, the query, and the URL-decoded fragment are never
+    echoed: a fragment may itself carry a secret (e.g. ``#token=...``), so the
+    diagnostic is a fixed string. The issue code and path still identify the
+    source document.
     """
-    return f"internal link fragment '{_bounded_label(fragment)}' heading not found"
+    return "internal link references a fragment heading that does not exist"
 
 
 def _broken_link_message(normalized: PurePosixPath | None) -> str:
@@ -682,7 +684,7 @@ def validate_links(
                     issues.append(
                         _link_issue(
                             concept,
-                            _fragment_link_message(fragment),
+                            _fragment_link_message(),
                             code="okf.link.missing_fragment",
                         )
                     )
@@ -704,7 +706,7 @@ def validate_links(
                 issues.append(
                     _link_issue(
                         concept,
-                        _fragment_link_message(fragment),
+                        _fragment_link_message(),
                         code="okf.link.missing_fragment",
                     )
                 )
@@ -1024,6 +1026,30 @@ def validate_generated_integrity(
         loaded_declares_descriptive = isinstance(
             loaded_generated, Mapping
         ) and isinstance(loaded_generated.get("descriptive"), bool)
+        # Only a genuinely *absent* flag may use the legacy comparison path. A
+        # present-but-non-boolean flag must not be silently treated as legacy
+        # absence (which would drop it from the controlled comparison): it is a
+        # controlled-frontmatter defect that survives a re-stamped fingerprint,
+        # so it is reported with a safe, value-free message. The comparison
+        # below still drops ``descriptive`` for this case (it is not a bool), so
+        # the dedicated issue is the single, clear signal rather than a
+        # redundant generic mismatch.
+        if (
+            isinstance(loaded_generated, Mapping)
+            and "descriptive" in loaded_generated
+            and not isinstance(loaded_generated["descriptive"], bool)
+        ):
+            issues.append(
+                OkfIssue(
+                    path=concept.relative_path.as_posix(),
+                    message=(
+                        f"generated concept '{semantic_id}' descriptive flag "
+                        f"must be a boolean when present"
+                    ),
+                    severity=severity,
+                    code="okf.generated.frontmatter_mismatch",
+                )
+            )
         if _controlled_frontmatter_signature(
             concept.frontmatter,
             controlled_keys,
