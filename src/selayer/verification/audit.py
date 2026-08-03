@@ -19,16 +19,27 @@ outcomes, and a raw connector/scan failure is normalized to a sanitized
 ``scan_failed`` error so no driver-derived location or credential text can
 ever escape.  Truly-internal programmer errors (a malformed grain column)
 propagate unchanged, and any unavailable source makes the report incomplete.
+
+After the source-grain pass, every declared relationship is audited for
+cardinality with the same aggregate-only, secret-safe contract: both sides
+are bound and materialized under the registry lock, then a cardinality-
+sspecific scan counts null keys, duplicate groups, referential orphans, and
+child multiplicity without ever selecting a key value.  Each relationship
+yields one ``relationship.<name>.cardinality`` outcome; an unavailable bound
+source makes that outcome ``unavailable`` and the report incomplete.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any
 
 import duckdb
 
-from selayer.model import SemanticLayer
+from selayer.model import Relationship, SemanticLayer
 from selayer.sources.base import SourceScanRequirement, SourceStatus
 from selayer.sources.errors import SourceConnectionError, SourceError
 from selayer.sources.profiles import (
@@ -40,6 +51,7 @@ from selayer.sources.profiles import (
 from selayer.sources.registry import SourceRegistry
 from selayer.verification.model import (
     PhysicalCheck,
+    Severity,
     VerificationDiagnostic,
     VerificationOutcome,
     VerificationReport,
@@ -263,6 +275,567 @@ def _validate_grain_identifiers(source_id: str, grain: tuple[str, ...]) -> None:
         _quote_identifier(column)
 
 
+# ---------------------------------------------------------------------------
+# Relationship cardinality audit
+# ---------------------------------------------------------------------------
+
+#: Fixed, leading-underscore temp-table names that materialize each
+#: relationship side once so single-pass query-scoped readers are pulled
+#: exactly once and the join re-scans the re-readable temp tables.  A leading
+#: underscore can never collide with a registered source name, and at most one
+#: relationship is audited at a time (the temp tables are dropped in a
+#: ``finally`` after every relationship).
+_REL_ONE = "__selayer_rel_one"
+_REL_MANY = "__selayer_rel_many"
+_REL_LEFT = "__selayer_rel_left"
+_REL_RIGHT = "__selayer_rel_right"
+
+#: Positional alias for the single join column in every materialized temp
+#: table — generated, never derived from a source value, so a column whose
+#: name carries a secret can never surface as an alias.
+_REL_KEY = "k"
+
+#: Constant diagnostic messages (never key values) for relationship outcomes.
+_REL_ONE_SIDE_NULL_MSG = "the one side of the relationship has null keys"
+_REL_ONE_SIDE_DUP_MSG = "the one side of the relationship has duplicate keys"
+_REL_MANY_SIDE_ORPHAN_MSG = (
+    "the many side has non-null keys with no one-side match"
+)
+_REL_SOURCE_NULL_MSG = "the source side of the relationship has null keys"
+_REL_SOURCE_DUP_MSG = "the source side of the relationship has duplicate keys"
+_REL_TARGET_NULL_MSG = "the target side of the relationship has null keys"
+_REL_TARGET_DUP_MSG = "the target side of the relationship has duplicate keys"
+_REL_SOURCE_UNMATCHED_MSG = (
+    "the source side has non-null keys with no target match"
+)
+_REL_TARGET_UNMATCHED_MSG = (
+    "the target side has non-null keys with no source match"
+)
+_REL_NO_SAFE_TRAVERSAL_MSG = (
+    "a many-to-many relationship does not claim uniqueness or safe traversal"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _RelationshipSides:
+    one_source: str | None
+    one_column: str | None
+    many_source: str | None
+    many_column: str | None
+
+
+def _relationship_sides(relationship: Relationship) -> _RelationshipSides:
+    """Normalize a directed relationship into its one and many sides.
+
+    For ``one_to_many`` the declared ``source`` is the one side; for
+    ``many_to_one`` the declared ``target`` is the one side.  One-to-one and
+    many-to-many return all-``None`` sides because their bidirectional
+    semantics are handled by dedicated query helpers.
+    """
+
+    if relationship.type == "one_to_many":
+        return _RelationshipSides(
+            relationship.source,
+            relationship.source_column,
+            relationship.target,
+            relationship.target_column,
+        )
+    if relationship.type == "many_to_one":
+        return _RelationshipSides(
+            relationship.target,
+            relationship.target_column,
+            relationship.source,
+            relationship.source_column,
+        )
+    return _RelationshipSides(None, None, None, None)
+
+
+def _validate_relationship_identifiers(relationship: Relationship) -> None:
+    """Validate every relationship endpoint identifier before any scan.
+
+    Mirrors :func:`_validate_grain_identifiers`: a malformed identifier (a SQL
+    fragment smuggled into an endpoint) raises ``ValueError`` — a clean,
+    truly-internal programmer error that propagates rather than being
+    sanitized into an availability outcome.  All four endpoints are validated
+    because every cardinality interpolates all of them.
+    """
+
+    for identifier in (
+        relationship.source,
+        relationship.target,
+        relationship.source_column,
+        relationship.target_column,
+    ):
+        _quote_identifier(identifier)
+
+
+def _relationship_diagnostic(
+    code: str, severity: Severity, message: str
+) -> VerificationDiagnostic:
+    """Build a relationship diagnostic on the shared physical path."""
+
+    return VerificationDiagnostic(code, severity, _PATH, message)
+
+
+@contextmanager
+def _materialize_relationship(
+    registry: SourceRegistry,
+    temp_specs: tuple[tuple[str, str, str], ...],
+) -> Iterator[None]:
+    """Bind both relationship sources and materialize each side once.
+
+    Each ``temp_specs`` entry is ``(temp_name, source_id, column)``.  The
+    distinct sources are bound together under one
+    :meth:`~SourceRegistry.bind_requirements` call (the registry lock spans the
+    whole audit), and each side is materialized into a private temp table
+    holding only its join column under the fixed alias :data:`_REL_KEY`.  A
+    self-relationship (``source == target``) binds the source once and
+    materializes two temp tables from it, so the two sides never collide.  The
+    temp tables are dropped in a ``finally`` so only one relationship's tables
+    ever exist.
+    """
+
+    needed: dict[str, list[str]] = {}
+    for _temp_name, source_id, column in temp_specs:
+        needed.setdefault(source_id, []).append(column)
+    requirements = {
+        source_id: SourceScanRequirement(
+            columns=tuple(dict.fromkeys(columns))
+        )
+        for source_id, columns in needed.items()
+    }
+    with registry.bind_requirements(requirements):
+        created: list[str] = []
+        try:
+            for temp_name, source_id, column in temp_specs:
+                registry.execute(
+                    "create or replace temp table "
+                    f"{_quote_identifier(temp_name)} as "
+                    f"select {_quote_identifier(column)} as "
+                    f"{_quote_identifier(_REL_KEY)} "
+                    f"from {_quote_identifier(source_id)}"
+                )
+                created.append(temp_name)
+            yield
+        finally:
+            for temp_name in created:
+                registry.execute(
+                    "drop table if exists "
+                    f"{_quote_identifier(temp_name)}"
+                )
+
+
+def _directed_relationship_counts(
+    registry: SourceRegistry,
+) -> tuple[int, int, int, int, int, int]:
+    """Run the aggregate-only one-to-many / many-to-one cardinality scan.
+
+    Counts one-side null rows, one-side duplicate groups, many-side null
+    rows, non-null many-side orphans (``not exists``), zero-child one-side
+    rows (``not exists``), and the maximum children per one-side parent
+    (``left join`` + ``group by``).  No key value is ever selected.  The
+    argument to ``execute`` is a single string literal whose only
+    interpolated components are re-validated, double-quoted identifiers (the
+    same validated-identifier contract as the grain SQL), so it is not a
+    dynamic-SQL sink.
+    """
+
+    one = _quote_identifier(_REL_ONE)
+    many = _quote_identifier(_REL_MANY)
+    key = _quote_identifier(_REL_KEY)
+    row = registry.execute(
+        "select "
+        f"(select count(*) from {one} where {key} is null) "
+        "as one_side_null_rows, "
+        f"(select count(*) from ("
+        f"select {key} from {one} "
+        f"group by {key} having count(*) > 1"
+        ")) as one_side_duplicate_groups, "
+        f"(select count(*) from {many} where {key} is null) "
+        "as many_side_null_rows, "
+        f"(select count(*) from {many} m "
+        f"where m.{key} is not null and not exists ("
+        f"select 1 from {one} o where o.{key} = m.{key}"
+        ")) as orphan_non_null_rows, "
+        f"(select count(*) from {one} o where not exists ("
+        f"select 1 from {many} m where m.{key} = o.{key}"
+        ")) as zero_child_one_side_rows, "
+        f"(select coalesce(max(child_count), 0) from ("
+        f"select count(m.{key}) as child_count "
+        f"from {one} o left join {many} m "
+        f"on m.{key} = o.{key} group by o.{key}"
+        ")) as maximum_child_multiplicity"
+    ).fetchone()
+    return (
+        int(row[0]),
+        int(row[1]),
+        int(row[2]),
+        int(row[3]),
+        int(row[4]),
+        int(row[5]),
+    )
+
+
+def _one_to_one_counts(
+    registry: SourceRegistry,
+) -> tuple[int, int, int, int, int, int]:
+    """Run the aggregate-only one-to-one cardinality scan.
+
+    Counts null and duplicate groups on each side plus unmatched non-null
+    keys in both directions (``not exists``).  No key value is ever selected;
+    the argument to ``execute`` is a single string literal of re-validated,
+    double-quoted identifiers (same contract as the grain SQL).
+    """
+
+    left = _quote_identifier(_REL_LEFT)
+    right = _quote_identifier(_REL_RIGHT)
+    key = _quote_identifier(_REL_KEY)
+    row = registry.execute(
+        "select "
+        f"(select count(*) from {left} where {key} is null) "
+        "as source_null_rows, "
+        f"(select count(*) from ("
+        f"select {key} from {left} "
+        f"group by {key} having count(*) > 1"
+        ")) as source_duplicate_groups, "
+        f"(select count(*) from {right} where {key} is null) "
+        "as target_null_rows, "
+        f"(select count(*) from ("
+        f"select {key} from {right} "
+        f"group by {key} having count(*) > 1"
+        ")) as target_duplicate_groups, "
+        f"(select count(*) from {left} l "
+        f"where l.{key} is not null and not exists ("
+        f"select 1 from {right} r where r.{key} = l.{key}"
+        ")) as source_unmatched_non_null_rows, "
+        f"(select count(*) from {right} r "
+        f"where r.{key} is not null and not exists ("
+        f"select 1 from {left} l where l.{key} = r.{key}"
+        ")) as target_unmatched_non_null_rows"
+    ).fetchone()
+    return (
+        int(row[0]),
+        int(row[1]),
+        int(row[2]),
+        int(row[3]),
+        int(row[4]),
+        int(row[5]),
+    )
+
+
+def _many_to_many_counts(
+    registry: SourceRegistry,
+) -> tuple[int, int]:
+    """Run the aggregate-only many-to-many unmatched-key scan.
+
+    Counts non-null source keys with no target match and non-null target
+    keys with no source match (``not exists`` in both directions).
+    Many-to-many does not claim uniqueness, so no duplicate-group counts are
+    computed.  No key value is ever selected; the argument to ``execute`` is
+    a single string literal of re-validated, double-quoted identifiers (same
+    contract as the grain SQL).
+    """
+
+    left = _quote_identifier(_REL_LEFT)
+    right = _quote_identifier(_REL_RIGHT)
+    key = _quote_identifier(_REL_KEY)
+    row = registry.execute(
+        "select "
+        f"(select count(*) from {left} l "
+        f"where l.{key} is not null and not exists ("
+        f"select 1 from {right} r where r.{key} = l.{key}"
+        ")) as source_unmatched_non_null_rows, "
+        f"(select count(*) from {right} r "
+        f"where r.{key} is not null and not exists ("
+        f"select 1 from {left} l where l.{key} = r.{key}"
+        ")) as target_unmatched_non_null_rows"
+    ).fetchone()
+    return (int(row[0]), int(row[1]))
+
+
+def _relationship_check_id(relationship: Relationship) -> str:
+    return f"relationship.{relationship.name}.cardinality"
+
+
+def _directed_relationship_outcome(
+    relationship: Relationship,
+    counts: tuple[int, int, int, int, int, int],
+) -> VerificationOutcome:
+    """Build a one-to-many / many-to-one outcome from the six counts.
+
+    Fails on one-side nulls, one-side duplicates, or non-null many-side
+    orphans.  Nullable many-side keys and zero-child one-side rows stay
+    informational (reported in evidence, never a failure).
+    """
+
+    (
+        one_null,
+        one_dup,
+        many_null,
+        orphan,
+        zero_child,
+        max_multiplicity,
+    ) = counts
+    diagnostics: list[VerificationDiagnostic] = []
+    if one_null:
+        diagnostics.append(
+            _relationship_diagnostic(
+                "relationship.one_side_null",
+                "error",
+                _REL_ONE_SIDE_NULL_MSG,
+            )
+        )
+    if one_dup:
+        diagnostics.append(
+            _relationship_diagnostic(
+                "relationship.one_side_duplicates",
+                "error",
+                _REL_ONE_SIDE_DUP_MSG,
+            )
+        )
+    if orphan:
+        diagnostics.append(
+            _relationship_diagnostic(
+                "relationship.many_side_orphans",
+                "error",
+                _REL_MANY_SIDE_ORPHAN_MSG,
+            )
+        )
+    failed = bool(diagnostics)
+    evidence: dict[str, EvidenceValue] = {
+        "one_side_null_rows": one_null,
+        "one_side_duplicate_groups": one_dup,
+        "many_side_null_rows": many_null,
+        "orphan_non_null_rows": orphan,
+        "zero_child_one_side_rows": zero_child,
+        "maximum_child_multiplicity": max_multiplicity,
+    }
+    return VerificationOutcome(
+        check_id=_relationship_check_id(relationship),
+        status="failed" if failed else "passed",
+        scope="full_scan",
+        path=_PATH,
+        evidence=evidence,
+        diagnostics=tuple(diagnostics),
+    )
+
+
+def _one_to_one_outcome(
+    relationship: Relationship,
+    counts: tuple[int, int, int, int, int, int],
+) -> VerificationOutcome:
+    """Build a one-to-one outcome, failing on any null, duplicate, or gap."""
+
+    (
+        source_null,
+        source_dup,
+        target_null,
+        target_dup,
+        source_unmatched,
+        target_unmatched,
+    ) = counts
+    diagnostics: list[VerificationDiagnostic] = []
+    if source_null:
+        diagnostics.append(
+            _relationship_diagnostic(
+                "relationship.source_null",
+                "error",
+                _REL_SOURCE_NULL_MSG,
+            )
+        )
+    if source_dup:
+        diagnostics.append(
+            _relationship_diagnostic(
+                "relationship.source_duplicates",
+                "error",
+                _REL_SOURCE_DUP_MSG,
+            )
+        )
+    if target_null:
+        diagnostics.append(
+            _relationship_diagnostic(
+                "relationship.target_null",
+                "error",
+                _REL_TARGET_NULL_MSG,
+            )
+        )
+    if target_dup:
+        diagnostics.append(
+            _relationship_diagnostic(
+                "relationship.target_duplicates",
+                "error",
+                _REL_TARGET_DUP_MSG,
+            )
+        )
+    if source_unmatched:
+        diagnostics.append(
+            _relationship_diagnostic(
+                "relationship.source_unmatched",
+                "error",
+                _REL_SOURCE_UNMATCHED_MSG,
+            )
+        )
+    if target_unmatched:
+        diagnostics.append(
+            _relationship_diagnostic(
+                "relationship.target_unmatched",
+                "error",
+                _REL_TARGET_UNMATCHED_MSG,
+            )
+        )
+    failed = bool(diagnostics)
+    evidence: dict[str, EvidenceValue] = {
+        "source_null_rows": source_null,
+        "source_duplicate_groups": source_dup,
+        "target_null_rows": target_null,
+        "target_duplicate_groups": target_dup,
+        "source_unmatched_non_null_rows": source_unmatched,
+        "target_unmatched_non_null_rows": target_unmatched,
+    }
+    return VerificationOutcome(
+        check_id=_relationship_check_id(relationship),
+        status="failed" if failed else "passed",
+        scope="full_scan",
+        path=_PATH,
+        evidence=evidence,
+        diagnostics=tuple(diagnostics),
+    )
+
+
+def _many_to_many_outcome(
+    relationship: Relationship, counts: tuple[int, int]
+) -> VerificationOutcome:
+    """Build a many-to-many outcome with an always-on no-traversal diagnostic.
+
+    Many-to-many never claims uniqueness or safe traversal: a stable
+    informational diagnostic is always attached.  The outcome fails only when
+    either side has unmatched non-null keys.
+    """
+
+    source_unmatched, target_unmatched = counts
+    diagnostics: list[VerificationDiagnostic] = [
+        _relationship_diagnostic(
+            "relationship.many_to_many_no_safe_traversal",
+            "info",
+            _REL_NO_SAFE_TRAVERSAL_MSG,
+        )
+    ]
+    failed = False
+    if source_unmatched:
+        diagnostics.append(
+            _relationship_diagnostic(
+                "relationship.source_unmatched",
+                "error",
+                _REL_SOURCE_UNMATCHED_MSG,
+            )
+        )
+        failed = True
+    if target_unmatched:
+        diagnostics.append(
+            _relationship_diagnostic(
+                "relationship.target_unmatched",
+                "error",
+                _REL_TARGET_UNMATCHED_MSG,
+            )
+        )
+        failed = True
+    evidence: dict[str, EvidenceValue] = {
+        "source_unmatched_non_null_rows": source_unmatched,
+        "target_unmatched_non_null_rows": target_unmatched,
+    }
+    return VerificationOutcome(
+        check_id=_relationship_check_id(relationship),
+        status="failed" if failed else "passed",
+        scope="full_scan",
+        path=_PATH,
+        evidence=evidence,
+        diagnostics=tuple(diagnostics),
+    )
+
+
+def _relationship_unavailable_outcome(
+    relationship: Relationship, error: SourceError
+) -> VerificationOutcome:
+    """An ``unavailable`` relationship outcome carrying only the error code."""
+
+    return VerificationOutcome(
+        check_id=_relationship_check_id(relationship),
+        status="unavailable",
+        scope="full_scan",
+        path=_PATH,
+        evidence={"error_code": error.code},
+        diagnostics=(),
+    )
+
+
+def _directed_specs(
+    relationship: Relationship,
+) -> tuple[tuple[str, str, str], tuple[str, str, str]]:
+    sides = _relationship_sides(relationship)
+    # ``_relationship_sides`` returns concrete sides for the directed types;
+    # the ``None`` fields are unreachable here.
+    assert sides.one_source is not None
+    assert sides.one_column is not None
+    assert sides.many_source is not None
+    assert sides.many_column is not None
+    return (
+        (_REL_ONE, sides.one_source, sides.one_column),
+        (_REL_MANY, sides.many_source, sides.many_column),
+    )
+
+
+def _bidirectional_specs(
+    relationship: Relationship,
+) -> tuple[tuple[str, str, str], tuple[str, str, str]]:
+    return (
+        (_REL_LEFT, relationship.source, relationship.source_column),
+        (_REL_RIGHT, relationship.target, relationship.target_column),
+    )
+
+
+def _audit_relationship(
+    registry: SourceRegistry, relationship: Relationship
+) -> VerificationOutcome:
+    """Audit one declared relationship's cardinality exactly.
+
+    Both sides are bound and materialized under the registry lock, then a
+    cardinality-specific aggregate-only SQL runs.  No key value is ever
+    selected.  A sanitized :class:`~selayer.sources.errors.SourceError` from
+    binding or a raw ``duckdb.Error`` from the materialization/scan is adapted
+    to an ``unavailable`` outcome (raw failures normalize to ``scan_failed``)
+    so no driver-derived detail can escape; a malformed endpoint identifier
+    propagates unchanged as a programmer error.
+    """
+
+    _validate_relationship_identifiers(relationship)
+    try:
+        if relationship.type in ("one_to_many", "many_to_one"):
+            specs = _directed_specs(relationship)
+            with _materialize_relationship(registry, specs):
+                counts = _directed_relationship_counts(registry)
+            return _directed_relationship_outcome(relationship, counts)
+        if relationship.type == "one_to_one":
+            specs = _bidirectional_specs(relationship)
+            with _materialize_relationship(registry, specs):
+                counts = _one_to_one_counts(registry)
+            return _one_to_one_outcome(relationship, counts)
+        specs = _bidirectional_specs(relationship)
+        with _materialize_relationship(registry, specs):
+            counts = _many_to_many_counts(registry)
+        return _many_to_many_outcome(relationship, counts)
+    except (SourceError, duckdb.Error) as error:
+        sanitized = (
+            error
+            if isinstance(error, SourceError)
+            else SourceConnectionError(
+                relationship.name,
+                "scan_failed",
+                "the relationship scan failed",
+            )
+        )
+        return _relationship_unavailable_outcome(relationship, sanitized)
+
+
 def _report(
     layer: SemanticLayer, outcomes: list[VerificationOutcome]
 ) -> VerificationReport:
@@ -309,6 +882,12 @@ def verify_physical(layer: SemanticLayer, check: PhysicalCheck) -> VerificationR
     sanitized code; raw scan failures are normalized to ``scan_failed``) so no
     driver-derived detail can ever escape.  Truly-internal programmer errors
     (a malformed grain column) propagate unchanged.
+
+    After the source-grain pass, every declared relationship is audited in
+    sorted name order via :func:`_audit_relationship`, producing one
+    ``relationship.<name>.cardinality`` outcome per relationship with the same
+    secret-safe, lock-spanning contract; any unavailable bound source makes
+    that outcome ``unavailable`` and the report incomplete.
     """
 
     profiles: RuntimeProfileResolver = (
@@ -333,6 +912,12 @@ def verify_physical(layer: SemanticLayer, check: PhysicalCheck) -> VerificationR
             # unavailable.  No status is available because nothing registered.
             for source_id in source_ids:
                 outcomes.append(_unavailable_outcome(source_id, error, None))
+            for relationship_id in sorted(layer.relationships):
+                outcomes.append(
+                    _relationship_unavailable_outcome(
+                        layer.relationships[relationship_id], error
+                    )
+                )
             return _report(layer, outcomes)
         try:
             for source_id in source_ids:
@@ -375,6 +960,12 @@ def verify_physical(layer: SemanticLayer, check: PhysicalCheck) -> VerificationR
                     )
                 else:
                     outcomes.append(_grain_outcome(source_id, status, counts))
+            for relationship_id in sorted(layer.relationships):
+                outcomes.append(
+                    _audit_relationship(
+                        registry, layer.relationships[relationship_id]
+                    )
+                )
         finally:
             registry.close()
     finally:

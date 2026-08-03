@@ -21,7 +21,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from selayer.catalog import SemanticLayer
-from selayer.model import DataSource
+from selayer.model import DataSource, Relationship
 from selayer.sources.base import (
     QueryBinding,
     SourceHandle,
@@ -859,3 +859,500 @@ def test_audit_reads_status_inside_binding_context(
     assert outcome.status == "passed"
     assert status_while_binding  # status was read
     assert all(status_while_binding)  # always while the binding is active
+
+
+# ---------------------------------------------------------------------------
+# Relationship cardinality audit tests (Task 13)
+# ---------------------------------------------------------------------------
+
+
+def _relationship_outcome(report: Any, name: str) -> Any:
+    return next(
+        item
+        for item in report.outcomes
+        if item.check_id == f"relationship.{name}.cardinality"
+    )
+
+
+def _relationship_layer(
+    name: str,
+    sources: dict[str, DataSource],
+    relationships: dict[str, Relationship],
+) -> SemanticLayer:
+    return SemanticLayer(
+        1, name, "", "", sources, {}, {}, {}, {}, relationships
+    )
+
+
+def _orders_schema() -> TableSchema:
+    return TableSchema(
+        (
+            FieldSchema("order_id", ScalarType("utf8"), True),
+            FieldSchema("amount", ScalarType("int64"), True),
+        )
+    )
+
+
+def _items_schema() -> TableSchema:
+    return TableSchema(
+        (
+            FieldSchema("item_id", ScalarType("utf8"), True),
+            FieldSchema("order_id", ScalarType("utf8"), True),
+        )
+    )
+
+
+def _order_id_schema() -> TableSchema:
+    return TableSchema((FieldSchema("order_id", ScalarType("utf8"), True),))
+
+
+def _key_schema() -> TableSchema:
+    return TableSchema((FieldSchema("key", ScalarType("int64"), True),))
+
+
+@dataclass
+class _DirectedSources:
+    orders: DataSource
+    items: DataSource
+
+
+@pytest.fixture
+def directed_sources(tmp_path: Path) -> _DirectedSources:
+    """A one(order_id)-to-many(order_id) pair with a secret order key.
+
+    ``orders`` carries a secret sentinel order id so the no-leak assertion is
+    meaningful; ``items`` has a nullable many-side key (one null order_id) and
+    one zero-child order.
+    """
+
+    orders_path = tmp_path / "orders.parquet"
+    _write_parquet(
+        orders_path,
+        pa.table(
+            {
+                "order_id": pa.array(
+                    ["o1", "o2", "secret-order-key"], pa.utf8()
+                ),
+                "amount": pa.array([10, 20, 30], pa.int64()),
+            }
+        ),
+    )
+    items_path = tmp_path / "items.parquet"
+    _write_parquet(
+        items_path,
+        pa.table(
+            {
+                "item_id": pa.array(["i1", "i2", "i3", "i4"], pa.utf8()),
+                "order_id": pa.array(["o1", "o1", "o2", None], pa.utf8()),
+            }
+        ),
+    )
+    return _DirectedSources(
+        orders=DataSource(
+            "orders",
+            ParquetConfig(str(orders_path)),
+            _orders_schema(),
+            ("order_id",),
+        ),
+        items=DataSource(
+            "items",
+            ParquetConfig(str(items_path)),
+            _items_schema(),
+            ("item_id",),
+        ),
+    )
+
+
+_DIRECTED_EVIDENCE = {
+    "one_side_null_rows": 0,
+    "one_side_duplicate_groups": 0,
+    "many_side_null_rows": 1,
+    "orphan_non_null_rows": 0,
+    "zero_child_one_side_rows": 1,
+    "maximum_child_multiplicity": 2,
+}
+
+
+def test_one_to_many_passes_with_nullable_many_side_and_zero_child(
+    directed_sources: _DirectedSources,
+) -> None:
+    layer = _relationship_layer(
+        "rel",
+        {"orders": directed_sources.orders, "items": directed_sources.items},
+        {
+            "orders_items": Relationship(
+                "orders_items",
+                "orders",
+                "items",
+                "one_to_many",
+                "order_id",
+                "order_id",
+            )
+        },
+    )
+    report = verify(layer, PhysicalCheck())
+    outcome = _relationship_outcome(report, "orders_items")
+    assert outcome.status == "passed"
+    assert outcome.scope == "full_scan"
+    assert outcome.evidence == _DIRECTED_EVIDENCE
+    # Nullable many-side keys and zero-child parents stay informational: no
+    # diagnostics and the outcome still passes.
+    assert outcome.diagnostics == ()
+    # The report also carries the source-grain outcomes alongside the
+    # relationship outcome.
+    assert any(
+        item.check_id == "source.orders.grain" for item in report.outcomes
+    )
+    rendered = repr(report.to_dict())
+    assert "secret" not in rendered.lower()
+
+
+def test_many_to_one_uses_target_as_one_side(
+    directed_sources: _DirectedSources,
+) -> None:
+    layer = _relationship_layer(
+        "rel",
+        {"orders": directed_sources.orders, "items": directed_sources.items},
+        {
+            "items_orders": Relationship(
+                "items_orders",
+                "items",
+                "orders",
+                "many_to_one",
+                "order_id",
+                "order_id",
+            )
+        },
+    )
+    report = verify(layer, PhysicalCheck())
+    outcome = _relationship_outcome(report, "items_orders")
+    assert outcome.status == "passed"
+    # many_to_one flips the sides: the declared target (orders) is the one
+    # side, so the evidence mirrors the one_to_many case exactly.
+    assert outcome.evidence == _DIRECTED_EVIDENCE
+
+
+def test_one_to_many_fails_on_duplicate_one_side_keys(
+    tmp_path: Path,
+) -> None:
+    orders_path = tmp_path / "orders.parquet"
+    _write_parquet(
+        orders_path,
+        pa.table(
+            {
+                "row_id": pa.array([1, 2, 3], pa.int64()),
+                "order_id": pa.array(
+                    ["dup-secret-key", "dup-secret-key", "o2"], pa.utf8()
+                ),
+            }
+        ),
+    )
+    items_path = tmp_path / "items.parquet"
+    _write_parquet(
+        items_path,
+        pa.table(
+            {
+                "item_id": pa.array(["i1", "i2"], pa.utf8()),
+                "order_id": pa.array(["dup-secret-key", "o2"], pa.utf8()),
+            }
+        ),
+    )
+    layer = _relationship_layer(
+        "rel",
+        {
+            "orders": DataSource(
+                "orders",
+                ParquetConfig(str(orders_path)),
+                TableSchema(
+                    (
+                        FieldSchema("row_id", ScalarType("int64"), True),
+                        FieldSchema("order_id", ScalarType("utf8"), True),
+                    )
+                ),
+                ("row_id",),
+            ),
+            "items": DataSource(
+                "items",
+                ParquetConfig(str(items_path)),
+                _items_schema(),
+                ("item_id",),
+            ),
+        },
+        {
+            "orders_items": Relationship(
+                "orders_items",
+                "orders",
+                "items",
+                "one_to_many",
+                "order_id",
+                "order_id",
+            )
+        },
+    )
+    report = verify(layer, PhysicalCheck())
+    outcome = _relationship_outcome(report, "orders_items")
+    assert outcome.status == "failed"
+    assert outcome.evidence["one_side_duplicate_groups"] == 1
+    codes = {diagnostic.code for diagnostic in outcome.diagnostics}
+    assert "relationship.one_side_duplicates" in codes
+    assert all(
+        diagnostic.severity == "error"
+        for diagnostic in outcome.diagnostics
+        if diagnostic.code == "relationship.one_side_duplicates"
+    )
+    # Failure codes and counts only — never the duplicate key value.
+    rendered = repr(report.to_dict())
+    assert "secret" not in rendered.lower()
+
+
+def test_one_to_many_fails_on_non_null_orphan_child_keys(
+    tmp_path: Path,
+) -> None:
+    orders_path = tmp_path / "orders.parquet"
+    _write_parquet(
+        orders_path,
+        pa.table({"order_id": pa.array(["o1", "o2"], pa.utf8())}),
+    )
+    items_path = tmp_path / "items.parquet"
+    _write_parquet(
+        items_path,
+        pa.table(
+            {
+                "item_id": pa.array(["i1", "i2"], pa.utf8()),
+                "order_id": pa.array(["o1", "orphan-secret-key"], pa.utf8()),
+            }
+        ),
+    )
+    layer = _relationship_layer(
+        "rel",
+        {
+            "orders": DataSource(
+                "orders",
+                ParquetConfig(str(orders_path)),
+                _order_id_schema(),
+                ("order_id",),
+            ),
+            "items": DataSource(
+                "items",
+                ParquetConfig(str(items_path)),
+                _items_schema(),
+                ("item_id",),
+            ),
+        },
+        {
+            "orders_items": Relationship(
+                "orders_items",
+                "orders",
+                "items",
+                "one_to_many",
+                "order_id",
+                "order_id",
+            )
+        },
+    )
+    report = verify(layer, PhysicalCheck())
+    outcome = _relationship_outcome(report, "orders_items")
+    assert outcome.status == "failed"
+    assert outcome.evidence["orphan_non_null_rows"] == 1
+    assert outcome.evidence["many_side_null_rows"] == 0
+    codes = {diagnostic.code for diagnostic in outcome.diagnostics}
+    assert "relationship.many_side_orphans" in codes
+    rendered = repr(report.to_dict())
+    assert "secret" not in rendered.lower()
+
+
+def _key_sources(
+    tmp_path: Path,
+    left_keys: list[int | None],
+    right_keys: list[int | None],
+) -> tuple[DataSource, DataSource]:
+    left_path = tmp_path / "left.parquet"
+    _write_parquet(
+        left_path, pa.table({"key": pa.array(left_keys, pa.int64())})
+    )
+    right_path = tmp_path / "right.parquet"
+    _write_parquet(
+        right_path, pa.table({"key": pa.array(right_keys, pa.int64())})
+    )
+    schema = _key_schema()
+    return (
+        DataSource(
+            "left_src", ParquetConfig(str(left_path)), schema, ("key",)
+        ),
+        DataSource(
+            "right_src", ParquetConfig(str(right_path)), schema, ("key",)
+        ),
+    )
+
+
+def _one_to_one_layer(left: DataSource, right: DataSource) -> SemanticLayer:
+    return _relationship_layer(
+        "oto",
+        {"left_src": left, "right_src": right},
+        {
+            "left_right": Relationship(
+                "left_right",
+                "left_src",
+                "right_src",
+                "one_to_one",
+                "key",
+                "key",
+            )
+        },
+    )
+
+
+def _many_to_many_layer(
+    left: DataSource, right: DataSource
+) -> SemanticLayer:
+    return _relationship_layer(
+        "mtm",
+        {"left_src": left, "right_src": right},
+        {
+            "left_right": Relationship(
+                "left_right",
+                "left_src",
+                "right_src",
+                "many_to_many",
+                "key",
+                "key",
+            )
+        },
+    )
+
+
+def test_one_to_one_passes_when_unique_and_matched(tmp_path: Path) -> None:
+    left, right = _key_sources(tmp_path, [1, 2, 3], [1, 2, 3])
+    report = verify(_one_to_one_layer(left, right), PhysicalCheck())
+    outcome = _relationship_outcome(report, "left_right")
+    assert outcome.status == "passed"
+    assert outcome.evidence == {
+        "source_null_rows": 0,
+        "source_duplicate_groups": 0,
+        "target_null_rows": 0,
+        "target_duplicate_groups": 0,
+        "source_unmatched_non_null_rows": 0,
+        "target_unmatched_non_null_rows": 0,
+    }
+    assert outcome.diagnostics == ()
+
+
+def test_one_to_one_fails_on_source_duplicates(tmp_path: Path) -> None:
+    left, right = _key_sources(tmp_path, [1, 1, 2], [1, 2])
+    report = verify(_one_to_one_layer(left, right), PhysicalCheck())
+    outcome = _relationship_outcome(report, "left_right")
+    assert outcome.status == "failed"
+    assert outcome.evidence["source_duplicate_groups"] == 1
+    assert "relationship.source_duplicates" in {
+        diagnostic.code for diagnostic in outcome.diagnostics
+    }
+
+
+def test_one_to_one_fails_on_null_keys(tmp_path: Path) -> None:
+    left, right = _key_sources(tmp_path, [1, 2, None], [1, 2])
+    report = verify(_one_to_one_layer(left, right), PhysicalCheck())
+    outcome = _relationship_outcome(report, "left_right")
+    assert outcome.status == "failed"
+    assert outcome.evidence["source_null_rows"] == 1
+    assert "relationship.source_null" in {
+        diagnostic.code for diagnostic in outcome.diagnostics
+    }
+
+
+def test_one_to_one_fails_on_unmatched_source(tmp_path: Path) -> None:
+    left, right = _key_sources(tmp_path, [1, 2, 3], [1, 2])
+    report = verify(_one_to_one_layer(left, right), PhysicalCheck())
+    outcome = _relationship_outcome(report, "left_right")
+    assert outcome.status == "failed"
+    assert outcome.evidence["source_unmatched_non_null_rows"] == 1
+    assert "relationship.source_unmatched" in {
+        diagnostic.code for diagnostic in outcome.diagnostics
+    }
+
+
+def test_one_to_one_fails_on_unmatched_target(tmp_path: Path) -> None:
+    left, right = _key_sources(tmp_path, [1, 2], [1, 2, 3])
+    report = verify(_one_to_one_layer(left, right), PhysicalCheck())
+    outcome = _relationship_outcome(report, "left_right")
+    assert outcome.status == "failed"
+    assert outcome.evidence["target_unmatched_non_null_rows"] == 1
+    assert "relationship.target_unmatched" in {
+        diagnostic.code for diagnostic in outcome.diagnostics
+    }
+
+
+def test_many_to_many_passes_with_duplicates_and_info_diagnostic(
+    tmp_path: Path,
+) -> None:
+    left, right = _key_sources(tmp_path, [1, 1, 2, 3], [1, 2, 2, 3])
+    report = verify(_many_to_many_layer(left, right), PhysicalCheck())
+    outcome = _relationship_outcome(report, "left_right")
+    assert outcome.status == "passed"
+    assert outcome.evidence == {
+        "source_unmatched_non_null_rows": 0,
+        "target_unmatched_non_null_rows": 0,
+    }
+    codes = {diagnostic.code for diagnostic in outcome.diagnostics}
+    severities = {diagnostic.severity for diagnostic in outcome.diagnostics}
+    assert "relationship.many_to_many_no_safe_traversal" in codes
+    # No uniqueness failure despite duplicate keys on both sides.
+    assert severities == {"info"}
+
+
+def test_many_to_many_fails_on_unmatched_non_null_keys(
+    tmp_path: Path,
+) -> None:
+    left, right = _key_sources(tmp_path, [1, 2, 3], [1, 2])
+    report = verify(_many_to_many_layer(left, right), PhysicalCheck())
+    outcome = _relationship_outcome(report, "left_right")
+    assert outcome.status == "failed"
+    assert outcome.evidence["source_unmatched_non_null_rows"] == 1
+    codes = {diagnostic.code for diagnostic in outcome.diagnostics}
+    assert "relationship.source_unmatched" in codes
+    # The informational no-safe-traversal diagnostic is always present.
+    assert "relationship.many_to_many_no_safe_traversal" in codes
+
+
+def test_relationship_unavailable_when_a_bound_source_is_missing(
+    tmp_path: Path,
+) -> None:
+    orders_path = tmp_path / "orders.parquet"
+    _write_parquet(
+        orders_path,
+        pa.table({"order_id": pa.array(["o1", "o2"], pa.utf8())}),
+    )
+    layer = _relationship_layer(
+        "rel",
+        {
+            "orders": DataSource(
+                "orders",
+                ParquetConfig(str(orders_path)),
+                _order_id_schema(),
+                ("order_id",),
+            )
+        },
+        {
+            "orders_missing": Relationship(
+                "orders_missing",
+                "orders",
+                "missing_source",
+                "one_to_many",
+                "order_id",
+                "order_id",
+            )
+        },
+    )
+    report = verify(layer, PhysicalCheck())
+    outcome = _relationship_outcome(report, "orders_missing")
+    assert outcome.status == "unavailable"
+    assert outcome.evidence["error_code"] == "scan_failed"
+    # An unavailable relationship makes the report incomplete + non-passing.
+    assert report.complete is False
+    assert report.passed is False
+    unavailable_diags = [
+        diagnostic
+        for diagnostic in report.diagnostics
+        if diagnostic.code == "source.audit.unavailable"
+    ]
+    assert unavailable_diags
+    assert unavailable_diags[0].severity == "error"
