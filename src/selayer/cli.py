@@ -364,11 +364,15 @@ def _run_catalog_audit(arguments: argparse.Namespace) -> int:
        :func:`load_profile_file` resolves the version-1 document (reading
        environment values, never retaining or rendering them).
     3. :func:`verify` with a :class:`PhysicalCheck` carrying only the profile
-       resolver.  An arrow-provider resolver is intentionally *not* initialized
-       from configuration: the physical audit is a credential-free, exact
-       full-scan, and a ``pyarrow`` source audits as ``unavailable`` (an
+       resolver.  An arrow-provider resolver is intentionally *not*
+       initialized from configuration, and the audit always performs an exact
+       full scan; a ``pyarrow`` source audits as ``unavailable`` (an
        incomplete, non-passing report) rather than reading caller-supplied
-       objects.
+       objects.  Without ``--profiles`` the audit is credential-free: it scans
+       local data sources directly with no runtime connection configuration.
+       With ``--profiles`` the resolved profile values may supply runtime
+       DSNs or credentials a connector uses for its physical scan, but those
+       values are never emitted.
 
     Profile-file and I/O errors are masked by the same secret-safe envelope
     used elsewhere: a missing environment variable, a malformed profile
