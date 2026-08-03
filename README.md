@@ -31,10 +31,19 @@ with QueryEngine(layer) as engine:
     print(result)
 ```
 
-Run the complete example from the repository root:
+Generate and run the complete e-commerce example from the repository root:
 
 ```bash
+uv run python examples/e_commerce/gen_data.py
 uv run python examples/e_commerce/selayer1.py
+```
+
+The default datasets stay under `examples/e_commerce/data/`. To use another
+location, pass the same directory to both commands:
+
+```bash
+uv run python examples/e_commerce/gen_data.py --output-dir /tmp/selayer-ecommerce
+uv run python examples/e_commerce/selayer1.py --data-dir /tmp/selayer-ecommerce
 ```
 
 For a multi-source manufacturing walkthrough with CSV, SQLite, DuckDB,
