@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from datetime import date
 from pathlib import Path
 from typing import cast
@@ -706,12 +707,16 @@ def test_safe_read_text_rejects_symlink_replacement(tmp_path: Path) -> None:
     target.write_text("SECRET-VALUE-DO-NOT-LEAK", encoding="utf-8")
     link = references / "link.md"
     link.symlink_to(target)
-    # The safe reader must refuse the symlink outright (replacement detected)
-    # and never follow it to read the secret-bearing target.
-    with pytest.raises(OkfDocumentError) as exc:
-        composition._safe_read_text(link, references, "link.md")
-    assert "replaced" in str(exc.value)
-    assert "SECRET-VALUE-DO-NOT-LEAK" not in str(exc.value)
+    root_fd = os.open(str(references), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        # The safe reader must refuse the symlink outright (replacement
+        # detected) and never follow it to read the secret-bearing target.
+        with pytest.raises(OkfDocumentError) as exc:
+            composition._safe_read_text(link, references, root_fd, "link.md")
+        assert "replaced" in str(exc.value)
+        assert "SECRET-VALUE-DO-NOT-LEAK" not in str(exc.value)
+    finally:
+        os.close(root_fd)
 
 
 def test_reference_file_replaced_with_symlink_after_walk_is_rejected(
@@ -724,13 +729,13 @@ def test_reference_file_replaced_with_symlink_after_walk_is_rejected(
     _write(guide, REFERENCE)
     real_walk = composition._walk_inputs
 
-    def swapping_walk(root: Path) -> list[Path]:
-        files = real_walk(root)
+    def swapping_walk(root: Path) -> tuple[list[Path], int]:
+        files, root_fd = real_walk(root)
         # Swap the regular file for an escaping symlink AFTER the walk's lstat
         # validated it as a regular file (the TOCTOU window) but before read.
         guide.unlink()
         guide.symlink_to(target)
-        return files
+        return files, root_fd
 
     monkeypatch.setattr(composition, "_walk_inputs", swapping_walk)
     with pytest.raises(OkfDocumentError) as exc:
@@ -749,11 +754,11 @@ def test_overlay_file_replaced_with_symlink_after_walk_is_rejected(
     _write(overlay, OVERLAY)
     real_walk = composition._walk_inputs
 
-    def swapping_walk(root: Path) -> list[Path]:
-        files = real_walk(root)
+    def swapping_walk(root: Path) -> tuple[list[Path], int]:
+        files, root_fd = real_walk(root)
         overlay.unlink()
         overlay.symlink_to(target)
-        return files
+        return files, root_fd
 
     monkeypatch.setattr(composition, "_walk_inputs", swapping_walk)
     with pytest.raises(OkfDocumentError) as exc:
@@ -827,3 +832,177 @@ def test_overlay_nested_duplicate_key_name_is_not_leaked(
     assert any(
         "duplicate frontmatter key" in issue.message for issue in exc.value.issues
     )
+
+
+# ---------------------------------------------------------------------------
+# High-finding follow-up: close root/intermediate-directory symlink TOCTOU and
+# enforce per-file and aggregate byte limits on the opened descriptor.
+# ---------------------------------------------------------------------------
+
+
+def test_safe_read_text_pins_root_against_symlink_swap(tmp_path: Path) -> None:
+    # A pinned root fd must keep reads inside the original root even if the
+    # root path is swapped for a symlink after the walk: the read must return
+    # the original content and never follow the symlink to the secret target.
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "guide.md").write_text("original-content", encoding="utf-8")
+    secret_dir = tmp_path / "secret"
+    secret_dir.mkdir()
+    (secret_dir / "guide.md").write_text(
+        "SECRET-VALUE-DO-NOT-LEAK", encoding="utf-8"
+    )
+    root_fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        shutil.move(str(root), str(tmp_path / "moved"))
+        root.symlink_to(secret_dir)
+        text, _ = composition._safe_read_text(
+            root / "guide.md", root, root_fd, "guide.md"
+        )
+        assert text == "original-content"
+        assert "SECRET-VALUE-DO-NOT-LEAK" not in text
+    finally:
+        os.close(root_fd)
+
+
+def test_safe_read_text_rejects_intermediate_directory_symlink_swap(
+    tmp_path: Path,
+) -> None:
+    # An intermediate directory swapped for a symlink must be refused at the
+    # no-follow component traversal, never followed into the secret tree.
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "metrics").mkdir()
+    (root / "metrics" / "gross_margin.md").write_text("original", encoding="utf-8")
+    secret_dir = tmp_path / "secret"
+    secret_dir.mkdir()
+    (secret_dir / "gross_margin.md").write_text(
+        "SECRET-VALUE-DO-NOT-LEAK", encoding="utf-8"
+    )
+    root_fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        shutil.rmtree(root / "metrics")
+        (root / "metrics").symlink_to(secret_dir)
+        with pytest.raises(OkfDocumentError) as exc:
+            composition._safe_read_text(
+                root / "metrics" / "gross_margin.md",
+                root,
+                root_fd,
+                "metrics/gross_margin.md",
+            )
+        assert "replaced" in str(exc.value)
+        assert "SECRET-VALUE-DO-NOT-LEAK" not in str(exc.value)
+    finally:
+        os.close(root_fd)
+
+
+def test_reference_root_swapped_to_symlink_after_walk_reads_pinned_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    references = _references(tmp_path)
+    _write(references / "guide.md", REFERENCE)
+    secret_dir = tmp_path / "secret"
+    secret_dir.mkdir()
+    (secret_dir / "guide.md").write_text(
+        "---\ntype: Reference\ntitle: SECRET-VALUE-DO-NOT-LEAK\n---\n\n# x\n",
+        encoding="utf-8",
+    )
+    real_walk = composition._walk_inputs
+
+    def swapping_walk(root: Path) -> tuple[list[Path], int]:
+        files, root_fd = real_walk(root)
+        # Move the real root away and replace its path with a symlink to the
+        # secret dir AFTER the root fd is pinned to the original root inode.
+        shutil.move(str(root), str(tmp_path / "moved"))
+        root.symlink_to(secret_dir)
+        return files, root_fd
+
+    monkeypatch.setattr(composition, "_walk_inputs", swapping_walk)
+    loaded = load_references(references)
+    guide = loaded["references/guide.md"]
+    # The pinned fd reads the original guide.md, never the symlink target.
+    assert guide.frontmatter["title"] == "Guide"
+    assert "SECRET-VALUE-DO-NOT-LEAK" not in str(guide.frontmatter)
+
+
+def test_overlay_intermediate_directory_swapped_to_symlink_after_walk_is_rejected(
+    tmp_path: Path, valid_layer: SemanticLayer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    overlays = _overlays_root(tmp_path)
+    overlay = overlays / "metrics" / "gross_margin.md"
+    _write(overlay, OVERLAY)
+    secret_dir = tmp_path / "secret"
+    secret_dir.mkdir()
+    (secret_dir / "gross_margin.md").write_text(
+        "---\nselayer_id: metric.gross_margin\n---\n\n"
+        "# Usage Guidance\nSECRET-VALUE-DO-NOT-LEAK\n",
+        encoding="utf-8",
+    )
+    real_walk = composition._walk_inputs
+
+    def swapping_walk(root: Path) -> tuple[list[Path], int]:
+        files, root_fd = real_walk(root)
+        # Replace the intermediate "metrics" directory with a symlink to a
+        # secret tree AFTER the walk enumerated the real file.
+        shutil.rmtree(overlays / "metrics")
+        (overlays / "metrics").symlink_to(secret_dir)
+        return files, root_fd
+
+    monkeypatch.setattr(composition, "_walk_inputs", swapping_walk)
+    with pytest.raises(OkfDocumentError) as exc:
+        load_overlays(overlays, valid_layer)
+    assert "replaced" in str(exc.value)
+    assert "SECRET-VALUE-DO-NOT-LEAK" not in str(exc.value)
+
+
+def test_file_grown_after_walk_is_rejected(
+    tmp_path: Path,
+    valid_layer: SemanticLayer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(composition, "_MAX_FILE_BYTES", 80)
+    overlays = _overlays_root(tmp_path)
+    overlay = overlays / "metrics" / "gross_margin.md"
+    content = "---\nselayer_id: metric.gross_margin\n---\n\n# Usage Guidance\nx\n"
+    assert len(content.encode()) <= 80
+    _write(overlay, content)
+    real_walk = composition._walk_inputs
+
+    def growing_walk(root: Path) -> tuple[list[Path], int]:
+        files, root_fd = real_walk(root)
+        # Grow the file past the per-file cap AFTER the walk's lstat accepted
+        # its small size; the post-open fstat on the descriptor must reject it.
+        _write(overlay, content + "y" * 200)
+        return files, root_fd
+
+    monkeypatch.setattr(composition, "_walk_inputs", growing_walk)
+    with pytest.raises(OkfDocumentError) as exc:
+        load_overlays(overlays, valid_layer)
+    assert "exceeds" in str(exc.value)
+
+
+def test_total_grown_after_walk_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(composition, "_MAX_TOTAL_BYTES", 120)
+    references = _references(tmp_path)
+    small = "---\ntype: Reference\ntitle: A\n---\n\n# Guidance\nx\n"
+    a = references / "a.md"
+    b = references / "b.md"
+    _write(a, small)
+    _write(b, small)
+    assert 2 * len(small.encode()) <= 120
+    real_walk = composition._walk_inputs
+
+    def growing_walk(root: Path) -> tuple[list[Path], int]:
+        files, root_fd = real_walk(root)
+        # Grow one file AFTER the walk so the read-time aggregate total exceeds
+        # the cap while each file stays under _MAX_FILE_BYTES (aggregate fires).
+        _write(b, small + "z" * 200)
+        return files, root_fd
+
+    monkeypatch.setattr(composition, "_walk_inputs", growing_walk)
+    with pytest.raises(OkfDocumentError) as exc:
+        load_references(references)
+    assert "total input exceeds" in str(exc.value)

@@ -68,9 +68,14 @@ _MAX_FILE_BYTES = 1_048_576
 _MAX_TOTAL_BYTES = 16_777_216
 _MAX_LINKS_PER_FILE = 1_000
 # ``O_NOFOLLOW`` refuses to open a path that is a symlink at open time, closing
-# the lstat->open window. It is present on every supported (POSIX) platform;
-# the ``getattr`` fallback keeps the module importable elsewhere.
+# the lstat->open window. ``O_DIRECTORY`` fails the open early for a non-directory
+# (so opening a FIFO/special root cannot block), and ``O_NONBLOCK`` keeps any
+# open of a swapped-in special file from blocking. All three are present on every
+# supported (POSIX) platform; the ``getattr`` fallbacks keep the module importable
+# elsewhere (the ``fstat`` checks below remain the authoritative guards).
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 _READ_CHUNK = 1 << 16
 
 
@@ -120,67 +125,113 @@ def _relative_posix(path: Path, root: Path) -> str:
         return path.name
 
 
-def _walk_inputs(root: Path) -> list[Path]:
-    """Return sorted regular files under ``root`` within the size/count limits.
+def _open_root(root: Path) -> int:
+    """Open the input root directory with no-follow semantics and return its fd.
 
-    The root itself is validated with ``lstat`` (never following a symlink): a
-    root that is a symlink, special file, or non-directory is rejected before
-    the walk begins. Each walked path is then checked for lexical containment
-    and read only when it is a regular file. Symbolic links and special files
-    are rejected before any content is read, and file count and byte totals are
-    accumulated during the walk so a pathological input cannot exhaust memory.
+    The root is opened with ``O_NOFOLLOW | O_DIRECTORY`` and the resulting
+    descriptor is *pinned* to the validated root inode at open time. Callers
+    traverse each file's relative components from this fd (see
+    :func:`_safe_read_text`), so a later swap of the root path for a symlink
+    cannot redirect reads: the pinned fd still refers to the original
+    directory. A root that is missing, a symlink, a special file, or not a
+    directory is rejected with the same diagnostics as before; ``fstat`` on the
+    opened descriptor is the authoritative (TOCTOU-safe) directory check.
     """
+    flags = os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_NONBLOCK
     try:
-        info = root.lstat()
+        root_fd = os.open(str(root), flags)
     except OSError as error:
-        raise FileNotFoundError(f"input root does not exist: '{root}'") from error
-    if stat_module.S_ISLNK(info.st_mode):
-        raise FileExistsError(f"input root is a symbolic link: '{root}'")
-    if not stat_module.S_ISDIR(info.st_mode):
-        raise NotADirectoryError(f"input root is not a directory: '{root}'")
-    candidates = sorted(root.rglob("*.md"), key=lambda path: path.as_posix())
-    files: list[Path] = []
-    total = 0
-    for path in candidates:
+        # Open refused (missing root, a symlink root under O_NOFOLLOW, or a
+        # non-directory under O_DIRECTORY). Classify via lstat purely for a
+        # preserved, secret-safe diagnostic; the fd is what protects reads.
         try:
-            info = path.lstat()
-        except OSError as error:
-            raise OkfDocumentError(
-                f"cannot stat '{_relative_posix(path, root)}'"
+            info = root.lstat()
+        except OSError:
+            raise FileNotFoundError(
+                f"input root does not exist: '{root}'"
             ) from error
         if stat_module.S_ISLNK(info.st_mode):
-            # Echo only the local input-relative path (never a URL secret); a
-            # symlink is a structural file-system concern, not a link target.
-            raise FileExistsError(
-                f"symbolic link is not allowed: '{_relative_posix(path, root)}'"
-            )
-        # Lexical containment: rglob normalizes, so a real escape requires a
-        # symlink (rejected above). The check is defensive belt-and-suspenders.
+            raise FileExistsError(f"input root is a symbolic link: '{root}'") from error
+        raise NotADirectoryError(f"input root is not a directory: '{root}'") from error
+    try:
+        if not stat_module.S_ISDIR(os.fstat(root_fd).st_mode):
+            raise NotADirectoryError(f"input root is not a directory: '{root}'")
+    except BaseException:
         try:
-            path.relative_to(root)
-        except ValueError as error:
-            raise OkfDocumentError(
-                f"path escapes input root: '{_relative_posix(path, root)}'"
-            ) from error
-        if not stat_module.S_ISREG(info.st_mode):
-            raise OkfDocumentError(
-                f"special file is not allowed: '{_relative_posix(path, root)}'"
-            )
-        size = info.st_size
-        if size > _MAX_FILE_BYTES:
-            raise OkfDocumentError(
-                f"file exceeds {_MAX_FILE_BYTES} bytes: "
-                f"'{_relative_posix(path, root)}'"
-            )
-        if len(files) + 1 > _MAX_FILES:
-            raise OkfDocumentError(f"more than {_MAX_FILES} input files")
-        total += size
-        if total > _MAX_TOTAL_BYTES:
-            raise OkfDocumentError(
-                f"total input exceeds {_MAX_TOTAL_BYTES} bytes"
-            )
-        files.append(path)
-    return files
+            os.close(root_fd)
+        except OSError:
+            pass
+        raise
+    return root_fd
+
+
+def _walk_inputs(root: Path) -> tuple[list[Path], int]:
+    """Return sorted regular files under ``root`` and a pinned root directory fd.
+
+    The root is opened once with no-follow semantics (:func:`_open_root`) and
+    the returned descriptor is pinned to the validated root inode. Every file is
+    later read by traversing its relative components from this fd with
+    ``O_NOFOLLOW`` at each level, so a symlink swapped in for the root, an
+    intermediate directory, or the file itself cannot redirect a read out of
+    the input root. The caller must close the returned fd.
+
+    Each walked path is still checked for lexical containment and read only when
+    it is a regular file. Symbolic links and special files are rejected before
+    any content is read, and file count and byte totals are accumulated during
+    the walk so a pathological input cannot exhaust memory.
+    """
+    root_fd = _open_root(root)
+    try:
+        candidates = sorted(root.rglob("*.md"), key=lambda path: path.as_posix())
+        files: list[Path] = []
+        total = 0
+        for path in candidates:
+            try:
+                info = path.lstat()
+            except OSError as error:
+                raise OkfDocumentError(
+                    f"cannot stat '{_relative_posix(path, root)}'"
+                ) from error
+            if stat_module.S_ISLNK(info.st_mode):
+                # Echo only the local input-relative path (never a URL secret);
+                # a symlink is a structural file-system concern, not a link
+                # target.
+                raise FileExistsError(
+                    f"symbolic link is not allowed: '{_relative_posix(path, root)}'"
+                )
+            # Lexical containment: rglob normalizes, so a real escape requires a
+            # symlink (rejected above). The check is defensive belt-and-suspenders.
+            try:
+                path.relative_to(root)
+            except ValueError as error:
+                raise OkfDocumentError(
+                    f"path escapes input root: '{_relative_posix(path, root)}'"
+                ) from error
+            if not stat_module.S_ISREG(info.st_mode):
+                raise OkfDocumentError(
+                    f"special file is not allowed: '{_relative_posix(path, root)}'"
+                )
+            size = info.st_size
+            if size > _MAX_FILE_BYTES:
+                raise OkfDocumentError(
+                    f"file exceeds {_MAX_FILE_BYTES} bytes: "
+                    f"'{_relative_posix(path, root)}'"
+                )
+            if len(files) + 1 > _MAX_FILES:
+                raise OkfDocumentError(f"more than {_MAX_FILES} input files")
+            total += size
+            if total > _MAX_TOTAL_BYTES:
+                raise OkfDocumentError(
+                    f"total input exceeds {_MAX_TOTAL_BYTES} bytes"
+                )
+            files.append(path)
+        return files, root_fd
+    except BaseException:
+        try:
+            os.close(root_fd)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -258,50 +309,116 @@ def _compose_frontmatter(text: str) -> dict[str, Any]:
     return loaded
 
 
-def _safe_read_text(path: Path, root: Path, relative: str) -> str:
-    """Read a trusted input file with an immediate re-validation of the lstat.
+def _safe_read_text(
+    path: Path, root: Path, root_fd: int, relative: str
+) -> tuple[str, int]:
+    """Read a trusted input file via a pinned root fd with no-follow traversal.
 
-    ``_walk_inputs`` lstat-checks every entry during enumeration, but the file
-    is read later. This closes that time-of-check/time-of-use window: the path
-    is re-checked with ``lstat`` immediately before opening, the open refuses
-    to follow a symlink (``O_NOFOLLOW``) so a regular file swapped for a
-    symlink after the walk cannot be followed out of the root, and ``fstat``
-    on the opened descriptor confirms it is still a regular file. Any detected
-    replacement raises a safe domain error rather than reading
-    attacker-controlled content. Lexical containment is re-checked as a
-    defensive string-level guard.
+    ``root_fd`` is pinned to the validated root inode (see :func:`_walk_inputs`)
+    and is never re-resolved through the filesystem, so a swap of the root path
+    for a symlink cannot redirect the read. The file's relative components are
+    traversed from that fd, each opened with ``O_NOFOLLOW`` so a symlink swapped
+    in for an intermediate directory or the file itself cannot be followed out
+    of the input root.
+
+    Byte limits are enforced on the opened descriptor, not only at walk time:
+    the descriptor is ``fstat``-checked for a regular file, its size is capped at
+    ``_MAX_FILE_BYTES``, and the read is bounded to that cap (then re-checked by
+    ``fstat``) so a file that grows after enumeration cannot bypass the limit or
+    accumulate an unbounded chunk. Any detected replacement raises a fixed,
+    secret-safe domain error. Returns the decoded text and the raw byte count
+    read, so the caller can enforce an aggregate cap across files.
     """
     try:
-        path.relative_to(root)
+        rel = PurePosixPath(path.relative_to(root).as_posix())
     except ValueError as error:
         raise OkfDocumentError(f"path escapes input root: '{relative}'") from error
-    try:
-        info = path.lstat()
-    except OSError as error:
-        raise OkfDocumentError(f"cannot stat '{relative}'") from error
-    if stat_module.S_ISLNK(info.st_mode) or not stat_module.S_ISREG(info.st_mode):
+    parts = rel.parts
+    if not parts:
         raise OkfDocumentError(f"input file was replaced: '{relative}'")
+    dir_fd = root_fd
+    opened: list[int] = []
+    fd: int | None = None
     try:
-        fd = os.open(path, os.O_RDONLY | _O_NOFOLLOW)
-    except OSError as error:
-        # A symlink swapped in between the lstat above and the open surfaces
-        # here (ELOOP under O_NOFOLLOW); never follow it.
-        raise OkfDocumentError(f"input file was replaced: '{relative}'") from error
-    try:
-        if not stat_module.S_ISREG(os.fstat(fd).st_mode):
+        # Traverse each intermediate directory component with O_NOFOLLOW from
+        # the pinned root fd: a symlink swapped in for any component is refused
+        # at open time rather than followed out of the input root.
+        for component in parts[:-1]:
+            try:
+                child_fd = os.open(
+                    component,
+                    os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_NONBLOCK,
+                    dir_fd=dir_fd,
+                )
+            except OSError as error:
+                raise OkfDocumentError(
+                    f"input file was replaced: '{relative}'"
+                ) from error
+            opened.append(child_fd)
+            try:
+                mode = os.fstat(child_fd).st_mode
+            except OSError as error:
+                raise OkfDocumentError(
+                    f"input file was replaced: '{relative}'"
+                ) from error
+            if not stat_module.S_ISDIR(mode):
+                raise OkfDocumentError(f"input file was replaced: '{relative}'")
+            dir_fd = child_fd
+        # Open the final component with O_NOFOLLOW so a symlink swapped in
+        # between the walk and this read is refused (ELOOP) at open time.
+        try:
+            fd = os.open(
+                parts[-1], os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK, dir_fd=dir_fd
+            )
+        except OSError as error:
+            raise OkfDocumentError(f"input file was replaced: '{relative}'") from error
+        try:
+            info = os.fstat(fd)
+        except OSError as error:
+            raise OkfDocumentError(f"input file was replaced: '{relative}'") from error
+        if not stat_module.S_ISREG(info.st_mode):
             raise OkfDocumentError(f"input file was replaced: '{relative}'")
+        # Per-file cap on the opened descriptor, not only the walk-time lstat.
+        if info.st_size > _MAX_FILE_BYTES:
+            raise OkfDocumentError(
+                f"file exceeds {_MAX_FILE_BYTES} bytes: '{relative}'"
+            )
         chunks: list[bytes] = []
-        while True:
-            chunk = os.read(fd, _READ_CHUNK)
+        remaining = _MAX_FILE_BYTES
+        while remaining > 0:
+            chunk = os.read(fd, min(_READ_CHUNK, remaining))
             if not chunk:
                 break
             chunks.append(chunk)
+            remaining -= len(chunk)
+        # Re-check after reading: a file that grew past the cap mid-read must be
+        # rejected even though the bounded read stopped at the limit.
+        try:
+            final_size = os.fstat(fd).st_size
+        except OSError as error:
+            raise OkfDocumentError(f"input file was replaced: '{relative}'") from error
+        if final_size > _MAX_FILE_BYTES:
+            raise OkfDocumentError(
+                f"file exceeds {_MAX_FILE_BYTES} bytes: '{relative}'"
+            )
+        try:
+            return (
+                b"".join(chunks).decode("utf-8").replace("\r\n", "\n"),
+                _MAX_FILE_BYTES - remaining,
+            )
+        except UnicodeDecodeError as error:
+            raise OkfDocumentError(f"invalid UTF-8 in '{relative}'") from error
     finally:
-        os.close(fd)
-    try:
-        return b"".join(chunks).decode("utf-8").replace("\r\n", "\n")
-    except UnicodeDecodeError as error:
-        raise OkfDocumentError(f"invalid UTF-8 in '{relative}'") from error
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        for opened_fd in opened:
+            try:
+                os.close(opened_fd)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -319,66 +436,84 @@ def load_references(root: Path) -> Mapping[str, OkfConcept]:
     ``selayer_id``.
     """
     input_root = Path(root)
-    files = _walk_inputs(input_root)
+    files, root_fd = _walk_inputs(input_root)
     base = input_root.parent
     concepts: dict[str, OkfConcept] = {}
     issues: list[OkfIssue] = []
-    for path in files:
-        relative = PurePosixPath(path.relative_to(base).as_posix())
-        relative_posix = relative.as_posix()
-        if path.name in _RESERVED_NAMES:
-            issues.append(
-                _issue(relative_posix, f"reserved path '{path.name}' is not allowed")
+    total_read = 0
+    try:
+        for path in files:
+            relative = PurePosixPath(path.relative_to(base).as_posix())
+            relative_posix = relative.as_posix()
+            if path.name in _RESERVED_NAMES:
+                issues.append(
+                    _issue(relative_posix, f"reserved path '{path.name}' is not allowed")
+                )
+                continue
+            # Read once from the pinned root fd (TOCTOU-safe: every component
+            # is opened with O_NOFOLLOW and the descriptor is fstat-checked, so
+            # a symlink swap at the root, an intermediate directory, or the file
+            # itself cannot redirect the read), then parse the concept from this
+            # in-memory text so parse_concept never re-opens the path.
+            text, consumed = _safe_read_text(
+                path, input_root, root_fd, relative_posix
             )
-            continue
-        # Read once with an immediate re-validation of the walk's lstat
-        # (TOCTOU-safe: O_NOFOLLOW + fstat refuse a symlink or file-type swap
-        # made after the walk), then parse the concept from this in-memory text
-        # so parse_concept never re-opens the path.
-        text = _safe_read_text(path, input_root, relative_posix)
-        # Duplicate-key-safe composition before parsing, so malformed or
-        # duplicate-keyed frontmatter is reported with a fixed, secret-safe
-        # message and never reaches parse_concept_text's source-bearing path
-        # (which would otherwise forward PyYAML's diagnostic).
-        frontmatter_match = _FRONTMATTER.match(text)
-        if frontmatter_match is not None:
+            # Aggregate byte cap is re-enforced on the bytes actually read, so
+            # files that grew after the walk-time lstat accounting cannot
+            # accumulate past the total limit.
+            total_read += consumed
+            if total_read > _MAX_TOTAL_BYTES:
+                raise OkfDocumentError(
+                    f"total input exceeds {_MAX_TOTAL_BYTES} bytes"
+                )
+            # Duplicate-key-safe composition before parsing, so malformed or
+            # duplicate-keyed frontmatter is reported with a fixed, secret-safe
+            # message and never reaches parse_concept_text's source-bearing path
+            # (which would otherwise forward PyYAML's diagnostic).
+            frontmatter_match = _FRONTMATTER.match(text)
+            if frontmatter_match is not None:
+                try:
+                    _compose_frontmatter(frontmatter_match.group(1))
+                except OkfDocumentError as error:
+                    issues.append(_issue(relative_posix, str(error)))
+                    continue
             try:
-                _compose_frontmatter(frontmatter_match.group(1))
+                concept = parse_concept_text(text, path, base)
             except OkfDocumentError as error:
                 issues.append(_issue(relative_posix, str(error)))
                 continue
+            if len(concept.links) > _MAX_LINKS_PER_FILE:
+                raise OkfDocumentError(
+                    f"more than {_MAX_LINKS_PER_FILE} links in '{relative_posix}'"
+                )
+            frontmatter = concept.frontmatter
+            if "selayer_id" in frontmatter:
+                issues.append(
+                    _frontmatter_issue(
+                        relative_posix,
+                        "selayer_id",
+                        "references must not declare a selayer_id",
+                    )
+                )
+            if not _is_nonempty_string(frontmatter.get("type")):
+                issues.append(
+                    _frontmatter_issue(
+                        relative_posix, "type", "reference must declare a non-empty type"
+                    )
+                )
+            if not _is_nonempty_string(frontmatter.get("title")):
+                issues.append(
+                    _frontmatter_issue(
+                        relative_posix, "title", "reference must declare a non-empty title"
+                    )
+                )
+            issues.extend(validate_concept(concept, None, strict=True))
+            concepts[relative_posix] = concept
+    finally:
         try:
-            concept = parse_concept_text(text, path, base)
-        except OkfDocumentError as error:
-            issues.append(_issue(relative_posix, str(error)))
-            continue
-        if len(concept.links) > _MAX_LINKS_PER_FILE:
-            raise OkfDocumentError(
-                f"more than {_MAX_LINKS_PER_FILE} links in '{relative_posix}'"
-            )
-        frontmatter = concept.frontmatter
-        if "selayer_id" in frontmatter:
-            issues.append(
-                _frontmatter_issue(
-                    relative_posix,
-                    "selayer_id",
-                    "references must not declare a selayer_id",
-                )
-            )
-        if not _is_nonempty_string(frontmatter.get("type")):
-            issues.append(
-                _frontmatter_issue(
-                    relative_posix, "type", "reference must declare a non-empty type"
-                )
-            )
-        if not _is_nonempty_string(frontmatter.get("title")):
-            issues.append(
-                _frontmatter_issue(
-                    relative_posix, "title", "reference must declare a non-empty title"
-                )
-            )
-        issues.extend(validate_concept(concept, None, strict=True))
-        concepts[relative_posix] = concept
+            os.close(root_fd)
+        except OSError:
+            pass
     _raise_if_errors(issues)
     return MappingProxyType(dict(sorted(concepts.items())))
 
@@ -477,107 +612,124 @@ def load_overlays(root: Path, layer: SemanticLayer) -> tuple[OkfOverlay, ...]:
     reuse the existing OKF field validators via a temporary concept.
     """
     input_root = Path(root)
-    files = _walk_inputs(input_root)
+    files, root_fd = _walk_inputs(input_root)
     overlays: list[OkfOverlay] = []
     issues: list[OkfIssue] = []
     all_ids: list[tuple[str, str]] = []
-    for path in files:
-        relative = PurePosixPath(path.relative_to(input_root).as_posix())
-        relative_posix = relative.as_posix()
-        if path.name in _RESERVED_NAMES:
-            issues.append(
-                _issue(relative_posix, f"reserved path '{path.name}' is not allowed")
-            )
-            continue
-        text = _safe_read_text(path, input_root, relative_posix)
-        try:
-            frontmatter, preamble, sections, links = _parse_overlay(text)
-        except OkfDocumentError as error:
-            issues.append(_issue(relative_posix, str(error)))
-            continue
-        if len(links) > _MAX_LINKS_PER_FILE:
-            raise OkfDocumentError(
-                f"more than {_MAX_LINKS_PER_FILE} links in '{relative_posix}'"
-            )
-
-        extra = set(frontmatter) - _ALLOWED_OVERLAY_FIELDS
-        if extra:
-            issues.append(
-                _frontmatter_issue(
-                    relative_posix,
-                    "",
-                    "overlay frontmatter allows only selayer_id, sources, "
-                    "and stale_after",
-                )
-            )
-
-        selayer_id = frontmatter.get("selayer_id")
-        valid_id = False
-        if not _is_nonempty_string(selayer_id):
-            issues.append(
-                _frontmatter_issue(
-                    relative_posix, "selayer_id", "overlay must declare a selayer_id"
-                )
-            )
-        elif _SELAYER_ID.fullmatch(cast(str, selayer_id)) is None:
-            issues.append(
-                _frontmatter_issue(
-                    relative_posix,
-                    "selayer_id",
-                    "selayer_id must use a canonical semantic kind and local name",
-                )
-            )
-        else:
-            identifier = cast(str, selayer_id)
-            # Track every valid-format identifier for duplicate detection,
-            # independent of path validation (reported separately). A list
-            # (not a dict keyed by id) preserves repeated IDs so a true
-            # duplicate-ID diagnostic is emitted even when paths mismatch.
-            all_ids.append((identifier, relative_posix))
-            valid_id = _validate_bound_overlay(
-                identifier,
-                layer,
-                relative,
-                relative_posix,
-                frontmatter,
-                sections,
-                issues,
-            )
-
-        if preamble:
-            issues.append(
-                _issue(relative_posix, "text before the first section is not allowed")
-            )
-
-        seen_titles: set[str] = set()
-        for section in sections:
-            if section.title not in _ALLOWED_OVERLAY_SECTIONS:
+    total_read = 0
+    try:
+        for path in files:
+            relative = PurePosixPath(path.relative_to(input_root).as_posix())
+            relative_posix = relative.as_posix()
+            if path.name in _RESERVED_NAMES:
                 issues.append(
-                    _issue(relative_posix, f"disallowed section '{section.title}'")
+                    _issue(relative_posix, f"reserved path '{path.name}' is not allowed")
                 )
-            if section.title in seen_titles:
-                issues.append(
-                    _issue(relative_posix, f"duplicate section '{section.title}'")
+                continue
+            text, consumed = _safe_read_text(
+                path, input_root, root_fd, relative_posix
+            )
+            # Aggregate byte cap re-enforced on the bytes actually read, so
+            # files that grew after the walk-time lstat accounting cannot
+            # accumulate past the total limit.
+            total_read += consumed
+            if total_read > _MAX_TOTAL_BYTES:
+                raise OkfDocumentError(
+                    f"total input exceeds {_MAX_TOTAL_BYTES} bytes"
                 )
-            seen_titles.add(section.title)
-
-        issues.extend(_validate_related_links(relative, sections))
-
-        if valid_id:
-            identifier = cast(str, selayer_id)
             try:
-                frozen_frontmatter = _freeze(frontmatter)
-            except OkfMetadataError as error:
+                frontmatter, preamble, sections, links = _parse_overlay(text)
+            except OkfDocumentError as error:
                 issues.append(_issue(relative_posix, str(error)))
                 continue
-            overlays.append(
-                OkfOverlay(
-                    relative_path=Path(relative.as_posix()),
-                    selayer_id=identifier,
-                    frontmatter=frozen_frontmatter,
-                    sections=sections,
+            if len(links) > _MAX_LINKS_PER_FILE:
+                raise OkfDocumentError(
+                    f"more than {_MAX_LINKS_PER_FILE} links in '{relative_posix}'"
                 )
-            )
+
+            extra = set(frontmatter) - _ALLOWED_OVERLAY_FIELDS
+            if extra:
+                issues.append(
+                    _frontmatter_issue(
+                        relative_posix,
+                        "",
+                        "overlay frontmatter allows only selayer_id, sources, "
+                        "and stale_after",
+                    )
+                )
+
+            selayer_id = frontmatter.get("selayer_id")
+            valid_id = False
+            if not _is_nonempty_string(selayer_id):
+                issues.append(
+                    _frontmatter_issue(
+                        relative_posix, "selayer_id", "overlay must declare a selayer_id"
+                    )
+                )
+            elif _SELAYER_ID.fullmatch(cast(str, selayer_id)) is None:
+                issues.append(
+                    _frontmatter_issue(
+                        relative_posix,
+                        "selayer_id",
+                        "selayer_id must use a canonical semantic kind and local name",
+                    )
+                )
+            else:
+                identifier = cast(str, selayer_id)
+                # Track every valid-format identifier for duplicate detection,
+                # independent of path validation (reported separately). A list
+                # (not a dict keyed by id) preserves repeated IDs so a true
+                # duplicate-ID diagnostic is emitted even when paths mismatch.
+                all_ids.append((identifier, relative_posix))
+                valid_id = _validate_bound_overlay(
+                    identifier,
+                    layer,
+                    relative,
+                    relative_posix,
+                    frontmatter,
+                    sections,
+                    issues,
+                )
+
+            if preamble:
+                issues.append(
+                    _issue(relative_posix, "text before the first section is not allowed")
+                )
+
+            seen_titles: set[str] = set()
+            for section in sections:
+                if section.title not in _ALLOWED_OVERLAY_SECTIONS:
+                    issues.append(
+                        _issue(relative_posix, f"disallowed section '{section.title}'")
+                    )
+                if section.title in seen_titles:
+                    issues.append(
+                        _issue(relative_posix, f"duplicate section '{section.title}'")
+                    )
+                seen_titles.add(section.title)
+
+            issues.extend(_validate_related_links(relative, sections))
+
+            if valid_id:
+                identifier = cast(str, selayer_id)
+                try:
+                    frozen_frontmatter = _freeze(frontmatter)
+                except OkfMetadataError as error:
+                    issues.append(_issue(relative_posix, str(error)))
+                    continue
+                overlays.append(
+                    OkfOverlay(
+                        relative_path=Path(relative.as_posix()),
+                        selayer_id=identifier,
+                        frontmatter=frozen_frontmatter,
+                        sections=sections,
+                    )
+                )
+    finally:
+        try:
+            os.close(root_fd)
+        except OSError:
+            pass
 
     _report_duplicate_ids(all_ids, issues)
     _raise_if_errors(issues)
