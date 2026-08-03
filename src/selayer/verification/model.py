@@ -16,6 +16,29 @@ EvidenceScope = Literal["declaration", "full_scan", "planner"]
 CheckKind = Literal["static", "physical", "compatibility", "okf"]
 EvidenceValue = bool | int | float | str | None
 
+#: Runtime schema version produced and accepted by ``VerificationReport``.
+_SCHEMA_VERSION = 1
+
+
+def _freeze_evidence(value: object) -> object:
+    """Freeze nested evidence into immutable ``MappingProxyType``/tuple trees."""
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _freeze_evidence(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_evidence(item) for item in value)
+    return value
+
+
+def _evidence_to_plain(value: object) -> object:
+    """Convert frozen evidence back into plain ``dict``/``list`` trees."""
+    if isinstance(value, Mapping):
+        return {key: _evidence_to_plain(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_evidence_to_plain(item) for item in value]
+    return value
+
 
 @dataclass(frozen=True, slots=True)
 class StaticCheck:
@@ -63,7 +86,7 @@ class VerificationOutcome:
     diagnostics: tuple[VerificationDiagnostic, ...]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "evidence", MappingProxyType(dict(self.evidence)))
+        object.__setattr__(self, "evidence", _freeze_evidence(self.evidence))
         object.__setattr__(self, "diagnostics", tuple(sorted(self.diagnostics)))
 
 
@@ -77,6 +100,11 @@ class VerificationReport:
     diagnostics: tuple[VerificationDiagnostic, ...]
 
     def __post_init__(self) -> None:
+        if self.schema_version != _SCHEMA_VERSION:
+            raise ValueError(
+                f"schema_version must be {_SCHEMA_VERSION}, "
+                f"got {self.schema_version!r}"
+            )
         object.__setattr__(
             self,
             "outcomes",
@@ -105,7 +133,7 @@ class VerificationReport:
                     "status": item.status,
                     "scope": item.scope,
                     "path": item.path,
-                    "evidence": dict(item.evidence),
+                    "evidence": _evidence_to_plain(item.evidence),
                     "diagnostics": [
                         {
                             "code": diagnostic.code,
