@@ -1,0 +1,546 @@
+"""Parse and validate authored Reference documents and concept overlays.
+
+This module produces private loaders (:func:`load_references` and
+:func:`load_overlays`) plus the immutable :class:`OkfOverlay` value. References
+are ordinary OKF concepts validated strictly. Overlays are curated curation
+that will replace the generated concept body for a bound semantic identifier;
+they are parsed with duplicate-key detection and a closed frontmatter /
+section vocabulary, and their ``selayer_id`` is resolved against the catalog.
+
+Cross-input link existence is intentionally deferred to the composition step
+(Task 8) where generated, Reference, and overlay concept sets are known
+together; this loader only rejects self-links, duplicate Related Concepts
+links, and links that lexically escape the bundle root.
+"""
+
+from __future__ import annotations
+
+import posixpath
+import stat as stat_module
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from types import MappingProxyType
+from typing import Any, cast
+from urllib.parse import unquote
+
+import yaml
+
+from selayer.catalog import SemanticLayer
+
+from .document import (
+    _FRONTMATTER,
+    _LINK,
+    OkfDocumentError,
+    parse_concept,
+    split_sections,
+)
+from .generation import concept_path, display_title
+from .model import (
+    OkfConcept,
+    OkfIssue,
+    OkfMetadataError,
+    OkfSection,
+    OkfValidationError,
+    _freeze,
+)
+from .validation import (
+    _KIND_TYPES,
+    _SELAYER_ID,
+    _is_nonempty_string,
+    _safe_urlsplit,
+    validate_concept,
+)
+
+_ALLOWED_OVERLAY_FIELDS = frozenset({"selayer_id", "sources", "stale_after"})
+_ALLOWED_OVERLAY_SECTIONS = (
+    "Usage Guidance",
+    "Examples",
+    "Caveats",
+    "Related Concepts",
+)
+_RESERVED_NAMES = frozenset({"index.md", "log.md"})
+_RELATED_CONCEPTS_SECTION = "Related Concepts"
+_MAX_FILES = 1_000
+_MAX_FILE_BYTES = 1_048_576
+_MAX_TOTAL_BYTES = 16_777_216
+_MAX_LINKS_PER_FILE = 1_000
+
+
+@dataclass(frozen=True, slots=True)
+class OkfOverlay:
+    relative_path: Path
+    selayer_id: str
+    frontmatter: Mapping[str, object]
+    sections: tuple[OkfSection, ...]
+
+
+# ---------------------------------------------------------------------------
+# Issue helpers (secret-safe: never echo raw link URLs)
+# ---------------------------------------------------------------------------
+
+
+def _issue(relative: str, message: str) -> OkfIssue:
+    return OkfIssue(relative, message, severity="error", code="okf.composition")
+
+
+def _frontmatter_issue(relative: str, field: str, message: str) -> OkfIssue:
+    path = f"{relative}.frontmatter.{field}" if field else f"{relative}.frontmatter"
+    return OkfIssue(path, message, severity="error", code="okf.composition")
+
+
+def _link_issue(relative: str, message: str) -> OkfIssue:
+    return OkfIssue(
+        f"{relative}.links", message, severity="error", code="okf.composition.link"
+    )
+
+
+def _raise_if_errors(issues: list[OkfIssue]) -> None:
+    if issues:
+        ordered = tuple(sorted(issues, key=lambda issue: (issue.path, issue.message)))
+        raise OkfValidationError(ordered)
+
+
+# ---------------------------------------------------------------------------
+# Bounded, symlink-safe input walking
+# ---------------------------------------------------------------------------
+
+
+def _relative_posix(path: Path, root: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.name
+
+
+def _walk_inputs(root: Path) -> list[Path]:
+    """Return sorted regular files under ``root`` within the size/count limits.
+
+    Symbolic links, special files, and lexically-escaping paths are rejected
+    before any file is read. File count and byte totals are accumulated during
+    the walk so a pathological input cannot exhaust memory.
+    """
+    if not root.exists():
+        raise FileNotFoundError(f"input root does not exist: '{root}'")
+    if not root.is_dir():
+        raise NotADirectoryError(f"input root is not a directory: '{root}'")
+    candidates = sorted(root.rglob("*.md"), key=lambda path: path.as_posix())
+    files: list[Path] = []
+    total = 0
+    for path in candidates:
+        try:
+            info = path.lstat()
+        except OSError as error:
+            raise OkfDocumentError(
+                f"cannot stat '{_relative_posix(path, root)}'"
+            ) from error
+        if stat_module.S_ISLNK(info.st_mode):
+            # Echo only the local input-relative path (never a URL secret); a
+            # symlink is a structural file-system concern, not a link target.
+            raise FileExistsError(
+                f"symbolic link is not allowed: '{_relative_posix(path, root)}'"
+            )
+        # Lexical containment: rglob normalizes, so a real escape requires a
+        # symlink (rejected above). The check is defensive belt-and-suspenders.
+        try:
+            path.relative_to(root)
+        except ValueError as error:
+            raise OkfDocumentError(
+                f"path escapes input root: '{_relative_posix(path, root)}'"
+            ) from error
+        if not stat_module.S_ISREG(info.st_mode):
+            raise OkfDocumentError(
+                f"special file is not allowed: '{_relative_posix(path, root)}'"
+            )
+        size = info.st_size
+        if size > _MAX_FILE_BYTES:
+            raise OkfDocumentError(
+                f"file exceeds {_MAX_FILE_BYTES} bytes: "
+                f"'{_relative_posix(path, root)}'"
+            )
+        if len(files) + 1 > _MAX_FILES:
+            raise OkfDocumentError(f"more than {_MAX_FILES} input files")
+        total += size
+        if total > _MAX_TOTAL_BYTES:
+            raise OkfDocumentError(
+                f"total input exceeds {_MAX_TOTAL_BYTES} bytes"
+            )
+        files.append(path)
+    return files
+
+
+# ---------------------------------------------------------------------------
+# YAML frontmatter with duplicate-key detection
+# ---------------------------------------------------------------------------
+
+
+def _reject_duplicate_keys(node: yaml.MappingNode) -> None:
+    seen: set[Any] = set()
+    for key_node, _value_node in node.value:
+        if isinstance(key_node, yaml.ScalarNode):
+            key = key_node.value
+            if key in seen:
+                raise OkfDocumentError(f"duplicate frontmatter key '{key}'")
+            seen.add(key)
+
+
+def _safe_load_mapping(text: str) -> dict[str, Any]:
+    """safe_load a YAML mapping, rejecting duplicate scalar keys first."""
+    try:
+        node = yaml.compose(text, Loader=cast(type[yaml.Loader], yaml.SafeLoader))
+    except yaml.YAMLError as error:
+        raise OkfDocumentError(f"invalid YAML frontmatter: {error}") from error
+    if node is None:
+        return {}
+    if not isinstance(node, yaml.MappingNode):
+        raise OkfDocumentError("frontmatter must be a mapping")
+    _reject_duplicate_keys(node)
+    loaded = yaml.safe_load(text)
+    if not isinstance(loaded, dict):
+        raise OkfDocumentError("frontmatter must be a mapping")
+    return loaded
+
+
+def _read_text(path: Path, relative: str) -> str:
+    try:
+        return path.read_text(encoding="utf-8").replace("\r\n", "\n")
+    except UnicodeDecodeError as error:
+        raise OkfDocumentError(f"invalid UTF-8 in '{relative}'") from error
+
+
+# ---------------------------------------------------------------------------
+# References
+# ---------------------------------------------------------------------------
+
+
+def load_references(root: Path) -> Mapping[str, OkfConcept]:
+    """Parse authored Reference documents as ordinary, strictly-validated concepts.
+
+    ``root`` is the references directory. Concept relative paths are computed
+    against ``root.parent`` (the future composed-bundle root) so a reference at
+    ``<root>/guide.md`` composes at ``references/guide.md``. References must
+    declare a non-empty ``type`` and ``title`` and must not bind a
+    ``selayer_id``.
+    """
+    input_root = Path(root)
+    files = _walk_inputs(input_root)
+    base = input_root.parent
+    concepts: dict[str, OkfConcept] = {}
+    issues: list[OkfIssue] = []
+    for path in files:
+        relative = PurePosixPath(path.relative_to(base).as_posix())
+        relative_posix = relative.as_posix()
+        if path.name in _RESERVED_NAMES:
+            issues.append(
+                _issue(relative_posix, f"reserved path '{path.name}' is not allowed")
+            )
+            continue
+        try:
+            concept = parse_concept(path, base)
+        except UnicodeDecodeError as error:
+            raise OkfDocumentError(
+                f"invalid UTF-8 in '{relative_posix}'"
+            ) from error
+        except OkfDocumentError as error:
+            issues.append(_issue(relative_posix, str(error)))
+            continue
+        if len(concept.links) > _MAX_LINKS_PER_FILE:
+            raise OkfDocumentError(
+                f"more than {_MAX_LINKS_PER_FILE} links in '{relative_posix}'"
+            )
+        frontmatter = concept.frontmatter
+        if "selayer_id" in frontmatter:
+            issues.append(
+                _frontmatter_issue(
+                    relative_posix,
+                    "selayer_id",
+                    "references must not declare a selayer_id",
+                )
+            )
+        if not _is_nonempty_string(frontmatter.get("type")):
+            issues.append(
+                _frontmatter_issue(
+                    relative_posix, "type", "reference must declare a non-empty type"
+                )
+            )
+        if not _is_nonempty_string(frontmatter.get("title")):
+            issues.append(
+                _frontmatter_issue(
+                    relative_posix, "title", "reference must declare a non-empty title"
+                )
+            )
+        issues.extend(validate_concept(concept, None, strict=True))
+        concepts[relative_posix] = concept
+    _raise_if_errors(issues)
+    return MappingProxyType(dict(sorted(concepts.items())))
+
+
+# ---------------------------------------------------------------------------
+# Overlays
+# ---------------------------------------------------------------------------
+
+
+def _parse_overlay(text: str) -> tuple[dict[str, Any], str, tuple[OkfSection, ...], list[str]]:
+    match = _FRONTMATTER.match(text)
+    if match is None:
+        raise OkfDocumentError("missing YAML frontmatter")
+    frontmatter = _safe_load_mapping(match.group(1))
+    body = text[match.end() :].lstrip("\n")
+    preamble, sections = split_sections(body)
+    links = _LINK.findall(body)
+    return frontmatter, preamble, sections, links
+
+
+def _classify_link(
+    source: PurePosixPath, link: str
+) -> tuple[str, PurePosixPath | None]:
+    """Classify an internal link without echoing attacker-controlled text.
+
+    Returns ``("path", target)`` for a normalizable internal concept link,
+    ``("external", None)`` for URLs/fragments that are out of scope, and
+    ``("broken", None)`` for links that escape the bundle root or cannot be
+    parsed. ``urlsplit`` failures (which surface before scheme/query/fragment
+    can be separated) are caught so a malformed URL cannot crash the loader.
+    """
+    split = _safe_urlsplit(link)
+    if split is None:
+        return "broken", None
+    if split.scheme or split.netloc:
+        return "external", None
+    path_text = unquote(split.path)
+    if not path_text:
+        return "external", None
+    if path_text.startswith("/"):
+        normalized = posixpath.normpath(path_text.lstrip("/"))
+    else:
+        normalized = posixpath.normpath(
+            posixpath.join(source.parent.as_posix(), path_text)
+        )
+    if normalized == ".." or normalized.startswith("../"):
+        return "broken", None
+    return "path", PurePosixPath(normalized)
+
+
+def _validate_related_links(
+    relative: PurePosixPath, sections: tuple[OkfSection, ...]
+) -> list[OkfIssue]:
+    related = next(
+        (section for section in sections if section.title == _RELATED_CONCEPTS_SECTION),
+        None,
+    )
+    if related is None:
+        return []
+    issues: list[OkfIssue] = []
+    seen: set[PurePosixPath] = set()
+    for link in _LINK.findall(related.content):
+        kind, target = _classify_link(relative, link)
+        if kind == "external":
+            continue
+        if kind == "broken":
+            issues.append(
+                _link_issue(relative.as_posix(), "Related Concepts link is broken")
+            )
+            continue
+        target_path = cast(PurePosixPath, target)
+        if target_path == relative:
+            issues.append(
+                _link_issue(relative.as_posix(), "self-link in Related Concepts")
+            )
+            continue
+        if target_path in seen:
+            issues.append(
+                _link_issue(relative.as_posix(), "duplicate Related Concepts link")
+            )
+            continue
+        seen.add(target_path)
+    return issues
+
+
+def load_overlays(root: Path, layer: SemanticLayer) -> tuple[OkfOverlay, ...]:
+    """Parse and validate curated concept overlays under ``root``.
+
+    ``root`` is the overlays directory, which mirrors the composed-bundle
+    semantic-kind layout (e.g. ``metrics/gross_margin.md``). Each overlay must
+    bind a catalog-resolvable ``selayer_id`` whose generated concept path
+    exactly matches its relative path, must use only the allowed frontmatter
+    fields (``selayer_id``, ``sources``, ``stale_after``) and section headings,
+    and must not carry generator-owned content (Catalog Definition, generated
+    metadata, ``verified``, ``title``, ...). ``sources`` and ``stale_after``
+    reuse the existing OKF field validators via a temporary concept.
+    """
+    input_root = Path(root)
+    files = _walk_inputs(input_root)
+    overlays: list[OkfOverlay] = []
+    issues: list[OkfIssue] = []
+    seen_ids: dict[str, str] = {}
+    for path in files:
+        relative = PurePosixPath(path.relative_to(input_root).as_posix())
+        relative_posix = relative.as_posix()
+        if path.name in _RESERVED_NAMES:
+            issues.append(
+                _issue(relative_posix, f"reserved path '{path.name}' is not allowed")
+            )
+            continue
+        text = _read_text(path, relative_posix)
+        try:
+            frontmatter, preamble, sections, links = _parse_overlay(text)
+        except OkfDocumentError as error:
+            issues.append(_issue(relative_posix, str(error)))
+            continue
+        if len(links) > _MAX_LINKS_PER_FILE:
+            raise OkfDocumentError(
+                f"more than {_MAX_LINKS_PER_FILE} links in '{relative_posix}'"
+            )
+
+        extra = set(frontmatter) - _ALLOWED_OVERLAY_FIELDS
+        if extra:
+            issues.append(
+                _frontmatter_issue(
+                    relative_posix,
+                    "",
+                    "overlay frontmatter allows only selayer_id, sources, "
+                    "and stale_after",
+                )
+            )
+
+        selayer_id = frontmatter.get("selayer_id")
+        valid_id = False
+        if not _is_nonempty_string(selayer_id):
+            issues.append(
+                _frontmatter_issue(
+                    relative_posix, "selayer_id", "overlay must declare a selayer_id"
+                )
+            )
+        elif _SELAYER_ID.fullmatch(cast(str, selayer_id)) is None:
+            issues.append(
+                _frontmatter_issue(
+                    relative_posix,
+                    "selayer_id",
+                    "selayer_id must use a canonical semantic kind and local name",
+                )
+            )
+        else:
+            identifier = cast(str, selayer_id)
+            valid_id = _validate_bound_overlay(
+                identifier,
+                layer,
+                relative,
+                relative_posix,
+                frontmatter,
+                sections,
+                issues,
+            )
+
+        if preamble:
+            issues.append(
+                _issue(relative_posix, "text before the first section is not allowed")
+            )
+
+        seen_titles: set[str] = set()
+        for section in sections:
+            if section.title not in _ALLOWED_OVERLAY_SECTIONS:
+                issues.append(
+                    _issue(relative_posix, f"disallowed section '{section.title}'")
+                )
+            if section.title in seen_titles:
+                issues.append(
+                    _issue(relative_posix, f"duplicate section '{section.title}'")
+                )
+            seen_titles.add(section.title)
+
+        issues.extend(_validate_related_links(relative, sections))
+
+        if valid_id:
+            identifier = cast(str, selayer_id)
+            try:
+                frozen_frontmatter = _freeze(frontmatter)
+            except OkfMetadataError as error:
+                issues.append(_issue(relative_posix, str(error)))
+                continue
+            overlays.append(
+                OkfOverlay(
+                    relative_path=Path(relative.as_posix()),
+                    selayer_id=identifier,
+                    frontmatter=frozen_frontmatter,
+                    sections=sections,
+                )
+            )
+            seen_ids[identifier] = relative_posix
+
+    _report_duplicate_ids(seen_ids, issues)
+    _raise_if_errors(issues)
+    return tuple(
+        sorted(overlays, key=lambda overlay: overlay.relative_path.as_posix())
+    )
+
+
+def _validate_bound_overlay(
+    identifier: str,
+    layer: SemanticLayer,
+    relative: PurePosixPath,
+    relative_posix: str,
+    frontmatter: Mapping[str, Any],
+    sections: tuple[OkfSection, ...],
+    issues: list[OkfIssue],
+) -> bool:
+    """Validate a format-valid, bound overlay; return whether it is buildable."""
+    kind, name = identifier.split(".", 1)
+    try:
+        layer.resolve(identifier)
+    except KeyError:
+        issues.append(
+            _frontmatter_issue(
+                relative_posix,
+                "selayer_id",
+                f"unknown selayer_id '{identifier}'",
+            )
+        )
+    expected = concept_path(identifier)
+    if relative != expected:
+        issues.append(
+            _issue(
+                relative_posix,
+                f"path must be '{expected.as_posix()}' for selayer_id '{identifier}'",
+            )
+        )
+    # Reuse the existing OKF field validators for sources/stale_after by
+    # constructing a temporary concept whose type/title/selayer_id are
+    # guaranteed valid, so only sources/stale_after defects surface.
+    temp_frontmatter: dict[str, Any] = {
+        "type": _KIND_TYPES[kind],
+        "title": display_title(name),
+        "selayer_id": identifier,
+    }
+    if "sources" in frontmatter:
+        temp_frontmatter["sources"] = frontmatter["sources"]
+    if "stale_after" in frontmatter:
+        temp_frontmatter["stale_after"] = frontmatter["stale_after"]
+    temp_concept = OkfConcept.create(
+        concept_id=relative.with_suffix("").as_posix(),
+        relative_path=relative,
+        frontmatter=temp_frontmatter,
+        sections=sections,
+        links=(),
+    )
+    issues.extend(validate_concept(temp_concept, None, strict=True))
+    return True
+
+
+def _report_duplicate_ids(
+    seen_ids: Mapping[str, str], issues: list[OkfIssue]
+) -> None:
+    counts: dict[str, int] = {}
+    for identifier in seen_ids:
+        counts[identifier] = counts.get(identifier, 0) + 1
+    for identifier, count in counts.items():
+        if count > 1:
+            issues.append(
+                _frontmatter_issue(
+                    seen_ids[identifier],
+                    "selayer_id",
+                    f"duplicate overlay selayer_id '{identifier}'",
+                )
+            )
+
+
+__all__ = ["OkfOverlay", "load_overlays", "load_references"]
