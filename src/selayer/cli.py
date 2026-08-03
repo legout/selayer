@@ -41,7 +41,12 @@ from selayer.catalog import SemanticLayer
 from selayer.okf import OkfBundle
 from selayer.okf.cli import add_okf_commands, execute_okf
 from selayer.planning.types import FilterInput, QueryRequest, RangeFilter
-from selayer.verification import CompatibilityCheck, verify
+from selayer.sources.profile_file import (
+    ProfileFileValidationError,
+    load_profile_file,
+)
+from selayer.sources.profiles import MappingProfileResolver
+from selayer.verification import CompatibilityCheck, PhysicalCheck, verify
 from selayer.verification.static import validate_catalog
 
 #: Fixed, secret-safe failure emitted for the expected I/O error (a missing
@@ -71,6 +76,17 @@ _OKF_FAILURE_MESSAGE = "okf command failed"
 #: it is adapted into a failed static report by ``validate_catalog``.
 _COMPAT_FAILURE_MESSAGE = "could not run compatibility check"
 
+#: Fixed, secret-safe failure emitted for the ``catalog audit`` command when a
+#: domain or I/O error escapes.  Like the other envelopes, the exception text
+#: is never interpolated: a profile document may carry credential-bearing
+#: bytes (and a missing/malformed profile file raises a sanitized
+#: ``ProfileFileValidationError`` whose message is constant but whose
+#: filesystem path or environment name must still never be echoed), while an
+#: ``OSError`` may carry the catalog path.  An invalid catalog never reaches
+#: this path: it is adapted into a failed static report by
+#: ``validate_catalog``.
+_AUDIT_FAILURE_MESSAGE = "could not run physical audit"
+
 #: Object keys accepted by a query-cases JSON entry. Whitelisting (rather
 #: than forwarding arbitrary keys) enforces "do not accept SQL or expression
 #: text": a ``sql``/``expression``/``where`` key is rejected up front.
@@ -95,6 +111,9 @@ def _parser() -> argparse.ArgumentParser:
     compatibility.add_argument("--metric", action="append", default=[])
     compatibility.add_argument("--dimension", action="append", default=[])
     compatibility.add_argument("--query-cases", action="append", default=[])
+    audit = catalog_commands.add_parser("audit")
+    audit.add_argument("catalog")
+    audit.add_argument("--profiles")
     add_okf_commands(commands)
     return parser
 
@@ -126,6 +145,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0 if result.report.passed else 1
     if args.area == "catalog" and args.command == "compatibility":
         return _run_catalog_compatibility(args)
+    if args.area == "catalog" and args.command == "audit":
+        return _run_catalog_audit(args)
     if args.area == "okf":
         # The unified ``okf`` area reuses the legacy command handler for
         # generate/sync/validate/retrieve so parity (stdout/exit) is exact on
@@ -324,6 +345,57 @@ def _run_catalog_compatibility(arguments: argparse.Namespace) -> int:
         # mistake that must propagate.
         print(
             json.dumps({"error": _COMPAT_FAILURE_MESSAGE}, sort_keys=True),
+            file=sys.stderr,
+        )
+        return 1
+    print(json.dumps(report.to_dict(), sort_keys=True))
+    return 0 if report.passed else 1
+
+
+def _run_catalog_audit(arguments: argparse.Namespace) -> int:
+    """Run physical verification and render its report as JSON.
+
+    Handler order:
+
+    1. :func:`validate_catalog` — an invalid catalog has no layer, so its
+       static failure report is printed and the command exits 1.
+    2. profile resolution — when ``--profiles`` is absent an empty
+       :class:`MappingProfileResolver` is used; otherwise
+       :func:`load_profile_file` resolves the version-1 document (reading
+       environment values, never retaining or rendering them).
+    3. :func:`verify` with a :class:`PhysicalCheck` carrying only the profile
+       resolver.  An arrow-provider resolver is intentionally *not* initialized
+       from configuration: the physical audit is a credential-free, exact
+       full-scan, and a ``pyarrow`` source audits as ``unavailable`` (an
+       incomplete, non-passing report) rather than reading caller-supplied
+       objects.
+
+    Profile-file and I/O errors are masked by the same secret-safe envelope
+    used elsewhere: a missing environment variable, a malformed profile
+    document, or an unreadable file can carry paths or credential-bearing
+    bytes, so the exception text is never echoed.
+    """
+    try:
+        result = validate_catalog(arguments.catalog)
+        if result.layer is None:
+            print(json.dumps(result.report.to_dict(), sort_keys=True))
+            return 1
+        if arguments.profiles is None:
+            resolver: MappingProfileResolver = MappingProfileResolver({})
+        else:
+            resolver = load_profile_file(arguments.profiles)
+        report = verify(result.layer, PhysicalCheck(profiles=resolver))
+    except (OSError, ProfileFileValidationError):
+        # Secret-safe failure: never echo the exception.  A
+        # ``ProfileFileValidationError`` is already sanitized (its code/path/
+        # message are constants), but its filesystem path or environment name
+        # must still never be echoed; an ``OSError`` may carry the catalog
+        # path.  Do not broaden to ``LookupError``/``ValueError``: a
+        # ``KeyError``/``IndexError``/``ValueError`` escaping
+        # ``verify_physical`` (e.g. a malformed grain identifier) is a
+        # programmer mistake that must propagate rather than be masked.
+        print(
+            json.dumps({"error": _AUDIT_FAILURE_MESSAGE}, sort_keys=True),
             file=sys.stderr,
         )
         return 1

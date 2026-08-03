@@ -159,6 +159,66 @@ metric = Metric.from_expression(
 print(layer.version, fact.expression, metric.measures)
 ```
 
+## Catalog verification
+
+`selayer` separates **validation** from **verification**. Validation is a
+static, declaration-only check of the catalog (schema version, identifier
+shape, grain columns, expression syntax, and reference resolution) that never
+opens a data source. Verification runs the loaded layer against either the
+grain-aware planner (compatibility) or the physical data state (audit). Both
+produce one sorted JSON object on standard output: a stable verification
+report keyed by `schema_version`, `subject`, `check_kind`, `complete`,
+`passed`, `outcomes`, and `diagnostics`. A passing report exits `0`; any
+failure, an incomplete audit, or a planner rejection exits `1`; invalid
+command-line usage exits `2`.
+
+The unified `selayer` console script exposes three catalog subcommands:
+
+```bash
+uv run selayer catalog validate ecommerce_semantic_layer.yaml
+uv run selayer catalog compatibility ecommerce_semantic_layer.yaml
+uv run selayer catalog audit ecommerce_semantic_layer.yaml
+uv run selayer catalog audit catalog.yaml --profiles runtime-profiles.yaml
+```
+
+`catalog validate CATALOG` runs the static check and emits a `static` report.
+`catalog compatibility CATALOG` runs the grain-aware planner over every
+declared metric, every metric-by-dimension combination, and any explicit
+`--query-cases` JSON files (repeatable `--metric` and `--dimension` flags
+restrict the generated request set). The `compatibility` report records both
+compatible and planner-rejected combinations and completes every requested
+check; it never reads data values. `catalog audit CATALOG` runs an exact
+full-scan source-grain and relationship-cardinality audit and emits a
+`physical` report.
+
+The physical audit pays an **exact scan cost**: every source's grain is
+read once (each source is bound under the registry lock and materialized into
+a private temp table holding only its grain columns), then counted for row
+count, distinct grain tuples, duplicate rows, null grain rows, and duplicate
+grain groups; every declared relationship is audited for cardinality by
+binding each distinct relationship source once and re-scanning the
+re-readable temp tables. Connector metadata (`connector`, `generation`,
+`snapshot`, `schema_fingerprint`) is read from registry status at audit time,
+so the report reflects the data state observed at audit time, not an ongoing
+guarantee: a snapshot-capable connector (Delta, Iceberg) pins the snapshot it
+observed, while file connectors report `snapshot: null`. A required source
+that cannot be read audits as an `unavailable` outcome, which makes the report
+`complete: false` and `passed: false`; a data-quality failure (a null or
+duplicated grain) keeps the report complete but non-passing. No offending
+value, key, location, or credential is ever selected or echoed.
+
+The optional `--profiles FILE` loads a version-1 profile document whose named
+profiles resolve runtime values from `env` (an environment variable read at
+load time, accepted only as a string) or `literal` (an inline boolean). The
+audit command does **not** initialize an arrow-provider resolver from
+configuration: it is a credential-free, exact full scan, and a `pyarrow`
+source audits as `unavailable` (an incomplete, non-passing report) rather than
+reading caller-supplied objects. Profile values are resolved into an opaque,
+defensively-copied profile and are never written to the report, logs, reprs,
+statuses, or errors; a missing environment variable, a malformed profile
+document, or an unreadable profile file exits `1` with a fixed, secret-safe
+JSON failure on standard error.
+
 ## Advisory OKF context
 
 The YAML catalog controls execution; OKF is advisory context only. The catalog
@@ -207,11 +267,31 @@ This boundary intentionally provides no semantic search or multi-provider broker
 It also provides no wiki publishing, RAG, embeddings, or orchestration. Those
 concerns belong outside `selayer`.
 
-### Dependency-free OKF CLI
+### OKF command-line interface
 
-The `selayer-okf` console script uses only the Python standard library for its
-command-line and JSON presentation layer; it adds no CLI framework dependency.
-It wraps the same advisory API:
+The unified `selayer okf` area wraps the advisory API. `build` composes a
+**fresh** bundle from the catalog plus authored Reference documents and
+overlay directories; it writes a brand-new bundle and never mutates an
+existing one (use `sync` to update generator-owned sections of an existing
+bundle):
+
+```bash
+uv run selayer okf build catalog.yaml knowledge \
+  --references business_context \
+  --overlays okf_overlays
+uv run selayer okf generate ecommerce_semantic_layer.yaml knowledge
+uv run selayer okf validate knowledge --catalog ecommerce_semantic_layer.yaml
+```
+
+Fresh composition restricts overlays to authored guidance (Reference
+documents and per-object overlay Markdown) layered onto the catalog-derived
+concepts, and reports deterministic concept and diagnostic counts. The
+`generate`/`sync`/`validate`/`retrieve` commands match the legacy
+`selayer-okf` console script exactly on success.
+
+The legacy `selayer-okf` console script uses only the Python standard library
+for its command-line and JSON presentation layer; it adds no CLI framework
+dependency, and its behavior is unchanged:
 
 ```bash
 uv run selayer-okf generate ecommerce_semantic_layer.yaml knowledge
@@ -228,11 +308,13 @@ and `retrieve BUNDLE SEMANTIC_ID...` accept an optional `--catalog`; retrieval
 also accepts `--no-linked`, `--max-chars`, and `--max-depth`.
 
 Successful commands exit 0 and write deterministic JSON to standard output;
-domain, validation, I/O, or sync-conflict errors exit 1 and write an `error:`
-message to standard error; a sync conflict also leaves its JSON report on
-standard output. As defined by `argparse`, invalid command-line usage exits 2.
-Diagnostics remain visible in the JSON rather than silently changing authority.
-See [`examples/e_commerce/okf_workflow.py`](examples/e_commerce/okf_workflow.py)
+domain, validation, I/O, or sync-conflict errors exit 1 and write to standard
+error (the legacy `selayer-okf` script keeps its `error: <message>` envelope,
+while the unified `selayer okf` area emits a fixed, secret-safe JSON failure
+that never echoes raw exception text); as defined by `argparse`,
+invalid command-line usage exits 2. A sync conflict also leaves its JSON
+report on standard output. Diagnostics remain visible in the JSON rather than
+silently changing authority. See [`examples/e_commerce/okf_workflow.py`](examples/e_commerce/okf_workflow.py)
 for the API workflow.
 
 ## Development

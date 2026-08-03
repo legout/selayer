@@ -14,6 +14,10 @@ be imported, packaged, linted, or extended as active product code.
 - `src/selayer/planning/`: grain-aware typed query planning.
 - `src/selayer/compilation/duckdb.py`: DuckDB SQL compilation from `QueryPlan`.
 - `src/selayer/query.py`: `QueryEngine` orchestration and execution.
+- `src/selayer/sources/`: closed connector matrix, runtime profiles, the registry, and the version-1 profile-file parser.
+- `src/selayer/verification/`: immutable verification reports and the `validate`/`compatibility`/`audit` checks.
+- `src/selayer/okf/`: advisory OKF bundles and the unified CLI area.
+- `src/selayer/cli.py`: unified `catalog` and `okf` command-line surface.
 - `src/selayer/__init__.py`: curated public exports.
 - `tests/`: behavior, regression, and integration tests.
 - `examples/e_commerce/`: migrated schema-version-1 example catalog and script.
@@ -54,8 +58,12 @@ only the result-frame boundary.
   grain-preserving many-to-one traversal is supported (`order_items -> products`
   and `order_items -> orders -> customers`). This documents that catalog's
   current path restriction; it is not a hardcoded rule for the generic planner.
-- Never add raw SQL, OKF, re-graining/allocation, many-to-many analytics, or an
-  additional execution engine.
+
+The catalog is execution authority. OKF is advisory and cannot add or override
+queryable dimensions, facts, measures, metrics, relationships, planning, or
+execution behavior. Keep LLM and agent orchestration outside the installable
+package.
+
 - Bind user-provided filter values as DuckDB parameters.
 - Quote catalog identifiers and reject unknown metrics, dimensions, and filters.
 - Do not silently cross join tables without a declared relationship path.

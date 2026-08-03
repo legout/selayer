@@ -694,3 +694,224 @@ def test_catalog_compatibility_query_cases_reject_metrics_dimensions_presence_se
     assert sentinel not in captured.out
     assert str(cases) not in captured.err
     assert captured.out == ""
+
+
+# ---------------------------------------------------------------------------
+# catalog audit (physical verification)
+# ---------------------------------------------------------------------------
+
+#: A small, credential-free local CSV catalog body shared by the audit
+#: fixtures.  Each fixture writes the same header plus its own rows so the
+#: grain (``id``) is clean, dirty, or backed by an unavailable provider.
+_LOCAL_CATALOG_HEADER = "id,value"
+
+
+def _local_csv_catalog(tmp_path: Path, name: str, rows: str) -> Path:
+    """Write a single-source local CSV catalog at ``tmp_path``.
+
+    The source has no ``credential_profile`` so it is audited directly against
+    the local file without ever resolving a runtime profile value.
+    """
+    data = tmp_path / "events.csv"
+    data.write_text(f"{_LOCAL_CATALOG_HEADER}\n{rows}\n", encoding="utf-8")
+    catalog = tmp_path / "catalog.yaml"
+    catalog.write_text(
+        "version: 1\n"
+        f"name: {name}\n"
+        "data_sources:\n"
+        "  events:\n"
+        "    type: csv\n"
+        f"    location: {data}\n"
+        "    schema:\n"
+        "      fields:\n"
+        "        - {name: id, type: int64, nullable: false}\n"
+        "        - {name: value, type: int64, nullable: true}\n"
+        "    grain: [id]\n",
+        encoding="utf-8",
+    )
+    return catalog
+
+
+@pytest.fixture
+def local_catalog_path(tmp_path: Path) -> Path:
+    """A credential-free local CSV catalog with a clean single-column grain."""
+    return _local_csv_catalog(tmp_path, "local_audit", "1,10\n2,20\n3,30")
+
+
+@pytest.fixture
+def dirty_catalog_path(tmp_path: Path) -> Path:
+    """A credential-free local CSV catalog whose grain has a duplicate tuple."""
+    return _local_csv_catalog(tmp_path, "dirty_audit", "1,10\n1,20\n3,30")
+
+
+@pytest.fixture
+def pyarrow_catalog_path(tmp_path: Path) -> Path:
+    """A valid catalog whose only source is a ``pyarrow`` handle.
+
+    The unified ``audit`` command does not initialize an arrow-provider
+    resolver from configuration, so the provider handle is unresolved and the
+    source audits as ``unavailable`` (the report is incomplete and non-passing).
+    """
+    catalog = tmp_path / "catalog.yaml"
+    catalog.write_text(
+        "version: 1\n"
+        "name: pyarrow_audit\n"
+        "data_sources:\n"
+        "  events:\n"
+        "    type: pyarrow\n"
+        "    handle: events\n"
+        "    schema:\n"
+        "      fields:\n"
+        "        - {name: id, type: int64, nullable: false}\n"
+        "    grain: [id]\n",
+        encoding="utf-8",
+    )
+    return catalog
+
+
+@pytest.fixture
+def profile_file(tmp_path: Path) -> Path:
+    """A version-1 profile document resolving a DSN from ``WAREHOUSE_DSN``."""
+    path = tmp_path / "profiles.yaml"
+    path.write_text(
+        "version: 1\n"
+        "profiles:\n"
+        "  warehouse:\n"
+        "    dsn:\n"
+        "      env: WAREHOUSE_DSN\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_catalog_audit_uses_profile_file_without_leaking_values(
+    local_catalog_path: Path,
+    profile_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    monkeypatch.setenv("WAREHOUSE_DSN", "sentinel-secret-dsn")
+    code = main([
+        "catalog", "audit", str(local_catalog_path),
+        "--profiles", str(profile_file),
+    ])
+    captured = capsys.readouterr()
+    assert code in {0, 1}
+    assert "sentinel-secret-dsn" not in captured.out
+    assert "sentinel-secret-dsn" not in captured.err
+    payload = json.loads(captured.out)
+    assert payload["check_kind"] == "physical"
+
+
+def test_catalog_audit_passes_credential_free_local_catalog(
+    local_catalog_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    """A credential-free local catalog with a clean grain audits and exits 0."""
+    assert main(["catalog", "audit", str(local_catalog_path)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["check_kind"] == "physical"
+    assert payload["passed"] is True
+    assert payload["complete"] is True
+
+
+def test_catalog_audit_failed_grain_exits_one(
+    dirty_catalog_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    """A duplicated grain fails the physical audit and exits 1."""
+    assert main(["catalog", "audit", str(dirty_catalog_path)]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["check_kind"] == "physical"
+    assert payload["passed"] is False
+    check_ids = {outcome["check_id"] for outcome in payload["outcomes"]}
+    assert "source.events.grain" in check_ids
+
+
+def test_catalog_audit_missing_profile_environment_exits_one(
+    local_catalog_path: Path,
+    profile_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    """A missing profile environment variable surfaces as the secret-safe envelope.
+
+    ``load_profile_file`` raises a sanitized
+    :class:`ProfileFileValidationError` (a missing environment variable); the
+    CLI masks it with the fixed envelope, never echoing the env name, the
+    profile path, or a traceback, and exits 1.
+    """
+    monkeypatch.delenv("WAREHOUSE_DSN", raising=False)
+    assert (
+        main([
+            "catalog", "audit", str(local_catalog_path),
+            "--profiles", str(profile_file),
+        ])
+        == 1
+    )
+    captured = capsys.readouterr()
+    body = json.loads(captured.err)
+    assert set(body) == {"error"}
+    assert body["error"]  # non-empty fixed message
+    assert "WAREHOUSE_DSN" not in captured.err
+    assert "WAREHOUSE_DSN" not in captured.out
+    assert str(profile_file) not in captured.err
+    assert "Traceback" not in captured.err
+    assert captured.out == ""
+
+
+def test_catalog_audit_unavailable_arrow_provider_exits_one(
+    pyarrow_catalog_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    """An unresolved arrow provider audits as ``unavailable`` and exits 1.
+
+    The unified ``audit`` command does not initialize an arrow-provider
+    resolver from configuration, so a ``pyarrow`` source with no configured
+    provider registers as ``unavailable``: the report is a physical report,
+    incomplete and non-passing, and the command exits 1.
+    """
+    assert main(["catalog", "audit", str(pyarrow_catalog_path)]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["check_kind"] == "physical"
+    assert payload["passed"] is False
+    assert payload["complete"] is False
+    check_ids = {outcome["check_id"] for outcome in payload["outcomes"]}
+    assert "source.events.grain" in check_ids
+
+
+def test_catalog_audit_missing_catalog_is_secret_safe(
+    tmp_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    """A missing catalog surfaces only the fixed secret-safe envelope."""
+    missing = tmp_path / "does_not_exist.yaml"
+    assert main(["catalog", "audit", str(missing)]) == 1
+    captured = capsys.readouterr()
+    body = json.loads(captured.err)
+    assert set(body) == {"error"}
+    assert body["error"]
+    assert str(missing) not in captured.err
+    assert str(missing) not in captured.out
+    assert "Traceback" not in captured.err
+    assert captured.out == ""
+
+
+def test_catalog_audit_invalid_catalog_emits_static_failure(
+    tmp_path: Path,
+    capsys,  # type: ignore[no-untyped-def]
+) -> None:
+    """An invalid catalog has no layer, so its static failure report is shown."""
+    path = tmp_path / "bad.yaml"
+    path.write_text("version: 2\nname: bad\ndata_sources: {}\n", encoding="utf-8")
+    assert main(["catalog", "audit", str(path)]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["check_kind"] == "static"
+    assert payload["passed"] is False
+
+
+def test_catalog_audit_usage_error_exits_two() -> None:
+    """A missing positional catalog argument exits 2 (argparse usage error)."""
+    with pytest.raises(SystemExit) as caught:
+        main(["catalog", "audit"])
+    assert caught.value.code == 2
