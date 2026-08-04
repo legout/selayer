@@ -26,9 +26,7 @@ members = ["packages/selayer-discovery"]
 [project.optional-dependencies]
 s3 = ["boto3>=1.40,<2"]
 delta = ["deltalake>=1.6.2,<2"]
-iceberg = [
-    "pyiceberg[pyarrow,sql-sqlite]>=0.11.1,<0.12",
-]
+iceberg = ["pyiceberg[pyarrow,sql-sqlite]>=0.11.1,<0.12"]
 postgres = ["psycopg[binary]>=3.3.4,<4"]
 all = [
   "boto3>=1.40,<2",
