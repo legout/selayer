@@ -1,17 +1,17 @@
 # Shop-floor motor-drive tutorial
 
-This example is a self-contained, deterministic walk through `selayer`'s
-grain-aware semantic model. It models a small motor-drive manufacturing floor
-and stitches together **eight** local source files across **five** physical
-formats — CSV, SQLite, DuckDB, Parquet, and Delta Lake — into one catalog, then
-runs seven valid business questions, an intentional mixed-grain rejection, and a
-live Delta source reload.
+This example is a self-contained, deterministic reference for safe grain-aware
+semantic modeling, exact physical verification, immutable reload demonstrations,
+and on-demand enriched OKF generation. It models a small motor-drive
+manufacturing floor and stitches together **eight** local source files across
+**five** physical formats — CSV, SQLite, DuckDB, Parquet, and Delta Lake — into
+one catalog, then runs twelve valid business metrics, an intentional mixed-grain
+rejection, and a live Delta source reload on temporary data.
 
-Everything is generated locally and produces deterministic logical data and
-results: the fixed literals guarantee the same rows and metrics on
-every run. (Delta transaction metadata is not byte-identical across writes, but
-the queried values are stable.) No cloud storage, credentials, Docker
-containers, or remote services are required.
+Everything is generated locally in a temporary directory and produces
+deterministic logical data and results: the fixed literals guarantee the same
+rows and metrics on every run. No cloud storage, credentials, Docker containers,
+or remote services are required.
 
 ## Motor-drive story
 
@@ -35,24 +35,34 @@ The example follows a single customer order through a make-to-order factory:
    winding, assembly, and torque test (`operation_executions`, Parquet), one row
    per execution, including cycle seconds, energy, and a rework flag.
 6. **Telemetry.** Machines emit an independent state/temperature/power stream
-   (`machine_telemetry`, Parquet) keyed by machine × timestamp.
+   (`machine_telemetry`, Parquet) keyed by telemetry machine × timestamp.
 7. **End-of-line (EOL) testing.** Every drive gets one or more EOL test
    attempts (`eol_test_runs`, Delta Lake), with an attempt number, result, and
    first-pass flag. DRV-003 fails its first attempt and is retested at runtime.
 
 ## Setup and run
 
-The Delta source requires the optional `delta` extra:
+The Delta source requires the optional `delta` extra. The runner generates
+all runtime data in a temporary directory and never writes to
+`examples/shopfloor/data/`:
 
 ```bash
 uv sync --extra delta
 uv run python examples/shopfloor/run_example.py
+uv run selayer catalog validate examples/shopfloor/shopfloor_semantic_layer.yaml
+uv run selayer catalog compatibility examples/shopfloor/shopfloor_semantic_layer.yaml
+uv run python examples/shopfloor/generate_data.py \
+  --output-dir examples/shopfloor/data
+uv run selayer catalog audit examples/shopfloor/shopfloor_semantic_layer.yaml
+uv run python examples/shopfloor/build_knowledge.py
+uv run selayer okf validate examples/shopfloor/.generated/knowledge \
+  --catalog examples/shopfloor/shopfloor_semantic_layer.yaml
 ```
 
-If Delta is not installed the runner exits with the exact remediation command
-`uv sync --extra delta` instead of producing a confusing import error. Running
-the example resets `examples/shopfloor/data/`, regenerates every source file,
-prints the walkthrough, and reloads the EOL source.
+The runner (`run_example.py`) generates temporary data and cleans up
+automatically. The standalone generator (`generate_data.py`) requires an
+explicit `--output-dir` and is used for physical audits that read source files
+from a known location.
 
 ## Source and grain map
 
@@ -71,15 +81,29 @@ a safe many-to-one relationship path.
 | `machine_telemetry` | Parquet | `[machine_id, recorded_at]` |
 | `eol_test_runs` | Delta Lake | `[eol_test_run_id]` |
 
-`machine_telemetry` is deliberately a **separate** machine × timestamp stream.
-There is no relationship from telemetry to per-drive operation facts: that would
-require a time-window join and would expand the operation grain. Telemetry is
-therefore queried at its own grain (`alarm_event_count`, `average_temperature_c`)
-and is never silently merged into unit-level analysis.
+## Corrected semantic model
+
+- Serialized drives own the conformed drive identity (`drive_serial_number`).
+- Operation and telemetry machine dimensions are domain-specific:
+  `operation_machine_id` belongs to operation executions and
+  `telemetry_machine_id` belongs to telemetry events.
+- No operation-to-telemetry relationship exists. Matching string values do not
+  establish a safe join.
+- `requested_ship_date` and `telemetry_recorded_at` are the only modeled times.
+  `requested_ship_date` is order intent, not actual shipment time.
+  `telemetry_recorded_at` is a sample timestamp, not operation time.
+
+`machine_telemetry` is deliberately a **separate** telemetry machine ×
+timestamp stream. There is no relationship from telemetry to per-drive
+operation facts: that would require a time-window join and would expand the
+operation grain. Telemetry is therefore queried at its own grain
+(`alarm_event_count`, `average_temperature_c`) and is never silently merged into
+unit-level analysis.
 
 ## Walkthrough
 
-`run_example.py` loads the static catalog, then `run_walkthrough` prints each
+`run_example.py` loads the static catalog, generates temporary data, rebases
+every source onto the temporary files, then `run_walkthrough` prints each
 section in order:
 
 1. **Production completion rate** — `production_completion_rate` by
@@ -94,8 +118,8 @@ section in order:
    and `component_type`. Four of five inspected lots were accepted (`4/5`); the
    quarantined `LOT-C-03` is never consumed.
 5. **Operation performance** — `average_cycle_seconds`, `rework_rate`, and
-   `energy_per_operation_kwh` by `line_id`, `machine_id`, `shift`, and
-   `operation_name`. Seven operations run, exactly one is a rework
+   `energy_per_operation_kwh` by `operation_line_id`, `operation_machine_id`,
+   `shift`, and `operation_name`. Seven operations run, exactly one is a rework
    (`rework_rate = 1/7`).
 6. **EOL quality before Delta reload** — `eol_attempt_pass_rate` and
    `first_pass_yield` by `station_id`, `product_model`, and `firmware_revision`.
@@ -119,34 +143,65 @@ path that preserves both grains. The runner catches the
 Expected mixed-grain rejection: mixed_grain
 ```
 
+## Baseline and retest states
+
 The runner then demonstrates a live Delta reload. It records the current EOL
 source generation, appends the deterministic DRV-003 **second** EOL attempt
 (`attempt = 2`, `result = pass`, `is_first_pass = false`) via
 `append_eol_retest(paths.eol_test_runs)`, and reloads the source:
 
-```python
-change = engine.reload_source("eol_test_runs")
+```
+EOL source generation: 0 -> 1
 ```
 
-This prints the generation transition (e.g. `1 -> 2`) and re-queries the EOL
-metrics. The appended row changes the attempt-pass rate from `2/3` to `3/4`
-while the first-pass yield stays at `2/3`, because the retest is a pass but is
-explicitly not a first pass. Reloads are explicit and preserve the previously
-published source if the refresh fails.
+The appended row changes only the temporary Delta data. The exact states are:
+
+```text
+Baseline: 3 EOL attempts, attempt pass rate 2/3, first-pass yield 2/3.
+Temporary retest: 4 EOL attempts, attempt pass rate 3/4, first-pass yield 2/3.
+```
+
+The reload mutates only temporary Delta data. Repository data is never touched.
+
+## Authored and generated knowledge
+
+The example ships reviewed business context and curated OKF overlays as source
+files:
+
+- `business_context/` contains four reviewed Reference documents (process
+  overview, KPI definitions, quality policy, and glossary).
+- `okf_overlays/` contains curated metric, source, relationship, dimension,
+  fact, and measure overlays with declarative query examples.
+
+`build_knowledge.py` composes a fresh OKF bundle from the catalog plus these
+authored inputs, validates it against the shopfloor knowledge policy, and
+publishes it atomically to `.generated/knowledge/`:
+
+```bash
+uv run python examples/shopfloor/build_knowledge.py
+```
+
+The generated output at `.generated/knowledge/` is disposable and never
+committed to Git. Generated fields and `Catalog Definition` come only from the
+catalog. Overlays can add only curated sections and approved provenance.
+
+**Catalog YAML is execution authority. OKF is advisory.** The catalog controls
+queryable dimensions, facts, measures, metrics, relationships, planning, and
+compilation. OKF Markdown can explain those objects, but it cannot add
+executable semantics or override the catalog.
 
 ## Non-goals
 
 This example intentionally does **not** do any of the following:
 
 - **JSON and DuckLake are not catalog connector types.** The closed connector
-  matrix is `csv`, `sqlite`, `duckdb`, `parquet`, and `delta`. Feeding a JSON
-  file or pointing at a DuckLake-managed table would require a new connector and
-  is out of scope.
+  matrix is `csv`, `sqlite`, `duckdb`, `parquet`, and `delta`.
 - No automatic re-graining or allocation. The `mixed_grain` boundary is a hard
   planning error, not something the example works around.
-- No time-window telemetry joins. `machine_telemetry` stays at its own machine ×
-  timestamp grain and is never joined onto per-drive operations.
+- No time-window telemetry joins. `machine_telemetry` stays at its own
+  `telemetry_machine_id` × `telemetry_recorded_at` grain and is never joined
+  onto per-drive operations.
 - No cloud storage, credentials, or remote services. Every source is a local
-  file written into `examples/shopfloor/data/`.
+  file generated into a temporary directory.
 - No MES, ERP, or SCADA behaviour. The fixtures are static literals, not a live
   factory integration.

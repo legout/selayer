@@ -1296,3 +1296,85 @@ def test_build_knowledge_outputs_deterministic_json(
     assert payload["destination"] == str(output)
     assert isinstance(payload["concepts"], int)
     assert payload["concepts"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Task 9: README documentation and end-to-end clean-checkout contract
+# ---------------------------------------------------------------------------
+
+
+def test_shopfloor_readme_documents_hardened_workflow() -> None:
+    """The README must document all hardened workflow markers."""
+    text = (SHOPFLOOR_ROOT / "README.md").read_text(encoding="utf-8")
+    required = (
+        "temporary directory",
+        "operation_machine_id",
+        "telemetry_machine_id",
+        "requested_ship_date",
+        "telemetry_recorded_at",
+        "business_context/",
+        "okf_overlays/",
+        "build_knowledge.py",
+        "selayer catalog audit",
+        ".generated/knowledge",
+        "Catalog YAML is execution authority",
+        "OKF is advisory",
+    )
+    assert all(marker in text for marker in required)
+
+
+def test_shopfloor_clean_checkout_workflow(tmp_path: Path) -> None:
+    """A clean checkout workflow runs entirely on temporary data.
+
+    No step reads or writes ``examples/shopfloor/data/`` or
+    ``examples/shopfloor/.generated/``.
+    """
+    # 1. Generate source data in a temporary directory.
+    paths = generate_shopfloor_data(tmp_path / "data")
+    layer = _layer_for_paths(SemanticLayer.load(SHOPFLOOR_CATALOG), paths)
+
+    # 3. Run static, physical, and compatibility verification.
+    report = verify(layer, PhysicalCheck())
+    assert report.complete
+    assert report.passed
+    compat = verify(layer, CompatibilityCheck())
+    assert compat.complete
+    assert compat.passed
+
+    # 4. Query all twelve metrics.
+    with QueryEngine(layer) as engine:
+        for metric_name in sorted(layer.metrics):
+            result = engine.query([metric_name])
+            assert len(result) == 1
+
+        # 5. Append the temporary EOL retest and reload.
+        before = engine.query(["eol_attempt_pass_rate", "first_pass_yield"])
+        append_eol_retest(paths.eol_test_runs)
+        engine.reload_source("eol_test_runs")
+        after = engine.query(["eol_attempt_pass_rate", "first_pass_yield"])
+        assert before["eol_attempt_pass_rate"].item() == pytest.approx(2 / 3)
+        assert after["eol_attempt_pass_rate"].item() == pytest.approx(3 / 4)
+        assert after["first_pass_yield"].item() == pytest.approx(2 / 3)
+
+    # 6. Build knowledge into a temporary output.
+    output = tmp_path / "knowledge"
+    assert build_knowledge_main(["--output-dir", str(output)]) == 0
+
+    # 7. Validate shopfloor policy.
+    built_layer = SemanticLayer.load(SHOPFLOOR_CATALOG)
+    bundle = OkfBundle.load(output, layer=built_layer, strict=True)
+    assert validate_shopfloor_knowledge(bundle, built_layer) == ()
+
+    # 8. Retrieve context for metric.first_pass_yield with linked concepts.
+    context = bundle.context_for(
+        ["metric.first_pass_yield"],
+        include_linked=True,
+        max_chars=12_000,
+    )
+    assert len(context.items) > 0
+
+    # Assert no step touched repository data or generated output.
+    assert not (SHOPFLOOR_ROOT / "data").exists() or not any(
+        (SHOPFLOOR_ROOT / "data").iterdir()
+    )
+    assert not (SHOPFLOOR_ROOT / ".generated").exists()
