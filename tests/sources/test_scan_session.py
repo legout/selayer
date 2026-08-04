@@ -20,7 +20,6 @@ from __future__ import annotations
 import inspect
 import threading
 import time
-from collections.abc import Callable
 from dataclasses import FrozenInstanceError
 from types import MappingProxyType
 from typing import Any
@@ -37,7 +36,6 @@ from selayer.sources.base import (
 )
 from selayer.sources.errors import (
     SourceConnectionError,
-    SourceDependencyError,
     SourceError,
 )
 from selayer.sources.profiles import (
@@ -50,7 +48,6 @@ from selayer.sources.profiles import (
 from selayer.sources.registry import SourceRegistry
 from selayer.sources.scan import (
     SourceConsistency,
-    SourceScanSession,
     SourceSnapshot,
 )
 from selayer.sources.schema import (
@@ -127,6 +124,53 @@ class _TrackingConnection:
     def close(self) -> None:
         self.closed = True
         self._conn.close()
+
+
+class _CloseCountingReader:
+    """Proxy ``RecordBatchReader`` that counts ``close()`` invocations."""
+
+    def __init__(self, inner: pa.RecordBatchReader) -> None:
+        self._inner = inner
+        self.close_count = 0
+
+    def read_next_batch(self) -> pa.RecordBatch:
+        return self._inner.read_next_batch()
+
+    def close(self) -> None:
+        self.close_count += 1
+        self._inner.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _ReaderTrackingResult:
+    """Proxy over a DuckDB result exposing a close-counting reader factory."""
+
+    def __init__(self, inner: Any, readers: list[_CloseCountingReader]) -> None:
+        self._inner = inner
+        self._readers = readers
+
+    def to_arrow_reader(self, batch_size: int = 1024) -> _CloseCountingReader:
+        wrapper = _CloseCountingReader(
+            self._inner.to_arrow_reader(batch_size=batch_size)
+        )
+        self._readers.append(wrapper)
+        return wrapper
+
+
+class _ReaderTrackingConnection(_TrackingConnection):
+    """Connection whose scan readers are wrapped to count ``close()``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.readers: list[_CloseCountingReader] = []
+
+    def execute(self, sql: str, *parameters: object) -> Any:
+        result = self._conn.execute(sql, *parameters)
+        if "FROM" in sql:
+            return _ReaderTrackingResult(result, self.readers)
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -476,7 +520,7 @@ def _lock_is_held(registry: SourceRegistry) -> bool:
 
 
 def test_session_cleanup_after_success_releases_lock() -> None:
-    registry, connection, adapter, provider = _build()
+    registry, *_ = _build()
     with registry.open_scan_session("events", columns=("id",)) as session:
         list(session.iter_batches())
         # The lifecycle lock is held for the full session lifetime.
@@ -489,7 +533,7 @@ def test_session_cleanup_after_success_releases_lock() -> None:
 
 
 def test_session_cleanup_after_reader_failure_releases_lock() -> None:
-    registry, connection, *_ = _build()
+    registry, *_ = _build()
 
     class _BadConnection(_TrackingConnection):
         def execute(self, sql: str, *parameters: object) -> Any:
@@ -499,7 +543,6 @@ def test_session_cleanup_after_reader_failure_releases_lock() -> None:
 
     registry._connection = _BadConnection()  # type: ignore[attr-defined]
     # Re-register the existing handle under the bad connection.
-    adapter_for = registry._registrations["events"].adapter
     handle = registry._registrations["events"].handle
     registry._connection.register("events", handle.resource)
 
@@ -515,7 +558,7 @@ def test_session_cleanup_after_reader_failure_releases_lock() -> None:
 
 
 def test_session_cleanup_after_binding_failure_releases_lock() -> None:
-    registry, connection, adapter, provider = _build_query_scoped()
+    registry, _, adapter, _ = _build_query_scoped()
     adapter.bind_raise = RuntimeError("injected bind failure echoing TOKEN")
     with pytest.raises(SourceConnectionError) as caught:
         registry.open_scan_session("events", columns=("id",))
@@ -550,7 +593,7 @@ def test_registry_operation_blocks_while_scan_session_holds_lock(
     completed = threading.Event()
 
     def holder() -> None:
-        with registry.open_scan_session("events", columns=("id",)) as session:
+        with registry.open_scan_session("events", columns=("id",)):
             entered.set()
             can_exit.wait(timeout=5)
 
@@ -591,8 +634,8 @@ def test_registry_operation_blocks_while_scan_session_holds_lock(
 def test_dedicated_registry_is_not_blocked_by_profile_scan_session() -> None:
     """A scan session on one registry does not block another registry's lock."""
 
-    profile_registry, connection_a, *_ = _build()
-    query_registry, connection_b, *_ = _build()
+    profile_registry, *_ = _build()
+    query_registry, *_ = _build()
 
     entered = threading.Event()
     can_exit = threading.Event()
@@ -697,7 +740,7 @@ def test_session_exposes_no_raw_connection_or_handle() -> None:
 
 def test_status_reload_and_scan_session_share_canonical_snapshot_token() -> None:
     token = "file-set:abc"
-    registry, connection, adapter, provider = _build(snapshot=token)
+    registry, _, adapter, _ = _build(snapshot=token)
     adapter.snapshot = token
 
     # status reads the registration handle's snapshot.
@@ -714,7 +757,7 @@ def test_status_reload_and_scan_session_share_canonical_snapshot_token() -> None
 
 
 def test_scan_session_reflects_handle_consistency() -> None:
-    registry, connection, adapter, provider = _build(
+    registry, *_ = _build(
         consistency=SourceConsistency.TRANSACTION_SNAPSHOT, snapshot="tx-9"
     )
     with registry.open_scan_session("events", columns=("id",)) as session:
@@ -728,7 +771,7 @@ def test_scan_session_reflects_handle_consistency() -> None:
 
 
 def test_recheck_snapshot_returns_fresh_candidate_view() -> None:
-    registry, connection, adapter, provider = _build(snapshot="snap-1")
+    registry, _, adapter, _ = _build(snapshot="snap-1")
     with registry.open_scan_session("events", columns=("id",)) as session:
         fresh = session.recheck_snapshot()
     assert isinstance(fresh, SourceSnapshot)
@@ -739,27 +782,64 @@ def test_recheck_snapshot_returns_fresh_candidate_view() -> None:
     assert "events" in adapter.closed
 
 
-def test_recheck_snapshot_detects_advanced_token() -> None:
-    registry, connection, adapter, provider = _build(snapshot="snap-1")
+def test_recheck_snapshot_detects_mismatched_token() -> None:
+    registry, _, adapter, _ = _build(snapshot="snap-1")
     with registry.open_scan_session("events", columns=("id",)) as session:
         assert session.snapshot_id == "snap-1"
         adapter.snapshot = "snap-2"
-        fresh = session.recheck_snapshot()
-        assert fresh.snapshot_id == "snap-2"
+        with pytest.raises(SourceConnectionError) as caught:
+            session.recheck_snapshot()
+        assert caught.value.code == "snapshot_mismatch"
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
         # The session itself still reflects the original token.
         assert session.snapshot_id == "snap-1"
+    # The fresh candidate was still closed after the mismatch was detected.
+    assert "events" in adapter.closed
+
+
+def test_recheck_snapshot_detects_consistency_mismatch() -> None:
+    registry, _, adapter, _ = _build(snapshot="snap-1")
+    with registry.open_scan_session("events", columns=("id",)) as session:
+        assert session.consistency is SourceConsistency.LIVE
+        adapter.consistency = SourceConsistency.TRANSACTION_SNAPSHOT
+        with pytest.raises(SourceConnectionError) as caught:
+            session.recheck_snapshot()
+        assert caught.value.code == "snapshot_mismatch"
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+
+
+def test_recheck_snapshot_detects_schema_mismatch() -> None:
+    registry, _, adapter, _ = _build(snapshot="snap-1")
+    drifted = TableSchema(
+        (FieldSchema("id", ScalarType("int64"), False),)
+    )
+
+    def drift(_handle: SourceHandle) -> TableSchema:
+        return drifted
+
+    with registry.open_scan_session("events", columns=("id",)) as session:
+        adapter.inspect_schema = drift  # type: ignore[method-assign]
+        with pytest.raises(SourceConnectionError) as caught:
+            session.recheck_snapshot()
+        assert caught.value.code == "snapshot_mismatch"
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+    assert "events" in adapter.closed
 
 
 def test_recheck_snapshot_sanitizes_adapter_failure() -> None:
-    registry, connection, adapter, provider = _build(snapshot="snap-1")
+    registry, _, adapter, _ = _build(snapshot="snap-1")
 
     def boom(_handle: SourceHandle) -> TableSchema:
         raise RuntimeError("injected recheck failure echoing CREDS")
 
     adapter.inspect_schema = boom  # type: ignore[method-assign]
-    with registry.open_scan_session("events", columns=("id",)) as session:
-        with pytest.raises(SourceConnectionError) as caught:
-            session.recheck_snapshot()
+    with registry.open_scan_session("events", columns=("id",)) as session, pytest.raises(
+        SourceConnectionError
+    ) as caught:
+        session.recheck_snapshot()
     assert caught.value.code == "scan_failed"
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
@@ -777,3 +857,44 @@ def test_all_scan_failures_surface_as_source_error() -> None:
         registry.open_scan_session("events", columns=("nope",))
     assert isinstance(caught.value, SourceError)
     assert caught.value.operation_id  # UUIDv4 present
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle idempotency: reader closed exactly once
+# ---------------------------------------------------------------------------
+
+
+def _reader_tracking_registry() -> (
+    tuple[SourceRegistry, _ReaderTrackingConnection]
+):
+    registry, *_ = _build()
+    conn = _ReaderTrackingConnection()
+    registry._connection = conn  # type: ignore[attr-defined]
+    handle = registry._registrations["events"].handle
+    conn.register("events", handle.resource)
+    return registry, conn
+
+
+def test_reader_closed_exactly_once_on_cancel_then_exit() -> None:
+    registry, conn = _reader_tracking_registry()
+    with registry.open_scan_session("events", columns=("id",)) as session:
+        session.cancel()
+    assert len(conn.readers) == 1
+    assert conn.readers[0].close_count == 1
+
+
+def test_reader_closed_exactly_once_on_normal_exit() -> None:
+    registry, conn = _reader_tracking_registry()
+    with registry.open_scan_session("events", columns=("id",)) as session:
+        list(session.iter_batches())
+    assert len(conn.readers) == 1
+    assert conn.readers[0].close_count == 1
+
+
+def test_reader_closed_exactly_once_on_cancel_without_iteration() -> None:
+    registry, conn = _reader_tracking_registry()
+    with registry.open_scan_session("events", columns=("id",)) as session:
+        session.cancel()
+        session.cancel()  # idempotent — no second close
+    assert len(conn.readers) == 1
+    assert conn.readers[0].close_count == 1

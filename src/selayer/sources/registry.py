@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
+from selayer.compilation.duckdb import quote_identifier
 from selayer.expressions.validation import references
 from selayer.sources.adapters.arrow import ArrowDatasetAdapter
 from selayer.sources.adapters.database import (
@@ -75,8 +76,6 @@ from selayer.sources.profiles import (
 )
 from selayer.sources.scan import SourceScanSession, SourceSnapshot
 from selayer.sources.schema import TableSchema, compare_schemas, schema_fingerprint
-from selayer.compilation.duckdb import quote_identifier
-
 
 # Default target row count for streamed scan-session batches.  Callers may
 # override per session via ``open_scan_session(batch_size=...)``.
@@ -852,9 +851,8 @@ class SourceRegistry:
         cleanup, and sanitization guarantees.
         """
 
-        with self._lock:
-            with self._bind_requirements_locked(requirements):
-                yield
+        with self._lock, self._bind_requirements_locked(requirements):
+            yield
 
     @contextmanager
     def bind(self, plan: QueryPlan) -> Iterator[None]:
@@ -1005,33 +1003,41 @@ class SourceRegistry:
             # Teardown whatever was acquired, release the lock exactly once,
             # then surface the sanitized error outside every ``except`` scope.
             if binding_entered and binding_ctx is not None:
-                with suppress(BaseException):  # noqa: BLE001 - best-effort
+                with suppress(BaseException):  # best-effort
                     binding_ctx.__exit__(None, None, None)
             self._lock.release()
             raise pending
         assert handle is not None
         assert reader is not None
 
-        # Idempotent release: closes the reader (if still open), exits the
-        # query-scoped binding context, and releases the lock exactly once.
-        # Every step suppresses so a connector cleanup exception can never
-        # escape raw or skip the lock release.
+        # Idempotent release: exits the query-scoped binding context and
+        # releases the registry lifecycle lock exactly once.  The stream
+        # reader is *not* closed here — the session owns that exclusively via
+        # its idempotent ``_close_reader`` (called from ``cancel`` and
+        # context-manager exit), so the reader is closed exactly once even
+        # when ``cancel`` runs before exit.  Every step suppresses so a
+        # connector cleanup exception can never escape raw or skip the lock
+        # release.
         released = [False]
 
         def _release() -> None:
             if released[0]:
                 return
             released[0] = True
-            if reader is not None:
-                with suppress(Exception):  # noqa: BLE001 - best-effort close
-                    reader.close()
             if binding_ctx is not None:
-                with suppress(BaseException):  # noqa: BLE001 - best-effort
+                with suppress(BaseException):  # best-effort
                     binding_ctx.__exit__(None, None, None)
             self._lock.release()
 
+        baseline_schema_fingerprint = schema_fingerprint(handle.schema)
+
         def _recheck() -> SourceSnapshot:
-            return self._recheck_source(source_id)
+            return self._recheck_source(
+                source_id,
+                baseline_consistency=handle.consistency,
+                baseline_snapshot_id=handle.snapshot,
+                baseline_schema_fingerprint=baseline_schema_fingerprint,
+            )
 
         return SourceScanSession(
             source_id=source_id,
@@ -1043,12 +1049,25 @@ class SourceRegistry:
             recheck=_recheck,
         )
 
-    def _recheck_source(self, source_id: str) -> SourceSnapshot:
-        """Prepare a fresh candidate and return its derived snapshot view.
+    def _recheck_source(
+        self,
+        source_id: str,
+        *,
+        baseline_consistency: SourceConsistency,
+        baseline_snapshot_id: str | None,
+        baseline_schema_fingerprint: str,
+    ) -> SourceSnapshot:
+        """Prepare a fresh candidate, verify it matches the session, return it.
 
         Reuses :meth:`_prepare_candidate` (the same adapter path reload uses)
-        so recheck observes exactly what a reload would.  The fresh candidate
-        is closed before returning; the session's own stream is unaffected.
+        so recheck observes exactly what a reload would.  The fresh
+        candidate's ``(consistency, snapshot_id, schema_fingerprint)`` triple
+        is compared against the session's baseline values *before* the
+        candidate is closed; on any mismatch a sanitized
+        :class:`~selayer.sources.errors.SourceConnectionError` (code
+        ``snapshot_mismatch``) is raised so a caller learns deterministically
+        that the snapshot it is streaming is no longer current.  The fresh
+        candidate is always closed; the session's own stream is unaffected.
         Called while the scan session holds the lifecycle lock.
         """
 
@@ -1087,12 +1106,27 @@ class SourceRegistry:
             raise SourceConnectionError(
                 source_id, "scan_failed", "the source could not be scanned"
             )
+        # Capture the fresh triple from the candidate *before* closing it, then
+        # close the candidate unconditionally.  The comparison runs against the
+        # session's open-time baseline: a mismatch means the snapshot the
+        # session is streaming is no longer current, surfaced as a sanitized,
+        # deterministic ``snapshot_mismatch`` error raised outside any
+        # ``except`` scope so ``__cause__``/``__context__`` remain ``None``.
+        fresh_fingerprint = schema_fingerprint(observed)
         snapshot = SourceSnapshot(
             consistency=candidate.consistency,
             snapshot_id=candidate.snapshot,
-            schema_fingerprint=schema_fingerprint(observed),
+            schema_fingerprint=fresh_fingerprint,
         )
         close_quietly(adapter, candidate)
+        if (
+            snapshot.consistency != baseline_consistency
+            or snapshot.snapshot_id != baseline_snapshot_id
+            or snapshot.schema_fingerprint != baseline_schema_fingerprint
+        ):
+            raise SourceConnectionError(
+                source_id, "snapshot_mismatch", "the source snapshot has changed"
+            )
         return snapshot
 
     # -- internals ---------------------------------------------------------

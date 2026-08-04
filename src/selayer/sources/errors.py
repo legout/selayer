@@ -63,6 +63,7 @@ _CODE_MESSAGES: dict[str, str] = {
     "cleanup_failed": "the source could not be cleaned up after the query",
     "scan_failed": "the source could not be scanned",
     "schema_mismatch": "the observed schema does not match the declared schema",
+    "snapshot_mismatch": "the source snapshot has changed since the scan session opened",
     "reload_failed": "the source could not be reloaded",
     "reload_all_failed": "one or more sources could not be reloaded together",
     "source_initialization_failed": (

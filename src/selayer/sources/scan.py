@@ -146,13 +146,19 @@ class SourceScanSession:
         self._schema = schema
         self._consistency = consistency
         self._snapshot_id = snapshot_id
-        self._reader = reader
-        # ``release`` is idempotent: it closes the reader (if still open),
-        # exits the query-scoped binding context, and releases the registry
-        # lifecycle lock exactly once.
+        self._reader: pa.RecordBatchReader | None = reader
+        # ``release`` is idempotent: it exits the query-scoped binding
+        # context and releases the registry lifecycle lock exactly once.  It
+        # does *not* close the reader — the session owns that exclusively via
+        # ``_close_reader`` so the reader is closed exactly once even when
+        # ``cancel`` runs before context-manager exit.
         self._release = release
-        # ``recheck`` prepares a fresh candidate through the owning adapter and
-        # returns its derived :class:`SourceSnapshot` without holding onto it.
+        # ``recheck`` prepares a fresh candidate through the owning adapter,
+        # compares its ``(consistency, snapshot_id, schema_fingerprint)``
+        # triple against the session's open-time baseline, and returns the
+        # derived :class:`SourceSnapshot` (raising a sanitized
+        # ``snapshot_mismatch`` error on any drift) without holding onto the
+        # candidate.
         self._recheck = recheck
         self._closed = False
         self._cancelled = False
@@ -215,13 +221,18 @@ class SourceScanSession:
         without surfacing a raw driver error.
         """
 
+        reader = self._reader
+        if reader is None:
+            # Should not happen: :meth:`iter_batches` guards against a closed
+            # session.  Defensive return keeps the generator total.
+            return
         read_failed = False
         try:
             while True:
                 if self._cancelled:
                     break
                 try:
-                    batch = self._reader.read_next_batch()
+                    batch = reader.read_next_batch()
                 except StopIteration:
                     break
                 except Exception:  # noqa: BLE001 - sanitize any read failure
@@ -241,16 +252,23 @@ class SourceScanSession:
     # -- snapshot recheck -------------------------------------------------
 
     def recheck_snapshot(self) -> SourceSnapshot:
-        """Prepare a fresh candidate and return its derived snapshot view.
+        """Prepare a fresh candidate, verify it matches the session, return it.
 
         The fresh candidate is prepared through the same adapter that owns the
         registered source, its ``(consistency, snapshot_id, schema_fingerprint)``
-        triple is captured into a :class:`SourceSnapshot`, and the candidate is
-        closed before returning.  The session's own stream is unaffected.
+        triple is compared against the session's open-time baseline, and the
+        candidate is closed before returning.  When every field still matches
+        the derived :class:`SourceSnapshot` is returned; on any drift a
+        sanitized :class:`~selayer.sources.errors.SourceConnectionError`
+        (code ``snapshot_mismatch``) is raised so the caller learns
+        deterministically that the snapshot it is streaming is no longer
+        current.  The session's own stream is unaffected.
 
         Raises:
-            SourceConnectionError: if the session is closed/cancelled or the
-                fresh candidate cannot be prepared.
+            SourceConnectionError: if the session is closed/cancelled, the
+                fresh candidate cannot be prepared, or the fresh candidate no
+                longer matches the session's snapshot (code
+                ``snapshot_mismatch``).
         """
         if self._closed or self._cancelled:
             raise SourceConnectionError(
@@ -263,8 +281,8 @@ class SourceScanSession:
     def cancel(self) -> None:
         """Interrupt the active cursor and mark the session unusable.
 
-        Idempotent.  Closes the underlying stream reader (interrupting any
-        in-flight read) and marks the session cancelled so further
+        Idempotent.  Closes the underlying stream reader *once* (interrupting
+        any in-flight read) and marks the session cancelled so further
         :meth:`iter_batches` / :meth:`recheck_snapshot` calls raise.  The
         registry lifecycle lock remains held until the context-manager exits,
         at which point the binding and lock are released exactly once.
@@ -272,10 +290,7 @@ class SourceScanSession:
         if self._cancelled:
             return
         self._cancelled = True
-        reader = self._reader
-        if reader is not None:
-            with suppress(Exception):  # noqa: BLE001 - close is best-effort
-                reader.close()
+        self._close_reader()
 
     # -- context manager --------------------------------------------------
 
@@ -285,12 +300,29 @@ class SourceScanSession:
     def __exit__(self, *exc_info: object) -> None:
         self._close()
 
+    def _close_reader(self) -> None:
+        """Close the stream reader exactly once (idempotent).
+
+        Nulls the stored reader reference before the best-effort ``close`` so
+        a second invocation (e.g. ``cancel()`` followed by context-manager
+        exit) is a no-op and the reader is never closed twice.
+        """
+        reader = self._reader
+        if reader is None:
+            return
+        self._reader = None
+        with suppress(Exception):  # close is best-effort
+            reader.close()
+
     def _close(self) -> None:
         """Release the reader, binding, and registry lock exactly once."""
         if self._closed:
             return
         self._closed = True
-        # ``_release`` is idempotent and suppresses every cleanup-side error
-        # so a connector cleanup exception can never escape raw or skip the
-        # lock release.
+        # The session owns closing the stream reader exactly once; ``_release``
+        # then exits the query-scoped binding context and releases the
+        # registry lock.  ``_release`` is idempotent and suppresses every
+        # cleanup-side error so a connector cleanup exception can never escape
+        # raw or skip the lock release.
+        self._close_reader()
         self._release()
