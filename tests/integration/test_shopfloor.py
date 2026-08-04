@@ -32,7 +32,10 @@ from examples.shopfloor.generate_data import (
     generate_shopfloor_data,
 )
 from examples.shopfloor.generate_data import main as generate_main
-from examples.shopfloor.knowledge_policy import validate_shopfloor_knowledge
+from examples.shopfloor.knowledge_policy import (
+    _MAX_QUERY_BODY_BYTES,
+    validate_shopfloor_knowledge,
+)
 from examples.shopfloor.run_example import _layer_for_paths, run_walkthrough
 from examples.shopfloor.run_example import main as run_main
 from selayer import QueryEngine, QueryPlanningError, SemanticLayer
@@ -1032,12 +1035,18 @@ def test_shopfloor_policy_rejects_non_empty_filters(tmp_path: Path) -> None:
 
 
 def test_shopfloor_policy_rejects_deeply_nested_json(tmp_path: Path) -> None:
-    """Deeply nested JSON must not raise an unhandled exception."""
+    """Deeply nested valid JSON must produce a deterministic issue, not crash.
+
+    Uses genuinely nested arrays (not malformed syntax) within the byte limit.
+    The body parses to a deeply nested list, which is not a dict, so the
+    policy rejects it deterministically on field validation.
+    """
     bundle = _composed_shopfloor_bundle(tmp_path)
     layer = _shopfloor_layer()
-    deep = '"x":' * 200 + "1" + "}" * 200
-    deep = "{" + deep
-    bad_block = f"```json selayer-query\n{deep}\n```"
+    depth = 2000
+    nested = "[" * depth + "1" + "]" * depth
+    assert len(nested.encode("utf-8")) <= _MAX_QUERY_BODY_BYTES
+    bad_block = f"```json selayer-query\n{nested}\n```"
     concept = bundle.concepts["metrics/component_count"]
     modified = _replace_section(concept, "Examples", bad_block)
     concepts = dict(bundle.concepts)
@@ -1052,22 +1061,23 @@ def test_shopfloor_policy_rejects_deeply_nested_json(tmp_path: Path) -> None:
 
 
 def test_shopfloor_policy_rejects_oversized_multibyte_body(tmp_path: Path) -> None:
-    """A multibyte body over the byte limit must be rejected, not accepted.
+    """A structurally valid body over the byte limit must be rejected by size.
 
-    The byte limit is enforced on UTF-8 encoded length, not Unicode character
-    count, so a short character string that expands past the bound is still
-    rejected without raising an unhandled exception.
+    Uses only allowed query keys with valid JSON structure, so the only reason
+    for rejection is the UTF-8 byte limit --- not field or syntax validation.
+    Without the byte cap this body would parse successfully.
     """
     bundle = _composed_shopfloor_bundle(tmp_path)
     layer = _shopfloor_layer()
     # Each snowman character is one code point but three UTF-8 bytes.
-    # 1400 characters => 4200 bytes > 4096 byte cap, but 1400 < 4096 characters.
+    # The resulting JSON body is well over 4096 UTF-8 bytes but structurally
+    # valid (only allowed keys, parses without the byte cap).
     oversized = "\u2603" * 1400
-    bad_block = (
-        "```json selayer-query\n"
-        + f'{{"metrics":["component_count"],"oversized":"{oversized}"}}'
-        + "\n```"
+    body = json.dumps(
+        {"metrics": ["component_count"], "dimensions": [oversized], "filters": {}}
     )
+    assert len(body.encode("utf-8")) > _MAX_QUERY_BODY_BYTES
+    bad_block = f"```json selayer-query\n{body}\n```"
     concept = bundle.concepts["metrics/component_count"]
     modified = _replace_section(concept, "Examples", bad_block)
     concepts = dict(bundle.concepts)
@@ -1076,6 +1086,29 @@ def test_shopfloor_policy_rejects_oversized_multibyte_body(tmp_path: Path) -> No
     issues = validate_shopfloor_knowledge(changed, layer)
     assert any(
         issue.code == "shopfloor.query.invalid"
-        and "metrics/component_count" in issue.path
+        and "exceeds maximum size" in issue.message
+        for issue in issues
+    )
+
+
+def test_shopfloor_policy_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    """Duplicate JSON object keys must be rejected, not silently merged."""
+    bundle = _composed_shopfloor_bundle(tmp_path)
+    layer = _shopfloor_layer()
+    duplicate_block = (
+        "```json selayer-query\n"
+        '{"metrics":["component_count"],"metrics":["bad"],'
+        '"dimensions":[],"filters":{}}\n'
+        "```"
+    )
+    concept = bundle.concepts["metrics/component_count"]
+    modified = _replace_section(concept, "Examples", duplicate_block)
+    concepts = dict(bundle.concepts)
+    concepts["metrics/component_count"] = modified
+    changed = dataclass_replace(bundle, concepts=MappingProxyType(concepts))
+    issues = validate_shopfloor_knowledge(changed, layer)
+    assert any(
+        issue.code == "shopfloor.query.invalid"
+        and "duplicate key" in issue.message
         for issue in issues
     )
