@@ -1172,6 +1172,7 @@ class SessionStore:
             os.fsync(handle.fileno())
         os.replace(tmp, self._cache_path)
         self._restrict_file(self._cache_path)
+        self._fsync_directory(self._cache_path.parent)
 
     def _write_committed_head(self) -> None:
         """Durably record the last committed head hash and event count.
@@ -1197,6 +1198,7 @@ class SessionStore:
             os.fsync(handle.fileno())
         os.replace(tmp, self._committed_head_path)
         self._restrict_file(self._committed_head_path)
+        self._fsync_directory(self._committed_head_path.parent)
 
     def _read_committed_head(self) -> tuple[str, int] | None:
         """Return the recorded ``(head_hash, event_count)`` or ``None``.
@@ -1337,6 +1339,20 @@ class SessionStore:
     def _restrict_file(path: Path) -> None:
         if os.name == "posix":
             os.chmod(path, 0o600)
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        """Persist atomic sidecar renames on POSIX filesystems."""
+        if os.name != "posix":
+            return
+        try:
+            descriptor = os.open(path, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     @staticmethod
     def _restrict_dir(path: Path) -> None:

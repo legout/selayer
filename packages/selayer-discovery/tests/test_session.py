@@ -1189,7 +1189,9 @@ def test_oversized_mapping_key_is_rejected_on_append(
     oversized_key = "k" * (MAX_TEXT_LENGTH + 1)
     with pytest.raises(SessionError):
         store.transition(
-            SessionState.INTAKE, actor=actor, payload={oversized_key: "value"}
+            SessionState.INTAKE,
+            actor=actor,
+            payload={"nested": {"items": {oversized_key: "value"}}},
         )
     # The rejected transition did not mutate the journal.
     assert len(_journal_lines(session_root)) == 1
@@ -1207,7 +1209,10 @@ def test_oversized_mapping_key_is_rejected_on_replay(
     bad_line = _event_line(
         genesis_hash,
         "state_transition",
-        {"target": "intake", oversized_key: "value"},
+        {
+            "target": "intake",
+            "nested": {"items": {oversized_key: "value"}},
+        },
         actor=actor,
     )
     _rewrite_journal(session_root, [genesis_line, bad_line])
