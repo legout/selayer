@@ -634,7 +634,9 @@ def test_every_metric_has_complete_curated_overlay(tmp_path: Path) -> None:
     )
     for metric_name in sorted(layer.metrics):
         concept = bundle.concepts[f"metrics/{metric_name}"]
-        sections = {section.title: section.content.strip() for section in concept.sections}
+        sections = {
+            section.title: section.content.strip() for section in concept.sections
+        }
         assert sections["Usage Guidance"]
         assert sections["Examples"]
         assert sections["Caveats"]
