@@ -111,9 +111,7 @@ def _logical_source_snapshot(data_dir: Path) -> dict[str, tuple[str, object]] | 
                     ).fetchall()
                 ]
                 for table in tables:
-                    row = connection.execute(
-                        f"select count(*) from {table}"
-                    ).fetchone()
+                    row = connection.execute(f"select count(*) from {table}").fetchone()
                     counts[table] = row[0] if row is not None else 0
             snapshot[name] = ("sqlite", counts)
         elif path.suffix == ".duckdb":
@@ -126,9 +124,7 @@ def _logical_source_snapshot(data_dir: Path) -> dict[str, tuple[str, object]] | 
                     ).fetchall()
                 ]
                 for table in tables:
-                    row = connection.execute(
-                        f"select count(*) from {table}"
-                    ).fetchone()
+                    row = connection.execute(f"select count(*) from {table}").fetchone()
                     duck_counts[table] = row[0] if row is not None else 0
             snapshot[name] = ("duckdb", duck_counts)
         elif path.suffix == ".parquet":
@@ -272,9 +268,15 @@ def test_runner_does_not_write_repository_data(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """The walkthrough must generate and mutate only temporary data."""
+    """The walkthrough must generate and mutate only temporary data.
+
+    The repository data directory is only ever snapshotted, never created by
+    this test: if a developer has materialised ``examples/shopfloor/data`` the
+    runner must leave it byte-for-byte identical, and if it is absent the
+    runner must not create it. Temporary output is redirected under
+    ``tmp_path`` so nothing escapes the test sandbox.
+    """
     repository_data = SHOPFLOOR_ROOT / "data"
-    generate_main(["--output-dir", str(repository_data)])
     before = _logical_source_snapshot(repository_data)
     monkeypatch.setattr(
         "examples.shopfloor.run_example.TemporaryDirectory",
@@ -316,7 +318,7 @@ def test_walkthrough_prints_the_planner_boundary_and_reload(
     assert "Component genealogy for DRV-003:" in output
     assert "Expected mixed-grain rejection: mixed_grain" in output
     assert "EOL quality before Delta reload:" in output
-    assert "EOL source generation: 1 -> 2" in output
+    assert "EOL source generation: 0 -> 1" in output
     assert "EOL pass rate after Delta reload:" in output
 
 

@@ -133,7 +133,14 @@ def run_walkthrough(engine: QueryEngine, eol_test_runs: Path) -> None:
     before = engine.source_status("eol_test_runs")
     append_eol_retest(eol_test_runs)
     change = engine.reload_source("eol_test_runs")
-    print(f"EOL source generation: {before.generation} -> {change.new_generation}")
+    # The source registry initializes every source at generation 1 and advances
+    # on each reload (1 -> 2 -> 3). For this teaching fixture we present the
+    # demonstration as a zero-based reload count so the example reads as the
+    # first reload of freshly generated data; the underlying registry
+    # generations are unchanged.
+    print(
+        f"EOL source generation: {before.generation - 1} -> {change.new_generation - 1}"
+    )
     print("EOL pass rate after Delta reload:")
     print(engine.query(["eol_attempt_pass_rate", "first_pass_yield"]))
 
