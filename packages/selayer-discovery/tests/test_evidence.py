@@ -153,6 +153,18 @@ def test_add_document_rejects_unsupported_suffix(tmp_path: Path) -> None:
     assert raised.value.code == CODE_EVIDENCE_UNSUPPORTED_SUFFIX
 
 
+def test_add_document_rejects_long_markdown_suffix(tmp_path: Path) -> None:
+    # The long ``.markdown`` form is rejected so a source label never carries
+    # an ambiguous or spoofable suffix; callers must use ``.md``.
+    project = tmp_path / "project"
+    project.mkdir()
+    path = _doc(project, "spec.markdown", b"# Heading\n")
+    store = EvidenceStore.create(tmp_path / "evidence")
+    with pytest.raises(EvidenceError) as raised:
+        store.add_document(path, allowed_roots=(project,))
+    assert raised.value.code == CODE_EVIDENCE_UNSUPPORTED_SUFFIX
+
+
 # --------------------------------------------------------------------------- #
 # Normalization                                                               #
 # --------------------------------------------------------------------------- #
@@ -448,6 +460,16 @@ def test_add_snapshot_rejects_blank_source(tmp_path: Path) -> None:
     assert raised.value.code == CODE_EVIDENCE_INVALID_SOURCE
 
 
+def test_add_snapshot_rejects_credential_and_url_sources(tmp_path: Path) -> None:
+    # A surfaced label must never carry a URL scheme, an embedded credential,
+    # or a path-escape backslash.
+    store = EvidenceStore.create(tmp_path / "evidence")
+    for bad in ("https://host/path", "user:pass@host", "with\\backslash"):
+        with pytest.raises(EvidenceError) as raised:
+            store.add_snapshot(b"x\n", media_type=MEDIA_TEXT_PLAIN, source=bad)
+        assert raised.value.code == CODE_EVIDENCE_INVALID_SOURCE
+
+
 # --------------------------------------------------------------------------- #
 # Secrecy: no body in repr, diagnostics, or JSON                              #
 # --------------------------------------------------------------------------- #
@@ -502,6 +524,7 @@ def test_document_line_selector_validates_current_revision(tmp_path: Path) -> No
     selector = DocumentLineSelector(
         record_id=record.record_id,
         content_hash=record.content_hash,
+        revision=record.revision,
         start_line=1,
         end_line=2,
     )
@@ -517,6 +540,7 @@ def test_document_line_selector_detects_stale_revision(tmp_path: Path) -> None:
     selector = DocumentLineSelector(
         record_id=record.record_id,
         content_hash=record.content_hash,
+        revision=record.revision,
         start_line=1,
         end_line=1,
     )
@@ -537,6 +561,7 @@ def test_document_line_selector_rejects_out_of_range(tmp_path: Path) -> None:
     selector = DocumentLineSelector(
         record_id=record.record_id,
         content_hash=record.content_hash,
+        revision=record.revision,
         start_line=1,
         end_line=5,
     )
@@ -550,6 +575,7 @@ def test_selector_rejects_unknown_record(tmp_path: Path) -> None:
     selector = CatalogPathSelector(
         record_id="catalog-nosuch",
         content_hash="0" * 64,
+        revision=1,
         json_path="/sources/0",
     )
     with pytest.raises(EvidenceError) as raised:
@@ -567,26 +593,31 @@ def test_other_selectors_validate_against_revision(tmp_path: Path) -> None:
         CatalogPathSelector(
             record_id=record.record_id,
             content_hash=record.content_hash,
+            revision=record.revision,
             json_path="/sources/0",
         ),
         SourceFieldSelector(
             record_id=record.record_id,
             content_hash=record.content_hash,
+            revision=record.revision,
             field="schema",
         ),
         ProviderSectionSelector(
             record_id=record.record_id,
             content_hash=record.content_hash,
+            revision=record.revision,
             section="overview",
         ),
         InterviewEventSelector(
             record_id=record.record_id,
             content_hash=record.content_hash,
+            revision=record.revision,
             event_id="evt-1",
         ),
         VerificationOutcomeSelector(
             record_id=record.record_id,
             content_hash=record.content_hash,
+            revision=record.revision,
             outcome="passed",
         ),
     ):
@@ -598,11 +629,79 @@ def test_selector_repr_has_no_body(tmp_path: Path) -> None:
     selector = DocumentLineSelector(
         record_id="document-abc",
         content_hash="0" * 64,
+        revision=1,
         start_line=1,
         end_line=2,
     )
     text = repr(selector)
     assert "record_id" in text or "document-abc" in text
+
+
+def test_selector_stale_after_abca_replay(tmp_path: Path) -> None:
+    # A→B→A: the content hash repeats at revision 3, so a selector bound to
+    # revision 1 must be stale even though the hashes now match again.
+    project = tmp_path / "project"
+    project.mkdir()
+    path = _doc(project, "spec.md", b"alpha\n")
+    store = EvidenceStore.create(tmp_path / "evidence")
+    rev_a = store.add_document(path, allowed_roots=(project,))
+    selector = DocumentLineSelector(
+        record_id=rev_a.record_id,
+        content_hash=rev_a.content_hash,
+        revision=rev_a.revision,
+        start_line=1,
+        end_line=1,
+    )
+    path.write_bytes(b"beta\n")
+    store.add_document(path, allowed_roots=(project,))
+    path.write_bytes(b"alpha\n")
+    rev_a_again = store.add_document(path, allowed_roots=(project,))
+    assert rev_a_again.revision == 3
+    assert rev_a_again.content_hash == rev_a.content_hash
+    with pytest.raises(EvidenceError) as raised:
+        store.validate_selector(selector)
+    assert raised.value.code == CODE_EVIDENCE_SELECTOR_STALE
+
+
+def test_typed_selectors_reject_malformed_fields(tmp_path: Path) -> None:
+    # Each typed selector rejects a malformed kind-specific field shape.
+    project = tmp_path / "project"
+    project.mkdir()
+    path = _doc(project, "spec.md", b"body\n")
+    store = EvidenceStore.create(tmp_path / "evidence")
+    record = store.add_document(path, allowed_roots=(project,))
+    rid = record.record_id
+    ch = record.content_hash
+    rev = record.revision
+    for selector in (
+        CatalogPathSelector(record_id=rid, content_hash=ch, revision=rev, json_path="sources/0"),
+        SourceFieldSelector(record_id=rid, content_hash=ch, revision=rev, field="Bad-Field"),
+        ProviderSectionSelector(record_id=rid, content_hash=ch, revision=rev, section="bad space"),
+        InterviewEventSelector(record_id=rid, content_hash=ch, revision=rev, event_id="bad space"),
+        VerificationOutcomeSelector(record_id=rid, content_hash=ch, revision=rev, outcome="bogus"),
+    ):
+        with pytest.raises(EvidenceError) as raised:
+            store.validate_selector(selector)
+        assert raised.value.code == CODE_EVIDENCE_SELECTOR_OUT_OF_RANGE
+
+
+def test_document_line_selector_rejects_snapshot_kind(tmp_path: Path) -> None:
+    # A line range only applies to documents, never to snapshots (which carry
+    # no line semantics).
+    store = EvidenceStore.create(tmp_path / "evidence")
+    record = store.add_snapshot(
+        b"line1\nline2\n", media_type=MEDIA_TEXT_PLAIN, source="snap"
+    )
+    selector = DocumentLineSelector(
+        record_id=record.record_id,
+        content_hash=record.content_hash,
+        revision=record.revision,
+        start_line=1,
+        end_line=1,
+    )
+    with pytest.raises(EvidenceError) as raised:
+        store.validate_selector(selector)
+    assert raised.value.code == CODE_EVIDENCE_SELECTOR_OUT_OF_RANGE
 
 
 # --------------------------------------------------------------------------- #

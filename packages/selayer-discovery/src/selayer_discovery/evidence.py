@@ -14,8 +14,8 @@ This module owns the evidence foundation for the discovery companion package:
 
 Design rules enforced here (see the approved discovery design and global plan):
 
-* Version 1 accepts normalized Markdown (``.md``/``.markdown``) and plain text
-  (``.txt``) only.
+* Version 1 accepts normalized Markdown (``.md``) and plain text (``.txt``)
+  only.
 * Preflight resolves the candidate against allowed roots, inspects the link
   itself with ``lstat`` (rejecting symbolic links and non-regular files), and
   enforces the per-document size bound **before** any byte is read. Bytes are
@@ -42,8 +42,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from filelock import FileLock, Timeout
-
-from selayer_discovery.model import MAX_TEXT_LENGTH
 
 __all__ = [
     "CODE_EVIDENCE_INVALID_ENCODING",
@@ -82,7 +80,7 @@ __all__ = [
 # Constants                                                                   #
 # --------------------------------------------------------------------------- #
 
-#: Markdown media type produced for ``.md``/``.markdown`` documents.
+#: Markdown media type produced for ``.md`` documents.
 MEDIA_TEXT_MARKDOWN: str = "text/markdown"
 
 #: Plain-text media type produced for ``.txt`` documents.
@@ -92,9 +90,10 @@ MEDIA_TEXT_PLAIN: str = "text/plain"
 _ALLOWED_MEDIA_TYPES: frozenset[str] = frozenset({MEDIA_TEXT_MARKDOWN, MEDIA_TEXT_PLAIN})
 
 #: Document suffix → media type. Only these suffixes are accepted for documents.
+#: The long ``.markdown`` form is intentionally rejected; callers must use
+#: ``.md`` so a source label never carries an ambiguous or spoofable suffix.
 _DOCUMENT_SUFFIX_MEDIA: Mapping[str, str] = {
     ".md": MEDIA_TEXT_MARKDOWN,
-    ".markdown": MEDIA_TEXT_MARKDOWN,
     ".txt": MEDIA_TEXT_PLAIN,
 }
 
@@ -320,6 +319,7 @@ class DocumentLineSelector:
 
     record_id: str
     content_hash: str
+    revision: int
     start_line: int
     end_line: int
     kind: str = _KIND_DOCUMENT_LINE
@@ -329,6 +329,7 @@ class DocumentLineSelector:
             "kind": self.kind,
             "record_id": self.record_id,
             "content_hash": self.content_hash,
+            "revision": self.revision,
             "start_line": self.start_line,
             "end_line": self.end_line,
         }
@@ -340,6 +341,7 @@ class CatalogPathSelector:
 
     record_id: str
     content_hash: str
+    revision: int
     json_path: str
     kind: str = _KIND_CATALOG_PATH
 
@@ -348,6 +350,7 @@ class CatalogPathSelector:
             "kind": self.kind,
             "record_id": self.record_id,
             "content_hash": self.content_hash,
+            "revision": self.revision,
             "json_path": self.json_path,
         }
 
@@ -358,6 +361,7 @@ class SourceFieldSelector:
 
     record_id: str
     content_hash: str
+    revision: int
     field: str
     kind: str = _KIND_SOURCE_FIELD
 
@@ -366,6 +370,7 @@ class SourceFieldSelector:
             "kind": self.kind,
             "record_id": self.record_id,
             "content_hash": self.content_hash,
+            "revision": self.revision,
             "field": self.field,
         }
 
@@ -376,6 +381,7 @@ class ProviderSectionSelector:
 
     record_id: str
     content_hash: str
+    revision: int
     section: str
     kind: str = _KIND_PROVIDER_SECTION
 
@@ -384,6 +390,7 @@ class ProviderSectionSelector:
             "kind": self.kind,
             "record_id": self.record_id,
             "content_hash": self.content_hash,
+            "revision": self.revision,
             "section": self.section,
         }
 
@@ -394,6 +401,7 @@ class InterviewEventSelector:
 
     record_id: str
     content_hash: str
+    revision: int
     event_id: str
     kind: str = _KIND_INTERVIEW_EVENT
 
@@ -402,6 +410,7 @@ class InterviewEventSelector:
             "kind": self.kind,
             "record_id": self.record_id,
             "content_hash": self.content_hash,
+            "revision": self.revision,
             "event_id": self.event_id,
         }
 
@@ -412,6 +421,7 @@ class VerificationOutcomeSelector:
 
     record_id: str
     content_hash: str
+    revision: int
     outcome: str
     kind: str = _KIND_VERIFICATION_OUTCOME
 
@@ -420,6 +430,7 @@ class VerificationOutcomeSelector:
             "kind": self.kind,
             "record_id": self.record_id,
             "content_hash": self.content_hash,
+            "revision": self.revision,
             "outcome": self.outcome,
         }
 
@@ -444,13 +455,55 @@ _SELECTOR_KINDS: Mapping[str, type[object]] = {
     _KIND_VERIFICATION_OUTCOME: VerificationOutcomeSelector,
 }
 
-#: Every selector carries a kind-specific bounded text field; map kind → field.
+#: JSON Pointer (RFC 6901): the empty root or ``/``-prefixed reference tokens
+#: with ``~`` only as ``~0``/``~1``. Rejects bare text, dangling ``~``, and bad
+#: escapes so a catalog selector never carries free text.
+_JSON_POINTER_RE: re.Pattern[str] = re.compile(r"\A(/([^~/]|~[01])*)*\Z")
+
+#: Upper bound on a catalog JSON Pointer length (defends against pathological
+#: inputs before the regex runs).
+_MAX_JSON_POINTER_LENGTH: int = 1024
+
+#: Source field identifier (snake_case, like ``order_id``/``schema``).
+_SOURCE_FIELD_RE: re.Pattern[str] = re.compile(r"\A[a-z][a-z0-9_]{0,63}\Z")
+
+#: Provider/OKF section identifier (safe-id shape, like ``overview``).
+_PROVIDER_SECTION_RE: re.Pattern[str] = re.compile(r"\A[a-z][a-z0-9_.-]{0,127}\Z")
+
+#: Interview event identifier (a slug or lowercase UUID hex; may start with a
+#: digit, like ``evt-1``).
+_INTERVIEW_EVENT_RE: re.Pattern[str] = re.compile(r"\A[a-z0-9][a-z0-9_.-]{0,127}\Z")
+
+#: Allowed verification outcomes (mirrors the verification ``OutcomeStatus``).
+_VERIFICATION_OUTCOMES: frozenset[str] = frozenset(
+    {"passed", "failed", "skipped", "unavailable"}
+)
+
+#: Identifier-shaped selector fields validated by a shared regex. Maps the
+#: kind to the attribute name on the selector dataclass.
 _SELECTOR_TEXT_FIELD: Mapping[str, str] = {
-    _KIND_CATALOG_PATH: "json_path",
     _KIND_SOURCE_FIELD: "field",
     _KIND_PROVIDER_SECTION: "section",
     _KIND_INTERVIEW_EVENT: "event_id",
-    _KIND_VERIFICATION_OUTCOME: "outcome",
+}
+
+#: Regex for each identifier-shaped selector field (indexed by kind).
+_SELECTOR_FIELD_RE: Mapping[str, re.Pattern[str]] = {
+    _KIND_SOURCE_FIELD: _SOURCE_FIELD_RE,
+    _KIND_PROVIDER_SECTION: _PROVIDER_SECTION_RE,
+    _KIND_INTERVIEW_EVENT: _INTERVIEW_EVENT_RE,
+}
+
+#: Record kinds each selector kind may bind to. A document line range requires
+#: a ``document`` record (snapshots carry no line semantics); the remaining
+#: selectors reference structured content stored as either kind.
+_SELECTOR_APPLICABLE_KINDS: Mapping[str, frozenset[str]] = {
+    _KIND_DOCUMENT_LINE: frozenset({_KIND_DOCUMENT}),
+    _KIND_CATALOG_PATH: frozenset({_KIND_DOCUMENT, _KIND_SNAPSHOT}),
+    _KIND_SOURCE_FIELD: frozenset({_KIND_DOCUMENT, _KIND_SNAPSHOT}),
+    _KIND_PROVIDER_SECTION: frozenset({_KIND_DOCUMENT, _KIND_SNAPSHOT}),
+    _KIND_INTERVIEW_EVENT: frozenset({_KIND_DOCUMENT, _KIND_SNAPSHOT}),
+    _KIND_VERIFICATION_OUTCOME: frozenset({_KIND_DOCUMENT, _KIND_SNAPSHOT}),
 }
 
 
@@ -509,6 +562,14 @@ def _validate_source_label(source: str, *, max_path_depth: int) -> str:
     non-blank, bounded string without NUL or control characters. Path-shaped
     labels must stay within the configured path-depth bound and contain no
     escaping ``..`` component.
+
+    Because a label is surfaced verbatim, it must never carry a URL, DSN, or
+    embedded credential. The structural indicators ``://`` (a URL/DSN scheme
+    separator), ``@`` (a userinfo/credential separator as in
+    ``user:pass@host``), and a backslash (a path-escape separator on Windows
+    and an unusual character in a POSIX label) are rejected outright. This
+    preserves every allowed label shape (paths, dotted identifiers, hyphenated
+    slugs) while blocking the common credential-leak vectors.
     """
 
     if type(source) is not str:
@@ -516,6 +577,11 @@ def _validate_source_label(source: str, *, max_path_depth: int) -> str:
     if not source.strip() or len(source) > _MAX_SOURCE_LABEL_LENGTH:
         raise EvidenceError(CODE_EVIDENCE_INVALID_SOURCE) from None
     if "\x00" in source or any(ord(ch) < 0x20 for ch in source):
+        raise EvidenceError(CODE_EVIDENCE_INVALID_SOURCE) from None
+    # Reject URL/DSN locators and embedded credentials before any path work:
+    # ``://`` signals a scheme, ``@`` signals userinfo, and a backslash signals
+    # a path separator/escape. No safe label shape uses any of these.
+    if "://" in source or "@" in source or "\\" in source:
         raise EvidenceError(CODE_EVIDENCE_INVALID_SOURCE) from None
     if "/" in source:
         # Path-shaped label: enforce depth and reject escaping components.
@@ -1011,19 +1077,27 @@ class EvidenceStore:
     def validate_selector(self, selector: _EvidenceSelector) -> None:
         """Validate a selector against the recorded revision.
 
-        Raises :class:`EvidenceError` (``selector_stale``) when the bound
-        revision no longer matches the current revision, ``not_found`` when the
-        record is absent, and ``selector_out_of_range`` for an invalid document
-        line range.
+        Raises :class:`EvidenceError`:
+
+        * ``selector_stale`` when the bound revision/hash no longer match the
+          current revision. Comparing both defeats the A→B→A replay where the
+          content hash repeats at a later revision.
+        * ``not_found`` when the record is absent or the selector is malformed.
+        * ``selector_out_of_range`` for an inapplicable record kind, an invalid
+          document line range, or a malformed kind-specific field (e.g. a
+          non-JSON-Pointer catalog path or an unknown verification outcome).
         """
 
         if not isinstance(selector, tuple(_SELECTOR_KINDS.values())):
             raise EvidenceError(CODE_EVIDENCE_NOT_FOUND) from None
         record_id = selector.record_id
         content_hash = selector.content_hash
+        revision = selector.revision
         if type(record_id) is not str or _RECORD_ID_RE.match(record_id) is None:
             raise EvidenceError(CODE_EVIDENCE_NOT_FOUND, safe_ids=(record_id,)) from None
         if type(content_hash) is not str or _HEX64_RE.match(content_hash) is None:
+            raise EvidenceError(CODE_EVIDENCE_SELECTOR_STALE) from None
+        if type(revision) is not int or revision < 1:
             raise EvidenceError(CODE_EVIDENCE_SELECTOR_STALE) from None
         kind = selector.kind
         expected_cls = _SELECTOR_KINDS.get(kind)
@@ -1032,20 +1106,52 @@ class EvidenceStore:
         record = self._index.latest.get(record_id)
         if record is None:
             raise EvidenceError(CODE_EVIDENCE_NOT_FOUND, safe_ids=(record_id,)) from None
-        if record.content_hash != content_hash:
+        # Bind to a specific revision, not just a content hash: identical
+        # content re-added later produces a new revision whose hash repeats.
+        if record.content_hash != content_hash or record.revision != revision:
             raise EvidenceError(
                 CODE_EVIDENCE_SELECTOR_STALE, safe_ids=(record_id,)
+            ) from None
+        applicable = _SELECTOR_APPLICABLE_KINDS.get(kind)
+        if applicable is None or record.kind not in applicable:
+            raise EvidenceError(
+                CODE_EVIDENCE_SELECTOR_OUT_OF_RANGE, safe_ids=(record_id,)
             ) from None
         if isinstance(selector, DocumentLineSelector):
             self._validate_line_range(selector, record)
         else:
+            self._validate_typed_field(selector, kind, record_id)
+
+    @staticmethod
+    def _validate_typed_field(
+        selector: object, kind: str, record_id: str
+    ) -> None:
+        """Validate the kind-specific field shape for non-line selectors."""
+
+        valid: bool
+        if kind == _KIND_CATALOG_PATH:
+            value = getattr(selector, "json_path", None)
+            valid = (
+                type(value) is str
+                and len(value) <= _MAX_JSON_POINTER_LENGTH
+                and _JSON_POINTER_RE.match(value) is not None
+            )
+        elif kind == _KIND_VERIFICATION_OUTCOME:
+            value = getattr(selector, "outcome", None)
+            valid = value in _VERIFICATION_OUTCOMES
+        else:
             field_name = _SELECTOR_TEXT_FIELD.get(kind)
-            if field_name is not None:
-                value = getattr(selector, field_name)
-                if type(value) is not str or not value.strip() or len(value) > MAX_TEXT_LENGTH:
-                    raise EvidenceError(
-                        CODE_EVIDENCE_SELECTOR_OUT_OF_RANGE, safe_ids=(record_id,)
-                    ) from None
+            pattern = _SELECTOR_FIELD_RE.get(kind)
+            if field_name is None or pattern is None:
+                raise EvidenceError(
+                    CODE_EVIDENCE_NOT_FOUND, safe_ids=(record_id,)
+                ) from None
+            value = getattr(selector, field_name, None)
+            valid = type(value) is str and pattern.match(value) is not None
+        if not valid:
+            raise EvidenceError(
+                CODE_EVIDENCE_SELECTOR_OUT_OF_RANGE, safe_ids=(record_id,)
+            ) from None
 
     @staticmethod
     def _validate_line_range(
