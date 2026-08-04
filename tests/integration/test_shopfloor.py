@@ -13,6 +13,7 @@ import csv
 import json
 import re
 import sqlite3
+import subprocess
 import tempfile
 from dataclasses import replace as dataclass_replace
 from pathlib import Path
@@ -25,6 +26,7 @@ import pytest
 import yaml
 from deltalake import DeltaTable
 
+from examples.shopfloor.build_knowledge import main as build_knowledge_main
 from examples.shopfloor.generate_data import (
     DeltaDependencyError,
     ShopfloorDataPaths,
@@ -1140,3 +1142,157 @@ def test_shopfloor_policy_rejects_duplicate_json_keys(tmp_path: Path) -> None:
         issue.code == "shopfloor.query.invalid" and "duplicate key" in issue.message
         for issue in issues
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 8: on-demand knowledge build and publication safety
+# ---------------------------------------------------------------------------
+
+
+def test_build_knowledge_publishes_complete_bundle(tmp_path: Path) -> None:
+    """A clean build publishes a strict, policy-valid bundle."""
+    output = tmp_path / "knowledge"
+    assert build_knowledge_main(["--output-dir", str(output)]) == 0
+    layer = SemanticLayer.load(SHOPFLOOR_CATALOG)
+    bundle = OkfBundle.load(output, layer=layer, strict=True)
+    assert validate_shopfloor_knowledge(bundle, layer) == ()
+    assert len(
+        [
+            concept
+            for concept in bundle.concepts.values()
+            if "selayer_id" in concept.frontmatter
+        ]
+    ) == len(layer.semantic_objects())
+    assert (
+        len(
+            [
+                concept
+                for concept in bundle.concepts.values()
+                if concept.frontmatter.get("type") == "Reference"
+            ]
+        )
+        == 4
+    )
+
+
+def test_build_knowledge_rejects_nonempty_output(tmp_path: Path) -> None:
+    """A non-empty output directory must be left unchanged."""
+    output = tmp_path / "knowledge"
+    output.mkdir()
+    (output / "stale.txt").write_text("do not touch", encoding="utf-8")
+    assert build_knowledge_main(["--output-dir", str(output)]) == 1
+    assert (output / "stale.txt").read_text(encoding="utf-8") == "do not touch"
+
+
+def test_build_knowledge_rejects_file_output(tmp_path: Path) -> None:
+    """A file at the output path must be rejected."""
+    output = tmp_path / "knowledge"
+    output.write_text("not a dir", encoding="utf-8")
+    assert build_knowledge_main(["--output-dir", str(output)]) == 1
+    assert output.read_text(encoding="utf-8") == "not a dir"
+
+
+def test_build_knowledge_rejects_symlink_output(tmp_path: Path) -> None:
+    """A symbolic link at the output path must be rejected."""
+    target = tmp_path / "real"
+    target.mkdir()
+    output = tmp_path / "knowledge"
+    output.symlink_to(target)
+    assert build_knowledge_main(["--output-dir", str(output)]) == 1
+
+
+def test_build_knowledge_malformed_overlay_publishes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed overlay must exit 1 and leave no output."""
+    overlay = SHOPFLOOR_ROOT / "okf_overlays" / "metrics" / "component_count.md"
+    original = overlay.read_text(encoding="utf-8")
+    overlay.write_text("---\nbad: yaml: frontmatter\n---\n# broken", encoding="utf-8")
+    output = tmp_path / "knowledge"
+    try:
+        assert build_knowledge_main(["--output-dir", str(output)]) == 1
+        assert not output.exists()
+    finally:
+        overlay.write_text(original, encoding="utf-8")
+
+
+def test_build_knowledge_no_staging_dirs_after_success(tmp_path: Path) -> None:
+    """No candidate directories must remain after a successful build."""
+    output = tmp_path / "knowledge"
+    assert build_knowledge_main(["--output-dir", str(output)]) == 0
+    siblings = [
+        p for p in tmp_path.iterdir() if p.name.startswith(".knowledge.candidate-")
+    ]
+    assert siblings == []
+
+
+def test_build_knowledge_no_staging_dirs_after_failure(tmp_path: Path) -> None:
+    """No candidate directories must remain after a failed build."""
+    output = tmp_path / "knowledge"
+    output.mkdir()
+    (output / "blocker").write_text("x", encoding="utf-8")
+    assert build_knowledge_main(["--output-dir", str(output)]) == 1
+    siblings = [
+        p for p in tmp_path.iterdir() if p.name.startswith(".knowledge.candidate-")
+    ]
+    assert siblings == []
+
+
+def test_build_knowledge_rename_failure_cleans_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rename failure must clean up the candidate directory."""
+    output = tmp_path / "knowledge"
+    original_replace = Path.replace
+
+    def failing_replace(self: Path, target: Path) -> Path:
+        if target.name == "knowledge" and ".candidate-" in str(self):
+            raise OSError("simulated rename failure")
+        return original_replace(self, target)
+
+    import examples.shopfloor.build_knowledge as bk
+
+    monkeypatch.setattr(bk.Path, "replace", failing_replace)
+    assert build_knowledge_main(["--output-dir", str(output)]) == 1
+    assert not output.exists()
+    siblings = [
+        p for p in tmp_path.iterdir() if p.name.startswith(".knowledge.candidate-")
+    ]
+    assert siblings == []
+
+
+def test_build_knowledge_default_output_is_generated_knowledge(
+    tmp_path: Path,
+) -> None:
+    """The default output resolves to .generated/knowledge under the example."""
+    from examples.shopfloor.build_knowledge import DEFAULT_OUTPUT
+
+    assert DEFAULT_OUTPUT == SHOPFLOOR_ROOT / ".generated" / "knowledge"
+
+
+def test_build_knowledge_generated_output_is_gitignored() -> None:
+    """The generated knowledge directory must be ignored by Git."""
+    from examples.shopfloor.build_knowledge import DEFAULT_OUTPUT
+
+    result = subprocess.run(
+        ["git", "check-ignore", str(DEFAULT_OUTPUT)],
+        cwd=_REPO,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0
+
+
+def test_build_knowledge_outputs_deterministic_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Success prints deterministic sorted JSON to stdout."""
+    output = tmp_path / "knowledge"
+    assert build_knowledge_main(["--output-dir", str(output)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["command"] == "build-shopfloor-knowledge"
+    assert payload["diagnostics"] == []
+    assert payload["destination"] == str(output)
+    assert isinstance(payload["concepts"], int)
+    assert payload["concepts"] > 0

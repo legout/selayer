@@ -39,6 +39,9 @@ examples/e_commerce/data/
 # Generated shop-floor example data
 examples/shopfloor/data/
 
+# Generated shopfloor OKF knowledge
+examples/shopfloor/.generated/
+
 # Local code graph and Graphify output
 .codegraph/
 graphify-out/
