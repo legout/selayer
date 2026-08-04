@@ -14,7 +14,9 @@ import json
 import re
 import sqlite3
 import tempfile
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, cast
 
 import duckdb
@@ -30,10 +32,12 @@ from examples.shopfloor.generate_data import (
     generate_shopfloor_data,
 )
 from examples.shopfloor.generate_data import main as generate_main
+from examples.shopfloor.knowledge_policy import validate_shopfloor_knowledge
 from examples.shopfloor.run_example import _layer_for_paths, run_walkthrough
 from examples.shopfloor.run_example import main as run_main
 from selayer import QueryEngine, QueryPlanningError, SemanticLayer
 from selayer.okf import OkfBundle
+from selayer.okf.model import OkfConcept, OkfSection
 from selayer.planning.types import QueryRequest
 from selayer.verification import CompatibilityCheck, PhysicalCheck, verify
 
@@ -754,3 +758,218 @@ def test_metric_overlay_query_blocks_are_valid_and_exact(tmp_path: Path) -> None
         assert dimensions == expected, (
             f"{metric_name} dimensions {dimensions} != {expected}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 7: shopfloor knowledge policy tests
+# ---------------------------------------------------------------------------
+
+
+def _composed_shopfloor_bundle(tmp_path: Path) -> OkfBundle:
+    """Build a fully composed bundle with all references and overlays."""
+    layer = SemanticLayer.load(SHOPFLOOR_CATALOG)
+    return OkfBundle.build(
+        layer,
+        tmp_path / "knowledge",
+        references_dir=SHOPFLOOR_ROOT / "business_context",
+        overlays_dir=SHOPFLOOR_ROOT / "okf_overlays",
+    )
+
+
+def _shopfloor_layer() -> SemanticLayer:
+    return SemanticLayer.load(SHOPFLOOR_CATALOG)
+
+
+def _replace_section(
+    concept: OkfConcept,
+    title: str,
+    content: str,
+) -> OkfConcept:
+    """Return a copy of ``concept`` with section ``title`` content replaced."""
+    sections = tuple(
+        OkfSection(title=s.title, content=content if s.title == title else s.content)
+        for s in concept.sections
+    )
+    return dataclass_replace(concept, sections=sections)
+
+
+def _replace_example_request(
+    bundle: OkfBundle,
+    concept_id: str,
+    payload: dict[str, object],
+) -> OkfBundle:
+    """Return a new bundle whose metric concept's Examples has ``payload``."""
+    concept = bundle.concepts[concept_id]
+    block = "```json selayer-query\n" + json.dumps(payload) + "\n```"
+    modified = _replace_section(concept, "Examples", block)
+    concepts = dict(bundle.concepts)
+    concepts[concept_id] = modified
+    return dataclass_replace(bundle, concepts=MappingProxyType(concepts))
+
+
+def _empty_section(
+    bundle: OkfBundle,
+    concept_id: str,
+    title: str,
+) -> OkfBundle:
+    """Return a new bundle whose concept section ``title`` is emptied."""
+    concept = bundle.concepts[concept_id]
+    modified = _replace_section(concept, title, "")
+    concepts = dict(bundle.concepts)
+    concepts[concept_id] = modified
+    return dataclass_replace(bundle, concepts=MappingProxyType(concepts))
+
+
+def _remove_concept(
+    bundle: OkfBundle,
+    concept_id: str,
+) -> OkfBundle:
+    """Return a new bundle without ``concept_id``."""
+    concepts = {k: v for k, v in bundle.concepts.items() if k != concept_id}
+    return dataclass_replace(bundle, concepts=MappingProxyType(concepts))
+
+
+def test_shopfloor_policy_accepts_valid_composed_bundle(tmp_path: Path) -> None:
+    bundle = _composed_shopfloor_bundle(tmp_path)
+    layer = _shopfloor_layer()
+    issues = validate_shopfloor_knowledge(bundle, layer)
+    assert issues == ()
+
+
+def test_shopfloor_policy_rejects_unplannable_example(tmp_path: Path) -> None:
+    bundle = _composed_shopfloor_bundle(tmp_path)
+    layer = _shopfloor_layer()
+    changed = _replace_example_request(
+        bundle,
+        "metrics/average_cycle_seconds",
+        {
+            "metrics": ["average_cycle_seconds"],
+            "dimensions": ["telemetry_machine_id"],
+            "filters": {},
+        },
+    )
+    issues = validate_shopfloor_knowledge(changed, layer)
+    assert any(issue.code == "shopfloor.example.unplannable" for issue in issues)
+    assert any("metrics/average_cycle_seconds" in issue.path for issue in issues)
+
+
+def test_shopfloor_policy_rejects_missing_required_section(tmp_path: Path) -> None:
+    bundle = _composed_shopfloor_bundle(tmp_path)
+    layer = _shopfloor_layer()
+    changed = _empty_section(bundle, "sources/customer_orders", "Usage Guidance")
+    issues = validate_shopfloor_knowledge(changed, layer)
+    assert any(
+        issue.code == "shopfloor.section.missing"
+        and "sources/customer_orders" in issue.path
+        for issue in issues
+    )
+
+
+def test_shopfloor_policy_rejects_missing_selected_overlay(tmp_path: Path) -> None:
+    bundle = _composed_shopfloor_bundle(tmp_path)
+    layer = _shopfloor_layer()
+    concept = bundle.concepts["dimensions/drive_serial_number"]
+    stripped = tuple(
+        OkfSection(
+            title=s.title, content="" if s.title != "Catalog Definition" else s.content
+        )
+        for s in concept.sections
+    )
+    modified = dataclass_replace(concept, sections=stripped)
+    concepts = dict(bundle.concepts)
+    concepts["dimensions/drive_serial_number"] = modified
+    changed = dataclass_replace(bundle, concepts=MappingProxyType(concepts))
+    issues = validate_shopfloor_knowledge(changed, layer)
+    assert any(
+        issue.code == "shopfloor.overlay.missing"
+        and "dimensions/drive_serial_number" in issue.path
+        for issue in issues
+    )
+
+
+def test_shopfloor_policy_rejects_missing_query_block(tmp_path: Path) -> None:
+    bundle = _composed_shopfloor_bundle(tmp_path)
+    layer = _shopfloor_layer()
+    changed = _empty_section(bundle, "metrics/operation_count", "Examples")
+    issues = validate_shopfloor_knowledge(changed, layer)
+    assert any(
+        issue.code == "shopfloor.query.invalid" and "one query request" in issue.message
+        for issue in issues
+    )
+
+
+def test_shopfloor_policy_rejects_malformed_json(tmp_path: Path) -> None:
+    bundle = _composed_shopfloor_bundle(tmp_path)
+    layer = _shopfloor_layer()
+    concept = bundle.concepts["metrics/component_count"]
+    bad_block = "```json selayer-query\n{not valid json}\n```"
+    modified = _replace_section(concept, "Examples", bad_block)
+    concepts = dict(bundle.concepts)
+    concepts["metrics/component_count"] = modified
+    changed = dataclass_replace(bundle, concepts=MappingProxyType(concepts))
+    issues = validate_shopfloor_knowledge(changed, layer)
+    assert any(
+        issue.code == "shopfloor.query.invalid" and "not valid JSON" in issue.message
+        for issue in issues
+    )
+
+
+def test_shopfloor_policy_rejects_unknown_query_keys(tmp_path: Path) -> None:
+    bundle = _composed_shopfloor_bundle(tmp_path)
+    layer = _shopfloor_layer()
+    changed = _replace_example_request(
+        bundle,
+        "metrics/shipped_unit_count",
+        {
+            "metrics": ["shipped_unit_count"],
+            "dimensions": ["customer_region"],
+            "filters": {},
+            "evil": "drop table",
+        },
+    )
+    issues = validate_shopfloor_knowledge(changed, layer)
+    assert any(
+        issue.code == "shopfloor.query.invalid" and "invalid fields" in issue.message
+        for issue in issues
+    )
+
+
+def test_shopfloor_policy_rejects_duplicate_query_blocks(tmp_path: Path) -> None:
+    bundle = _composed_shopfloor_bundle(tmp_path)
+    layer = _shopfloor_layer()
+    block = (
+        "```json selayer-query\n"
+        '{"metrics":["rework_rate"],"dimensions":["shift"],"filters":{}}\n'
+        "```\n"
+        "```json selayer-query\n"
+        '{"metrics":["rework_rate"],"dimensions":["shift"],"filters":{}}\n'
+        "```"
+    )
+    concept = bundle.concepts["metrics/rework_rate"]
+    modified = _replace_section(concept, "Examples", block)
+    concepts = dict(bundle.concepts)
+    concepts["metrics/rework_rate"] = modified
+    changed = dataclass_replace(bundle, concepts=MappingProxyType(concepts))
+    issues = validate_shopfloor_knowledge(changed, layer)
+    assert any(
+        issue.code == "shopfloor.query.invalid" and "one query request" in issue.message
+        for issue in issues
+    )
+
+
+def test_shopfloor_policy_rejects_mixed_grain_query_as_policy_issue(
+    tmp_path: Path,
+) -> None:
+    bundle = _composed_shopfloor_bundle(tmp_path)
+    layer = _shopfloor_layer()
+    changed = _replace_example_request(
+        bundle,
+        "metrics/average_temperature_c",
+        {
+            "metrics": ["average_temperature_c", "operation_count"],
+            "dimensions": ["machine_state"],
+            "filters": {},
+        },
+    )
+    issues = validate_shopfloor_knowledge(changed, layer)
+    assert any(issue.code == "shopfloor.example.unplannable" for issue in issues)
