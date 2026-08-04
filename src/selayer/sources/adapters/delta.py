@@ -32,6 +32,7 @@ Design pillars:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any, cast
 
 import pyarrow.dataset as padataset
 import pyarrow.fs as pafs
@@ -44,6 +45,7 @@ from selayer.sources.adapters.arrow import (
 )
 from selayer.sources.base import (
     QueryBinding,
+    SourceConsistency,
     SourceHandle,
     SourceScanRequirement,
 )
@@ -89,6 +91,13 @@ class DeltaAdapter:
     ``to_pyarrow_dataset(filesystem=...)`` builds a PyArrow Dataset for DuckDB
     registration.  ``table.version()`` is the safe snapshot string.  No DuckDB
     Delta extension is used — DuckDB scans the PyArrow Dataset.
+
+    A Delta table version can be reopened by name, so every handle advertises
+    :attr:`~selayer.sources.base.SourceConsistency.REOPENABLE_SNAPSHOT`.  The
+    :meth:`reopen` method pins a specific version, letting a scan session's
+    recheck succeed even after a new version is appended — the old, pinned
+    version is reopened and its schema verified rather than compared against
+    the latest.
     """
 
     __slots__ = ()
@@ -101,48 +110,54 @@ class DeltaAdapter:
         profiles: RuntimeProfileResolver,
         arrow_providers: ArrowProviderResolver,
     ) -> SourceHandle:
-        if _DeltaTable is None:
-            # Raised outside any ``except`` scope so ``__cause__`` and
-            # ``__context__`` remain ``None``.  No location or profile value
-            # is interpolated: ``SourceDependencyError`` discards the
-            # caller-supplied message and stores only the constant generic
-            # text for ``"missing_delta_dependency"``.
-            raise SourceDependencyError(
-                source.name,
-                "missing_delta_dependency",
-                "deltalake is required for delta sources",
-            )
+        del arrow_providers  # Delta sources resolve no arrow provider
+        return self._open(source, profiles, version=None)
+
+    def reopen(
+        self,
+        source: ParsedSource,
+        profiles: RuntimeProfileResolver,
+        arrow_providers: ArrowProviderResolver,
+        snapshot_id: str | None,
+    ) -> SourceHandle:
+        """Reopen the table pinned at *snapshot_id* (a Delta version).
+
+        ``snapshot_id`` is the decimal version string recorded on the baseline
+        handle.  Opening ``DeltaTable(location, version=N)`` reacquires exactly
+        that revision, so a later append (a new version) does not invalidate a
+        session opened at the old version: recheck reopens the pinned revision
+        and verifies its schema rather than comparing against the latest.  A
+        deleted/expired version fails to reopen, surfaced by the registry as a
+        sanitized ``snapshot_mismatch``.
+        """
+
+        del arrow_providers  # Delta sources resolve no arrow provider
+        if snapshot_id is None:
+            # No version to pin: this is not a reopenable snapshot after all,
+            # so fall back to the latest rather than fabricating a revision.
+            return self._open(source, profiles, version=None)
+        return self._open(source, profiles, version=_parse_version(snapshot_id))
+
+    def _open(
+        self,
+        source: ParsedSource,
+        profiles: RuntimeProfileResolver,
+        *,
+        version: int | None,
+    ) -> SourceHandle:
         connector = source.connector
         assert isinstance(connector, DeltaConfig)
 
-        credential_profile = connector.credential_profile
-        location = connector.location
-
-        if credential_profile is not None:
-            profile = profiles.resolve(credential_profile, source_id=source.name)
-            storage_options = _delta_storage_options(profile)
-            base_filesystem = s3_filesystem(profile)
-            # Root the filesystem at the table's bucket/prefix.  The wrapped
-            # S3FileSystem owns the ``s3://`` scheme/host, so the root is a
-            # clean ``bucket/prefix`` path and the relative file paths stored
-            # in the Delta log resolve against it.  A local path is returned
-            # unchanged (trailing slash stripped) so local behavior is
-            # preserved exactly.
-            root = _s3_root_path(location)
-            filesystem = pafs.SubTreeFileSystem(root, base_filesystem)
-            # The DeltaTable reads the transaction log via its own storage
-            # backend; ``storage_options`` carry the resolved credentials.
-            # For a local path the options are harmlessly ignored.
-            table = _DeltaTable(location, storage_options=storage_options)
-        else:
-            filesystem = None
-            table = _DeltaTable(location)
+        table, filesystem = _resolve_delta_table(
+            connector, profiles, source.name, version=version
+        )
 
         # Build the Dataset from the Delta log's physical schema (no declared
         # override) so ``inspect_schema`` observes the physical types and any
         # drift is caught by ``compare_schemas`` before registration.
-        dataset = table.to_pyarrow_dataset(filesystem=filesystem)
-        snapshot = str(table.version())
+        delta_table = cast(Any, table)
+        dataset = delta_table.to_pyarrow_dataset(filesystem=filesystem)
+        snapshot = str(delta_table.version())
 
         return SourceHandle(
             source_id=source.name,
@@ -151,6 +166,7 @@ class DeltaAdapter:
             schema=source.schema,
             snapshot=snapshot,
             query_scoped=False,
+            consistency=SourceConsistency.REOPENABLE_SNAPSHOT,
         )
 
     # -- schema inspection -------------------------------------------------
@@ -170,7 +186,7 @@ class DeltaAdapter:
     ) -> None:
         resource = handle.resource
         assert isinstance(resource, _DeltaResource)
-        connection.register(stable_name, resource.dataset)  # type: ignore[attr-defined]
+        cast(Any, connection).register(stable_name, resource.dataset)
 
     # -- query binding -----------------------------------------------------
 
@@ -200,6 +216,77 @@ class DeltaAdapter:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _parse_version(snapshot_id: str) -> int:
+    """Parse a Delta version snapshot token into an ``int``.
+
+    The snapshot token is ``str(table.version())`` — a non-negative decimal
+    integer.  A non-decimal value (never produced by this adapter) is
+    rejected with a constant message so no token text surfaces.
+    """
+
+    if type(snapshot_id) is not str or not snapshot_id.isdigit():
+        raise ValueError("invalid delta version")
+    try:
+        return int(snapshot_id)
+    except (TypeError, ValueError):
+        raise ValueError("invalid delta version") from None
+
+
+def _resolve_delta_table(
+    connector: DeltaConfig,
+    profiles: RuntimeProfileResolver,
+    source_id: str,
+    *,
+    version: int | None,
+) -> tuple[Any, pafs.FileSystem | None]:
+    """Open a (version-pinned) ``DeltaTable`` and its PyArrow filesystem.
+
+    Shared by :meth:`DeltaAdapter.prepare` (``version=None`` for latest) and
+    :meth:`DeltaAdapter.reopen` (``version`` pinned to a baseline snapshot).
+    Returns the open ``DeltaTable`` and the filesystem to pass to
+    ``to_pyarrow_dataset`` (``None`` for local paths).  Raises a sanitized
+    :class:`SourceDependencyError` when ``deltalake`` is not installed,
+    outside any ``except`` scope so ``__cause__``/``__context__`` remain
+    ``None``.
+    """
+
+    if _DeltaTable is None:
+        raise SourceDependencyError(
+            source_id,
+            "missing_delta_dependency",
+            "deltalake is required for delta sources",
+        )
+    delta_table = cast(Any, _DeltaTable)
+    location = connector.location
+    credential_profile = connector.credential_profile
+    if credential_profile is not None:
+        profile = profiles.resolve(credential_profile, source_id=source_id)
+        storage_options = _delta_storage_options(profile)
+        base_filesystem = s3_filesystem(profile)
+        # Root the filesystem at the table's bucket/prefix.  The wrapped
+        # S3FileSystem owns the ``s3://`` scheme/host, so the root is a
+        # clean ``bucket/prefix`` path and the relative file paths stored
+        # in the Delta log resolve against it.  A local path is returned
+        # unchanged (trailing slash stripped) so local behavior is
+        # preserved exactly.
+        root = _s3_root_path(location)
+        filesystem: pafs.FileSystem | None = pafs.SubTreeFileSystem(
+            root, base_filesystem
+        )
+        # The DeltaTable reads the transaction log via its own storage
+        # backend; ``storage_options`` carry the resolved credentials.
+        # For a local path the options are harmlessly ignored.
+        table = delta_table(
+            location, storage_options=storage_options, version=version
+        )
+    else:
+        filesystem = None
+        table = delta_table(location) if version is None else delta_table(
+            location, version=version
+        )
+    return table, filesystem
 
 
 def _s3_root_path(location: str) -> str:

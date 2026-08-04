@@ -27,8 +27,11 @@ Design pillars:
 
 from __future__ import annotations
 
+import hashlib
+import os
 from collections.abc import Callable
 from contextlib import suppress
+from pathlib import Path
 from urllib.parse import urlparse
 
 import pyarrow as pa
@@ -43,6 +46,7 @@ except ImportError:  # pragma: no cover - exercised only without the s3 extra
 
 from selayer.sources.base import (
     QueryBinding,
+    SourceConsistency,
     SourceHandle,
     SourceScanRequirement,
 )
@@ -111,13 +115,24 @@ class ArrowDatasetAdapter:
             resource = _csv_dataset(connector, arrow_schema, filesystem, path)
         else:  # pragma: no cover - registry only dispatches these kinds
             raise TypeError(f"ArrowDatasetAdapter does not serve connector {kind!r}")
+        # Local file sets carry a content digest over sorted physical files
+        # and are reopenable: the same digest can be reacquired by re-reading
+        # the files.  Remote (credential-profile-backed) objects are
+        # unversioned and remain LIVE in version 1.
+        snapshot = _local_content_snapshot(connector, source.name)
+        consistency = (
+            SourceConsistency.REOPENABLE_SNAPSHOT
+            if snapshot is not None
+            else SourceConsistency.LIVE
+        )
         return SourceHandle(
             source_id=source.name,
             connector=kind,
             resource=resource,
             schema=source.schema,
-            snapshot=None,
+            snapshot=snapshot,
             query_scoped=False,
+            consistency=consistency,
         )
 
     # -- schema inspection -------------------------------------------------
@@ -162,6 +177,109 @@ class ArrowDatasetAdapter:
         if closer is not None:
             with suppress(Exception):
                 closer()
+
+
+# ---------------------------------------------------------------------------
+# Local content fingerprints
+# ---------------------------------------------------------------------------
+
+# Read chunk size for streaming file content into the digest.
+_DIGEST_CHUNK = 65536
+
+
+def _local_content_snapshot(
+    connector: ParquetConfig | CsvConfig, source_id: str
+) -> str | None:
+    """Return a content digest over sorted local physical files, or ``None``.
+
+    For a local file set (no ``credential_profile``) the snapshot is a SHA-256
+    digest over every physical file's content, keyed by its sorted relative
+    path.  The digest is stable across prepares for unchanged content and
+    changes deterministically when files are added, removed, or modified.
+
+    Returns ``None`` when the connector is remote (``credential_profile`` set)
+    or the local path cannot be enumerated — remote objects remain LIVE in
+    version 1 because they cannot be content-digested without a network
+    round-trip.  The source location never appears in the returned digest;
+    only file *contents* and *relative* paths are hashed.
+    """
+
+    if connector.credential_profile is not None:
+        return None
+    location = connector.location
+    files = _enumerate_local_files(location)
+    if not files:
+        return None
+    base = _digest_base(location)
+    digest = hashlib.sha256()
+    for file_path in sorted(files, key=lambda p: str(p.relative_to(base))):
+        rel = str(file_path.relative_to(base))
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\x00")
+        _hash_file_content(digest, file_path)
+    return digest.hexdigest()
+
+
+def _enumerate_local_files(location: str) -> list[Path]:
+    """Return the sorted physical files referenced by a local *location*.
+
+    Handles a single file, a directory (recursive), and a glob pattern.  An
+    unreadable or nonexistent path yields an empty list so the caller falls
+    back to LIVE.
+    """
+
+    import glob as _glob
+
+    path = Path(location)
+    if path.is_file():
+        return [path]
+    if path.is_dir():
+        return [p for p in path.rglob("*") if p.is_file()]
+    # Glob pattern (e.g. ``data/*.parquet``).  Use Python's ``glob`` which
+    # honours ``*`` / ``?`` / ``[`` / recursive ``**``.
+    matched = _glob.glob(location, recursive=True)
+    result = [Path(m) for m in matched if os.path.isfile(m)]
+    return result
+
+
+def _digest_base(location: str) -> Path:
+    """Return the base directory for computing relative paths in the digest.
+
+    For a single file the base is its parent directory; for a directory the
+    base is the directory itself; for a glob the base is the longest
+    non-glob prefix.
+    """
+
+    path = Path(location)
+    if path.is_dir():
+        return path
+    if path.is_file():
+        return path.parent
+    # Glob: walk up to the first component without glob metacharacters.
+    parts = path.parts
+    base_parts: list[str] = []
+    for part in parts:
+        if any(c in part for c in "*?["):
+            break
+        base_parts.append(part)
+    if not base_parts:
+        return Path(".")
+    return Path(*base_parts) if len(base_parts) > 1 else Path(base_parts[0])
+
+
+def _hash_file_content(digest: hashlib._Hash, file_path: Path) -> None:
+    """Stream a file's content into *digest* in fixed-size chunks."""
+
+    try:
+        with open(file_path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(_DIGEST_CHUNK), b""):
+                digest.update(chunk)
+    except OSError:
+        # If the file cannot be read (permissions, race), include a sentinel
+        # so the digest is still deterministic and differs from a readable
+        # file — the caller treats ``None`` (empty file set) as LIVE, but a
+        # readable-but-now-unreadable file still produces a non-``None`` digest.
+        digest.update(b"\x01<unreadable>")
 
 
 # ---------------------------------------------------------------------------

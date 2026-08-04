@@ -153,6 +153,41 @@ def test_delta_reload_publishes_latest_snapshot(
         assert engine.query(["total_value"])["total_value"].item() == 30
 
 
+def test_delta_reopen_pins_original_version(
+    tmp_path: Path,
+    profiles: RuntimeProfileResolver,
+    providers: ArrowProviderResolver,
+) -> None:
+    location = tmp_path / "events.delta"
+    write_deltalake(location, _events_table({"id": [1], "value": [10]}))
+    source = ParsedSource(
+        name="events",
+        connector=DeltaConfig(str(location)),
+        schema=_events_schema(),
+        grain=("id",),
+    )
+    adapter = DeltaAdapter()
+    baseline = adapter.prepare(source, profiles, providers)
+    assert baseline.consistency.value == "reopenable_snapshot"
+    assert baseline.snapshot is not None
+
+    write_deltalake(
+        location,
+        _events_table({"id": [2], "value": [20]}),
+        mode="append",
+    )
+    reopened = adapter.reopen(source, profiles, providers, baseline.snapshot)
+    connection = duckdb.connect(":memory:")
+    try:
+        adapter.register(connection, "events", reopened)
+        assert connection.execute('SELECT sum("value") FROM "events"').fetchone() == (10,)
+        assert reopened.snapshot == baseline.snapshot
+    finally:
+        adapter.close(reopened)
+        adapter.close(baseline)
+        connection.close()
+
+
 # ---------------------------------------------------------------------------
 # Registers a pyarrow Dataset
 # ---------------------------------------------------------------------------

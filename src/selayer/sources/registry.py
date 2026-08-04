@@ -1079,7 +1079,62 @@ class SourceRegistry:
             )
         adapter = registration.adapter
         source = self._sources[source_id]
-        candidate: SourceHandle | None = None
+
+        # Versioned adapters can reacquire the exact baseline revision even
+        # after the source has advanced.  Prefer that path over preparing the
+        # latest candidate; content-digest adapters intentionally fall through
+        # to the normal prepare-and-compare path below.
+        reopen = getattr(adapter, "reopen", None)
+        if (
+            baseline_consistency is SourceConsistency.REOPENABLE_SNAPSHOT
+            and baseline_snapshot_id is not None
+            and callable(reopen)
+        ):
+            candidate: SourceHandle | None = None
+            observed: TableSchema | None = None
+            reopen_failed = False
+            try:
+                reopened = reopen(
+                    source,
+                    self._profiles,
+                    self._arrow_providers,
+                    baseline_snapshot_id,
+                )
+                if not isinstance(reopened, SourceHandle):
+                    raise TypeError("adapter returned an invalid handle")
+                candidate = reopened
+                observed = adapter.inspect_schema(candidate)
+            except Exception:  # noqa: BLE001 - sanitize all reopen failures
+                reopen_failed = True
+            if reopen_failed or candidate is None or observed is None:
+                if candidate is not None:
+                    close_quietly(adapter, candidate)
+                raise SourceConnectionError(
+                    source_id,
+                    "snapshot_mismatch",
+                    "the source snapshot has changed",
+                )
+            try:
+                fresh_fingerprint = schema_fingerprint(observed)
+                if (
+                    candidate.consistency is not baseline_consistency
+                    or candidate.snapshot != baseline_snapshot_id
+                    or fresh_fingerprint != baseline_schema_fingerprint
+                ):
+                    raise SourceConnectionError(
+                        source_id,
+                        "snapshot_mismatch",
+                        "the source snapshot has changed",
+                    )
+                return SourceSnapshot(
+                    consistency=baseline_consistency,
+                    snapshot_id=baseline_snapshot_id,
+                    schema_fingerprint=fresh_fingerprint,
+                )
+            finally:
+                close_quietly(adapter, candidate)
+
+        candidate = None
         observed: TableSchema | None = None
         preparation_failure: _CandidatePreparationFailed | None = None
         try:

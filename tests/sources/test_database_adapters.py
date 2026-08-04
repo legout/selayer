@@ -32,6 +32,7 @@ from selayer.sources.adapters.database import (
     SqliteAdapter,
     _quote_relation,
 )
+from selayer.sources.base import SourceConsistency
 from selayer.sources.catalog import ParsedSource
 from selayer.sources.config import DuckDbConfig, PostgresConfig, SqliteConfig
 from selayer.sources.errors import (
@@ -719,3 +720,108 @@ def test_database_errors_hide_location_and_dsn(tmp_path: Path) -> None:
         QueryEngine(_postgres_layer("warehouse", "public.facts"), profiles=profiles)
     assert pg_caught.value.code == "source_initialization_failed"
     _assert_no_secret_leak(pg_caught.value, secret_user, secret_pw)
+
+
+# ---------------------------------------------------------------------------
+# Task 5: consistency modes and safe snapshot tokens
+# ---------------------------------------------------------------------------
+
+
+def test_sqlite_is_reopenable_with_file_digest(
+    tmp_path: Path,
+) -> None:
+    """A local SQLite file is REOPENABLE_SNAPSHOT with a file content digest.
+
+    The digest is the SHA-256 of the database file content — never the file
+    location.  It is stable across prepares and changes when the file content
+    changes.
+    """
+
+    sqlite_path = tmp_path / "SECRET_db" / "reference.sqlite"
+    sqlite_path.parent.mkdir(parents=True)
+    with sqlite3.connect(sqlite_path) as connection:
+        connection.execute('create table codes (code text, "value" integer)')
+        connection.execute("insert into codes values ('A', 1)")
+
+    source = ParsedSource(
+        name="codes",
+        connector=SqliteConfig(str(sqlite_path), "codes"),
+        schema=_codes_schema(),
+        grain=("code",),
+    )
+    adapter = SqliteAdapter()
+    handle = adapter.prepare(source, _empty_profiles(), _empty_providers())
+
+    assert handle.consistency is SourceConsistency.REOPENABLE_SNAPSHOT
+    assert handle.snapshot is not None
+    assert all(c in "0123456789abcdef" for c in handle.snapshot)
+    assert "SECRET_db" not in handle.snapshot
+    assert str(sqlite_path) not in handle.snapshot
+    adapter.close(handle)
+
+
+def test_sqlite_file_digest_changes_on_content_change(
+    tmp_path: Path,
+) -> None:
+    """The SQLite file digest changes when the database content changes."""
+
+    sqlite_path = tmp_path / "reference.sqlite"
+    with sqlite3.connect(sqlite_path) as connection:
+        connection.execute('create table codes (code text, "value" integer)')
+        connection.execute("insert into codes values ('A', 1)")
+
+    source = ParsedSource(
+        name="codes",
+        connector=SqliteConfig(str(sqlite_path), "codes"),
+        schema=_codes_schema(),
+        grain=("code",),
+    )
+    adapter = SqliteAdapter()
+    digest1 = adapter.prepare(source, _empty_profiles(), _empty_providers()).snapshot
+
+    with sqlite3.connect(sqlite_path) as connection:
+        connection.execute("insert into codes values ('B', 2)")
+        connection.commit()
+
+    digest2 = adapter.prepare(source, _empty_profiles(), _empty_providers()).snapshot
+    assert digest1 != digest2
+
+
+def test_duckdb_is_reopenable_with_file_digest(
+    tmp_path: Path,
+) -> None:
+    """A local DuckDB file is REOPENABLE_SNAPSHOT with a file content digest."""
+
+    duckdb_path = tmp_path / "SECRET_loc" / "facts.duckdb"
+    duckdb_path.parent.mkdir(parents=True)
+    with duckdb.connect(str(duckdb_path)) as connection:
+        connection.execute(
+            'create table facts as select 1::bigint id, 10::bigint "value"'
+        )
+
+    source = ParsedSource(
+        name="facts",
+        connector=DuckDbConfig(str(duckdb_path), "facts"),
+        schema=_facts_schema(),
+        grain=("id",),
+    )
+    adapter = DuckDbAdapter()
+    handle = adapter.prepare(source, _empty_profiles(), _empty_providers())
+
+    assert handle.consistency is SourceConsistency.REOPENABLE_SNAPSHOT
+    assert handle.snapshot is not None
+    assert all(c in "0123456789abcdef" for c in handle.snapshot)
+    assert "SECRET_loc" not in handle.snapshot
+    adapter.close(handle)
+
+
+def test_postgres_is_live() -> None:
+    """A PostgreSQL source is LIVE in version 1 (no pinned transaction).
+
+    The DuckDB-backed adapter does not expose one pinned repeatable-read
+    transaction through the scan session, so Postgres remains LIVE.
+    """
+
+    # The class attribute marks Postgres as non-reopenable; the adapter's
+    # ``prepare`` builds a handle with LIVE consistency and no snapshot.
+    assert dbmod.PostgresAdapter._reopenable_snapshot is False

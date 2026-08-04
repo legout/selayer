@@ -44,6 +44,7 @@ import pyarrow as pa
 
 from selayer.sources.base import (
     QueryBinding,
+    SourceConsistency,
     SourceFilter,
     SourceHandle,
     SourceScanRequirement,
@@ -73,13 +74,21 @@ __all__ = ["IcebergAdapter"]
 class _IcebergResource:
     """Internal record holding a PyIceberg table handle.
 
-    Both fields are ``repr=False`` so no resource object can surface in
+    Both resource fields are ``repr=False`` so no resource object can surface in
     diagnostics.  The catalog and table are retained so :meth:`close` can
     release them and :meth:`bind_query` can create per-query scans.
+
+    ``snapshot_schema`` carries the Arrow schema of a *specific* pinned
+    snapshot (set by :meth:`IcebergAdapter.reopen`), so :meth:`inspect_schema`
+    reports that revision's schema rather than the table's current schema.
+    When ``None`` (a fresh ``prepare``), :meth:`inspect_schema` falls back to
+    ``table.schema().as_arrow()`` — the current schema, which equals the pinned
+    snapshot's schema because ``prepare`` records the current snapshot.
     """
 
     catalog: object = field(repr=False)
     table: object = field(repr=False)
+    snapshot_schema: pa.Schema | None = field(repr=False, default=None)
 
 
 class IcebergAdapter:
@@ -101,23 +110,19 @@ class IcebergAdapter:
         profiles: RuntimeProfileResolver,
         arrow_providers: ArrowProviderResolver,
     ) -> SourceHandle:
-        if _load_catalog is None:
-            # Raised outside any ``except`` scope so ``__cause__`` and
-            # ``__context__`` remain ``None``.
-            raise SourceDependencyError(
-                source.name,
-                "missing_iceberg_dependency",
-                "pyiceberg is required for iceberg sources",
-            )
-        connector = source.connector
-        assert isinstance(connector, IcebergConfig)
-
-        profile = profiles.resolve(connector.catalog_profile, source_id=source.name)
-        config = _catalog_config(profile)
-        catalog = _load_catalog(connector.catalog_profile, **config)
-        table = catalog.load_table((*connector.namespace, connector.table))  # type: ignore[attr-defined]
+        del arrow_providers  # Iceberg sources resolve no arrow provider
+        catalog, table = _load_table(source, profiles)
         snapshot = _safe_snapshot_id(table)
-
+        # A table with a current snapshot ID can be re-opened at that exact
+        # revision via ``reopen`` (a PyIceberg snapshot-id scan).  A table with
+        # no current snapshot (empty / metadata-only) cannot be pinned, so it
+        # advertises ``LIVE`` rather than claiming a reopenable revision it
+        # cannot reacquire.
+        consistency = (
+            SourceConsistency.REOPENABLE_SNAPSHOT
+            if snapshot is not None
+            else SourceConsistency.LIVE
+        )
         return SourceHandle(
             source_id=source.name,
             connector="iceberg",
@@ -125,6 +130,50 @@ class IcebergAdapter:
             schema=source.schema,
             snapshot=snapshot,
             query_scoped=True,
+            consistency=consistency,
+        )
+
+    # -- reopen ------------------------------------------------------------
+
+    def reopen(
+        self,
+        source: ParsedSource,
+        profiles: RuntimeProfileResolver,
+        arrow_providers: ArrowProviderResolver,
+        snapshot_id: str | None,
+    ) -> SourceHandle:
+        """Reopen the table pinned at *snapshot_id* (a PyIceberg snapshot ID).
+
+        ``snapshot_id`` is the decimal snapshot-ID string recorded on the
+        baseline handle.  The table is reloaded and the snapshot's schema is
+        captured into the resource's ``snapshot_schema`` so
+        :meth:`inspect_schema` reports *that* revision's schema rather than the
+        table's current schema.  Reloading a fresh candidate table (rather than
+        reusing the published table handle) keeps the published generation
+        untouched, mirroring the candidate-first invariant the registry relies
+        on.  A deleted/expired snapshot ID (one no longer present in the
+        table's metadata) raises a constant ``ValueError`` so the registry can
+        surface a sanitized ``snapshot_mismatch`` — the session's pinned
+        revision can no longer be reacquired.
+        """
+
+        if snapshot_id is None:
+            # No revision to pin: this is not a reopenable snapshot after all,
+            # so fall back to the latest rather than fabricating a revision.
+            return self.prepare(source, profiles, arrow_providers)
+        del arrow_providers  # Iceberg sources resolve no arrow provider
+        catalog, table = _load_table(source, profiles)
+        pinned_schema = _snapshot_arrow_schema(table, snapshot_id)
+        return SourceHandle(
+            source_id=source.name,
+            connector="iceberg",
+            resource=_IcebergResource(
+                catalog=catalog, table=table, snapshot_schema=pinned_schema
+            ),
+            schema=source.schema,
+            snapshot=snapshot_id,
+            query_scoped=True,
+            consistency=SourceConsistency.REOPENABLE_SNAPSHOT,
         )
 
     # -- schema inspection -------------------------------------------------
@@ -132,6 +181,14 @@ class IcebergAdapter:
     def inspect_schema(self, handle: SourceHandle) -> TableSchema:
         resource = handle.resource
         assert isinstance(resource, _IcebergResource)
+        # A reopened handle carries the pinned snapshot's Arrow schema so the
+        # reported schema matches *that* revision rather than the table's
+        # current schema.  A fresh ``prepare`` leaves ``snapshot_schema`` as
+        # ``None`` and falls back to ``table.schema().as_arrow()`` — the
+        # current schema, which equals the pinned snapshot's schema because
+        # ``prepare`` records the current snapshot.
+        if resource.snapshot_schema is not None:
+            return table_schema_from_arrow(resource.snapshot_schema)
         raw_schema = resource.table.schema().as_arrow()  # type: ignore[attr-defined]
         return table_schema_from_arrow(_normalize_arrow_schema(raw_schema))
 
@@ -255,6 +312,25 @@ def _catalog_config(profile: object) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
+def _load_table(
+    source: ParsedSource, profiles: RuntimeProfileResolver
+) -> tuple[object, object]:
+    """Load an Iceberg catalog/table without exposing profile values."""
+    if _load_catalog is None:
+        raise SourceDependencyError(
+            source.name,
+            "missing_iceberg_dependency",
+            "pyiceberg is required for iceberg sources",
+        )
+    connector = source.connector
+    assert isinstance(connector, IcebergConfig)
+    profile = profiles.resolve(connector.catalog_profile, source_id=source.name)
+    config = _catalog_config(profile)
+    catalog = _load_catalog(connector.catalog_profile, **config)
+    table = catalog.load_table((*connector.namespace, connector.table))  # type: ignore[attr-defined]
+    return catalog, table
+
+
 def _safe_snapshot_id(table: object) -> str | None:
     """Return the current snapshot ID as a ``str``, or ``None`` when absent."""
 
@@ -265,6 +341,30 @@ def _safe_snapshot_id(table: object) -> str | None:
     if snapshot_id is None:
         return None
     return str(snapshot_id)
+
+
+def _snapshot_arrow_schema(table: object, snapshot_id: str) -> pa.Schema:
+    """Return the normalized Arrow schema recorded by one snapshot."""
+    metadata = getattr(table, "metadata", None)
+    snapshots = getattr(metadata, "snapshots", ()) if metadata is not None else ()
+    for snapshot in snapshots:
+        if str(getattr(snapshot, "snapshot_id", "")) != snapshot_id:
+            continue
+        schema_id = getattr(snapshot, "schema_id", None)
+        if schema_id is None:
+            return _normalize_arrow_schema(table.schema().as_arrow())  # type: ignore[attr-defined]
+        schema_by_id = getattr(metadata, "schema_by_id", None)
+        if not callable(schema_by_id):
+            raise TypeError("snapshot schema is unavailable")
+        schema = schema_by_id(schema_id)
+        as_arrow = getattr(schema, "as_arrow", None)
+        if not callable(as_arrow):
+            raise TypeError("snapshot schema is unavailable")
+        raw_schema = as_arrow()
+        if not isinstance(raw_schema, pa.Schema):
+            raise TypeError("snapshot schema is unavailable")
+        return _normalize_arrow_schema(raw_schema)
+    raise ValueError("snapshot not found")
 
 
 # ---------------------------------------------------------------------------
@@ -417,8 +517,9 @@ def _iceberg_row_filter(
             values = value
             if isinstance(values, tuple) and values:
                 literals = [_iceberg_literal(v) for v in values]
-                if all(lit is not None for lit in literals):
-                    joined = ", ".join(literals)  # type: ignore[arg-type]
+                non_null_literals = [lit for lit in literals if lit is not None]
+                if len(non_null_literals) == len(literals):
+                    joined = ", ".join(non_null_literals)
                     parts.append(f"{column} IN ({joined})")
         elif operator == "ge":
             lit = _iceberg_literal(value)

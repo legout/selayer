@@ -23,6 +23,7 @@ from selayer.query import QueryEngine
 from selayer.sources.adapters.arrow import ArrowDatasetAdapter
 from selayer.sources.base import (
     QueryBinding,
+    SourceConsistency,
     SourceHandle,
     SourceScanRequirement,
 )
@@ -772,3 +773,269 @@ def test_parquet_with_credential_profile_uses_s3_filesystem(
     assert connection.execute('SELECT sum("amount") FROM "orders"').fetchone() == (60,)
     adapter.close(handle)
     connection.close()
+
+
+# ---------------------------------------------------------------------------
+# Task 5: consistency modes and safe snapshot tokens
+# ---------------------------------------------------------------------------
+
+
+def test_local_parquet_is_reopenable_with_content_digest(
+    tmp_path: Path,
+    profiles: RuntimeProfileResolver,
+    providers: ArrowProviderResolver,
+) -> None:
+    """A local parquet file is REOPENABLE_SNAPSHOT with a content digest token.
+
+    The snapshot is a hex content digest over the physical file(s) — never the
+    file location.  The digest is stable across prepares and changes when the
+    content changes.
+    """
+
+    path = tmp_path / "orders_secret_loc" / "orders.parquet"
+    path.parent.mkdir()
+    pq.write_table(
+        pa.table(
+            {
+                "id": pa.array([1, 2, 3], pa.int64()),
+                "amount": pa.array([5, 15, 3], pa.int64()),
+            },
+            schema=pa.schema(
+                [
+                    pa.field("id", pa.int64(), nullable=False),
+                    pa.field("amount", pa.int64(), nullable=False),
+                ]
+            ),
+        ),
+        path,
+    )
+    source = ParsedSource(
+        name="orders",
+        connector=ParquetConfig(str(path)),
+        schema=_orders_schema(),
+        grain=("id",),
+    )
+    adapter = ArrowDatasetAdapter()
+    handle = adapter.prepare(source, profiles, providers)
+
+    assert handle.consistency is SourceConsistency.REOPENABLE_SNAPSHOT
+    assert handle.snapshot is not None
+    # The snapshot is a hex digest, not the file location.
+    assert all(c in "0123456789abcdef" for c in handle.snapshot)
+    assert "secret_loc" not in handle.snapshot
+    assert str(path) not in handle.snapshot
+
+    # Stable across prepares.
+    handle2 = adapter.prepare(source, profiles, providers)
+    assert handle2.snapshot == handle.snapshot
+    adapter.close(handle)
+    adapter.close(handle2)
+
+
+def test_local_parquet_digest_changes_on_content_change(
+    tmp_path: Path,
+    profiles: RuntimeProfileResolver,
+    providers: ArrowProviderResolver,
+) -> None:
+    """The content digest changes when the underlying file content changes."""
+
+    path = tmp_path / "orders.parquet"
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("amount", pa.int64(), nullable=False),
+        ]
+    )
+    pq.write_table(
+        pa.Table.from_arrays(
+            [pa.array([1, 2, 3], pa.int64()), pa.array([5, 15, 3], pa.int64())],
+            schema=schema,
+        ),
+        path,
+    )
+    source = ParsedSource(
+        name="orders",
+        connector=ParquetConfig(str(path)),
+        schema=_orders_schema(),
+        grain=("id",),
+    )
+    adapter = ArrowDatasetAdapter()
+    digest1 = adapter.prepare(source, profiles, providers).snapshot
+
+    # Overwrite with different content (same schema).
+    pq.write_table(
+        pa.Table.from_arrays(
+            [pa.array([1, 2, 3], pa.int64()), pa.array([9, 9, 9], pa.int64())],
+            schema=schema,
+        ),
+        path,
+    )
+    digest2 = adapter.prepare(source, profiles, providers).snapshot
+
+    assert digest1 != digest2
+
+
+def test_local_csv_is_reopenable_with_content_digest(
+    tmp_path: Path,
+    profiles: RuntimeProfileResolver,
+    providers: ArrowProviderResolver,
+) -> None:
+    """A local csv file is REOPENABLE_SNAPSHOT with a content digest token."""
+
+    path = tmp_path / "events.csv"
+    path.write_text("id,amount\n1,10\n2,20\n3,30\n", encoding="utf-8")
+    source = ParsedSource(
+        name="events",
+        connector=CsvConfig(str(path)),
+        schema=TableSchema(
+            (
+                FieldSchema("id", ScalarType("int64"), True),
+                FieldSchema("amount", ScalarType("int64"), True),
+            )
+        ),
+        grain=("id",),
+    )
+    adapter = ArrowDatasetAdapter()
+    handle = adapter.prepare(source, profiles, providers)
+
+    assert handle.consistency is SourceConsistency.REOPENABLE_SNAPSHOT
+    assert handle.snapshot is not None
+    assert all(c in "0123456789abcdef" for c in handle.snapshot)
+    assert str(path) not in handle.snapshot
+    adapter.close(handle)
+
+
+def test_local_parquet_directory_digests_sorted_files(
+    tmp_path: Path,
+    profiles: RuntimeProfileResolver,
+    providers: ArrowProviderResolver,
+) -> None:
+    """A local parquet directory produces a digest over sorted physical files.
+
+    Adding a file changes the digest; the digest is independent of file
+    enumeration order.
+    """
+
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("amount", pa.int64(), nullable=False),
+        ]
+    )
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    pq.write_table(
+        pa.Table.from_arrays(
+            [pa.array([1], pa.int64()), pa.array([10], pa.int64())], schema=schema
+        ),
+        data_dir / "a.parquet",
+    )
+    declared = TableSchema(
+        (
+            FieldSchema("id", ScalarType("int64"), False),
+            FieldSchema("amount", ScalarType("int64"), False),
+        )
+    )
+    source = ParsedSource(
+        name="orders",
+        connector=ParquetConfig(str(data_dir)),
+        schema=declared,
+        grain=("id",),
+    )
+    adapter = ArrowDatasetAdapter()
+    digest1 = adapter.prepare(source, profiles, providers).snapshot
+
+    # Adding a second file changes the digest.
+    pq.write_table(
+        pa.Table.from_arrays(
+            [pa.array([2], pa.int64()), pa.array([20], pa.int64())], schema=schema
+        ),
+        data_dir / "b.parquet",
+    )
+    digest2 = adapter.prepare(source, profiles, providers).snapshot
+    assert digest1 != digest2
+    assert digest2 is not None
+
+
+def test_remote_parquet_with_credential_profile_is_live(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """A parquet source with a ``credential_profile`` is LIVE (unversioned remote).
+
+    Remote objects cannot be content-digested at prepare time without a network
+    round-trip, so they remain LIVE in version 1.
+    """
+
+    import pyarrow.fs as pafs
+
+    bucket_dir = tmp_path / "mybucket"
+    bucket_dir.mkdir()
+    table = pa.table(
+        {
+            "id": pa.array([1], pa.int64()),
+            "amount": pa.array([10], pa.int64()),
+        },
+        schema=pa.schema(
+            [
+                pa.field("id", pa.int64(), nullable=False),
+                pa.field("amount", pa.int64(), nullable=False),
+            ]
+        ),
+    )
+    pq.write_table(table, bucket_dir / "data.parquet")
+    subtree = pafs.SubTreeFileSystem(str(tmp_path), pafs.LocalFileSystem())
+    monkeypatch.setattr(
+        "selayer.sources.adapters.arrow.s3_filesystem",
+        lambda _profile: subtree,
+    )
+    source = ParsedSource(
+        name="orders",
+        connector=ParquetConfig(
+            "s3://mybucket/data.parquet",
+            credential_profile="s3_profile",
+        ),
+        schema=_orders_schema(),
+        grain=("id",),
+    )
+    profiles = MappingProfileResolver(
+        {"s3_profile": {"access_key": "AKIA", "secret_key": "shh"}}
+    )
+    adapter = ArrowDatasetAdapter()
+    handle = adapter.prepare(source, profiles, MappingArrowProviderResolver({}))
+
+    assert handle.consistency is SourceConsistency.LIVE
+    assert handle.snapshot is None
+    adapter.close(handle)
+
+
+def test_pyarrow_provider_is_live() -> None:
+    """A programmatic pyarrow source is LIVE (no stable snapshot in version 1)."""
+
+    def provider() -> ArrowObject:
+        return pa.table(
+            {
+                "id": pa.array([1], pa.int64()),
+                "value": pa.array([1], pa.int64()),
+            },
+            schema=pa.schema(
+                [
+                    pa.field("id", pa.int64(), nullable=False),
+                    pa.field("value", pa.int64(), nullable=False),
+                ]
+            ),
+        )
+
+    providers = MappingArrowProviderResolver({"events": provider})
+    source = ParsedSource(
+        name="events",
+        connector=PyArrowConfig("events"),
+        schema=_events_schema(),
+        grain=("id",),
+    )
+    adapter = ArrowDatasetAdapter()
+    handle = adapter.prepare(source, MappingProfileResolver({}), providers)
+
+    assert handle.consistency is SourceConsistency.LIVE
+    assert handle.snapshot is None
+    adapter.close(handle)

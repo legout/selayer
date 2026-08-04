@@ -41,6 +41,7 @@ Design pillars:
 
 from __future__ import annotations
 
+import hashlib
 import re
 import uuid
 from contextlib import suppress
@@ -49,6 +50,7 @@ from typing import Any
 
 from selayer.sources.base import (
     QueryBinding,
+    SourceConsistency,
     SourceHandle,
     SourceScanRequirement,
 )
@@ -505,6 +507,40 @@ def _reconcile_schema(observed: TableSchema, declared: TableSchema) -> TableSche
     return TableSchema(tuple(fields))
 
 
+# Read chunk size for streaming a database file's content into the digest.
+_DB_DIGEST_CHUNK = 65536
+
+
+def _local_file_digest(path: str | None) -> str | None:
+    """Return a SHA-256 content digest over the local database file bytes.
+
+    For a local read-only database file (SQLite, DuckDB) the snapshot is a
+    SHA-256 of the file content.  The digest is stable across prepares for
+    unchanged content and changes deterministically when the file is modified,
+    so the registry's prepare-and-compare-triple recheck detects a changed
+    file as a snapshot mismatch.  The file *path* is never included in the
+    digest — only the raw bytes — so a location cannot surface in the token.
+
+    Returns ``None`` when *path* is ``None`` (a remote/non-file source) or the
+    file cannot be read, so the caller falls back to LIVE.
+    """
+
+    if path is None:
+        return None
+    if type(path) is not str:
+        return None
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(_DB_DIGEST_CHUNK), b""):
+                digest.update(chunk)
+    except OSError:
+        # An unreadable or vanished file cannot be content-digested; the
+        # caller falls back to LIVE rather than carrying a stale token.
+        return None
+    return digest.hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # Adapter base behavior (shared via a private mixin-free helper set)
 # ---------------------------------------------------------------------------
@@ -524,6 +560,11 @@ class _DatabaseAdapterBase:
     _kind: str = ""
     _extension: str | None = None
     _attach_options: str = ""
+    # Whether this adapter can track a reopenable snapshot.  Local file-backed
+    # databases (SQLite, DuckDB) carry a file content digest that can be
+    # reacquired; remote databases (Postgres) cannot pin a transaction through
+    # the scan session in version 1 and remain LIVE.
+    _reopenable_snapshot: bool = True
 
     # -- subclass hook -----------------------------------------------------
 
@@ -539,6 +580,21 @@ class _DatabaseAdapterBase:
         """
 
         raise NotImplementedError
+
+    def _local_database_path(self, source: ParsedSource) -> str | None:
+        """Return the local database file path for a file-backed source.
+
+        Local file-backed databases (SQLite, DuckDB) carry a content digest that
+        can be reacquired by re-reading the file, so they are
+        :attr:`~selayer.sources.base.SourceConsistency.REOPENABLE_SNAPSHOT`.
+        Remote databases (Postgres) cannot pin a transaction through the scan
+        session in version 1 and return ``None`` to remain LIVE.  The path is
+        used only to compute a content digest; it is never echoed in reprs,
+        errors, or the snapshot token.
+        """
+
+        del source
+        return None
 
     # -- prepare -----------------------------------------------------------
 
@@ -592,13 +648,28 @@ class _DatabaseAdapterBase:
             observed_schema=observed,
             quoted_relation=quoted_relation,
         )
+        # Local file-backed databases carry a content digest over the file
+        # bytes and are REOPENABLE_SNAPSHOT: the same digest can be reacquired
+        # by re-reading the file, and a changed file makes a later recheck
+        # fail (the registry's prepare-and-compare-triple path recomputes the
+        # digest and detects the drift).  Remote databases (Postgres) cannot
+        # pin a transaction through the scan session in version 1 and remain
+        # LIVE.  The file path never appears in the digest; only file bytes
+        # are hashed.
+        snapshot = _local_file_digest(self._local_database_path(source))
+        consistency = (
+            SourceConsistency.REOPENABLE_SNAPSHOT
+            if snapshot is not None
+            else SourceConsistency.LIVE
+        )
         return SourceHandle(
             source_id=source.name,
             connector=kind,
             resource=resource,
             schema=source.schema,
-            snapshot=None,
+            snapshot=snapshot,
             query_scoped=False,
+            consistency=consistency,
         )
 
     # -- schema inspection -------------------------------------------------
@@ -724,6 +795,12 @@ class SqliteAdapter(_DatabaseAdapterBase):
         # the scanner must already be installed in the DuckDB extension dir.
         return _escape_attach_literal(connector.location), False, connector.relation
 
+    def _local_database_path(self, source: ParsedSource) -> str | None:
+        assert isinstance(source.connector, SqliteConfig)
+        # The raw file path feeds the content digest; the location itself is
+        # never stored on the handle or echoed in the snapshot token.
+        return source.connector.location
+
 
 class DuckDbAdapter(_DatabaseAdapterBase):
     """DuckDB database-file adapter using DuckDB's native file ATTACH.
@@ -750,6 +827,12 @@ class DuckDbAdapter(_DatabaseAdapterBase):
         # never open the file for mutation through the semantic layer.
         return _escape_attach_literal(connector.location), False, connector.relation
 
+    def _local_database_path(self, source: ParsedSource) -> str | None:
+        assert isinstance(source.connector, DuckDbConfig)
+        # The raw file path feeds the content digest; the location itself is
+        # never stored on the handle or echoed in the snapshot token.
+        return source.connector.location
+
 
 class PostgresAdapter(_DatabaseAdapterBase):
     """PostgreSQL relation adapter using DuckDB's ``postgres_scanner``.
@@ -766,6 +849,10 @@ class PostgresAdapter(_DatabaseAdapterBase):
     _kind = "postgres"
     _extension = "postgres_scanner"
     _attach_options = "(TYPE postgres, READ_ONLY)"
+    # The DuckDB-backed adapter does not expose one pinned repeatable-read
+    # transaction through the scan session in version 1, so a PostgreSQL
+    # relation remains LIVE: there is no safe reopenable snapshot token.
+    _reopenable_snapshot: bool = False
 
     def _resolve_target(
         self, source: ParsedSource, profiles: RuntimeProfileResolver
