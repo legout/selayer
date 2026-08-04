@@ -31,6 +31,7 @@ from examples.shopfloor.generate_data import main as generate_main
 from examples.shopfloor.run_example import _layer_for_paths, run_walkthrough
 from examples.shopfloor.run_example import main as run_main
 from selayer import QueryEngine, QueryPlanningError, SemanticLayer
+from selayer.okf import OkfBundle
 from selayer.planning.types import QueryRequest
 from selayer.verification import CompatibilityCheck, PhysicalCheck, verify
 
@@ -584,4 +585,41 @@ def test_shopfloor_compatibility_check_records_planner_rejections(
     assert report.passed
     assert any(
         item.evidence.get("planner_code") == "mixed_grain" for item in report.outcomes
+    )
+
+
+def test_business_context_is_four_valid_reference_concepts(tmp_path: Path) -> None:
+    """The authored business context composes as four Reference concepts.
+
+    Each reference must declare ``type: Reference`` and must not bind a
+    ``selayer_id`` (references are advisory, never execution authority). The
+    OKF composer keys references by their directory-relative concept id, so
+    a document at ``business_context/glossary.md`` composes at the concept
+    id ``business_context/glossary``.
+    """
+    output = tmp_path / "knowledge"
+    layer = SemanticLayer.load(SHOPFLOOR_CATALOG)
+    bundle = OkfBundle.build(
+        layer,
+        output,
+        references_dir=SHOPFLOOR_ROOT / "business_context",
+    )
+    references = {
+        path: concept
+        for path, concept in bundle.concepts.items()
+        if path.startswith("business_context/")
+    }
+    assert set(references) == {
+        "business_context/glossary",
+        "business_context/kpi_definitions",
+        "business_context/process_overview",
+        "business_context/quality_policy",
+    }
+    assert all(
+        concept.frontmatter["type"] == "Reference"
+        for concept in references.values()
+    )
+    assert all(
+        "selayer_id" not in concept.frontmatter
+        for concept in references.values()
     )
