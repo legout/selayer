@@ -45,6 +45,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from json import JSONDecodeError
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Self, cast
 
@@ -285,12 +286,20 @@ class SessionLockTimeoutError(SessionError):
 class SessionCharter:
     """Immutable, versioned discovery session charter.
 
-    The charter binds the stable session id, the target catalog fingerprint,
-    one business question, the named approver identity, and the in-scope
-    inclusions, exclusions, and acceptance questions. Its canonical
-    :meth:`fingerprint` (and the separate approver hash) are dependency nodes:
-    changing the charter or the approver invalidates every transitive
-    dependent.
+    The charter binds the stable session id, the target catalog path and its
+    normalized fingerprint, one business question, the named approver identity,
+    and the in-scope inclusions, exclusions, and acceptance questions. Its
+    canonical :meth:`fingerprint` (and the separate approver hash) are
+    dependency nodes: changing the charter or the approver invalidates every
+    transitive dependent.
+
+    The ``catalog_path`` is the project-relative target catalog path resolved
+    and validated as project-contained by the CLI before construction. It is
+    persisted as part of the charter so the session contract records the exact
+    catalog target alongside its fingerprint. The lower-level value type keeps
+    an empty-string default so direct construction (and the Task 7 session
+    primitives) stays unaffected; the CLI is the mutation surface that requires
+    and validates the path.
 
     The approver is normalized at construction. Identity matching is workflow
     enforcement, not authentication.
@@ -303,6 +312,7 @@ class SessionCharter:
     session_id: str = ""
     business_question: str = ""
     catalog_fingerprint: str = ""
+    catalog_path: str = ""
     approver: str = ""
     inclusions: tuple[str, ...] = ()
     exclusions: tuple[str, ...] = ()
@@ -325,12 +335,20 @@ class SessionCharter:
         ):
             raise SessionError(CODE_INVALID_CHARTER)
         _validate_hash(self.catalog_fingerprint)
+        # The catalog path is a free-text project-relative path: it must be a
+        # string and text-bounded, but it is not required to be non-empty here
+        # so the lower-level value type stays usable without a CLI-validated
+        # path (the CLI is the surface that requires and validates it).
+        if type(self.catalog_path) is not str:
+            raise SessionError(CODE_INVALID_CHARTER)
         # Frozen dataclass: normalize the approver in place.
         object.__setattr__(self, "approver", normalize_actor_identity(self.approver))
         # Bound every free-text charter field (including the named approver
         # and the scope/acceptance collections) so a charter payload can never
         # carry unbounded text into the journal or through reconstruction.
         if len(self.business_question) > MAX_TEXT_LENGTH:
+            raise SessionError(CODE_INVALID_CHARTER)
+        if len(self.catalog_path) > MAX_TEXT_LENGTH:
             raise SessionError(CODE_INVALID_CHARTER)
         if len(self.approver) > MAX_TEXT_LENGTH:
             raise SessionError(CODE_INVALID_CHARTER)
@@ -501,9 +519,7 @@ def _bound_text_recursive(value: object, *, code: str) -> None:
         for key, item in value.items():
             _bound_text_recursive(key, code=code)
             _bound_text_recursive(item, code=code)
-    elif isinstance(value, Sequence) and not isinstance(
-        value, (str, bytes, bytearray)
-    ):
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         for item in value:
             _bound_text_recursive(item, code=code)
 
@@ -521,9 +537,7 @@ def _assert_payload_bounded(
     """
 
     _bound_text_recursive(payload, code=code)
-    serialized = json.dumps(
-        payload, ensure_ascii=False, sort_keys=True
-    ).encode("utf-8")
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     if len(serialized) > MAX_EVENT_PAYLOAD_BYTES:
         raise SessionError(code)
 
@@ -550,11 +564,19 @@ def _charter_from_payload(payload: Mapping[str, object]) -> SessionCharter:
             raise SessionError(CODE_INTEGRITY, safe_detail="malformed event")
         return tuple(str(item) for item in value)
 
+    # ``catalog_path`` is optional in the recorded record: sessions created
+    # before the field was bound have no key, so default to the empty string
+    # (the value-type default) rather than treating its absence as malformed.
+    catalog_path = record.get("catalog_path", "")
+    if not isinstance(catalog_path, str):
+        raise SessionError(CODE_INTEGRITY, safe_detail="malformed event")
+
     return SessionCharter(
         schema_version=schema_version,
         session_id=_text("session_id"),
         business_question=_text("business_question"),
         catalog_fingerprint=_text("catalog_fingerprint"),
+        catalog_path=catalog_path,
         approver=_text("approver"),
         inclusions=_text_tuple("inclusions"),
         exclusions=_text_tuple("exclusions"),
@@ -624,7 +646,9 @@ class SessionStore:
     Construct with :meth:`create` (new session) or :meth:`open` (existing).
     """
 
-    def __init__(self, root: Path, *, lock_timeout: float = _DEFAULT_LOCK_TIMEOUT) -> None:
+    def __init__(
+        self, root: Path, *, lock_timeout: float = _DEFAULT_LOCK_TIMEOUT
+    ) -> None:
         self._root = root
         self._lock_timeout = lock_timeout
         self._journal = root / _JOURNAL_NAME
@@ -786,7 +810,10 @@ class SessionStore:
             self._assert_open()
             current = self._reconstructed.state
             if target_state not in _ALLOWED_TRANSITIONS[current]:
-                if target_state is SessionState.CLOSED and current is SessionState.CLOSED:
+                if (
+                    target_state is SessionState.CLOSED
+                    and current is SessionState.CLOSED
+                ):
                     raise SessionError(
                         CODE_DUPLICATE_TERMINAL,
                         safe_ids=(self._safe_session_id(),),
@@ -955,9 +982,7 @@ class SessionStore:
     ) -> SessionEvent:
         try:
             obj = json.loads(line)
-        # pi-lens-ignore: bare-except (false positive: this catches the
-        # specific json.JSONDecodeError, not a bare except)
-        except json.JSONDecodeError:
+        except JSONDecodeError:
             raise SessionError(
                 CODE_INTEGRITY,
                 safe_detail="malformed event",
@@ -1250,9 +1275,7 @@ class SessionStore:
             # missing/corrupt sidecar proves tampering. Fail closed rather
             # than silently accepting a journal whose trailing event and
             # sidecar were both removed.
-            raise SessionError(
-                CODE_INTEGRITY, safe_detail="committed head missing"
-            )
+            raise SessionError(CODE_INTEGRITY, safe_detail="committed head missing")
         committed_head, committed_count = committed
         if rebuilt_count < committed_count:
             raise SessionError(CODE_INTEGRITY, safe_detail="journal truncated")
@@ -1317,7 +1340,7 @@ class SessionStore:
     def _read_owner(self) -> dict[str, str]:
         try:
             data = json.loads(self._owner_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, JSONDecodeError):
             return {
                 "session_id": "<unknown>",
                 "actor": "<unknown>",

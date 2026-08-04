@@ -247,12 +247,15 @@ def _build_charter(
     data: Mapping[str, object],
     *,
     explicit_session_id: str | None,
+    catalog_path: str,
 ) -> SessionCharter:
     """Validate charter fields and construct a :class:`SessionCharter`.
 
     All charter validation failures surface as :data:`CODE_CHARTER_INVALID`;
     the :class:`SessionCharter` constructor is defense in depth. The session id
     is the explicit CLI/charter id when provided, else an auto-generated value.
+    The ``catalog_path`` is the canonical project-relative POSIX path already
+    resolved and validated as project-contained by the caller.
     """
 
     for field in _REQUIRED_TEXT_FIELDS:
@@ -281,6 +284,7 @@ def _build_charter(
 
     return SessionCharter(
         session_id=session_id,
+        catalog_path=catalog_path,
         business_question=data["business_question"],  # type: ignore[arg-type]
         catalog_fingerprint=data["catalog_fingerprint"],  # type: ignore[arg-type]
         approver=data["approver"],  # type: ignore[arg-type]
@@ -308,10 +312,12 @@ def _emit_json(payload: Mapping[str, object]) -> None:
 
 def _handle_init(args: argparse.Namespace) -> int:
     project = _project_root(args.project)
-    # Validate workspace path policy before parsing the charter or touching
-    # the session store: an escaping path must fail before any lock.
-    if args.catalog_path is not None:
-        _assert_contained(project, Path(args.catalog_path), kind="catalog")
+    project_abs = project.resolve()
+    # The catalog path is required and validated as project-contained before
+    # the mutation lock is acquired, then normalized to the canonical
+    # project-relative POSIX path persisted alongside the charter fingerprint.
+    catalog_abs = _assert_contained(project, Path(args.catalog_path), kind="catalog")
+    catalog_path = catalog_abs.relative_to(project_abs).as_posix()
     summary_root = args.summary_root or _DEFAULT_SUMMARY_ROOT
     _assert_contained(project, Path(summary_root), kind="summary_root")
 
@@ -320,7 +326,9 @@ def _handle_init(args: argparse.Namespace) -> int:
     if explicit_id is None:
         charter_id = data.get("session_id")
         explicit_id = charter_id if type(charter_id) is str and charter_id else None
-    charter = _build_charter(data, explicit_session_id=explicit_id)
+    charter = _build_charter(
+        data, explicit_session_id=explicit_id, catalog_path=catalog_path
+    )
     session_dir = _session_dir(project, charter.session_id)
     actor = args.actor or charter.approver
     store = SessionStore.create(session_dir, charter=charter, actor=actor)
@@ -397,14 +405,10 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help=argparse.SUPPRESS,
     )
-    subparsers = parser.add_subparsers(dest="command")
+    subparsers = parser.add_subparsers(dest="command", required=True)
 
-    session_parser = subparsers.add_parser(
-        "session", help="Manage discovery sessions."
-    )
-    session_sub = session_parser.add_subparsers(
-        dest="session_command", required=True
-    )
+    session_parser = subparsers.add_parser("session", help="Manage discovery sessions.")
+    session_sub = session_parser.add_subparsers(dest="session_command", required=True)
 
     init_parser = session_sub.add_parser(
         "init", help="Initialize a new discovery session."
@@ -417,6 +421,7 @@ def _parser() -> argparse.ArgumentParser:
     init_parser.add_argument(
         "--catalog-path",
         dest="catalog_path",
+        required=True,
         help="Catalog file path (must be project-contained).",
     )
     init_parser.add_argument(

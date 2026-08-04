@@ -90,8 +90,7 @@ def _init_git_repo(path: Path) -> None:
         capture_output=True,
     )
     (path / ".gitignore").write_text(
-        ".selayer/discovery/sessions/\n"
-        ".selayer/discovery/transactions/\n",
+        ".selayer/discovery/sessions/\n.selayer/discovery/transactions/\n",
         encoding="utf-8",
     )
 
@@ -127,6 +126,8 @@ def _init_session(
         str(charter_path),
         "--project",
         str(project),
+        "--catalog-path",
+        "catalogs/shopfloor.yaml",
     ]
     if session_id is not None:
         args += ["--session-id", session_id]
@@ -209,7 +210,16 @@ def test_session_init_uses_charter_session_id(
     _write_charter(charter_path, session_id="session-charter-001")
     assert (
         main(
-            ["session", "init", "--charter", str(charter_path), "--project", str(tmp_path)]
+            [
+                "session",
+                "init",
+                "--charter",
+                str(charter_path),
+                "--project",
+                str(tmp_path),
+                "--catalog-path",
+                "catalogs/shopfloor.yaml",
+            ]
         )
         == 0
     )
@@ -232,6 +242,8 @@ def test_session_init_repeated_explicit_id_fails(
             str(charter_path),
             "--project",
             str(tmp_path),
+            "--catalog-path",
+            "catalogs/shopfloor.yaml",
             "--session-id",
             "session-001",
         ]
@@ -265,7 +277,16 @@ def test_session_init_requires_charter_field(
     charter_path = tmp_path / "charter.yaml"
     _write_charter(charter_path, remove=(field,))
     code = main(
-        ["session", "init", "--charter", str(charter_path), "--project", str(tmp_path)]
+        [
+            "session",
+            "init",
+            "--charter",
+            str(charter_path),
+            "--project",
+            str(tmp_path),
+            "--catalog-path",
+            "catalogs/shopfloor.yaml",
+        ]
     )
     assert code == 1
     err = json.loads(capsys.readouterr().err)
@@ -292,7 +313,16 @@ def test_session_init_rejects_blank_charter_field(
     charter_path = tmp_path / "charter.yaml"
     _write_charter(charter_path, **{field: value})
     code = main(
-        ["session", "init", "--charter", str(charter_path), "--project", str(tmp_path)]
+        [
+            "session",
+            "init",
+            "--charter",
+            str(charter_path),
+            "--project",
+            str(tmp_path),
+            "--catalog-path",
+            "catalogs/shopfloor.yaml",
+        ]
     )
     assert code == 1
     err = json.loads(capsys.readouterr().err)
@@ -306,7 +336,16 @@ def test_session_init_rejects_invalid_catalog_fingerprint(
     charter_path = tmp_path / "charter.yaml"
     _write_charter(charter_path, catalog_fingerprint="not-a-valid-hash")
     code = main(
-        ["session", "init", "--charter", str(charter_path), "--project", str(tmp_path)]
+        [
+            "session",
+            "init",
+            "--charter",
+            str(charter_path),
+            "--project",
+            str(tmp_path),
+            "--catalog-path",
+            "catalogs/shopfloor.yaml",
+        ]
     )
     assert code == 1
     err = json.loads(capsys.readouterr().err)
@@ -320,7 +359,16 @@ def test_session_init_rejects_non_mapping_charter(
     charter_path = tmp_path / "charter.yaml"
     charter_path.write_text("- just\n- a list\n", encoding="utf-8")
     code = main(
-        ["session", "init", "--charter", str(charter_path), "--project", str(tmp_path)]
+        [
+            "session",
+            "init",
+            "--charter",
+            str(charter_path),
+            "--project",
+            str(tmp_path),
+            "--catalog-path",
+            "catalogs/shopfloor.yaml",
+        ]
     )
     assert code == 1
     err = json.loads(capsys.readouterr().err)
@@ -339,6 +387,8 @@ def test_session_init_rejects_unreadable_charter(
             str(tmp_path / "missing.yaml"),
             "--project",
             str(tmp_path),
+            "--catalog-path",
+            "catalogs/shopfloor.yaml",
         ]
     )
     assert code == 1
@@ -409,6 +459,8 @@ def test_session_init_rejects_summary_root_escape(
             str(charter_path),
             "--project",
             str(tmp_path),
+            "--catalog-path",
+            "catalogs/shopfloor.yaml",
             "--summary-root",
             "../../leaked",
         ]
@@ -435,6 +487,19 @@ def test_session_init_accepts_contained_paths(
         ],
     )
     assert out["state"] == "initialized"
+
+
+def test_session_init_persists_catalog_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The catalog path is persisted in the charter and rebuilt from the journal."""
+    _init_git_repo(tmp_path)
+    _init_session(tmp_path, capsys, session_id="session-001")
+    session_dir = tmp_path / ".selayer" / "discovery" / "sessions" / "session-001"
+    # Remove the non-authority cache so the charter is rebuilt from the journal.
+    (session_dir / "state.json").unlink()
+    store = SessionStore.open(session_dir)
+    assert store.charter.catalog_path == "catalogs/shopfloor.yaml"
 
 
 # --- session status --------------------------------------------------------- #
@@ -495,7 +560,10 @@ def test_session_status_stale_nodes_sorted(
         "claim-beta", content_hash="b" * 64, depends_on=("claim-zeta",), actor="analyst"
     )
     store.record_artifact(
-        "claim-alpha", content_hash="1" * 64, depends_on=("claim-zeta",), actor="analyst"
+        "claim-alpha",
+        content_hash="1" * 64,
+        depends_on=("claim-zeta",),
+        actor="analyst",
     )
     store.record_artifact("claim-zeta", content_hash="9" * 64, actor="analyst")
     code = main(
@@ -532,7 +600,9 @@ def test_session_status_reports_closed(
 ) -> None:
     _init_git_repo(tmp_path)
     _init_session(tmp_path, capsys, session_id="session-001")
-    main(["session", "close", "--session-id", "session-001", "--project", str(tmp_path)])
+    main(
+        ["session", "close", "--session-id", "session-001", "--project", str(tmp_path)]
+    )
     capsys.readouterr()  # clear
     code = main(
         ["session", "status", "--session-id", "session-001", "--project", str(tmp_path)]
@@ -547,7 +617,9 @@ def test_session_close_already_closed_fails(
 ) -> None:
     _init_git_repo(tmp_path)
     _init_session(tmp_path, capsys, session_id="session-001")
-    main(["session", "close", "--session-id", "session-001", "--project", str(tmp_path)])
+    main(
+        ["session", "close", "--session-id", "session-001", "--project", str(tmp_path)]
+    )
     capsys.readouterr()  # clear
     code = main(
         ["session", "close", "--session-id", "session-001", "--project", str(tmp_path)]
@@ -621,6 +693,8 @@ def test_session_init_output_keys_sorted(
                 str(charter_path),
                 "--project",
                 str(tmp_path),
+                "--catalog-path",
+                "catalogs/shopfloor.yaml",
                 "--session-id",
                 "session-sorted-001",
             ]
@@ -637,7 +711,9 @@ def test_session_status_output_keys_sorted(
     _init_git_repo(tmp_path)
     _init_session(tmp_path, capsys, session_id="session-001")
     capsys.readouterr()  # clear
-    main(["session", "status", "--session-id", "session-001", "--project", str(tmp_path)])
+    main(
+        ["session", "status", "--session-id", "session-001", "--project", str(tmp_path)]
+    )
     raw = capsys.readouterr().out.strip()
     assert raw == json.dumps(json.loads(raw), sort_keys=True)
 
@@ -677,6 +753,8 @@ def test_cli_never_prints_traceback_for_unreadable_charter(
             str(charter_path),
             "--project",
             str(tmp_path),
+            "--catalog-path",
+            "catalogs/shopfloor.yaml",
         ]
     )
     assert code == 1
@@ -693,9 +771,20 @@ def test_charter_error_never_echoes_charter_values(
     secret = "supersecret-dsn-token-VALUE-12345"
     charter_path = tmp_path / "charter.yaml"
     # A charter carrying a secret in valid fields but missing a required field.
-    _write_charter(charter_path, business_question=secret, approver=secret, remove=("inclusions",))
+    _write_charter(
+        charter_path, business_question=secret, approver=secret, remove=("inclusions",)
+    )
     code = main(
-        ["session", "init", "--charter", str(charter_path), "--project", str(tmp_path)]
+        [
+            "session",
+            "init",
+            "--charter",
+            str(charter_path),
+            "--project",
+            str(tmp_path),
+            "--catalog-path",
+            "catalogs/shopfloor.yaml",
+        ]
     )
     assert code == 1
     captured = capsys.readouterr()
@@ -711,7 +800,16 @@ def test_yaml_parse_error_never_echoes_content(
     charter_path = tmp_path / "charter.yaml"
     charter_path.write_text(f"bad: : : {secret}\n  - broken\n", encoding="utf-8")
     code = main(
-        ["session", "init", "--charter", str(charter_path), "--project", str(tmp_path)]
+        [
+            "session",
+            "init",
+            "--charter",
+            str(charter_path),
+            "--project",
+            str(tmp_path),
+            "--catalog-path",
+            "catalogs/shopfloor.yaml",
+        ]
     )
     assert code == 1
     captured = capsys.readouterr()
