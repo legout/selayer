@@ -489,13 +489,17 @@ def _bound_text_recursive(value: object, *, code: str) -> None:
 
     Walks mappings and (non-string) sequences recursively so a nested payload
     can never smuggle an unbounded text field past the append or replay guards.
+    Both mapping keys and values are bounded: JSON object keys are strings, so a
+    deeply nested mapping key is just as capable of carrying an unbounded text
+    field as a value and must not be exempted.
     """
 
     if type(value) is str:
         if len(value) > MAX_TEXT_LENGTH:
             raise SessionError(code)
     elif isinstance(value, Mapping):
-        for item in value.values():
+        for key, item in value.items():
+            _bound_text_recursive(key, code=code)
             _bound_text_recursive(item, code=code)
     elif isinstance(value, Sequence) and not isinstance(
         value, (str, bytes, bytearray)
@@ -910,7 +914,7 @@ class SessionStore:
                 dependencies=dict(r.dependencies),
             )
 
-    def _reconstruct(self) -> _Reconstructed:
+    def _reconstruct(self, *, validate_head: bool = True) -> _Reconstructed:
         if not self._journal.exists():
             return _Reconstructed.empty()
         reconstructed = _Reconstructed.empty()
@@ -936,7 +940,11 @@ class SessionStore:
         # sidecar records the last durably-appended head so silent truncation
         # of a complete trailing event is detected (the cache cannot be this
         # authority because it is explicitly non-authority and rebuildable).
-        self._validate_committed_head(reconstructed)
+        # The in-append reconstruct skips this check: the append itself is the
+        # authority for the freshly-fsynced trailing event, and the sidecar
+        # legitimately lags (or is still absent during genesis).
+        if validate_head:
+            self._validate_committed_head(reconstructed)
         return reconstructed
 
     def _parse_event(
@@ -1115,8 +1123,11 @@ class SessionStore:
             handle.flush()
             os.fsync(handle.fileno())
         self._restrict_file(self._journal)
-        # The journal is authority: rebuild from it after every append.
-        self._reconstructed = self._reconstruct()
+        # The journal is authority: rebuild from it after every append. The
+        # in-append reconstruct bypasses the committed-head check because the
+        # append is the authority for the freshly-fsynced trailing event and
+        # the sidecar legitimately lags it (genesis has no sidecar yet).
+        self._reconstructed = self._reconstruct(validate_head=False)
         # Record the durably-committed head independent of the non-authority
         # cache so a later deletion of a complete trailing event is detected.
         self._write_committed_head()
@@ -1209,27 +1220,47 @@ class SessionStore:
         return head, count
 
     def _validate_committed_head(self, r: _Reconstructed) -> None:
-        """Detect silent truncation of a complete trailing event.
+        """Detect silent truncation or tampering of a complete trailing event.
 
         Because the committed head is written only after the journal is
         fsynced, a valid journal never holds fewer events than the committed
         count. A smaller rebuilt count therefore proves a trailing event was
         removed; an equal count with a different head proves tampering.
+
+        This check fails **closed**: every durable append atomically writes
+        the sidecar, so a non-empty journal with a missing, unreadable, or
+        malformed sidecar proves the sidecar was removed or corrupted
+        (typically alongside the trailing event it would have flagged). An
+        empty journal legitimately has no sidecar, and the in-append
+        reconstruct bypasses this check entirely (the append is the authority
+        for the trailing event, and the sidecar lags it).
         """
 
+        rebuilt_count = len(r.events)
+        if rebuilt_count == 0:
+            # An empty journal has never committed an event, so no committed
+            # head is expected (fresh directory or all-blank journal).
+            return
         committed = self._read_committed_head()
         if committed is None:
-            return
+            # Non-empty journal but no readable sidecar: the journal is the
+            # base authority and every append writes the sidecar, so a
+            # missing/corrupt sidecar proves tampering. Fail closed rather
+            # than silently accepting a journal whose trailing event and
+            # sidecar were both removed.
+            raise SessionError(
+                CODE_INTEGRITY, safe_detail="committed head missing"
+            )
         committed_head, committed_count = committed
-        rebuilt_count = len(r.events)
         if rebuilt_count < committed_count:
             raise SessionError(CODE_INTEGRITY, safe_detail="journal truncated")
         if rebuilt_count == committed_count and r.head_hash != committed_head:
             raise SessionError(CODE_INTEGRITY, safe_detail="head hash mismatch")
         # A rebuilt count greater than the committed count means the journal
         # holds a freshly fsynced event whose committed head has not yet caught
-        # up (mid-append or crash recovery); the journal is authority, so this
-        # is accepted and the next mutation/open refreshes the sidecar.
+        # up (crash recovery after a journal fsync that preceded the sidecar
+        # write); the journal is authority, so this is accepted and the next
+        # mutation/open refreshes the sidecar.
 
     # -- locking + permissions --------------------------------------------- #
 

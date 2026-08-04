@@ -1145,3 +1145,72 @@ def test_session_lock_file_is_mode_0600_while_locked(
         lock_path = session_root / "session.lock"
         assert lock_path.exists()
         assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+
+
+# --------------------------------------------------------------------------- #
+# Fail-closed committed-head sidecar + mapping-key bounds regression tests   #
+# --------------------------------------------------------------------------- #
+
+
+def test_missing_committed_head_sidecar_fails_closed(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+) -> None:
+    store = SessionStore.create(session_root, charter=charter, actor=actor)
+    store.transition(SessionState.INTAKE, actor=actor)
+    # The journal is non-empty; a missing sidecar proves the trailing event
+    # (and its sidecar) were removed. Fail closed rather than silently accept.
+    (session_root / "committed_head").unlink()
+    with pytest.raises(SessionError, match="committed head missing"):
+        SessionStore.open(session_root)
+
+
+def test_corrupting_committed_head_sidecar_fails_closed(
+    session_root: Path,
+    charter: SessionCharter,
+ actor: str,
+) -> None:
+    store = SessionStore.create(session_root, charter=charter, actor=actor)
+    store.transition(SessionState.INTAKE, actor=actor)
+    # A corrupt (unparseable) sidecar is indistinguishable from a removed one:
+    # _read_committed_head returns None, so fail closed.
+    (session_root / "committed_head").write_text("not-json", encoding="utf-8")
+    with pytest.raises(SessionError, match="committed head missing"):
+        SessionStore.open(session_root)
+
+
+def test_oversized_mapping_key_is_rejected_on_append(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+) -> None:
+    store = SessionStore.create(session_root, charter=charter, actor=actor)
+    oversized_key = "k" * (MAX_TEXT_LENGTH + 1)
+    with pytest.raises(SessionError):
+        store.transition(
+            SessionState.INTAKE, actor=actor, payload={oversized_key: "value"}
+        )
+    # The rejected transition did not mutate the journal.
+    assert len(_journal_lines(session_root)) == 1
+
+
+def test_oversized_mapping_key_is_rejected_on_replay(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+) -> None:
+    SessionStore.create(session_root, charter=charter, actor=actor)
+    genesis_line = _journal_lines(session_root)[0]
+    genesis_hash = json.loads(genesis_line)["event_hash"]
+    oversized_key = "k" * (MAX_TEXT_LENGTH + 1)
+    bad_line = _event_line(
+        genesis_hash,
+        "state_transition",
+        {"target": "intake", oversized_key: "value"},
+        actor=actor,
+    )
+    _rewrite_journal(session_root, [genesis_line, bad_line])
+
+    with pytest.raises(SessionError, match="integrity"):
+        SessionStore.open(session_root).reconstruct()
