@@ -79,6 +79,10 @@ _QUERY_FENCE = re.compile(
 )
 _ALLOWED_QUERY_KEYS = frozenset({"metrics", "dimensions", "filters"})
 
+#: Maximum byte length of a parsed query-request body.  A well-formed request
+#: is well under 1 KiB; anything larger is almost certainly an attack.
+_MAX_QUERY_BODY_BYTES = 4096
+
 
 def _concept_path(semantic_id: str) -> str:
     """Return the composed-bundle concept path for ``semantic_id``."""
@@ -94,6 +98,45 @@ def _section_text(concept: OkfConcept, title: str) -> str:
     return ""
 
 
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Raise on duplicate JSON object keys so ``json.loads`` never merges them."""
+    seen: set[str] = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate key '{key}'")
+        seen.add(key)
+    return dict(pairs)
+
+
+def _reject_nonstandard_constant(value: str) -> object:
+    """Reject NaN/Infinity JSON constants (not part of the strict JSON spec)."""
+    raise ValueError(f"non-standard JSON constant '{value}'")
+
+
+def _parse_query_body(body: str) -> object:
+    """Safely parse ``body`` as JSON, converting all failures to ``ValueError``.
+
+    Bounds the body length, rejects duplicate object keys, rejects
+    non-standard constants (``NaN``, ``Infinity``), and catches every
+    parse/recursion/encoding failure as a deterministic ``ValueError`` so the
+    caller can convert it to a safe :class:`ShopfloorKnowledgeError`.
+    """
+    if len(body) > _MAX_QUERY_BODY_BYTES:
+        raise ValueError("query request exceeds maximum size")
+    try:
+        return json.loads(
+            body,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_nonstandard_constant,
+        )
+    except json.JSONDecodeError as error:
+        raise ValueError(f"not valid JSON: {error.msg}") from error
+    except RecursionError as error:
+        raise ValueError("query request nesting exceeds recursion limit") from error
+    except UnicodeDecodeError as error:
+        raise ValueError("query request has invalid encoding") from error
+
+
 def _query_requests(concept: OkfConcept) -> tuple[QueryRequest, ...]:
     """Parse exactly one safe query request from a metric concept's Examples.
 
@@ -106,10 +149,10 @@ def _query_requests(concept: OkfConcept) -> tuple[QueryRequest, ...]:
         raise ShopfloorKnowledgeError("metric example must contain one query request")
     body = matches[0].group("body")
     try:
-        payload = json.loads(body)
-    except json.JSONDecodeError as error:
+        payload = _parse_query_body(body)
+    except ValueError as error:
         raise ShopfloorKnowledgeError(
-            f"metric query request is not valid JSON: {error.msg}"
+            f"metric query request is not valid JSON: {error}"
         ) from error
     if type(payload) is not dict or set(payload) - _ALLOWED_QUERY_KEYS:
         raise ShopfloorKnowledgeError("metric query request has invalid fields")
@@ -194,13 +237,23 @@ def _check_metric_queries(
     layer: SemanticLayer,
     issues: list[ShopfloorKnowledgeIssue],
 ) -> None:
-    """Verify each metric overlay has exactly one plannable query request."""
-    for concept_id in sorted(bundle.concepts):
-        concept = bundle.concepts[concept_id]
-        selayer_id = concept.frontmatter.get("selayer_id")
-        if not isinstance(selayer_id, str):
-            continue
-        if not selayer_id.startswith("metric."):
+    """Verify every catalog metric has exactly one plannable query request.
+
+    Iterates ``layer.metrics`` (catalog authority), not ``bundle.concepts``,
+    so a missing generated/overlay metric concept produces a deterministic
+    issue rather than being silently skipped.
+    """
+    for metric_name in sorted(layer.metrics):
+        concept_id = f"metrics/{metric_name}"
+        concept = bundle.concepts.get(concept_id)
+        if concept is None:
+            issues.append(
+                ShopfloorKnowledgeIssue(
+                    code="shopfloor.metric.missing",
+                    path=concept_id,
+                    message=f"metric '{metric_name}' has no composed concept",
+                )
+            )
             continue
         try:
             requests = _query_requests(concept)
@@ -214,6 +267,27 @@ def _check_metric_queries(
             )
             continue
         for request in requests:
+            if request.metrics != (metric_name,):
+                issues.append(
+                    ShopfloorKnowledgeIssue(
+                        code="shopfloor.query.invalid",
+                        path=concept_id,
+                        message=(
+                            "metric query request must name only "
+                            f"'{metric_name}'"
+                        ),
+                    )
+                )
+                continue
+            if request.filters != {}:
+                issues.append(
+                    ShopfloorKnowledgeIssue(
+                        code="shopfloor.query.invalid",
+                        path=concept_id,
+                        message="metric query request must have empty filters",
+                    )
+                )
+                continue
             try:
                 plan_query(layer, request)
             except QueryPlanningError as error:

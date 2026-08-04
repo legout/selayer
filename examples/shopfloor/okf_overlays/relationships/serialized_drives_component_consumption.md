@@ -7,8 +7,10 @@ sources:
 # Usage Guidance
 
 This relationship connects serialized drives (parent) to component consumption
-(child). The safe traversal direction is from the many side (component
-consumption, one row per fitted position) to the one side (serialized drives).
+(child). Source grain: serialized_drives [serial_number]. Target grain:
+component_consumption [serial_number, fitted_position]. The safe traversal
+direction is from the many side (component consumption, one row per fitted
+position) to the one side (serialized drives).
 
 # Caveats
 

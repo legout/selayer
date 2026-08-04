@@ -8,9 +8,10 @@ sources:
 # Usage Guidance
 
 This relationship connects component lot inspections (parent) to component
-consumption (child). The safe traversal direction is from the many side
-(component consumption) to the one side (component lot inspections). Fitted
-components reference a component lot.
+consumption (child). Source grain: component_lot_inspections [component_lot_id].
+Target grain: component_consumption [serial_number, fitted_position]. The safe
+traversal direction is from the many side (component consumption) to the one
+side (component lot inspections). Fitted components reference a component lot.
 
 # Caveats
 

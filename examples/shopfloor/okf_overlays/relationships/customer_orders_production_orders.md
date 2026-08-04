@@ -7,9 +7,10 @@ sources:
 # Usage Guidance
 
 This relationship connects customer orders (parent) to production orders
-(child). The safe traversal direction is from the many side (production orders)
-to the one side (customer orders). A production order belongs to exactly one
-customer order.
+(child). Source grain: customer_orders [customer_order_id]. Target grain:
+production_orders [production_order_id]. The safe traversal direction is from
+the many side (production orders) to the one side (customer orders). A
+production order belongs to exactly one customer order.
 
 # Caveats
 

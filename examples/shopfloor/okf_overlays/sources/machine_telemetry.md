@@ -9,7 +9,7 @@ sources:
 The machine-telemetry source records independent machine samples. The declared
 grain is one row per telemetry event, identified by a telemetry-local machine
 identifier and a sample timestamp. Each event carries a machine state and a
-temperature reading.
+temperature reading. This source uses a Parquet connector.
 
 # Caveats
 

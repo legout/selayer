@@ -8,7 +8,8 @@ sources:
 
 The operation-execution source records production operations on serialized
 drives. The declared grain is one row per operation execution, including rework
-operations. Each row carries cycle time, energy, and an is-rework flag.
+operations. Each row carries cycle time, energy, and an is-rework flag. This
+source uses a Parquet connector.
 
 # Caveats
 

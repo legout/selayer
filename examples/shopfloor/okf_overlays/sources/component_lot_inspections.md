@@ -9,7 +9,8 @@ sources:
 
 The component-lot-inspection source records incoming quality checks for
 component lots. One row per inspected lot is the declared grain; each row
-carries an incoming result and a disposition.
+carries an incoming result and a disposition. This source uses a Parquet
+connector.
 
 # Caveats
 

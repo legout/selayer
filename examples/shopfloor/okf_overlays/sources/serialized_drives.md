@@ -7,8 +7,9 @@ sources:
 # Usage Guidance
 
 The serialized-drive registry owns the conformed drive serial number. One row
-per serialized drive is the declared grain; this source is the identity anchor
-for component genealogy, operation executions, and end-of-line tests.
+per serialized drive is the declared grain; this source uses a DuckDB
+connector and is the identity anchor for component genealogy, operation
+executions, and end-of-line tests.
 
 # Caveats
 

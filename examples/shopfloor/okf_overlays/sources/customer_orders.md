@@ -7,8 +7,8 @@ sources:
 # Usage Guidance
 
 The customer-order source captures demand for a product model. One row per
-customer order is the declared grain; the source feeds order-intent dimensions
-such as customer region and requested ship date.
+customer order is the declared grain; this source uses a CSV connector and
+feeds order-intent dimensions such as customer region and requested ship date.
 
 # Caveats
 

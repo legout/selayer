@@ -9,7 +9,8 @@ sources:
 
 The end-of-line test source records EOL test attempts for serialized drives.
 The declared grain is one row per EOL attempt, identified by drive serial number
-and attempt number. Attempts start at one and are unique per drive.
+and attempt number. Attempts start at one and are unique per drive. This source
+uses a Delta connector.
 
 # Caveats
 

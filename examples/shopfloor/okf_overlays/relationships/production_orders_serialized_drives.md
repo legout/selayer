@@ -7,9 +7,10 @@ sources:
 # Usage Guidance
 
 This relationship connects production orders (parent) to serialized drives
-(child). The safe traversal direction is from the many side (serialized drives)
-to the one side (production orders). A serialized drive is produced by exactly
-one production order.
+(child). Source grain: production_orders [production_order_id]. Target grain:
+serialized_drives [serial_number]. The safe traversal direction is from the
+many side (serialized drives) to the one side (production orders). A serialized
+drive is produced by exactly one production order.
 
 # Caveats
 

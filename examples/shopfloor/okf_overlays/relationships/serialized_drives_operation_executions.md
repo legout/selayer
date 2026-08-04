@@ -7,9 +7,10 @@ sources:
 # Usage Guidance
 
 This relationship connects serialized drives (parent) to operation executions
-(child). The safe traversal direction is from the many side (operation
-executions) to the one side (serialized drives). An operation execution belongs
-to exactly one drive.
+(child). Source grain: serialized_drives [serial_number]. Target grain:
+operation_executions [operation_execution_id]. The safe traversal direction is
+from the many side (operation executions) to the one side (serialized drives).
+An operation execution belongs to exactly one drive.
 
 # Caveats
 

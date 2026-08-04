@@ -7,9 +7,9 @@ sources:
 # Usage Guidance
 
 The production-order source records planned and completed units against a
-customer order. One row per production order is the declared grain; the source
-feeds schedule-status and product-model dimensions and the completion-rate
-metric.
+customer order. One row per production order is the declared grain; this
+source uses a SQLite connector and feeds schedule-status and product-model
+dimensions and the completion-rate metric.
 
 # Caveats
 

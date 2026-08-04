@@ -8,7 +8,8 @@ sources:
 
 The component-consumption source records fitted component positions across
 serialized drives. The declared grain is one row per fitted component position,
-including serial number, component lot, and fitted position.
+including serial number, component lot, and fitted position. This source uses
+a Parquet connector.
 
 # Caveats
 

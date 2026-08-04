@@ -960,16 +960,115 @@ def test_shopfloor_policy_rejects_duplicate_query_blocks(tmp_path: Path) -> None
 def test_shopfloor_policy_rejects_mixed_grain_query_as_policy_issue(
     tmp_path: Path,
 ) -> None:
+    """A valid-identity query with a cross-grain dimension is unplannable."""
     bundle = _composed_shopfloor_bundle(tmp_path)
     layer = _shopfloor_layer()
     changed = _replace_example_request(
         bundle,
         "metrics/average_temperature_c",
         {
-            "metrics": ["average_temperature_c", "operation_count"],
-            "dimensions": ["machine_state"],
+            "metrics": ["average_temperature_c"],
+            "dimensions": ["operation_machine_id"],
             "filters": {},
         },
     )
     issues = validate_shopfloor_knowledge(changed, layer)
     assert any(issue.code == "shopfloor.example.unplannable" for issue in issues)
+
+
+def test_shopfloor_policy_rejects_missing_metric_concept(tmp_path: Path) -> None:
+    """A missing generated/overlay metric concept must produce an issue."""
+    bundle = _composed_shopfloor_bundle(tmp_path)
+    layer = _shopfloor_layer()
+    changed = _remove_concept(bundle, "metrics/operation_count")
+    issues = validate_shopfloor_knowledge(changed, layer)
+    assert any(
+        issue.code == "shopfloor.metric.missing"
+        and "metrics/operation_count" in issue.path
+        for issue in issues
+    )
+
+
+def test_shopfloor_policy_rejects_wrong_metric_identity(tmp_path: Path) -> None:
+    """A query naming a different metric than the owning concept is invalid."""
+    bundle = _composed_shopfloor_bundle(tmp_path)
+    layer = _shopfloor_layer()
+    changed = _replace_example_request(
+        bundle,
+        "metrics/component_count",
+        {
+            "metrics": ["shipped_unit_count"],
+            "dimensions": ["drive_serial_number"],
+            "filters": {},
+        },
+    )
+    issues = validate_shopfloor_knowledge(changed, layer)
+    assert any(
+        issue.code == "shopfloor.query.invalid"
+        and "metrics/component_count" in issue.path
+        for issue in issues
+    )
+
+
+def test_shopfloor_policy_rejects_non_empty_filters(tmp_path: Path) -> None:
+    """A query with non-empty filters violates the exact template contract."""
+    bundle = _composed_shopfloor_bundle(tmp_path)
+    layer = _shopfloor_layer()
+    changed = _replace_example_request(
+        bundle,
+        "metrics/component_count",
+        {
+            "metrics": ["component_count"],
+            "dimensions": ["drive_serial_number"],
+            "filters": {"bad": "value"},
+        },
+    )
+    issues = validate_shopfloor_knowledge(changed, layer)
+    assert any(
+        issue.code == "shopfloor.query.invalid"
+        and "metrics/component_count" in issue.path
+        for issue in issues
+    )
+
+
+def test_shopfloor_policy_rejects_deeply_nested_json(tmp_path: Path) -> None:
+    """Deeply nested JSON must not raise an unhandled exception."""
+    bundle = _composed_shopfloor_bundle(tmp_path)
+    layer = _shopfloor_layer()
+    deep = "\"x\":" * 200 + "1" + "}" * 200
+    deep = "{" + deep
+    bad_block = f"```json selayer-query\n{deep}\n```"
+    concept = bundle.concepts["metrics/component_count"]
+    modified = _replace_section(concept, "Examples", bad_block)
+    concepts = dict(bundle.concepts)
+    concepts["metrics/component_count"] = modified
+    changed = dataclass_replace(bundle, concepts=MappingProxyType(concepts))
+    issues = validate_shopfloor_knowledge(changed, layer)
+    assert any(
+        issue.code == "shopfloor.query.invalid"
+        and "metrics/component_count" in issue.path
+        for issue in issues
+    )
+
+
+def test_shopfloor_policy_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    """Duplicate JSON object keys must be rejected, not silently accepted."""
+    bundle = _composed_shopfloor_bundle(tmp_path)
+    layer = _shopfloor_layer()
+    dup_block = (
+        "```json selayer-query\n"
+        '{"metrics":["component_count"],"metrics":["component_count"],'
+        '"dimensions":["drive_serial_number"],"filters":{}}\n'
+        "```"
+    )
+    concept = bundle.concepts["metrics/component_count"]
+    modified = _replace_section(concept, "Examples", dup_block)
+    concepts = dict(bundle.concepts)
+    concepts["metrics/component_count"] = modified
+    changed = dataclass_replace(bundle, concepts=MappingProxyType(concepts))
+    issues = validate_shopfloor_knowledge(changed, layer)
+    assert any(
+        issue.code == "shopfloor.query.invalid"
+        and "metrics/component_count" in issue.path
+        for issue in issues
+    )

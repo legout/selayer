@@ -8,8 +8,10 @@ sources:
 # Usage Guidance
 
 This relationship connects serialized drives (parent) to end-of-line test runs
-(child). The safe traversal direction is from the many side (EOL attempts) to
-the one side (serialized drives). Each EOL attempt belongs to exactly one drive.
+(child). Source grain: serialized_drives [serial_number]. Target grain:
+eol_test_runs [eol_test_run_id]. The safe traversal direction is from the many
+side (EOL attempts) to the one side (serialized drives). Each EOL attempt
+belongs to exactly one drive.
 
 # Caveats
 
