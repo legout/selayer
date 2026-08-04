@@ -33,11 +33,6 @@ from typing import Any, cast
 
 import pyarrow as pa
 import pytest
-
-from selayer.sources.base import SourceConsistency
-from selayer.sources.scan import SourceScanSession, SourceSnapshot
-from selayer.sources.schema import schema_fingerprint, table_schema_from_arrow
-
 from selayer_discovery.profiling import (
     DEFAULT_PROFILE_TIMEOUT_SECONDS,
     ColumnProfile,
@@ -48,6 +43,10 @@ from selayer_discovery.profiling import (
     ProfileUnavailableReason,
     SourceProfile,
 )
+
+from selayer.sources.base import SourceConsistency
+from selayer.sources.scan import SourceScanSession, SourceSnapshot
+from selayer.sources.schema import schema_fingerprint, table_schema_from_arrow
 
 # ---------------------------------------------------------------------------
 # Schema / batch fixtures
@@ -89,8 +88,8 @@ def _two_batches() -> list[pa.RecordBatch]:
             ratio=[1.5, 2.5],
             d=[_dt.date(2020, 1, 1), _dt.date(2020, 1, 3)],
             ts=[
-                _dt.datetime(2020, 1, 1, tzinfo=_dt.timezone.utc),
-                _dt.datetime(2020, 1, 1, 0, 0, 2, tzinfo=_dt.timezone.utc),
+                _dt.datetime(2020, 1, 1, tzinfo=_dt.UTC),
+                _dt.datetime(2020, 1, 1, 0, 0, 2, tzinfo=_dt.UTC),
             ],
         ),
         _batch(
@@ -100,7 +99,7 @@ def _two_batches() -> list[pa.RecordBatch]:
             ratio=[2.5, None],
             d=[_dt.date(2020, 1, 3), None],
             ts=[
-                _dt.datetime(2020, 1, 1, 0, 0, 2, tzinfo=_dt.timezone.utc),
+                _dt.datetime(2020, 1, 1, 0, 0, 2, tzinfo=_dt.UTC),
                 None,
             ],
         ),

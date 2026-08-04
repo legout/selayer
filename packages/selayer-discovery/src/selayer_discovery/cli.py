@@ -38,8 +38,16 @@ import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
+import duckdb
 from ruamel.yaml import YAML, YAMLError
 
+from selayer.catalog import SemanticLayer
+from selayer.sources.errors import SourceError
+from selayer.sources.profiles import (
+    MappingArrowProviderResolver,
+    MappingProfileResolver,
+)
+from selayer.sources.registry import SourceRegistry
 from selayer_discovery.evidence import (
     MEDIA_TEXT_MARKDOWN,
     MEDIA_TEXT_PLAIN,
@@ -47,6 +55,7 @@ from selayer_discovery.evidence import (
     EvidenceStore,
 )
 from selayer_discovery.model import SCHEMA_VERSION
+from selayer_discovery.profiling import ProfileRunner
 from selayer_discovery.session import (
     CODE_NOT_INITIALIZED,
     SessionCharter,
@@ -150,6 +159,8 @@ def _error_payload(exc: BaseException) -> dict[str, object]:
         return exc.to_dict()
     if isinstance(exc, EvidenceError):
         return exc.to_dict()
+    if isinstance(exc, SourceError):
+        return {"code": exc.code, "source_id": _safe_id(exc.source_id)}
     return {"code": CODE_INTERNAL}
 
 
@@ -435,6 +446,40 @@ def _handle_intake_add_document(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _handle_profile_scan(args: argparse.Namespace) -> int:
+    project = _project_root(args.project)
+    session_id = _validate_session_id(args.session_id)
+    session_dir = _require_session(project, session_id)
+    charter = SessionStore.open(session_dir).charter
+    catalog_abs = _assert_contained(
+        project, project / charter.catalog_path, kind="catalog"
+    )
+    layer = SemanticLayer.load(catalog_abs)
+    connection = duckdb.connect(":memory:")
+    registry = SourceRegistry.create(
+        layer,
+        connection,
+        MappingProfileResolver({}),
+        MappingArrowProviderResolver({}),
+    )
+    try:
+        with registry.open_scan_session(
+            args.source_id,
+            columns=tuple(args.columns),
+            batch_size=args.batch_size,
+        ) as session:
+            profile = ProfileRunner(
+                session,
+                session_dir / "profile" / "spill",
+                timeout=args.timeout,
+                grain=tuple(args.grain),
+            ).run()
+        _emit_json(profile.to_dict())
+    finally:
+        registry.close()
+    return EXIT_OK
+
+
 def _handle_intake_snapshot(args: argparse.Namespace) -> int:
     project = _project_root(args.project)
     session_id = _validate_session_id(args.session_id)
@@ -567,6 +612,24 @@ def _parser() -> argparse.ArgumentParser:
         help="Media type (text/markdown or text/plain).",
     )
     snapshot_parser.set_defaults(func=_handle_intake_snapshot)
+
+    profile_parser = subparsers.add_parser(
+        "profile", help="Profile a bounded source scan."
+    )
+    profile_sub = profile_parser.add_subparsers(
+        dest="profile_command", required=True
+    )
+    scan_parser = profile_sub.add_parser(
+        "scan", help="Compute exact aggregate profile metadata."
+    )
+    scan_parser.add_argument("--session-id", required=True)
+    scan_parser.add_argument("--source-id", required=True)
+    scan_parser.add_argument("--project", help="Project root (default: cwd).")
+    scan_parser.add_argument("--timeout", type=float, default=900.0)
+    scan_parser.add_argument("--batch-size", type=int, default=1024)
+    scan_parser.add_argument("--grain", action="append", default=[])
+    scan_parser.add_argument("--columns", action="append", default=[])
+    scan_parser.set_defaults(func=_handle_profile_scan)
 
     return parser
 

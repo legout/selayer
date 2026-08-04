@@ -24,10 +24,11 @@ Secrecy / safety invariants:
 * **Exact aggregates only.**  DuckDB computes ``COUNT``, ``COUNT(DISTINCT)``,
   and ``MIN``/``MAX`` over the full spilled relation, so the profile is exact,
   not sampled.
-* **No partial claims.**  Timeout, cancellation, and partial iterator failures
-  discard every partial aggregate and record an ``unavailable`` outcome with a
-  stable reason.  A bounded partial scan (reopenable only) preserves its spill
-  for resume but emits no aggregate claims.
+* **No partial claims.**  Timeout, cancellation, partial iterator failures,
+  an unsupported column type, and a checkpoint/stream batch-hash mismatch all
+  discard every partial aggregate (and the spill) and record an ``unavailable``
+  outcome with a stable reason.  A bounded partial scan (reopenable only)
+  preserves its spill for resume but emits no aggregate claims.
 * **Consistency rules.**  Only reopenable profiles may resume, and only with
   the same snapshot token and batch hashes; transaction and live profiles
   always restart.
@@ -44,6 +45,8 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import re
+import threading
 import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -70,14 +73,12 @@ from selayer.sources.schema import (
     MapType,
     ScalarType,
     StructType,
-    TimeType,
     TimestampType,
+    TimeType,
     schema_fingerprint,
 )
 
 if TYPE_CHECKING:
-    import threading
-
     from selayer.sources.scan import SourceScanSession
 
 __all__ = [
@@ -98,6 +99,17 @@ __all__ = [
 #: Default per-source profile deadline in seconds (15 minutes).
 DEFAULT_PROFILE_TIMEOUT_SECONDS: float = 900.0
 
+#: Maximum time to wait for a watchdog thread to exit after the scan finishes.
+_WATCHDOG_JOIN_SECONDS: float = 5.0
+
+#: Spill batch filename: ``batch-{zero-padded index}-{full 64-hex digest}.arrow``.
+#: The full digest lets resume validate that preserved spill files exactly match
+#: a checkpoint's batch hashes before reusing them.
+_SPILL_GLOB: str = "*.arrow"
+_SPILL_FILE_RE: re.Pattern[str] = re.compile(
+    r"\Abatch-(\d+)-([0-9a-f]{64})\.arrow\Z"
+)
+
 #: Scalar logical-type names that carry an orderable numeric range.
 _NUMERIC_SCALARS: frozenset[str] = frozenset(
     {
@@ -117,8 +129,6 @@ _NUMERIC_SCALARS: frozenset[str] = frozenset(
 
 #: Scalar logical-type names that carry an orderable calendar range.
 _DATE_SCALARS: frozenset[str] = frozenset({"date32", "date64"})
-
-_SPILL_GLOB: str = "*.arrow"
 
 
 # --------------------------------------------------------------------------- #
@@ -148,6 +158,8 @@ class ProfileUnavailableReason(StrEnum):
     TIMEOUT = "timeout"
     CANCELLED = "cancelled"
     ITERATOR_FAILURE = "iterator_failure"
+    CHECKPOINT_MISMATCH = "checkpoint_mismatch"
+    UNSUPPORTED_TYPE = "unsupported_type"
 
 
 # --------------------------------------------------------------------------- #
@@ -313,6 +325,21 @@ def _has_range(logical_type: object) -> bool:
     return isinstance(logical_type, (DecimalType, TimestampType))
 
 
+def _profile_supported(logical_type: object) -> bool:
+    """Return ``True`` when a column type can be exactly, safely aggregated.
+
+    The profiler guarantees exact ``COUNT``/``COUNT(DISTINCT)`` and an
+    orderable ``MIN``/``MAX`` range only for scalar, decimal, and timestamp
+    logical types.  Every other type (time, duration, interval, fixed-size and
+    large binary, list/large-list/fixed-size-list, struct, map, dictionary, and
+    unknown types) cannot be truthfully aggregated, so a source carrying one
+    yields an ``unavailable`` outcome rather than a completed profile with
+    degraded (``None``) counts.
+    """
+
+    return isinstance(logical_type, (ScalarType, DecimalType, TimestampType))
+
+
 def _type_name(logical_type: object) -> str:
     """Return a canonical, model-safe logical-type label."""
 
@@ -446,13 +473,40 @@ class ProfileRunner:
         consistency = self._session.consistency.value
         snapshot_id = self._session.snapshot_id
 
-        resume = checkpoint is not None and self._resume_allowed(checkpoint, mode)
-        if not resume:
+        # A column type the profiler cannot exactly/safely aggregate yields a
+        # stable ``unavailable`` outcome with no aggregate claims (never a
+        # completed profile carrying degraded ``None`` counts).  Discard any
+        # preserved spill so a prior partial run can never leak through.
+        if self._has_unsupported_type():
+            self._clear_spill()
+            return self._profile_unavailable(
+                mode,
+                ProfileUnavailableReason.UNSUPPORTED_TYPE,
+                schema_fp,
+                consistency,
+                snapshot_id,
+            )
+
+        resume_checkpoint = (
+            checkpoint
+            if checkpoint is not None and self._resume_allowed(checkpoint, mode)
+            else None
+        )
+        if resume_checkpoint is not None and not self._spill_matches_checkpoint(
+            resume_checkpoint
+        ):
+            # The preserved spill does not correspond to the checkpoint's batch
+            # hashes (stale or corrupt from a prior run).  Resume is unsafe:
+            # restart from scratch so old batches can never pollute the new
+            # aggregate.  This is the only mismatch that can safely restart,
+            # because nothing has been streamed yet.
+            resume_checkpoint = None
+        if resume_checkpoint is None:
             # A fresh run (or an invalidated checkpoint) discards any stale
             # spill so old batches can never pollute the new aggregate.
             self._clear_spill()
 
-        batch_hashes = self._stream(checkpoint if resume else None, mode)
+        batch_hashes = self._stream(resume_checkpoint, mode)
         outcome, reason, hashes = batch_hashes
 
         if outcome is ProfileOutcome.UNAVAILABLE:
@@ -492,6 +546,47 @@ class ProfileRunner:
             and checkpoint.snapshot_id == self._session.snapshot_id
         )
 
+    def _has_unsupported_type(self) -> bool:
+        """Return ``True`` if any column type cannot be exactly aggregated."""
+
+        return any(
+            not _profile_supported(field.type)
+            for field in self._session.schema.fields
+        )
+
+    def _spill_matches_checkpoint(
+        self, checkpoint: ProfileCheckpoint
+    ) -> bool:
+        """Return ``True`` when preserved spill files match the checkpoint.
+
+        Each preserved spill filename embeds the full batch digest; this parses
+        them and requires the set of files to correspond *exactly* (contiguous
+        indices ``0..N-1`` and matching digests) to ``checkpoint.batch_hashes``.
+        A stale or corrupt spill (from a crashed or different prior run) fails
+        so resume restarts from scratch instead of reusing wrong data.
+        """
+
+        files = self._spill_files()
+        if len(files) != len(checkpoint.batch_hashes):
+            return False
+        by_index: dict[int, str] = {}
+        for path in files:
+            match = _SPILL_FILE_RE.match(path.name)
+            if match is None:
+                return False
+            try:
+                idx = int(match.group(1))
+            except (TypeError, ValueError):
+                return False
+            digest = match.group(2)
+            if idx in by_index:
+                return False
+            by_index[idx] = digest
+        for pos, expected in enumerate(checkpoint.batch_hashes):
+            if by_index.get(pos) != expected:
+                return False
+        return True
+
     # -- streaming + spill ----------------------------------------------- #
 
     def _stream(
@@ -506,51 +601,113 @@ class ProfileRunner:
         outcome = ProfileOutcome.COMPLETED
         reason: ProfileUnavailableReason | None = None
         iterator = self._session.iter_batches()
-        while True:
-            if self._cancel_event is not None and self._cancel_event.is_set():
-                outcome, reason = (
-                    ProfileOutcome.UNAVAILABLE,
-                    ProfileUnavailableReason.CANCELLED,
-                )
-                break
-            if time.monotonic() >= deadline:
-                outcome, reason = (
-                    ProfileOutcome.UNAVAILABLE,
-                    ProfileUnavailableReason.TIMEOUT,
-                )
-                break
-            try:
-                batch = next(iterator)
-            except StopIteration:
-                break
-            except Exception:  # noqa: BLE001 - any scan failure is unavailable
-                outcome, reason = (
-                    ProfileOutcome.UNAVAILABLE,
-                    ProfileUnavailableReason.ITERATOR_FAILURE,
-                )
-                break
-            digest = _hash_batch(batch)
-            already_spilled = (
-                checkpoint is not None
-                and pos < len(checkpoint.batch_hashes)
-                and digest == checkpoint.batch_hashes[pos]
-            )
-            if already_spilled:
-                # Reuse the prior partial run's spill file; do not rewrite it.
-                hashes.append(digest)
-            else:
-                self._spill_batch(batch, index, digest)
-                hashes.append(digest)
-                index += 1
-            pos += 1
-            if (
-                mode is ProfileMode.REOPENABLE
-                and self._stop_after_batches is not None
-                and len(hashes) >= self._stop_after_batches
-            ):
-                outcome = ProfileOutcome.PARTIAL
-                break
+        # Deadline watchdog: if a single ``next(iterator)`` blocks past the
+        # deadline (not only the between-batch check below), the watchdog flags
+        # the timeout and calls :meth:`SourceScanSession.cancel` so the blocked
+        # read is interrupted by closing the reader — consistent with the
+        # session's own cancellation/cleanup path.  ``finished`` stops the
+        # watchdog once streaming ends.
+        timed_out = threading.Event()
+        finished = threading.Event()
+        watchdog = threading.Thread(
+            target=self._watchdog,
+            args=(deadline, timed_out, finished),
+            daemon=True,
+        )
+        watchdog.start()
+        try:
+            while True:
+                if (
+                    self._cancel_event is not None
+                    and self._cancel_event.is_set()
+                ):
+                    outcome, reason = (
+                        ProfileOutcome.UNAVAILABLE,
+                        ProfileUnavailableReason.CANCELLED,
+                    )
+                    break
+                if timed_out.is_set() or time.monotonic() >= deadline:
+                    outcome, reason = (
+                        ProfileOutcome.UNAVAILABLE,
+                        ProfileUnavailableReason.TIMEOUT,
+                    )
+                    break
+                try:
+                    batch = next(iterator)
+                except StopIteration:
+                    # A watchdog cancel closes the reader, ending the stream
+                    # without raising; treat that as the flagged timeout.
+                    if timed_out.is_set():
+                        outcome, reason = (
+                            ProfileOutcome.UNAVAILABLE,
+                            ProfileUnavailableReason.TIMEOUT,
+                        )
+                    break
+                except Exception:  # noqa: BLE001 - any scan failure is unavailable
+                    if timed_out.is_set():
+                        outcome, reason = (
+                            ProfileOutcome.UNAVAILABLE,
+                            ProfileUnavailableReason.TIMEOUT,
+                        )
+                    else:
+                        outcome, reason = (
+                            ProfileOutcome.UNAVAILABLE,
+                            ProfileUnavailableReason.ITERATOR_FAILURE,
+                        )
+                    break
+                digest = _hash_batch(batch)
+                if checkpoint is not None and pos < len(checkpoint.batch_hashes):
+                    # Exact checkpoint batch-hash match is required for every
+                    # prefix batch: a changed prefix means the (allegedly
+                    # reopenable) snapshot is inconsistent.  Never reuse the
+                    # preserved spill or combine it with the new stream.
+                    if digest != checkpoint.batch_hashes[pos]:
+                        outcome, reason = (
+                            ProfileOutcome.UNAVAILABLE,
+                            ProfileUnavailableReason.CHECKPOINT_MISMATCH,
+                        )
+                        break
+                    # Reuse the prior partial run's spill file; do not rewrite.
+                    hashes.append(digest)
+                else:
+                    self._spill_batch(batch, index, digest)
+                    hashes.append(digest)
+                    index += 1
+                pos += 1
+                if (
+                    mode is ProfileMode.REOPENABLE
+                    and self._stop_after_batches is not None
+                    and len(hashes) >= self._stop_after_batches
+                ):
+                    outcome = ProfileOutcome.PARTIAL
+                    break
+        finally:
+            finished.set()
+            watchdog.join(timeout=_WATCHDOG_JOIN_SECONDS)
         return outcome, reason, _StreamResult(tuple(hashes), iterator)
+
+    def _watchdog(
+        self,
+        deadline: float,
+        timed_out: threading.Event,
+        finished: threading.Event,
+    ) -> None:
+        """Cancel the scan when the deadline expires.
+
+        Blocks on ``finished.wait(remaining)`` so a normal completion wakes it
+        immediately; when the deadline passes first it flags ``timed_out`` and
+        calls :meth:`SourceScanSession.cancel`, closing the reader so a blocked
+        ``read_next_batch`` is interrupted rather than waited out.
+        """
+
+        while not finished.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out.set()
+                self._session.cancel()
+                return
+            if finished.wait(timeout=remaining):
+                return
 
     def _drain(self, iterator: Iterator[pa.RecordBatch]) -> None:
         """Exhaust a (likely cancelled) iterator so its cleanup finalizes."""
@@ -559,7 +716,7 @@ class ProfileRunner:
             for _ in iterator:
                 pass
         except Exception:  # noqa: BLE001 - best-effort cleanup
-            pass
+            return
 
     # -- spill filesystem ------------------------------------------------ #
 
@@ -597,10 +754,11 @@ class ProfileRunner:
 
     def _spill_batch(self, batch: pa.RecordBatch, index: int, digest: str) -> None:
         self._ensure_spill_dir()
-        path = self._spill_root / f"batch-{index:06d}-{digest[:16]}.arrow"
-        with pa.OSFile(str(path), "wb") as sink:
-            with pa.ipc.new_file(sink, batch.schema) as writer:
-                writer.write_batch(batch)
+        path = self._spill_root / f"batch-{index:06d}-{digest}.arrow"
+        with pa.OSFile(str(path), "wb") as sink, pa.ipc.new_file(
+            sink, batch.schema
+        ) as writer:
+            writer.write_batch(batch)
         _restrict(path, 0o600)
 
     # -- exact DuckDB aggregates ----------------------------------------- #
