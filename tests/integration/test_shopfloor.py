@@ -243,6 +243,55 @@ def test_delta_retest_reload_changes_only_attempt_rate(tmp_path: Path) -> None:
     assert after["first_pass_yield"].item() == pytest.approx(2 / 3)
 
 
+def test_shopfloor_catalog_uses_conformed_and_domain_specific_dimensions() -> None:
+    layer = SemanticLayer.load(SHOPFLOOR_CATALOG)
+    assert layer.dimension("drive_serial_number").source == "serialized_drives"
+    assert layer.dimension("operation_line_id").source == "operation_executions"
+    assert layer.dimension("operation_machine_id").source == "operation_executions"
+    assert layer.dimension("telemetry_line_id").source == "machine_telemetry"
+    assert layer.dimension("telemetry_machine_id").source == "machine_telemetry"
+    assert layer.dimension("requested_ship_date").data_type == "date"
+    assert layer.dimension("telemetry_recorded_at").data_type == "timestamp"
+    with pytest.raises(KeyError):
+        layer.dimension("line_id")
+    with pytest.raises(KeyError):
+        layer.dimension("machine_id")
+
+
+def test_telemetry_count_facts_are_event_markers() -> None:
+    layer = SemanticLayer.load(SHOPFLOOR_CATALOG)
+    assert layer.measure("telemetry_event_count").fact == "telemetry_event_machine_id"
+    assert layer.measure("alarm_event_count_measure").fact == "alarm_event_machine_id"
+    with pytest.raises(KeyError):
+        layer.fact("telemetry_machine_id")
+    with pytest.raises(KeyError):
+        layer.fact("alarm_machine_id")
+
+
+def test_shopfloor_planner_supports_intended_semantics(tmp_path: Path) -> None:
+    paths = generate_shopfloor_data(tmp_path / "data")
+    layer = _layer_for_paths(SemanticLayer.load(SHOPFLOOR_CATALOG), paths)
+    with QueryEngine(layer) as engine:
+        engine.plan(["component_count"], ["drive_serial_number"])
+        engine.plan(
+            ["average_cycle_seconds"], ["drive_serial_number", "operation_machine_id"]
+        )
+        engine.plan(["eol_attempt_pass_rate"], ["drive_serial_number", "station_id"])
+        engine.plan(["production_completion_rate"], ["requested_ship_date"])
+        engine.plan(
+            ["average_temperature_c"],
+            ["telemetry_recorded_at", "telemetry_machine_id"],
+        )
+
+        with pytest.raises(QueryPlanningError) as raised:
+            engine.plan(["average_cycle_seconds"], ["telemetry_machine_id"])
+        assert raised.value.code == "no_relationship_path"
+
+        with pytest.raises(QueryPlanningError) as raised:
+            engine.plan(["average_temperature_c"], ["operation_machine_id"])
+        assert raised.value.code == "no_relationship_path"
+
+
 def test_layer_for_paths_rebases_every_source(tmp_path: Path) -> None:
     paths = generate_shopfloor_data(tmp_path / "data")
     original = SemanticLayer.load(SHOPFLOOR_CATALOG)

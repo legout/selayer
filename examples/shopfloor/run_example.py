@@ -103,7 +103,7 @@ def run_walkthrough(engine: QueryEngine, eol_test_runs: Path) -> None:
     print(
         engine.query(
             ["average_cycle_seconds", "rework_rate", "energy_per_operation_kwh"],
-            ["line_id", "machine_id", "shift", "operation_name"],
+            ["operation_line_id", "operation_machine_id", "shift", "operation_name"],
         )
     )
     print("EOL quality before Delta reload:")
@@ -117,7 +117,7 @@ def run_walkthrough(engine: QueryEngine, eol_test_runs: Path) -> None:
     print(
         engine.query(
             ["alarm_event_count", "average_temperature_c"],
-            ["telemetry_line_id", "machine_state"],
+            ["telemetry_line_id", "telemetry_machine_id", "machine_state"],
         )
     )
 
