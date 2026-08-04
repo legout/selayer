@@ -992,6 +992,34 @@ def test_shopfloor_policy_rejects_missing_metric_concept(tmp_path: Path) -> None
     )
 
 
+def test_shopfloor_policy_rejects_missing_source_concept(tmp_path: Path) -> None:
+    """A missing generated source concept must produce an issue."""
+    bundle = _composed_shopfloor_bundle(tmp_path)
+    layer = _shopfloor_layer()
+    changed = _remove_concept(bundle, "sources/customer_orders")
+    issues = validate_shopfloor_knowledge(changed, layer)
+    assert any(
+        issue.code == "shopfloor.concept.missing"
+        and "sources/customer_orders" in issue.path
+        for issue in issues
+    )
+
+
+def test_shopfloor_policy_rejects_missing_relationship_concept(tmp_path: Path) -> None:
+    """A missing generated relationship concept must produce an issue."""
+    bundle = _composed_shopfloor_bundle(tmp_path)
+    layer = _shopfloor_layer()
+    changed = _remove_concept(
+        bundle, "relationships/customer_orders_production_orders"
+    )
+    issues = validate_shopfloor_knowledge(changed, layer)
+    assert any(
+        issue.code == "shopfloor.concept.missing"
+        and "relationships/customer_orders_production_orders" in issue.path
+        for issue in issues
+    )
+
+
 def test_shopfloor_policy_rejects_wrong_metric_identity(tmp_path: Path) -> None:
     """A query naming a different metric than the owning concept is invalid."""
     bundle = _composed_shopfloor_bundle(tmp_path)
@@ -1070,12 +1098,15 @@ def test_shopfloor_policy_rejects_oversized_multibyte_body(tmp_path: Path) -> No
     bundle = _composed_shopfloor_bundle(tmp_path)
     layer = _shopfloor_layer()
     # Each snowman character is one code point but three UTF-8 bytes.
-    # The resulting JSON body is well over 4096 UTF-8 bytes but structurally
-    # valid (only allowed keys, parses without the byte cap).
+    # The resulting JSON body has fewer than 4096 *characters* but more than
+    # 4096 UTF-8 *bytes*, so a character-count implementation would wrongly
+    # accept it while a byte-count implementation correctly rejects it.
     oversized = "\u2603" * 1400
     body = json.dumps(
-        {"metrics": ["component_count"], "dimensions": [oversized], "filters": {}}
+        {"metrics": ["component_count"], "dimensions": [oversized], "filters": {}},
+        ensure_ascii=False,
     )
+    assert len(body) < _MAX_QUERY_BODY_BYTES
     assert len(body.encode("utf-8")) > _MAX_QUERY_BODY_BYTES
     bad_block = f"```json selayer-query\n{body}\n```"
     concept = bundle.concepts["metrics/component_count"]

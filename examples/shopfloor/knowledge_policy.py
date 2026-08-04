@@ -73,6 +73,12 @@ _KIND_DIRECTORIES: dict[str, str] = {
     "relationship": "relationships",
 }
 
+#: Semantic kinds whose composed concept must exist and carry required
+#: sections.  Metric presence is enforced separately by
+#: :func:`_check_metric_queries`, so it is excluded from this catalog-
+#: authoritative presence check to avoid duplicate issues.
+_COVERAGE_KINDS = frozenset({"source", "relationship"})
+
 _QUERY_FENCE = re.compile(
     r"```json selayer-query\n(?P<body>.*?)\n```",
     re.DOTALL,
@@ -177,15 +183,32 @@ def _check_required_kind_sections(
     layer: SemanticLayer,
     issues: list[ShopfloorKnowledgeIssue],
 ) -> None:
-    """Verify required curated sections are present and non-empty per kind."""
-    for concept_id in sorted(bundle.concepts):
-        concept = bundle.concepts[concept_id]
-        selayer_id = concept.frontmatter.get("selayer_id")
-        if not isinstance(selayer_id, str):
-            continue
-        kind = selayer_id.split(".", 1)[0]
+    """Verify required curated sections for every catalog-authoritative concept.
+
+    Iterates :meth:`SemanticLayer.semantic_objects` for source and relationship
+    kinds, mapping each semantic ID via :func:`_concept_path`.  A missing
+    composed concept is itself a policy issue.  Metric presence is enforced
+    separately by :func:`_check_metric_queries`.
+    """
+    for semantic_id in sorted(layer.semantic_objects()):
+        kind = semantic_id.split(".", 1)[0]
         required = _REQUIRED_SECTIONS.get(kind)
         if required is None:
+            continue
+        concept_id = _concept_path(semantic_id)
+        concept = bundle.concepts.get(concept_id)
+        if concept is None:
+            if kind in _COVERAGE_KINDS:
+                issues.append(
+                    ShopfloorKnowledgeIssue(
+                        code="shopfloor.concept.missing",
+                        path=concept_id,
+                        message=(
+                            f"required {kind} concept '{semantic_id}' "
+                            "is absent from the bundle"
+                        ),
+                    )
+                )
             continue
         present = {section.title for section in concept.sections}
         for section_title in sorted(required):
