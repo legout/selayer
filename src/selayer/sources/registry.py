@@ -1106,28 +1106,31 @@ class SourceRegistry:
             raise SourceConnectionError(
                 source_id, "scan_failed", "the source could not be scanned"
             )
-        # Capture the fresh triple from the candidate *before* closing it, then
-        # close the candidate unconditionally.  The comparison runs against the
-        # session's open-time baseline: a mismatch means the snapshot the
-        # session is streaming is no longer current, surfaced as a sanitized,
-        # deterministic ``snapshot_mismatch`` error raised outside any
-        # ``except`` scope so ``__cause__``/``__context__`` remain ``None``.
-        fresh_fingerprint = schema_fingerprint(observed)
-        snapshot = SourceSnapshot(
-            consistency=candidate.consistency,
-            snapshot_id=candidate.snapshot,
-            schema_fingerprint=fresh_fingerprint,
-        )
-        close_quietly(adapter, candidate)
-        if (
-            snapshot.consistency != baseline_consistency
-            or snapshot.snapshot_id != baseline_snapshot_id
-            or snapshot.schema_fingerprint != baseline_schema_fingerprint
-        ):
-            raise SourceConnectionError(
-                source_id, "snapshot_mismatch", "the source snapshot has changed"
+        # Compare the fresh triple against the session's open-time baseline
+        # *while the candidate is still open* (Step 6): a mismatch means the
+        # snapshot the session is streaming is no longer current, surfaced as a
+        # sanitized, deterministic ``snapshot_mismatch`` error raised outside
+        # any ``except`` scope so ``__cause__``/``__context__`` remain ``None``.
+        # The fresh candidate is always closed exactly once in ``finally``;
+        # the session's own stream is unaffected.
+        try:
+            fresh_fingerprint = schema_fingerprint(observed)
+            snapshot = SourceSnapshot(
+                consistency=candidate.consistency,
+                snapshot_id=candidate.snapshot,
+                schema_fingerprint=fresh_fingerprint,
             )
-        return snapshot
+            if (
+                snapshot.consistency != baseline_consistency
+                or snapshot.snapshot_id != baseline_snapshot_id
+                or snapshot.schema_fingerprint != baseline_schema_fingerprint
+            ):
+                raise SourceConnectionError(
+                    source_id, "snapshot_mismatch", "the source snapshot has changed"
+                )
+            return snapshot
+        finally:
+            close_quietly(adapter, candidate)
 
     # -- internals ---------------------------------------------------------
 

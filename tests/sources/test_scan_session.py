@@ -778,8 +778,8 @@ def test_recheck_snapshot_returns_fresh_candidate_view() -> None:
     assert fresh.snapshot_id == "snap-1"
     assert fresh.consistency is SourceConsistency.LIVE
     assert fresh.schema_fingerprint == schema_fingerprint(_events_schema())
-    # The fresh candidate was closed after recheck.
-    assert "events" in adapter.closed
+    # The fresh candidate is closed exactly once after recheck.
+    assert adapter.closed.count("events") == 1
 
 
 def test_recheck_snapshot_detects_mismatched_token() -> None:
@@ -794,8 +794,9 @@ def test_recheck_snapshot_detects_mismatched_token() -> None:
         assert caught.value.__context__ is None
         # The session itself still reflects the original token.
         assert session.snapshot_id == "snap-1"
-    # The fresh candidate was still closed after the mismatch was detected.
-    assert "events" in adapter.closed
+    # The fresh candidate is closed exactly once even though the comparison
+    # raised: Step 6 compares *before* closing, and close runs in ``finally``.
+    assert adapter.closed.count("events") == 1
 
 
 def test_recheck_snapshot_detects_consistency_mismatch() -> None:
@@ -826,7 +827,24 @@ def test_recheck_snapshot_detects_schema_mismatch() -> None:
         assert caught.value.code == "snapshot_mismatch"
         assert caught.value.__cause__ is None
         assert caught.value.__context__ is None
-    assert "events" in adapter.closed
+    assert adapter.closed.count("events") == 1
+
+
+def test_recheck_snapshot_closes_candidate_exactly_once_on_mismatch() -> None:
+    """Step 6 ordering: the triple comparison runs *before* the candidate is
+    closed, and the candidate is closed exactly once (via ``finally``) even
+    when the comparison raises ``snapshot_mismatch``.
+    """
+    registry, _, adapter, _ = _build(snapshot="snap-1")
+    with registry.open_scan_session("events", columns=("id",)) as session:
+        adapter.snapshot = "snap-2"
+        with pytest.raises(SourceConnectionError) as caught:
+            session.recheck_snapshot()
+        assert caught.value.code == "snapshot_mismatch"
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+    # Closed exactly once — never leaked (zero) and never double-closed (two).
+    assert adapter.closed.count("events") == 1
 
 
 def test_recheck_snapshot_sanitizes_adapter_failure() -> None:
