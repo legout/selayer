@@ -1410,7 +1410,25 @@ def test_shopfloor_clean_checkout_workflow(tmp_path: Path) -> None:
     assert compat.complete
     assert compat.passed
 
-    # 4. Query all twelve metrics.
+    # 4. Query all twelve metrics.  The exact set/count is required by the
+    # README and the global contract, so a catalog edit that drops or adds a
+    # metric must fail this workflow rather than silently passing.
+    expected_metrics = {
+        "production_completion_rate",
+        "shipped_unit_count",
+        "component_count",
+        "incoming_acceptance_rate",
+        "average_cycle_seconds",
+        "operation_count",
+        "rework_rate",
+        "energy_per_operation_kwh",
+        "eol_attempt_pass_rate",
+        "first_pass_yield",
+        "alarm_event_count",
+        "average_temperature_c",
+    }
+    assert set(layer.metrics) == expected_metrics
+    assert len(layer.metrics) == 12
     with QueryEngine(layer) as engine:
         for metric_name in sorted(layer.metrics):
             result = engine.query([metric_name])
