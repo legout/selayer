@@ -40,6 +40,12 @@ from pathlib import Path
 
 from ruamel.yaml import YAML, YAMLError
 
+from selayer_discovery.evidence import (
+    MEDIA_TEXT_MARKDOWN,
+    MEDIA_TEXT_PLAIN,
+    EvidenceError,
+    EvidenceStore,
+)
 from selayer_discovery.model import SCHEMA_VERSION
 from selayer_discovery.session import (
     CODE_NOT_INITIALIZED,
@@ -136,11 +142,13 @@ def _safe_id(value: object) -> str:
 
 
 def _error_payload(exc: BaseException) -> dict[str, object]:
-    """Build a JSON-safe payload from a sanitized CLI or session error."""
+    """Build a JSON-safe payload from a sanitized CLI, session, or evidence error."""
 
     if isinstance(exc, _CliError):
         return exc.to_dict()
     if isinstance(exc, SessionError):
+        return exc.to_dict()
+    if isinstance(exc, EvidenceError):
         return exc.to_dict()
     return {"code": CODE_INTERNAL}
 
@@ -391,6 +399,70 @@ def _handle_close(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Evidence intake handlers                                                   #
+# --------------------------------------------------------------------------- #
+
+#: Evidence store lives inside the Git-ignored session workspace.
+_EVIDENCE_REL = "evidence"
+
+
+def _evidence_root(session_dir: Path) -> Path:
+    """Return the evidence store root for a session directory."""
+
+    return session_dir / _EVIDENCE_REL
+
+
+def _require_session(project: Path, session_id: str) -> Path:
+    """Validate the session exists and return its directory."""
+
+    session_dir = _session_dir(project, session_id)
+    if not (session_dir / "events.jsonl").exists():
+        raise SessionError(CODE_NOT_INITIALIZED, safe_ids=(session_id,))
+    return session_dir
+
+
+def _handle_intake_add_document(args: argparse.Namespace) -> int:
+    project = _project_root(args.project)
+    session_id = _validate_session_id(args.session_id)
+    session_dir = _require_session(project, session_id)
+    store = EvidenceStore.create(_evidence_root(session_dir))
+    record = store.add_document(
+        args.path,
+        allowed_roots=(project,),
+        source=args.source,
+    )
+    _emit_json(record.to_dict())
+    return EXIT_OK
+
+
+def _handle_intake_snapshot(args: argparse.Namespace) -> int:
+    project = _project_root(args.project)
+    session_id = _validate_session_id(args.session_id)
+    session_dir = _require_session(project, session_id)
+    media_type = args.media_type
+    if media_type not in (MEDIA_TEXT_MARKDOWN, MEDIA_TEXT_PLAIN):
+        raise EvidenceError("discovery.evidence.invalid_media") from None
+    raw = _read_stdin_bytes()
+    store = EvidenceStore.create(_evidence_root(session_dir))
+    record = store.add_snapshot(
+        raw,
+        media_type=media_type,
+        source=args.source,
+    )
+    _emit_json(record.to_dict())
+    return EXIT_OK
+
+
+def _read_stdin_bytes() -> bytes:
+    """Read raw bytes from stdin (never decodes or echoes content)."""
+
+    handle = sys.stdin.buffer if sys.stdin is not None else None
+    if handle is None:
+        raise EvidenceError("discovery.evidence.invalid_encoding") from None
+    return handle.read()
+
+
+# --------------------------------------------------------------------------- #
 # Argument parser                                                             #
 # --------------------------------------------------------------------------- #
 
@@ -451,6 +523,51 @@ def _parser() -> argparse.ArgumentParser:
     close_parser.add_argument("--actor", help="Actor identity (default: approver).")
     close_parser.set_defaults(func=_handle_close)
 
+    intake_parser = subparsers.add_parser(
+        "intake", help="Capture normalized evidence into a session."
+    )
+    intake_sub = intake_parser.add_subparsers(
+        dest="intake_command", required=True
+    )
+
+    add_document_parser = intake_sub.add_parser(
+        "add-document", help="Ingest a Markdown or plain-text document."
+    )
+    add_document_parser.add_argument(
+        "--session-id", dest="session_id", required=True, help="Session id."
+    )
+    add_document_parser.add_argument(
+        "--project", help="Project root (default: cwd)."
+    )
+    add_document_parser.add_argument(
+        "--path", required=True, help="Document path (must be project-contained)."
+    )
+    add_document_parser.add_argument(
+        "--source",
+        help="Source label (default: project-relative POSIX path).",
+    )
+    add_document_parser.set_defaults(func=_handle_intake_add_document)
+
+    snapshot_parser = intake_sub.add_parser(
+        "snapshot", help="Store normalized text content read from stdin."
+    )
+    snapshot_parser.add_argument(
+        "--session-id", dest="session_id", required=True, help="Session id."
+    )
+    snapshot_parser.add_argument(
+        "--project", help="Project root (default: cwd)."
+    )
+    snapshot_parser.add_argument(
+        "--source", required=True, help="Source label for the snapshot."
+    )
+    snapshot_parser.add_argument(
+        "--media-type",
+        dest="media_type",
+        required=True,
+        help="Media type (text/markdown or text/plain).",
+    )
+    snapshot_parser.set_defaults(func=_handle_intake_snapshot)
+
     return parser
 
 
@@ -466,7 +583,7 @@ def _run(handler: object, args: argparse.Namespace) -> int:
         return handler(args)  # type: ignore[operator]
     except SystemExit:
         raise
-    except (SessionError, _CliError) as exc:
+    except (SessionError, EvidenceError, _CliError) as exc:
         _emit_error(exc)
         return EXIT_ERROR
     except Exception:
