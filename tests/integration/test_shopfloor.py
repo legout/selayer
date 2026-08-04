@@ -620,3 +620,22 @@ def test_business_context_is_four_valid_reference_concepts(tmp_path: Path) -> No
     assert all(
         "selayer_id" not in concept.frontmatter for concept in references.values()
     )
+
+
+def test_every_metric_has_complete_curated_overlay(tmp_path: Path) -> None:
+    """Every headline metric has a curated overlay with four non-empty sections."""
+    output = tmp_path / "knowledge"
+    layer = SemanticLayer.load(SHOPFLOOR_CATALOG)
+    bundle = OkfBundle.build(
+        layer,
+        output,
+        references_dir=SHOPFLOOR_ROOT / "business_context",
+        overlays_dir=SHOPFLOOR_ROOT / "okf_overlays",
+    )
+    for metric_name in sorted(layer.metrics):
+        concept = bundle.concepts[f"metrics/{metric_name}"]
+        sections = {section.title: section.content.strip() for section in concept.sections}
+        assert sections["Usage Guidance"]
+        assert sections["Examples"]
+        assert sections["Caveats"]
+        assert sections["Related Concepts"]
