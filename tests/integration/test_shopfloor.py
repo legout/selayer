@@ -1309,7 +1309,7 @@ def test_build_knowledge_policy_failure_publishes_nothing(
 
 
 def test_build_knowledge_rejects_symlinked_parent(tmp_path: Path) -> None:
-    """A symlinked ancestor directory must be rejected without writing its target."""
+    """A symlinked immediate parent must be rejected without writing its target."""
     real = tmp_path / "real"
     real.mkdir()
     linked = tmp_path / "linked"
@@ -1317,6 +1317,25 @@ def test_build_knowledge_rejects_symlinked_parent(tmp_path: Path) -> None:
     output = linked / "knowledge"
     assert build_knowledge_main(["--output-dir", str(output)]) == 1
     assert not (real / "knowledge").exists()
+
+
+def test_build_knowledge_allows_canonical_symlink_ancestor(tmp_path: Path) -> None:
+    """A higher (non-boundary) symlink ancestor must be allowed.
+
+    Every platform exposes the temporary root through a canonical symlink
+    (e.g. macOS ``/var -> /private/var``); rejecting it breaks portable
+    temporary-output builds.  Only the destination itself and its immediate
+    parent are mutation boundaries that must be symlink-free.
+    """
+    real = tmp_path / "real"
+    real.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real)
+    output = alias / "work" / "knowledge"
+    assert build_knowledge_main(["--output-dir", str(output)]) == 0
+    # The output resolves through the canonical ancestor into the real target.
+    assert (real / "work" / "knowledge").is_dir()
+    assert any((real / "work" / "knowledge").iterdir())
 
 
 def test_build_knowledge_rejects_special_file_output(tmp_path: Path) -> None:

@@ -49,15 +49,19 @@ class ShopfloorKnowledgeBuildError(Exception):
         return self._issues
 
 
-def _reject_symlink_ancestors(path: Path) -> None:
-    """Reject any existing symlink in the lexical parent chain of ``path``.
+def _reject_boundary_symlinks(destination: Path) -> None:
+    """Reject mutation-redirecting symlinks while allowing canonical ancestors.
 
-    Walks ancestors without resolving through symlinks so a symlinked
-    parent cannot redirect output to an unintended target.
+    A symlink at the destination itself or its immediate parent redirects
+    the whole mutation into an unintended location and is rejected.  Higher
+    ancestor components are allowed to be symlinks: every supported platform
+    exposes the system temporary root through a canonical symlink
+    (``/var -> /private/var`` on macOS), and documented smoke builds write
+    into exactly such a path.  This matches the repository mutation preflight
+    in :func:`selayer.okf.bundle._preflight_mutation_path`.
     """
-    for ancestor in path.parents:
-        if ancestor.is_symlink():
-            raise ValueError("path component must not be a symbolic link")
+    if destination.is_symlink() or destination.parent.is_symlink():
+        raise ValueError("output path or its parent must not be a symbolic link")
 
 
 def _require_absent_or_empty(destination: Path) -> None:
@@ -88,7 +92,7 @@ def build_knowledge(output_dir: Path) -> OkfBundle:
     # Preserve the lexical absolute path without resolving symlinks so a
     # symlinked ancestor cannot redirect output to an unintended target.
     destination = output_dir.absolute()
-    _reject_symlink_ancestors(destination)
+    _reject_boundary_symlinks(destination)
     _require_absent_or_empty(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(
