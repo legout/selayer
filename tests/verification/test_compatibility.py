@@ -12,9 +12,11 @@ completed; ``status="failed"`` is reserved for invalid selectors.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
-from selayer.model import SemanticLayer
+from selayer import QueryEngine
+from selayer.model import SemanticLayer, SemanticStatus
 from selayer.planning.planner import plan_query
 from selayer.planning.types import QueryRequest
 from selayer.verification import CompatibilityCheck, verify
@@ -496,3 +498,114 @@ def test_metric_alone_explicit_case_with_no_dimensions_is_compatible(
     assert outcome.status == "passed"
     assert outcome.evidence["compatible"] is True
     assert outcome.evidence["selected_dimensions"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Deprecation reporting (Task 3)
+# ---------------------------------------------------------------------------
+
+
+def _layer_with_deprecated_metric(
+    valid_layer: SemanticLayer,
+    *,
+    deprecated_measure: bool = False,
+) -> SemanticLayer:
+    """Return ``valid_layer`` with ``gross_margin`` deprecated and a successor.
+
+    ``gross_margin`` is marked deprecated with ``metric.gross_margin_v2`` as its
+    replacement; ``gross_margin_v2`` is an active metric with the same measures.
+    When ``deprecated_measure`` is set, ``total_item_revenue`` is additionally
+    deprecated with an active successor so transitive usage is exercised.
+    """
+    base = valid_layer.metrics["gross_margin"]
+    v2 = replace(base, name="gross_margin_v2")
+    metrics = {
+        **valid_layer.metrics,
+        "gross_margin": replace(
+            base,
+            status=SemanticStatus.DEPRECATED,
+            replaced_by="metric.gross_margin_v2",
+        ),
+        "gross_margin_v2": v2,
+    }
+    layer = replace(valid_layer, metrics=metrics)
+    if not deprecated_measure:
+        return layer
+    measure = valid_layer.measures["total_item_revenue"]
+    measures = {
+        **valid_layer.measures,
+        "total_item_revenue": replace(
+            measure,
+            status=SemanticStatus.DEPRECATED,
+            replaced_by="measure.total_item_revenue_v2",
+        ),
+        "total_item_revenue_v2": replace(measure, name="total_item_revenue_v2"),
+    }
+    return replace(layer, measures=measures)
+
+
+def test_deprecated_metric_still_plans_and_executes(
+    valid_layer: SemanticLayer,
+) -> None:
+    """A deprecated metric remains plannable and executable (not removed)."""
+    layer = _layer_with_deprecated_metric(valid_layer)
+
+    plan = plan_query(layer, QueryRequest(["gross_margin"]))
+    assert plan.anchor_source == "order_items"
+    assert tuple(metric.id for metric in plan.metrics) == ("gross_margin",)
+
+    # The deprecated metric still executes against the underlying data.
+    with QueryEngine(layer) as engine:
+        result = engine.query(["gross_margin"], ["product_category"])
+    assert "gross_margin" in result.columns
+    assert result.height > 0
+
+
+def test_compatibility_reports_deprecated_metric_and_replacement(
+    valid_layer: SemanticLayer,
+) -> None:
+    """A compatible outcome lists the deprecated metric and its replacement."""
+    layer = _layer_with_deprecated_metric(valid_layer)
+    report = verify(layer, CompatibilityCheck(metrics=("gross_margin",)))
+    outcome = next(
+        item
+        for item in report.outcomes
+        if item.check_id == "compatibility.metric.gross_margin"
+    )
+    assert outcome.evidence["compatible"] is True
+    assert outcome.evidence["deprecated_ids"] == "metric.gross_margin"
+    assert outcome.evidence["replacements"] == "metric.gross_margin_v2"
+
+
+def test_compatibility_reports_transitively_used_deprecated_measure(
+    valid_layer: SemanticLayer,
+) -> None:
+    """A transitively used deprecated measure is reported alongside its metric."""
+    layer = _layer_with_deprecated_metric(valid_layer, deprecated_measure=True)
+    report = verify(layer, CompatibilityCheck(metrics=("gross_margin",)))
+    outcome = next(
+        item
+        for item in report.outcomes
+        if item.check_id == "compatibility.metric.gross_margin"
+    )
+    deprecated_ids = outcome.evidence["deprecated_ids"]
+    assert isinstance(deprecated_ids, str)
+    assert "metric.gross_margin" in deprecated_ids
+    assert "measure.total_item_revenue" in deprecated_ids
+    replacements = outcome.evidence["replacements"]
+    assert isinstance(replacements, str)
+    assert "measure.total_item_revenue_v2" in replacements
+
+
+def test_compatibility_outcome_has_no_deprecated_keys_when_clean(
+    valid_layer: SemanticLayer,
+) -> None:
+    """A request touching no deprecated objects omits the deprecated evidence."""
+    report = verify(valid_layer, CompatibilityCheck(metrics=("gross_margin",)))
+    outcome = next(
+        item
+        for item in report.outcomes
+        if item.check_id == "compatibility.metric.gross_margin"
+    )
+    assert "deprecated_ids" not in outcome.evidence
+    assert "replacements" not in outcome.evidence

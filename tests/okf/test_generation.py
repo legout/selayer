@@ -6,9 +6,9 @@ from pathlib import Path
 import pytest
 
 from selayer import SemanticLayer
-from selayer.model import DataSource, Dimension
+from selayer.model import DataSource, Dimension, SemanticStatus
 from selayer.okf import OkfBundle
-from selayer.okf.generation import catalog_definition
+from selayer.okf.generation import catalog_definition, concepts_from_layer
 from selayer.sources.config import ParquetConfig
 from selayer.sources.schema import FieldSchema, ScalarType, TableSchema
 
@@ -553,3 +553,71 @@ def test_generation_never_accesses_source_data(
     monkeypatch.setattr(pl, "read_parquet", fail)
 
     OkfBundle.generate(ecommerce_layer, tmp_path / "knowledge")
+
+
+# ---------------------------------------------------------------------------
+# Deprecation migration metadata (Task 3)
+# ---------------------------------------------------------------------------
+
+
+def _layer_with_deprecated_metric(ecommerce_layer: SemanticLayer) -> SemanticLayer:
+    """Return ``ecommerce_layer`` with ``gross_margin`` deprecated and a successor."""
+    base = ecommerce_layer.metrics["gross_margin"]
+    v2 = replace(base, name="gross_margin_v2")
+    return replace(
+        ecommerce_layer,
+        metrics={
+            **ecommerce_layer.metrics,
+            "gross_margin": replace(
+                base,
+                status=SemanticStatus.DEPRECATED,
+                replaced_by="metric.gross_margin_v2",
+            ),
+            "gross_margin_v2": v2,
+        },
+    )
+
+
+def test_generated_deprecated_concept_uses_deprecated_status_and_links_replacement(
+    ecommerce_layer: SemanticLayer,
+) -> None:
+    """A deprecated object generates ``status: deprecated`` and a replacement link."""
+    layer = _layer_with_deprecated_metric(ecommerce_layer)
+    concepts = concepts_from_layer(layer)
+
+    deprecated = concepts["metrics/gross_margin"]
+    assert deprecated.frontmatter["status"] == "deprecated"
+    # The replacement target is linked through the concept-path function.
+    assert deprecated.frontmatter["replaced_by"] == "metrics/gross_margin_v2.md"
+
+    successor = concepts["metrics/gross_margin_v2"]
+    assert successor.frontmatter["status"] == "stable"
+    assert "replaced_by" not in successor.frontmatter
+
+
+def test_active_generated_concepts_retain_stable_status(
+    ecommerce_layer: SemanticLayer,
+) -> None:
+    """Active objects keep the current ``stable`` status and no replacement link."""
+    layer = _layer_with_deprecated_metric(ecommerce_layer)
+    concepts = concepts_from_layer(layer)
+
+    for concept_id in ("dimensions/product_category", "sources/orders", "metrics/gross_margin_v2"):
+        concept = concepts[concept_id]
+        assert concept.frontmatter["status"] == "stable", concept_id
+        assert "replaced_by" not in concept.frontmatter, concept_id
+
+
+def test_generated_deprecated_bundle_validates_cleanly(
+    tmp_path: Path,
+    ecommerce_layer: SemanticLayer,
+) -> None:
+    """A generated bundle whose deprecated concept carries migration metadata validates."""
+    layer = _layer_with_deprecated_metric(ecommerce_layer)
+    bundle = OkfBundle.generate(layer, tmp_path / "knowledge")
+    # The generated deprecated concept must satisfy OKF concept validation.
+    from selayer.okf.validation import validate_concept
+
+    deprecated = bundle.concepts["metrics/gross_margin"]
+    issues = validate_concept(deprecated, layer=layer)
+    assert issues == ()

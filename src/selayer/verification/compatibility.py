@@ -20,9 +20,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from types import MappingProxyType
 
-from selayer.model import SemanticLayer
+from selayer.model import SemanticLayer, SemanticStatus
 from selayer.planning.planner import plan_query
-from selayer.planning.types import QueryPlanningError, QueryRequest
+from selayer.planning.types import QueryPlan, QueryPlanningError, QueryRequest
 from selayer.verification.model import (
     CompatibilityCheck,
     VerificationDiagnostic,
@@ -145,6 +145,56 @@ def _unknown_selector_outcome(kind: str, index: int) -> VerificationOutcome:
     )
 
 
+def _deprecated_evidence(layer: SemanticLayer, plan: QueryPlan) -> dict[str, str]:
+    """Return deprecation evidence for a compatible plan, or an empty dict.
+
+    Collects every deprecated semantic object touched by the plan — directly
+    requested deprecated metrics and dimensions, plus transitively used
+    deprecated measures, facts, sources, and relationships — and returns
+    comma-joined sorted ``deprecated_ids`` and ``replacements``. Returns an
+    empty dict when no deprecated object is touched so clean requests keep
+    their existing evidence shape unchanged.
+    """
+    deprecated: dict[str, str] = {}  # semantic_id -> replaced_by
+    for planned_metric in plan.metrics:
+        metric = planned_metric.metric
+        if metric.status == SemanticStatus.DEPRECATED:
+            deprecated[f"metric.{planned_metric.id}"] = metric.replaced_by or ""
+    for planned_dimension in plan.dimensions:
+        dimension = planned_dimension.dimension
+        if dimension.status == SemanticStatus.DEPRECATED:
+            deprecated[f"dimension.{planned_dimension.id}"] = (
+                dimension.replaced_by or ""
+            )
+    for planned_measure in plan.measures:
+        measure = planned_measure.measure
+        if measure.status == SemanticStatus.DEPRECATED:
+            deprecated[f"measure.{planned_measure.id}"] = measure.replaced_by or ""
+        fact = planned_measure.fact
+        if fact.status == SemanticStatus.DEPRECATED:
+            deprecated[f"fact.{fact.name}"] = fact.replaced_by or ""
+    for source_name in plan.source_grains:
+        source = layer.data_sources.get(source_name)
+        if source is not None and source.status == SemanticStatus.DEPRECATED:
+            deprecated[f"source.{source_name}"] = source.replaced_by or ""
+    for join in plan.joins:
+        relationship = layer.relationships.get(join.relationship_id)
+        if (
+            relationship is not None
+            and relationship.status == SemanticStatus.DEPRECATED
+        ):
+            deprecated[f"relationship.{join.relationship_id}"] = (
+                relationship.replaced_by or ""
+            )
+    if not deprecated:
+        return {}
+    replacements = ",".join(sorted(value for value in deprecated.values() if value))
+    return {
+        "deprecated_ids": ",".join(sorted(deprecated)),
+        "replacements": replacements,
+    }
+
+
 def _plan_outcome(
     layer: SemanticLayer, check_id: str, request: QueryRequest
 ) -> VerificationOutcome:
@@ -188,6 +238,7 @@ def _plan_outcome(
             "selected_dimensions": ",".join(
                 sorted(dimension.id for dimension in plan.dimensions)
             ),
+            **_deprecated_evidence(layer, plan),
         },
         diagnostics=(),
     )

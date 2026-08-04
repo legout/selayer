@@ -16,8 +16,9 @@ from pathlib import Path
 
 import pytest
 
-from selayer import DataSource, Fact, SemanticLayer, TableSchema
+from selayer import DataSource, Fact, Metric, SemanticLayer, TableSchema
 from selayer.catalog import CatalogIssue, CatalogValidationError
+from selayer.model import SemanticStatus
 from selayer.sources.config import ParquetConfig
 from selayer.sources.schema import FieldSchema, ScalarType
 from selayer.verification import StaticCheck, validate_catalog, verify
@@ -376,3 +377,148 @@ def test_static_check_malformed_collection_entry_is_coded_not_crash(
 def test_verify_rejects_unknown_check(valid_layer) -> None:  # type: ignore[no-untyped-def]
     with pytest.raises(TypeError, match="unsupported verification check"):
         verify(valid_layer, object())  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Deprecation replacement-graph validation (Task 3)
+# ---------------------------------------------------------------------------
+
+
+def _metric_layer(valid_layer: SemanticLayer, **metrics: Metric) -> SemanticLayer:
+    """Return a copy of ``valid_layer`` with the given metrics overlaid.
+
+    Replacement metrics are passed by local name (e.g.
+    ``gross_margin=...``); the overlay preserves every other collection so the
+    declaration rules still resolve measures, facts, and sources.
+    """
+    return replace(valid_layer, metrics={**valid_layer.metrics, **metrics})
+
+
+def _deprecated(name: str, metric: Metric, replaced_by: str | None) -> Metric:
+    return replace(
+        metric, name=name, status=SemanticStatus.DEPRECATED, replaced_by=replaced_by
+    )
+
+
+def test_static_replacement_missing_fails(valid_layer: SemanticLayer) -> None:
+    """A deprecated object with no resolvable replacement fails static validation."""
+    base = valid_layer.metrics["gross_margin"]
+    # No ``replaced_by`` declared at all.
+    layer = _metric_layer(valid_layer, gross_margin=_deprecated("gross_margin", base, None))
+    report = verify(layer, StaticCheck())
+    codes = {item.code for item in report.diagnostics}
+    assert "catalog.deprecation.replacement_missing" in codes
+    assert not report.passed
+
+
+def test_static_replacement_unresolved_target_fails(valid_layer: SemanticLayer) -> None:
+    """A ``replaced_by`` pointing at an unknown object fails as missing."""
+    base = valid_layer.metrics["gross_margin"]
+    layer = _metric_layer(
+        valid_layer, gross_margin=_deprecated("gross_margin", base, "metric.ghost")
+    )
+    report = verify(layer, StaticCheck())
+    codes = {item.code for item in report.diagnostics}
+    assert "catalog.deprecation.replacement_missing" in codes
+    assert not report.passed
+
+
+def test_static_replacement_kind_mismatch_fails(valid_layer: SemanticLayer) -> None:
+    """A replacement of a different semantic kind fails."""
+    base = valid_layer.metrics["gross_margin"]
+    layer = _metric_layer(
+        valid_layer,
+        gross_margin=_deprecated("gross_margin", base, "dimension.product_category"),
+    )
+    report = verify(layer, StaticCheck())
+    codes = {item.code for item in report.diagnostics}
+    assert "catalog.deprecation.replacement_kind" in codes
+    assert "catalog.deprecation.replacement_missing" not in codes
+    assert not report.passed
+
+
+def test_static_self_replacement_fails(valid_layer: SemanticLayer) -> None:
+    """An object that replaces itself fails with the self-replacement code."""
+    base = valid_layer.metrics["gross_margin"]
+    layer = _metric_layer(
+        valid_layer,
+        gross_margin=_deprecated("gross_margin", base, "metric.gross_margin"),
+    )
+    report = verify(layer, StaticCheck())
+    codes = {item.code for item in report.diagnostics}
+    assert "catalog.deprecation.self_replacement" in codes
+    assert "catalog.deprecation.cycle" not in codes
+    assert not report.passed
+
+
+def test_static_replacement_cycle_fails(valid_layer: SemanticLayer) -> None:
+    """A two-object replacement cycle fails with the cycle code on both nodes."""
+    base = valid_layer.metrics["gross_margin"]
+    v2 = replace(base, name="gross_margin_v2")
+    layer = _metric_layer(
+        valid_layer,
+        gross_margin=_deprecated("gross_margin", base, "metric.gross_margin_v2"),
+        gross_margin_v2=_deprecated("gross_margin_v2", v2, "metric.gross_margin"),
+    )
+    report = verify(layer, StaticCheck())
+    cycle_paths = {
+        item.path for item in report.diagnostics if item.code == "catalog.deprecation.cycle"
+    }
+    assert cycle_paths == {"metric.gross_margin", "metric.gross_margin_v2"}
+    assert not report.passed
+
+
+def test_static_valid_same_kind_chain_passes(valid_layer: SemanticLayer) -> None:
+    """A valid same-kind replacement chain produces notices but no errors."""
+    base = valid_layer.metrics["gross_margin"]
+    v2 = replace(base, name="gross_margin_v2")
+    v3 = replace(base, name="gross_margin_v3")
+    layer = _metric_layer(
+        valid_layer,
+        gross_margin=_deprecated("gross_margin", base, "metric.gross_margin_v2"),
+        gross_margin_v2=_deprecated("gross_margin_v2", v2, "metric.gross_margin_v3"),
+        gross_margin_v3=v3,
+    )
+    report = verify(layer, StaticCheck())
+    errors = [item for item in report.diagnostics if item.severity == "error"]
+    assert errors == []
+    assert report.passed
+
+
+def test_static_emits_one_notice_per_deprecated_object(valid_layer: SemanticLayer) -> None:
+    """Each deprecated object yields exactly one non-blocking notice."""
+    base = valid_layer.metrics["gross_margin"]
+    v2 = replace(base, name="gross_margin_v2")
+    layer = _metric_layer(
+        valid_layer,
+        gross_margin=_deprecated("gross_margin", base, "metric.gross_margin_v2"),
+        gross_margin_v2=v2,
+    )
+    report = verify(layer, StaticCheck())
+    notices = [
+        item for item in report.diagnostics if item.code == "catalog.deprecation.notice"
+    ]
+    assert len(notices) == 1
+    assert notices[0].severity == "info"
+    assert notices[0].path == "metric.gross_margin"
+    # The notice is non-blocking: the report still passes.
+    assert report.passed
+
+
+def test_static_deprecation_outcome_carries_count(valid_layer: SemanticLayer) -> None:
+    """The deprecation outcome is present only when objects are deprecated."""
+    base = valid_layer.metrics["gross_margin"]
+    v2 = replace(base, name="gross_margin_v2")
+    layer = _metric_layer(
+        valid_layer,
+        gross_margin=_deprecated("gross_margin", base, "metric.gross_margin_v2"),
+        gross_margin_v2=v2,
+    )
+    report = verify(layer, StaticCheck())
+    outcome = next(
+        item for item in report.outcomes if item.check_id == "catalog.deprecation"
+    )
+    assert outcome.evidence["deprecated_count"] == 1
+    # A clean catalog with no deprecations has no deprecation outcome.
+    clean = verify(valid_layer, StaticCheck())
+    assert all(item.check_id != "catalog.deprecation" for item in clean.outcomes)

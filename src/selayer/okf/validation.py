@@ -298,6 +298,17 @@ def validate_concept(
                 optional_severity,
             )
         )
+    if status == "deprecated":
+        replaced_by = frontmatter.get("replaced_by")
+        if not _is_nonempty_string(replaced_by):
+            issues.append(
+                _optional_issue(
+                    concept,
+                    "replaced_by",
+                    "replaced_by is required when status is deprecated",
+                    optional_severity,
+                )
+            )
     if "stale_after" in frontmatter and not _is_iso_date(frontmatter["stale_after"]):
         issues.append(
             _optional_issue(

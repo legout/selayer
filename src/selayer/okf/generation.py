@@ -7,7 +7,15 @@ from types import MappingProxyType
 
 from selayer.catalog import SemanticLayer, SemanticObject
 from selayer.expressions import format_expression
-from selayer.model import DataSource, Dimension, Fact, Measure, Metric, Relationship
+from selayer.model import (
+    DataSource,
+    Dimension,
+    Fact,
+    Measure,
+    Metric,
+    Relationship,
+    SemanticStatus,
+)
 from selayer.sources.config import connector_kind
 from selayer.sources.schema import (
     DecimalType,
@@ -284,7 +292,14 @@ def concepts_from_layer(
             }
         )
         generated["fingerprint"] = generated_fingerprint(frontmatter, definition)
-        frontmatter["status"] = "stable"
+        if value.status == SemanticStatus.DEPRECATED:
+            frontmatter["status"] = "deprecated"
+            if value.replaced_by is not None:
+                frontmatter["replaced_by"] = concept_path(
+                    value.replaced_by
+                ).as_posix()
+        else:
+            frontmatter["status"] = "stable"
         sections = (
             OkfSection("Catalog Definition", definition),
             *(OkfSection(title, "") for title in _CURATED_SECTION_TITLES),
