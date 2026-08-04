@@ -1108,7 +1108,6 @@ def test_shopfloor_policy_rejects_duplicate_json_keys(tmp_path: Path) -> None:
     changed = dataclass_replace(bundle, concepts=MappingProxyType(concepts))
     issues = validate_shopfloor_knowledge(changed, layer)
     assert any(
-        issue.code == "shopfloor.query.invalid"
-        and "duplicate key" in issue.message
+        issue.code == "shopfloor.query.invalid" and "duplicate key" in issue.message
         for issue in issues
     )
