@@ -21,7 +21,7 @@ import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Final
+from typing import Final, NewType
 
 from selayer_discovery.diagnostics import DiscoveryError
 
@@ -31,6 +31,7 @@ __all__ = [
     "MAX_TEXT_LENGTH",
     "SCHEMA_VERSION",
     "Artifact",
+    "ArtifactId",
     "EvidenceClass",
     "GateDisposition",
     "GroupStatus",
@@ -38,6 +39,7 @@ __all__ = [
     "bounded_sequence",
     "bounded_text",
     "normalize_actor_identity",
+    "validate_artifact_id",
 ]
 
 #: Canonical artifact schema version produced by this package.
@@ -51,6 +53,20 @@ MAX_COLLECTION_ITEMS: Final[int] = 100_000
 
 #: Maximum container nesting depth accepted by the canonicalizer.
 MAX_NESTING_DEPTH: Final[int] = 64
+
+#: Nominal type for bounded, machine-generated artifact identifiers.
+ArtifactId = NewType("ArtifactId", str)
+_ARTIFACT_ID_RE: Final[re.Pattern[str]] = re.compile(r"\A[a-z][a-z0-9_.-]{0,127}\Z")
+
+
+def validate_artifact_id(value: object) -> ArtifactId:
+    """Validate and return a bounded deterministic artifact identifier."""
+    if type(value) is not str or _ARTIFACT_ID_RE.match(value) is None:
+        raise DiscoveryError(
+            "discovery.artifact.invalid",
+            safe_detail="artifact id is invalid",
+        )
+    return ArtifactId(value)
 
 
 class EvidenceClass(StrEnum):
@@ -92,13 +108,20 @@ class GateDisposition(StrEnum):
 class Artifact:
     """Base type for versioned discovery artifacts.
 
-    Every machine-readable artifact carries its :data:`SCHEMA_VERSION` so a
-    canonical fingerprint is self-describing. ``schema_version`` is
-    keyword-only with a default so subclasses may declare required positional
-    fields without positional-after-default ordering conflicts.
+    Every machine-readable artifact carries a bounded artifact ID and the
+    current schema version so a canonical fingerprint is self-describing.
     """
 
+    artifact_id: str
     schema_version: int = SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        validate_artifact_id(self.artifact_id)
+        if type(self.schema_version) is not int or self.schema_version != SCHEMA_VERSION:
+            raise DiscoveryError(
+                "discovery.artifact.invalid",
+                safe_detail="artifact schema version is invalid",
+            )
 
 
 _ACTOR_WHITESPACE: Final[re.Pattern[str]] = re.compile(r"\s+")

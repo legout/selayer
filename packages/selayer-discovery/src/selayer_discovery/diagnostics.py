@@ -64,8 +64,56 @@ _KNOWN_CODES: Final[frozenset[str]] = frozenset(_CODE_MESSAGES)
 # names, qualified semantic ids (``dimension.foo``), session/group slugs, and
 # lowercase UUIDs, while rejecting credential URIs, free text, and secrets.
 _SAFE_ID_RE: Final[re.Pattern[str]] = re.compile(r"\A[a-z][a-z0-9_.-]*\Z")
+_SAFE_ID_PREFIXES: Final[tuple[str, ...]] = (
+    "session-",
+    "record-",
+    "artifact-",
+    "evidence-",
+    "document-",
+    "source-",
+    "provider-",
+    "interview-",
+    "answer-",
+    "claim-",
+    "conflict-",
+    "proposal-",
+    "group-",
+    "verification-",
+    "batch-",
+    "transaction-",
+    "event-",
+    "gate-",
+    "question-",
+    "reference-",
+    "overlay-",
+    "catalog.",
+    "source.",
+    "dimension.",
+    "fact.",
+    "measure.",
+    "metric.",
+    "relationship.",
+)
+_SAFE_ID_MAX_LENGTH: Final[int] = 128
+_SAFE_ID_MAX_COUNT: Final[int] = 100_000
 _SAFE_ID_PLACEHOLDER: Final[str] = "<id>"
 _SAFE_DETAIL_MAX_LENGTH: Final[int] = 256
+_SAFE_DETAILS: Final[frozenset[str]] = frozenset(
+    {
+        "evidence record rejected",
+        "actor identity must be text",
+        "actor identity must not be blank",
+        "value must be text",
+        "value exceeds the maximum text length",
+        "value must be a sequence",
+        "sequence exceeds the maximum item count",
+        "value must be a mapping",
+        "mapping exceeds the maximum item count",
+        "mapping keys must be text",
+        "artifact id is invalid",
+        "artifact schema version is invalid",
+    }
+)
 
 
 def _safe_code(code: object) -> str:
@@ -80,34 +128,33 @@ def _safe_code(code: object) -> str:
 
 
 def _safe_detail(detail: object) -> str | None:
-    """Return ``detail`` only if it is a bounded plain string, else ``None``."""
+    """Return only an allowlisted constant detail string."""
 
     if type(detail) is not str:
         return None
-    if len(detail) > _SAFE_DETAIL_MAX_LENGTH:
+    if len(detail) > _SAFE_DETAIL_MAX_LENGTH or detail not in _SAFE_DETAILS:
         return None
     return detail
 
 
 def _safe_ids(ids: object) -> tuple[str, ...]:
-    """Return validated stable identifiers, coercing unsafe values to a placeholder.
+    """Return bounded, prefixed artifact identifiers or placeholders."""
 
-    A bare string is treated as no ids (a string is not an id collection); any
-    other non-iterable is likewise empty. Each id is retained only when it is
-    an exact builtin ``str`` matching the stable-identifier shape.
-    """
-
-    if isinstance(ids, str):
-        return ()
-    if not isinstance(ids, Iterable):
+    if isinstance(ids, str) or not isinstance(ids, Iterable):
         return ()
     result: list[str] = []
-    for item in ids:
-        result.append(
-            item
-            if type(item) is str and _SAFE_ID_RE.match(item) is not None
-            else _SAFE_ID_PLACEHOLDER
-        )
+    for index, item in enumerate(ids):
+        if index >= _SAFE_ID_MAX_COUNT:
+            return (_SAFE_ID_PLACEHOLDER,)
+        if (
+            type(item) is str
+            and len(item) <= _SAFE_ID_MAX_LENGTH
+            and _SAFE_ID_RE.match(item) is not None
+            and item.startswith(_SAFE_ID_PREFIXES)
+        ):
+            result.append(item)
+        else:
+            result.append(_SAFE_ID_PLACEHOLDER)
     return tuple(result)
 
 

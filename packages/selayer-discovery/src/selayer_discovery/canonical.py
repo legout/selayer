@@ -74,6 +74,8 @@ def _normalize(value: object, depth: int) -> NormalizedArtifact:
         return value
     if type(value) is str:
         return value
+    if isinstance(value, str):
+        raise _unsupported("discovery.canonical.unsupported")
     if isinstance(value, (bytes, bytearray)):
         raise _unsupported("discovery.canonical.unsupported")
     # datetime is a subclass of date; reject timestamps before accepting dates.

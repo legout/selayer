@@ -40,6 +40,7 @@ from selayer_discovery.model import (
     bounded_sequence,
     bounded_text,
     normalize_actor_identity,
+    validate_artifact_id,
 )
 
 # --------------------------------------------------------------------------- #
@@ -192,9 +193,15 @@ def test_artifact_base_carries_schema_version() -> None:
         klass: EvidenceClass
         observed_on: date
 
-    record = ClaimRecord(claim_id="c1", klass=EvidenceClass.OBSERVED, observed_on=date(2026, 1, 2))
+    record = ClaimRecord(
+        artifact_id="claim-c1",
+        claim_id="c1",
+        klass=EvidenceClass.OBSERVED,
+        observed_on=date(2026, 1, 2),
+    )
     normalized = normalize_artifact(record)
     assert normalized == {
+        "artifact_id": "claim-c1",
         "schema_version": SCHEMA_VERSION,
         "claim_id": "c1",
         "klass": "observed",
@@ -209,7 +216,7 @@ def test_artifact_base_is_immutable() -> None:
     class Record(Artifact):
         value: int
 
-    record = Record(value=1)
+    record = Record(artifact_id="record-1", value=1)
     with pytest.raises(FrozenInstanceError):
         record.value = 2  # type: ignore[misc]
 
@@ -334,6 +341,27 @@ def _secret_error() -> DiscoveryError:
 def _assert_no_secrets(text: str) -> None:
     for fragment in _SECRET_FRAGMENTS:
         assert fragment not in text, f"secret fragment leaked: {fragment!r}"
+
+
+def test_diagnostic_rejects_untrusted_rendered_fields() -> None:
+    token = "sk-live-token-9f8a7c6b5d"
+    error = DiscoveryError(
+        "discovery.artifact.invalid",
+        safe_detail="postgres://user:s3cr3t@db.example.com/prod",
+        safe_ids=[token] * (MAX_COLLECTION_ITEMS + 1),
+    )
+    rendered = json.dumps(error.to_dict(), sort_keys=True) + repr(error)
+    _assert_no_secrets(rendered)
+    assert "<id>" in rendered
+    assert "postgres://" not in rendered
+
+
+def test_artifact_ids_are_bounded_and_grammar_checked() -> None:
+    assert str(validate_artifact_id("claim-c1")) == "claim-c1"
+    with pytest.raises(DiscoveryError):
+        validate_artifact_id("../secret")
+    with pytest.raises(DiscoveryError):
+        validate_artifact_id("x" * 129)
 
 
 def test_exception_str_is_safe() -> None:
