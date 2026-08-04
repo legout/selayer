@@ -45,3 +45,9 @@ examples/shopfloor/.generated/
 # Local code graph and Graphify output
 .codegraph/
 graphify-out/
+
+# Discovery: raw sessions and apply journals are never committed.
+# Approved summaries (semantic_changes/) and project config
+# (.selayer/discovery.yaml) remain Git-visible.
+.selayer/discovery/sessions/
+.selayer/discovery/transactions/
