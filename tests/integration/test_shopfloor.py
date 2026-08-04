@@ -616,10 +616,8 @@ def test_business_context_is_four_valid_reference_concepts(tmp_path: Path) -> No
         "business_context/quality_policy",
     }
     assert all(
-        concept.frontmatter["type"] == "Reference"
-        for concept in references.values()
+        concept.frontmatter["type"] == "Reference" for concept in references.values()
     )
     assert all(
-        "selayer_id" not in concept.frontmatter
-        for concept in references.values()
+        "selayer_id" not in concept.frontmatter for concept in references.values()
     )
