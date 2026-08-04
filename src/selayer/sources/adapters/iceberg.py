@@ -216,6 +216,8 @@ class IcebergAdapter:
         row_filter = _iceberg_row_filter(requirement.filters)
         selected_fields = requirement.columns
         scan_kwargs: dict[str, object] = {"selected_fields": selected_fields}
+        if handle.snapshot is not None:
+            scan_kwargs["snapshot_id"] = _parse_snapshot_id(handle.snapshot)
         if row_filter is not None:
             scan_kwargs["row_filter"] = row_filter
 
@@ -341,6 +343,14 @@ def _safe_snapshot_id(table: object) -> str | None:
     if snapshot_id is None:
         return None
     return str(snapshot_id)
+
+
+def _parse_snapshot_id(snapshot_id: str) -> int:
+    """Parse an Iceberg snapshot token without exposing token text."""
+    try:
+        return int(snapshot_id)
+    except (TypeError, ValueError):
+        raise ValueError("invalid iceberg snapshot") from None
 
 
 def _snapshot_arrow_schema(table: object, snapshot_id: str) -> pa.Schema:

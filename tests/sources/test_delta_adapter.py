@@ -180,7 +180,9 @@ def test_delta_reopen_pins_original_version(
     connection = duckdb.connect(":memory:")
     try:
         adapter.register(connection, "events", reopened)
-        assert connection.execute('SELECT sum("value") FROM "events"').fetchone() == (10,)
+        row = connection.execute('SELECT sum("value") FROM "events"').fetchone()
+        assert row is not None
+        assert row[0] == 10
         assert reopened.snapshot == baseline.snapshot
     finally:
         adapter.close(reopened)
@@ -217,7 +219,9 @@ def test_delta_registers_pyarrow_dataset(
 
     connection = duckdb.connect(":memory:")
     adapter.register(connection, "events", handle)
-    assert connection.execute('SELECT sum("value") FROM "events"').fetchone() == (10,)
+    row = connection.execute('SELECT sum("value") FROM "events"').fetchone()
+    assert row is not None
+    assert row[0] == 10
     adapter.close(handle)
     connection.close()
 
@@ -310,7 +314,9 @@ def test_delta_schema_mismatch_preserves_old_snapshot(
     )
 
     assert registry.status("events").generation == 1
-    assert registry.execute('SELECT sum("id") FROM "events"').fetchone() == (6,)
+    row = registry.execute('SELECT sum("id") FROM "events"').fetchone()
+    assert row is not None
+    assert row[0] == 6
 
     # Overwrite the Delta table with a drifted schema (extra column).
     drifted_schema = pa.schema(
@@ -341,7 +347,9 @@ def test_delta_schema_mismatch_preserves_old_snapshot(
     # The failed reload did not swap the registration: the generation is
     # unchanged and the previously registered data is still queryable.
     assert registry.status("events").generation == 1
-    assert registry.execute('SELECT sum("id") FROM "events"').fetchone() == (6,)
+    row = registry.execute('SELECT sum("id") FROM "events"').fetchone()
+    assert row is not None
+    assert row[0] == 6
 
     registry.close()
 
@@ -451,7 +459,9 @@ def test_delta_s3_profile_builds_filesystem(
 
     connection = duckdb.connect(":memory:")
     adapter.register(connection, "events", handle)
-    assert connection.execute('SELECT sum("value") FROM "events"').fetchone() == (10,)
+    row = connection.execute('SELECT sum("value") FROM "events"').fetchone()
+    assert row is not None
+    assert row[0] == 10
     adapter.close(handle)
     connection.close()
 

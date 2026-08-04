@@ -512,33 +512,42 @@ _DB_DIGEST_CHUNK = 65536
 
 
 def _local_file_digest(path: str | None) -> str | None:
-    """Return a SHA-256 content digest over the local database file bytes.
+    """Return a SHA-256 digest over a local database and journal state.
 
-    For a local read-only database file (SQLite, DuckDB) the snapshot is a
-    SHA-256 of the file content.  The digest is stable across prepares for
-    unchanged content and changes deterministically when the file is modified,
-    so the registry's prepare-and-compare-triple recheck detects a changed
-    file as a snapshot mismatch.  The file *path* is never included in the
-    digest — only the raw bytes — so a location cannot surface in the token.
+    SQLite may commit changes to a sidecar WAL or rollback journal while the
+    main file remains unchanged.  Include the relevant fixed-name sidecars so
+    the digest represents the effective read-only source state.  The sidecar
+    labels are stable constants; no filesystem location or raw value enters
+    the token.
 
-    Returns ``None`` when *path* is ``None`` (a remote/non-file source) or the
-    file cannot be read, so the caller falls back to LIVE.
+    Returns ``None`` when *path* is ``None`` (a remote/non-file source) or any
+    required file cannot be read, so the caller falls back to LIVE.
     """
 
-    if path is None:
-        return None
-    if type(path) is not str:
+    if path is None or type(path) is not str:
         return None
     digest = hashlib.sha256()
-    try:
-        with open(path, "rb") as handle:
-            for chunk in iter(lambda: handle.read(_DB_DIGEST_CHUNK), b""):
-                digest.update(chunk)
-    except OSError:
-        # An unreadable or vanished file cannot be content-digested; the
-        # caller falls back to LIVE rather than carrying a stale token.
-        return None
-    return digest.hexdigest()
+    candidates = (
+        (path, "main"),
+        (f"{path}-wal", "wal"),
+        (f"{path}-shm", "shm"),
+        (f"{path}-journal", "journal"),
+        (f"{path}.wal", "duckdb_wal"),
+    )
+    opened = False
+    for candidate, label in candidates:
+        try:
+            with open(candidate, "rb") as handle:
+                opened = True
+                digest.update(label.encode("ascii"))
+                digest.update(b"\0")
+                for chunk in iter(lambda: handle.read(_DB_DIGEST_CHUNK), b""):
+                    digest.update(chunk)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+    return digest.hexdigest() if opened else None
 
 
 # ---------------------------------------------------------------------------

@@ -210,6 +210,8 @@ class _ScanAdapter:
         self.prepare_count = 0
         self.closed: list[str] = []
         self.bind_count = 0
+        self.reopen_count = 0
+        self.reopen_raise: BaseException | None = None
         self.bind_raise: BaseException | None = None
 
     def prepare(
@@ -232,6 +234,31 @@ class _ScanAdapter:
             snapshot=self.snapshot,
             query_scoped=query_scoped,
             consistency=self.consistency,
+        )
+
+    def reopen(
+        self,
+        source: Any,
+        profiles: RuntimeProfileResolver,
+        arrow_providers: ArrowProviderResolver,
+        snapshot_id: str | None,
+    ) -> SourceHandle:
+        self.reopen_count += 1
+        if self.reopen_raise is not None:
+            failure = self.reopen_raise
+            self.reopen_raise = None
+            raise failure
+        factory = arrow_providers.resolve(
+            source.connector.handle, source_id=source.name
+        )
+        return SourceHandle(
+            source_id=source.name,
+            connector="pyarrow",
+            resource=factory(),
+            schema=source.schema,
+            snapshot=snapshot_id,
+            query_scoped=False,
+            consistency=SourceConsistency.REOPENABLE_SNAPSHOT,
         )
 
     def inspect_schema(self, handle: SourceHandle) -> TableSchema:
@@ -763,6 +790,19 @@ def test_scan_session_reflects_handle_consistency() -> None:
     with registry.open_scan_session("events", columns=("id",)) as session:
         assert session.consistency is SourceConsistency.TRANSACTION_SNAPSHOT
         assert session.snapshot_id == "tx-9"
+
+
+def test_recheck_reopens_versioned_adapter_at_baseline_snapshot() -> None:
+    registry, _, adapter, _ = _build(
+        consistency=SourceConsistency.REOPENABLE_SNAPSHOT, snapshot="v1"
+    )
+    with registry.open_scan_session("events", columns=("id",)) as session:
+        fresh = session.recheck_snapshot()
+    assert fresh.consistency is SourceConsistency.REOPENABLE_SNAPSHOT
+    assert fresh.snapshot_id == "v1"
+    assert adapter.prepare_count == 1
+    assert adapter.reopen_count == 1
+    assert adapter.closed.count("events") == 1
 
 
 # ---------------------------------------------------------------------------
