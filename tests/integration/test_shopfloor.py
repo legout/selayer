@@ -1441,9 +1441,7 @@ def test_shopfloor_clean_checkout_workflow(tmp_path: Path) -> None:
         max_chars=12_000,
     )
     assert len(context.items) > 1
-    semantic_ids = {
-        ref for item in context.items for ref in item.semantic_refs
-    }
+    semantic_ids = {ref for item in context.items for ref in item.semantic_refs}
     assert "metric.first_pass_yield" in semantic_ids
     assert "measure.first_pass_unit_count" in semantic_ids
 
