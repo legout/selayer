@@ -739,11 +739,17 @@ def test_metric_overlay_query_blocks_are_valid_and_exact(tmp_path: Path) -> None
         assert (
             type(metrics) is list and metrics and all(type(m) is str for m in metrics)
         ), f"{metric_name} metrics must be a non-empty list of strings"
+        assert metrics == [metric_name], (
+            f"{metric_name} metrics {metrics} != [{metric_name!r}]"
+        )
         dimensions = payload["dimensions"]
         assert type(dimensions) is list and all(type(d) is str for d in dimensions), (
             f"{metric_name} dimensions must be a list of strings"
         )
         assert type(payload["filters"]) is dict, f"{metric_name} filters must be a dict"
+        assert payload["filters"] == {}, (
+            f"{metric_name} filters {payload['filters']} != {{}}"
+        )
         expected = _EXPECTED_METRIC_DIMENSIONS[metric_name]
         assert dimensions == expected, (
             f"{metric_name} dimensions {dimensions} != {expected}"
