@@ -130,8 +130,10 @@ section in order:
    `first_pass_yield` by `station_id`, `product_model`, and `firmware_revision`.
    Two of three attempts pass and the first-pass yield is `2/3`.
 7. **Raw machine health** — `alarm_event_count` and `average_temperature_c` by
-   `telemetry_line_id` and `machine_state`. There is one alarm event and the
-   average machine temperature across the four telemetry samples is `48.5` °C.
+   `telemetry_line_id`, `telemetry_machine_id`, and `machine_state`. There is one
+   alarm event. The global average machine temperature across the four telemetry
+   samples is `48.5` °C (each grouped row reports the per-group average, not the
+   global value).
 
 After the seven sections, the runner demonstrates the planning boundary:
 
