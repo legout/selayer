@@ -48,7 +48,12 @@ from selayer import QueryEngine, QueryPlanningError, SemanticLayer
 from selayer.okf import OkfBundle
 from selayer.okf.model import OkfConcept, OkfSection
 from selayer.planning.types import QueryRequest
-from selayer.verification import CompatibilityCheck, PhysicalCheck, verify
+from selayer.verification import (
+    CompatibilityCheck,
+    PhysicalCheck,
+    StaticCheck,
+    verify,
+)
 
 _REPO = Path(__file__).parents[2]
 SHOPFLOOR_ROOT = _REPO / "examples" / "shopfloor"
@@ -1395,6 +1400,9 @@ def test_shopfloor_clean_checkout_workflow(tmp_path: Path) -> None:
     layer = _layer_for_paths(SemanticLayer.load(SHOPFLOOR_CATALOG), paths)
 
     # 3. Run static, physical, and compatibility verification.
+    static = verify(layer, StaticCheck())
+    assert static.complete
+    assert static.passed
     report = verify(layer, PhysicalCheck())
     assert report.complete
     assert report.passed
@@ -1432,7 +1440,12 @@ def test_shopfloor_clean_checkout_workflow(tmp_path: Path) -> None:
         include_linked=True,
         max_chars=12_000,
     )
-    assert len(context.items) > 0
+    assert len(context.items) > 1
+    semantic_ids = {
+        ref for item in context.items for ref in item.semantic_refs
+    }
+    assert "metric.first_pass_yield" in semantic_ids
+    assert "measure.first_pass_unit_count" in semantic_ids
 
     # Assert no step touched repository data or generated output.
     assert not (SHOPFLOOR_ROOT / "data").exists() or not any(

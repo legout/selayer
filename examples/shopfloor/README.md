@@ -60,25 +60,29 @@ uv run selayer okf validate examples/shopfloor/.generated/knowledge \
 ```
 
 The runner (`run_example.py`) generates temporary data and cleans up
-automatically. The standalone generator (`generate_data.py`) requires an
-explicit `--output-dir` and is used for physical audits that read source files
-from a known location.
+automatically; it never writes to `examples/shopfloor/data/`. The standalone
+generator (`generate_data.py`) requires an explicit `--output-dir`, resets or
+replaces any existing output on each run, and is used for physical audits that
+read source files from a known location. `examples/shopfloor/data/` is
+disposable generated output, not an authored source directory — never edit it
+or commit it.
 
 ## Source and grain map
 
 The catalog declares eight sources. Each one owns a non-empty, physically valid
 grain, and the planner only combines metrics that resolve to the same grain via
-a safe many-to-one relationship path.
+a safe many-to-one relationship path. Physical grain columns are shown below
+with an arrow to the catalog semantic identifier where the name differs.
 
 | Source | Physical format | Grain |
 | --- | --- | --- |
 | `customer_orders` | CSV | `[customer_order_id]` |
 | `production_orders` | SQLite | `[production_order_id]` |
-| `serialized_drives` | DuckDB | `[serial_number]` |
+| `serialized_drives` | DuckDB | `[serial_number]` → `drive_serial_number` |
 | `component_consumption` | Parquet | `[serial_number, fitted_position]` |
 | `component_lot_inspections` | Parquet | `[component_lot_id]` |
 | `operation_executions` | Parquet | `[operation_execution_id]` |
-| `machine_telemetry` | Parquet | `[machine_id, recorded_at]` |
+| `machine_telemetry` | Parquet | `[machine_id, recorded_at]` → `telemetry_machine_id`, `telemetry_recorded_at` |
 | `eol_test_runs` | Delta Lake | `[eol_test_run_id]` |
 
 ## Corrected semantic model
@@ -117,9 +121,10 @@ section in order:
 4. **Incoming component quality** — `incoming_acceptance_rate` by `supplier_name`
    and `component_type`. Four of five inspected lots were accepted (`4/5`); the
    quarantined `LOT-C-03` is never consumed.
-5. **Operation performance** — `average_cycle_seconds`, `rework_rate`, and
-   `energy_per_operation_kwh` by `operation_line_id`, `operation_machine_id`,
-   `shift`, and `operation_name`. Seven operations run, exactly one is a rework
+5. **Operation performance** — `average_cycle_seconds`, `operation_count`,
+   `rework_rate`, and `energy_per_operation_kwh` by `operation_line_id`,
+   `operation_machine_id`, `shift`, and `operation_name`. Seven distinct
+   operation executions run, exactly one is a rework
    (`rework_rate = 1/7`).
 6. **EOL quality before Delta reload** — `eol_attempt_pass_rate` and
    `first_pass_yield` by `station_id`, `product_model`, and `firmware_revision`.
@@ -154,6 +159,11 @@ source generation, appends the deterministic DRV-003 **second** EOL attempt
 EOL source generation: 0 -> 1
 ```
 
+The source registry initializes every source at generation `1` and advances
+on each reload (`1 -> 2 -> 3`). The walkthrough presents this demonstration as
+a zero-based reload count so it reads as the first reload of freshly generated
+data; the underlying registry generations are unchanged.
+
 The appended row changes only the temporary Delta data. The exact states are:
 
 ```text
@@ -184,6 +194,8 @@ uv run python examples/shopfloor/build_knowledge.py
 The generated output at `.generated/knowledge/` is disposable and never
 committed to Git. Generated fields and `Catalog Definition` come only from the
 catalog. Overlays can add only curated sections and approved provenance.
+`build_knowledge.py` rejects an existing non-empty destination; remove
+`.generated/knowledge/` (or pass a fresh `--output-dir`) before rerunning.
 
 **Catalog YAML is execution authority. OKF is advisory.** The catalog controls
 queryable dimensions, facts, measures, metrics, relationships, planning, and

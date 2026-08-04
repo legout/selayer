@@ -102,7 +102,12 @@ def run_walkthrough(engine: QueryEngine, eol_test_runs: Path) -> None:
     print("Operation performance:")
     print(
         engine.query(
-            ["average_cycle_seconds", "rework_rate", "energy_per_operation_kwh"],
+            [
+                "average_cycle_seconds",
+                "operation_count",
+                "rework_rate",
+                "energy_per_operation_kwh",
+            ],
             ["operation_line_id", "operation_machine_id", "shift", "operation_name"],
         )
     )
