@@ -1009,9 +1009,7 @@ def test_shopfloor_policy_rejects_missing_relationship_concept(tmp_path: Path) -
     """A missing generated relationship concept must produce an issue."""
     bundle = _composed_shopfloor_bundle(tmp_path)
     layer = _shopfloor_layer()
-    changed = _remove_concept(
-        bundle, "relationships/customer_orders_production_orders"
-    )
+    changed = _remove_concept(bundle, "relationships/customer_orders_production_orders")
     issues = validate_shopfloor_knowledge(changed, layer)
     assert any(
         issue.code == "shopfloor.concept.missing"
