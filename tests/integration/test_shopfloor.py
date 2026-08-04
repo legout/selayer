@@ -593,9 +593,8 @@ def test_business_context_is_four_valid_reference_concepts(tmp_path: Path) -> No
 
     Each reference must declare ``type: Reference`` and must not bind a
     ``selayer_id`` (references are advisory, never execution authority). The
-    OKF composer keys references by their directory-relative concept id, so
-    a document at ``business_context/glossary.md`` composes at the concept
-    id ``business_context/glossary``.
+    OKF composer publishes authored references under the canonical
+    ``references/`` namespace regardless of the input directory name.
     """
     output = tmp_path / "knowledge"
     layer = SemanticLayer.load(SHOPFLOOR_CATALOG)
@@ -607,13 +606,13 @@ def test_business_context_is_four_valid_reference_concepts(tmp_path: Path) -> No
     references = {
         path: concept
         for path, concept in bundle.concepts.items()
-        if path.startswith("business_context/")
+        if path.startswith("references/")
     }
     assert set(references) == {
-        "business_context/glossary",
-        "business_context/kpi_definitions",
-        "business_context/process_overview",
-        "business_context/quality_policy",
+        "references/glossary",
+        "references/kpi_definitions",
+        "references/process_overview",
+        "references/quality_policy",
     }
     assert all(
         concept.frontmatter["type"] == "Reference" for concept in references.values()

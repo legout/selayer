@@ -16,10 +16,11 @@ relationships, and metrics can be verified exactly without external services.
 # Order to shipment
 
 A customer order captures demand for a product model. A production order is
-opened against that order and schedules planned units. Each production order
-produces one or more serialized drives, each identified by a conformed drive
-serial number from the serialized-drive registry. A serialized drive ends in
-either the `shipped` or `in_stock` shipment state.
+opened against that order and schedules planned units. A production order may
+produce one or more serialized drives, and an open order can have zero drives;
+each serialized drive is identified by a conformed drive serial number from the
+serialized-drive registry. A serialized drive ends in either the `shipped` or
+`in_stock` shipment state.
 
 # Component genealogy
 

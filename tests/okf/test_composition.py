@@ -65,6 +65,20 @@ def test_loads_valid_reference_and_overlay(
     assert loaded_overlays[0].selayer_id == "metric.gross_margin"
 
 
+def test_reference_namespace_is_canonical_regardless_of_input_dir(
+    tmp_path: Path,
+) -> None:
+    """Authored references publish under ``references/`` for any input name."""
+    business_context = tmp_path / "business_context"
+    business_context.mkdir()
+    _write(business_context / "guide.md", REFERENCE)
+    loaded = load_references(business_context)
+    assert tuple(loaded) == ("references/guide.md",)
+    concept = loaded["references/guide.md"]
+    assert concept.concept_id == "references/guide"
+    assert concept.relative_path == PurePosixPath("references/guide.md")
+
+
 def test_overlay_is_immutable_and_carries_sections(
     tmp_path: Path, valid_layer: SemanticLayer
 ) -> None:

@@ -21,7 +21,7 @@ import secrets
 import shutil
 import stat as stat_module
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
@@ -577,11 +577,12 @@ def _safe_read_text(
 def load_references(root: Path) -> Mapping[str, OkfConcept]:
     """Parse authored Reference documents as ordinary, strictly-validated concepts.
 
-    ``root`` is the references directory. Concept relative paths are computed
-    against ``root.parent`` (the future composed-bundle root) so a reference at
-    ``<root>/guide.md`` composes at ``references/guide.md``. References must
-    declare a non-empty ``type`` and ``title`` and must not bind a
-    ``selayer_id``.
+    ``root`` is the references directory. Authored documents always publish
+    under the canonical ``references/`` output namespace regardless of the
+    input directory name, so a reference at ``<root>/guide.md`` composes at
+    ``references/guide.md`` whether ``root`` is named ``references``,
+    ``business_context``, or anything else. References must declare a
+    non-empty ``type`` and ``title`` and must not bind a ``selayer_id``.
     """
     input_root = Path(root)
     files, root_fd = _walk_inputs(input_root)
@@ -591,12 +592,16 @@ def load_references(root: Path) -> Mapping[str, OkfConcept]:
     total_read = 0
     try:
         for path in files:
-            relative = PurePosixPath(path.relative_to(base).as_posix())
-            relative_posix = relative.as_posix()
+            # Canonicalize every authored reference under the ``references/``
+            # output namespace so overlay links and integrity checks resolve
+            # to ``references/...`` no matter what the input directory is named.
+            file_relative = PurePosixPath(path.relative_to(input_root).as_posix())
+            canonical = PurePosixPath("references") / file_relative
+            canonical_posix = canonical.as_posix()
             if path.name in _RESERVED_NAMES:
                 issues.append(
                     _issue(
-                        relative_posix, f"reserved path '{path.name}' is not allowed"
+                        canonical_posix, f"reserved path '{path.name}' is not allowed"
                     )
                 )
                 continue
@@ -607,7 +612,7 @@ def load_references(root: Path) -> Mapping[str, OkfConcept]:
             # in-memory text so parse_concept never re-opens the path.
             budget = _MAX_TOTAL_BYTES - total_read
             text, consumed = _safe_read_text(
-                path, input_root, root_fd, relative_posix, budget
+                path, input_root, root_fd, canonical_posix, budget
             )
             # _safe_read_text caps the read to the remaining budget so no bytes
             # beyond _MAX_TOTAL_BYTES are consumed before a rejection; the
@@ -625,22 +630,30 @@ def load_references(root: Path) -> Mapping[str, OkfConcept]:
                 try:
                     _compose_frontmatter(frontmatter_match.group(1))
                 except OkfDocumentError as error:
-                    issues.append(_issue(relative_posix, str(error)))
+                    issues.append(_issue(canonical_posix, str(error)))
                     continue
             try:
                 concept = parse_concept_text(text, path, base)
             except OkfDocumentError as error:
-                issues.append(_issue(relative_posix, str(error)))
+                issues.append(_issue(canonical_posix, str(error)))
                 continue
             if len(concept.links) > _MAX_LINKS_PER_FILE:
                 raise OkfDocumentError(
-                    f"more than {_MAX_LINKS_PER_FILE} links in '{relative_posix}'"
+                    f"more than {_MAX_LINKS_PER_FILE} links in '{canonical_posix}'"
                 )
+            # Remap the parsed concept onto the canonical ``references/``
+            # namespace so its published concept_id and relative_path match
+            # where ``_write_references`` renders it in the composed bundle.
+            concept = replace(
+                concept,
+                concept_id=canonical.with_suffix("").as_posix(),
+                relative_path=canonical,
+            )
             frontmatter = concept.frontmatter
             if "selayer_id" in frontmatter:
                 issues.append(
                     _frontmatter_issue(
-                        relative_posix,
+                        canonical_posix,
                         "selayer_id",
                         "references must not declare a selayer_id",
                     )
@@ -648,7 +661,7 @@ def load_references(root: Path) -> Mapping[str, OkfConcept]:
             if not _is_nonempty_string(frontmatter.get("type")):
                 issues.append(
                     _frontmatter_issue(
-                        relative_posix,
+                        canonical_posix,
                         "type",
                         "reference must declare a non-empty type",
                     )
@@ -656,13 +669,13 @@ def load_references(root: Path) -> Mapping[str, OkfConcept]:
             if not _is_nonempty_string(frontmatter.get("title")):
                 issues.append(
                     _frontmatter_issue(
-                        relative_posix,
+                        canonical_posix,
                         "title",
                         "reference must declare a non-empty title",
                     )
                 )
             issues.extend(validate_concept(concept, None, strict=True))
-            concepts[relative_posix] = concept
+            concepts[canonical_posix] = concept
     finally:
         try:
             os.close(root_fd)
