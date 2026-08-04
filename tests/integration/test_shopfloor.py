@@ -449,6 +449,13 @@ def test_shopfloor_docs_match_the_runnable_contract() -> None:
     assert "mixed_grain" in shopfloor_readme
     assert "JSON" in shopfloor_readme
     assert "DuckLake" in shopfloor_readme
+    assert (
+        "docs/superpowers/plans/2026-07-31-selayer-verification.md" in shopfloor_readme
+    )
+    assert (
+        "docs/superpowers/plans/2026-07-31-agent-assisted-semantic-discovery.md"
+        in shopfloor_readme
+    )
     assert "examples/shopfloor/README.md" in root_readme
 
 

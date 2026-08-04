@@ -219,3 +219,14 @@ This example intentionally does **not** do any of the following:
   file generated into a temporary directory.
 - No MES, ERP, or SCADA behaviour. The fixtures are static literals, not a live
   factory integration.
+
+## Related designs
+
+This example is a runnable companion to two later library designs:
+
+- [Library verification](../../docs/superpowers/plans/2026-07-31-selayer-verification.md) —
+  the catalog static, physical, compatibility, and reload checks exercised by
+  `selayer catalog` above.
+- [Agent-assisted semantic discovery](../../docs/superpowers/plans/2026-07-31-agent-assisted-semantic-discovery.md) —
+  how an agent can use a verified catalog and enriched OKF bundle like this one
+  to answer questions safely.
