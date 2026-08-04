@@ -24,14 +24,21 @@ import itertools
 import json
 import os
 import stat
-from datetime import datetime
+import uuid
+from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from selayer_discovery import canonical
-from selayer_discovery.model import SCHEMA_VERSION, normalize_actor_identity
+from selayer_discovery.model import (
+    MAX_TEXT_LENGTH,
+    SCHEMA_VERSION,
+    normalize_actor_identity,
+)
 from selayer_discovery.session import (
     GENESIS_HASH,
+    MAX_EVENT_PAYLOAD_BYTES,
     ArtifactRecord,
     SessionCharter,
     SessionError,
@@ -93,6 +100,35 @@ def _advance_to(
             store.transition(state, actor=actor)
         if store.state is target:
             return
+
+
+def _event_line(
+    previous_hash: str,
+    event_type: str,
+    payload: Mapping[str, object],
+    *,
+    actor: str,
+) -> str:
+    """Build a single hash-valid, chain-linked journal event line.
+
+    Used by replay-regression tests to construct journals whose events are
+    individually hash-valid (so the integrity failure must come from the
+    replayed state-machine or payload-bound logic, never a hash mismatch).
+    """
+
+    record: dict[str, object] = {
+        "schema_version": SCHEMA_VERSION,
+        "event_id": uuid.uuid4().hex,
+        "previous_hash": previous_hash,
+        "actor": normalize_actor_identity(actor),
+        "timestamp": datetime.now(UTC).isoformat(timespec="microseconds"),
+        "type": event_type,
+        "payload": dict(payload),
+    }
+    event_hash = canonical.fingerprint(record)
+    return json.dumps(
+        {**record, "event_hash": event_hash}, ensure_ascii=False, sort_keys=True
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -884,3 +920,228 @@ def test_session_snapshot_exposes_reconstructed_view(
     assert snapshot.charter == charter
     assert snapshot.events  # genesis present
     assert all(isinstance(event, SessionEvent) for event in snapshot.events)
+
+
+# --------------------------------------------------------------------------- #
+# Review-fix regression tests                                                 #
+#                                                                             #
+# These pin the four hardening fixes layered on top of the Task 7 contract:   #
+# committed-head trailing-deletion detection, replay-time state-machine        #
+# enforcement for hash-valid journals, recursive text/size payload bounds on   #
+# append and replay, SessionCharter field bounds, and the session.lock 0600   #
+# file mode.                                                                  #
+# --------------------------------------------------------------------------- #
+
+
+def test_deletion_of_complete_trailing_event_is_detected(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+) -> None:
+    store = SessionStore.create(session_root, charter=charter, actor=actor)
+    store.transition(SessionState.INTAKE, actor=actor)
+    store.transition(SessionState.SAMPLE_POLICY_PENDING, actor=actor)
+
+    lines = _journal_lines(session_root)
+    assert len(lines) == 3
+    # Remove the last *complete* trailing event. The two remaining events still
+    # form an intact hash chain, so without the committed-head sidecar this
+    # would silently reconstruct as a shorter-but-valid session.
+    del lines[-1]
+    _rewrite_journal(session_root, lines)
+
+    with pytest.raises(SessionError, match="integrity"):
+        SessionStore.open(session_root).reconstruct()
+
+
+def test_committed_head_detects_equal_count_head_mismatch(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+) -> None:
+    store = SessionStore.create(session_root, charter=charter, actor=actor)
+    store.transition(SessionState.INTAKE, actor=actor)
+
+    # The committed-head sidecar now records count=2, head=H_intake. Replace the
+    # intake event with a different hash-valid transition to the same state
+    # (extra payload field) so the rebuilt count stays 2 but the head differs.
+    lines = _journal_lines(session_root)
+    genesis_line = lines[0]
+    genesis_hash = json.loads(genesis_line)["event_hash"]
+    alt_line = _event_line(
+        genesis_hash,
+        "state_transition",
+        {"target": "intake", "note": "alternate content"},
+        actor=actor,
+    )
+    _rewrite_journal(session_root, [genesis_line, alt_line])
+
+    with pytest.raises(SessionError, match="integrity"):
+        SessionStore.open(session_root).reconstruct()
+
+
+def test_hash_valid_skipped_transition_replay_is_rejected(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+) -> None:
+    SessionStore.create(session_root, charter=charter, actor=actor)
+    genesis_line = _journal_lines(session_root)[0]
+    genesis_hash = json.loads(genesis_line)["event_hash"]
+
+    intake_line = _event_line(
+        genesis_hash, "state_transition", {"target": "intake"}, actor=actor
+    )
+    intake_hash = json.loads(intake_line)["event_hash"]
+    # A direct skip from INTAKE to DRAFTING (not an allowed transition), each
+    # event individually hash-valid so only the replayed state-machine guard
+    # can reject it.
+    skip_line = _event_line(
+        intake_hash, "state_transition", {"target": "drafting"}, actor=actor
+    )
+    _rewrite_journal(session_root, [genesis_line, intake_line, skip_line])
+
+    with pytest.raises(SessionError, match="integrity"):
+        SessionStore.open(session_root).reconstruct()
+
+
+def test_hash_valid_event_after_close_replay_is_rejected(
+    session_root: Path,
+    charter: SessionCharter,
+ actor: str,
+) -> None:
+    SessionStore.create(session_root, charter=charter, actor=actor)
+    genesis_line = _journal_lines(session_root)[0]
+    genesis_hash = json.loads(genesis_line)["event_hash"]
+
+    close_line = _event_line(
+        genesis_hash, "closed", {"target": "closed"}, actor=actor
+    )
+    close_hash = json.loads(close_line)["event_hash"]
+    # A transition appended after the terminal close event; the journal is
+    # hash-valid, so only the replayed "event after close" guard rejects it.
+    after_line = _event_line(
+        close_hash, "state_transition", {"target": "intake"}, actor=actor
+    )
+    _rewrite_journal(session_root, [genesis_line, close_line, after_line])
+
+    with pytest.raises(SessionError, match="integrity"):
+        SessionStore.open(session_root).reconstruct()
+
+
+def test_oversized_text_field_is_rejected_on_append(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+) -> None:
+    store = SessionStore.create(session_root, charter=charter, actor=actor)
+    oversized = "x" * (MAX_TEXT_LENGTH + 1)
+    with pytest.raises(SessionError):
+        store.transition(
+            SessionState.INTAKE, actor=actor, payload={"note": oversized}
+        )
+    # The rejected transition did not mutate the journal.
+    assert len(_journal_lines(session_root)) == 1
+
+
+def test_oversized_serialized_payload_is_rejected_on_append(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+) -> None:
+    store = SessionStore.create(session_root, charter=charter, actor=actor)
+    # Many individually-bounded text fields (each exactly at the text bound) so
+    # the recursive text guard passes but the aggregate serialization exceeds
+    # the payload byte limit.
+    fields = {f"field_{i}": "x" * MAX_TEXT_LENGTH for i in range(17)}
+    assert len(json.dumps(fields).encode("utf-8")) > MAX_EVENT_PAYLOAD_BYTES
+    with pytest.raises(SessionError):
+        store.transition(SessionState.INTAKE, actor=actor, payload=fields)
+    assert len(_journal_lines(session_root)) == 1
+
+
+def test_oversized_text_field_is_rejected_on_replay(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+) -> None:
+    SessionStore.create(session_root, charter=charter, actor=actor)
+    genesis_line = _journal_lines(session_root)[0]
+    genesis_hash = json.loads(genesis_line)["event_hash"]
+    oversized = "x" * (MAX_TEXT_LENGTH + 1)
+    bad_line = _event_line(
+        genesis_hash,
+        "state_transition",
+        {"target": "intake", "note": oversized},
+        actor=actor,
+    )
+    _rewrite_journal(session_root, [genesis_line, bad_line])
+
+    with pytest.raises(SessionError, match="integrity"):
+        SessionStore.open(session_root).reconstruct()
+
+
+def test_oversized_serialized_payload_is_rejected_on_replay(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+) -> None:
+    SessionStore.create(session_root, charter=charter, actor=actor)
+    genesis_line = _journal_lines(session_root)[0]
+    genesis_hash = json.loads(genesis_line)["event_hash"]
+    fields = {f"field_{i}": "x" * MAX_TEXT_LENGTH for i in range(17)}
+    fields["target"] = "intake"
+    bad_line = _event_line(
+        genesis_hash, "state_transition", fields, actor=actor
+    )
+    _rewrite_journal(session_root, [genesis_line, bad_line])
+
+    with pytest.raises(SessionError, match="integrity"):
+        SessionStore.open(session_root).reconstruct()
+
+
+def test_charter_rejects_oversized_business_question(
+    make_charter,  # type: ignore[no-untyped-def]
+) -> None:
+    with pytest.raises(SessionError, match="invalid_charter"):
+        make_charter(business_question="q" * (MAX_TEXT_LENGTH + 1))
+
+
+def test_charter_rejects_oversized_approver(
+    make_charter,  # type: ignore[no-untyped-def]
+) -> None:
+    # No whitespace to collapse, so the normalized form stays oversized.
+    with pytest.raises(SessionError, match="invalid_charter"):
+        make_charter(approver="a" * (MAX_TEXT_LENGTH + 1))
+
+
+@pytest.mark.parametrize(
+    "collection", ["inclusions", "exclusions", "acceptance_questions"]
+)
+def test_charter_rejects_oversized_collection_item(
+    make_charter,  # type: ignore[no-untyped-def]
+    collection: str,
+) -> None:
+    with pytest.raises(SessionError, match="invalid_charter"):
+        make_charter(**{collection: ("x" * (MAX_TEXT_LENGTH + 1),)})
+
+
+def test_charter_accepts_text_at_the_bound(
+    make_charter,  # type: ignore[no-untyped-def]
+) -> None:
+    # Exactly MAX_TEXT_LENGTH is allowed (the bound is inclusive).
+    charter = make_charter(business_question="q" * MAX_TEXT_LENGTH)
+    assert len(charter.business_question) == MAX_TEXT_LENGTH
+
+
+@posix_only
+def test_session_lock_file_is_mode_0600_while_locked(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+) -> None:
+    store = SessionStore.create(session_root, charter=charter, actor=actor)
+    with store.lock():
+        lock_path = session_root / "session.lock"
+        assert lock_path.exists()
+        assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600

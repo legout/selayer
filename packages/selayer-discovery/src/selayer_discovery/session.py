@@ -53,6 +53,7 @@ from filelock import FileLock, Timeout
 from selayer_discovery import canonical
 from selayer_discovery.diagnostics import DiscoveryError, UnsupportedArtifactError
 from selayer_discovery.model import (
+    MAX_TEXT_LENGTH,
     SCHEMA_VERSION,
     bounded_mapping,
     normalize_actor_identity,
@@ -63,6 +64,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "GENESIS_HASH",
+    "MAX_EVENT_PAYLOAD_BYTES",
     "ArtifactRecord",
     "EventType",
     "SessionCharter",
@@ -88,6 +90,11 @@ _JOURNAL_NAME = "events.jsonl"
 _LOCK_NAME = "session.lock"
 _OWNER_NAME = "session.lock.owner"
 _CACHE_NAME = "state.json"
+_COMMITTED_HEAD_NAME = "committed_head"
+
+#: Maximum size (in UTF-8 bytes) of a serialized event payload. Every payload
+#: is recursively text-bounded and size-bounded before append and on replay.
+MAX_EVENT_PAYLOAD_BYTES: int = 256 * 1024
 
 # Stable node identifier shape: lowercase letter first, then lowercase letters,
 # digits, underscores, dots, or hyphens. Admits ``charter``, ``approver``,
@@ -320,6 +327,13 @@ class SessionCharter:
         _validate_hash(self.catalog_fingerprint)
         # Frozen dataclass: normalize the approver in place.
         object.__setattr__(self, "approver", normalize_actor_identity(self.approver))
+        # Bound every free-text charter field (including the named approver
+        # and the scope/acceptance collections) so a charter payload can never
+        # carry unbounded text into the journal or through reconstruction.
+        if len(self.business_question) > MAX_TEXT_LENGTH:
+            raise SessionError(CODE_INVALID_CHARTER)
+        if len(self.approver) > MAX_TEXT_LENGTH:
+            raise SessionError(CODE_INVALID_CHARTER)
         for collection in (
             self.inclusions,
             self.exclusions,
@@ -329,6 +343,9 @@ class SessionCharter:
                 type(item) is str for item in collection
             ):
                 raise SessionError(CODE_INVALID_CHARTER)
+            for item in collection:
+                if len(item) > MAX_TEXT_LENGTH:
+                    raise SessionError(CODE_INVALID_CHARTER)
 
     @property
     def fingerprint(self) -> str:
@@ -467,6 +484,46 @@ def _normalize_payload(payload: object) -> dict[str, object]:
     return cast("dict[str, object]", normalized)
 
 
+def _bound_text_recursive(value: object, *, code: str) -> None:
+    """Recursively enforce the bounded-text limit on every string in ``value``.
+
+    Walks mappings and (non-string) sequences recursively so a nested payload
+    can never smuggle an unbounded text field past the append or replay guards.
+    """
+
+    if type(value) is str:
+        if len(value) > MAX_TEXT_LENGTH:
+            raise SessionError(code)
+    elif isinstance(value, Mapping):
+        for item in value.values():
+            _bound_text_recursive(item, code=code)
+    elif isinstance(value, Sequence) and not isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        for item in value:
+            _bound_text_recursive(item, code=code)
+
+
+def _assert_payload_bounded(
+    payload: Mapping[str, object],
+    *,
+    code: str = CODE_INVALID_PAYLOAD,
+) -> None:
+    """Enforce recursive text bounds and the serialized payload size bound.
+
+    Every event payload is bounded before it is appended to the journal and
+    again when it is replayed from the journal, so neither an oversized single
+    text field nor an oversized aggregate payload can enter or persist.
+    """
+
+    _bound_text_recursive(payload, code=code)
+    serialized = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True
+    ).encode("utf-8")
+    if len(serialized) > MAX_EVENT_PAYLOAD_BYTES:
+        raise SessionError(code)
+
+
 def _charter_from_payload(payload: Mapping[str, object]) -> SessionCharter:
     """Reconstruct a :class:`SessionCharter` from a recorded event payload."""
 
@@ -570,6 +627,7 @@ class SessionStore:
         self._lock_path = root / _LOCK_NAME
         self._owner_path = root / _OWNER_NAME
         self._cache_path = root / _CACHE_NAME
+        self._committed_head_path = root / _COMMITTED_HEAD_NAME
         self._lock = FileLock(str(self._lock_path))
         self._session_id: str | None = None
         self._last_actor: str | None = None
@@ -616,6 +674,9 @@ class SessionStore:
                     CODE_EXISTS,
                     safe_ids=(self._safe_session_id(),),
                 )
+            # A fresh session discards any orphaned committed-head sidecar
+            # left by a prior, removed journal so it cannot block genesis.
+            self._committed_head_path.unlink(missing_ok=True)
             payload = self._charter_payload(charter)
             self._append(EventType.CHARTER_RECORDED, payload=payload, actor=actor)
 
@@ -624,6 +685,9 @@ class SessionStore:
             if self._reconstructed.charter is None:
                 raise SessionError(CODE_NOT_INITIALIZED)
             self._session_id = self._reconstructed.charter.session_id
+            # Refresh the committed-head sidecar so any crash-induced lag is
+            # caught up before the session is handed back to the caller.
+            self._write_committed_head()
         self._write_cache()
 
     # -- context managers --------------------------------------------------- #
@@ -868,6 +932,11 @@ class SessionStore:
                 expected_prev = event.event_hash
                 reconstructed.events.append(event)
                 reconstructed.head_hash = event.event_hash
+        # The journal is the base authority, but an independent committed-head
+        # sidecar records the last durably-appended head so silent truncation
+        # of a complete trailing event is detected (the cache cannot be this
+        # authority because it is explicitly non-authority and rebuildable).
+        self._validate_committed_head(reconstructed)
         return reconstructed
 
     def _parse_event(
@@ -878,6 +947,8 @@ class SessionStore:
     ) -> SessionEvent:
         try:
             obj = json.loads(line)
+        # pi-lens-ignore: bare-except (false positive: this catches the
+        # specific json.JSONDecodeError, not a bare except)
         except json.JSONDecodeError:
             raise SessionError(
                 CODE_INTEGRITY,
@@ -918,6 +989,9 @@ class SessionStore:
         if recomputed != obj["event_hash"]:
             raise SessionError(CODE_INTEGRITY, safe_detail="event hash mismatch")
         _validate_timestamp(obj["timestamp"])
+        # Re-enforce the recursive text/size bounds on replay so an unbounded
+        # payload recorded by a non-conforming writer is rejected on load.
+        _assert_payload_bounded(payload, code=CODE_INTEGRITY)
         return SessionEvent(
             schema_version=schema_version,
             event_id=str(obj["event_id"]),
@@ -933,7 +1007,9 @@ class SessionStore:
         event_type = event.type
         payload = event.payload
         if event_type == EventType.CHARTER_RECORDED:
-            if r.charter is not None:
+            # The charter-recorded event is the genesis: it must be the first
+            # event (no charter recorded yet, no events applied yet).
+            if r.charter is not None or r.events:
                 raise SessionError(
                     CODE_INTEGRITY,
                     safe_detail="duplicate genesis event",
@@ -952,12 +1028,26 @@ class SessionStore:
                 _validate_hash(payload.get("approver_hash")),
                 (),
             )
+            return
+        # Every non-genesis event requires an established charter and an open
+        # (non-terminal) session; reconstruction enforces the same transition
+        # and terminal rules as live mutations, so a hash-valid journal that
+        # skips a state, re-opens a closed session, or appends after close is
+        # rejected exactly as a live mutation would be.
+        if r.charter is None:
+            raise SessionError(CODE_INTEGRITY, safe_detail="event before genesis")
+        if r.state is SessionState.CLOSED:
+            raise SessionError(CODE_INTEGRITY, safe_detail="event after close")
+        if event_type == EventType.TRANSITION:
+            target = self._state_from_payload(payload)
+            if target not in _ALLOWED_TRANSITIONS[r.state]:
+                raise SessionError(CODE_INTEGRITY, safe_detail="invalid transition")
+            r.state = target
+        elif event_type == EventType.CLOSED:
+            if SessionState.CLOSED not in _ALLOWED_TRANSITIONS[r.state]:
+                raise SessionError(CODE_INTEGRITY, safe_detail="invalid transition")
+            r.state = SessionState.CLOSED
         elif event_type == EventType.CHARTER_REVISED:
-            if r.charter is None:
-                raise SessionError(
-                    CODE_INTEGRITY,
-                    safe_detail="revision before genesis",
-                )
             new_charter = _charter_from_payload(payload)
             new_cf = _validate_hash(payload.get("charter_fingerprint"))
             new_ah = _validate_hash(payload.get("approver_hash"))
@@ -966,11 +1056,6 @@ class SessionStore:
             if _register_artifact(r, "approver", new_ah, ()):
                 r.stale |= _transitive_dependents(r, {"approver"})
             r.charter = new_charter
-        elif event_type == EventType.TRANSITION:
-            target = self._state_from_payload(payload)
-            r.state = target
-        elif event_type == EventType.CLOSED:
-            r.state = SessionState.CLOSED
         elif event_type == EventType.ARTIFACT_RECORDED:
             artifact_id = _validate_node_id(payload.get("artifact_id"))
             content_hash = _validate_hash(payload.get("content_hash"))
@@ -1008,6 +1093,10 @@ class SessionStore:
         event_id = uuid.uuid4().hex
         timestamp = _utc_now_iso()
         payload_obj = dict(payload)
+        # Bound every text field and the serialized payload size before the
+        # event is hashed or written, so an unbounded payload can never enter
+        # the journal.
+        _assert_payload_bounded(payload_obj)
         record: dict[str, object] = {
             "schema_version": SCHEMA_VERSION,
             "event_id": event_id,
@@ -1028,6 +1117,9 @@ class SessionStore:
         self._restrict_file(self._journal)
         # The journal is authority: rebuild from it after every append.
         self._reconstructed = self._reconstruct()
+        # Record the durably-committed head independent of the non-authority
+        # cache so a later deletion of a complete trailing event is detected.
+        self._write_committed_head()
         self._write_cache()
         return SessionEvent(
             schema_version=SCHEMA_VERSION,
@@ -1070,6 +1162,75 @@ class SessionStore:
         os.replace(tmp, self._cache_path)
         self._restrict_file(self._cache_path)
 
+    def _write_committed_head(self) -> None:
+        """Durably record the last committed head hash and event count.
+
+        This sidecar is independent of the non-authority ``state.json`` cache:
+        it is written after the journal is fsynced (never before) so it can
+        never claim an event that is not durably in the journal, and it lets
+        reconstruction detect when a complete trailing event has been removed
+        even though the remaining hash chain stays intact.
+        """
+
+        if self._reconstructed.charter is None:
+            return
+        data = {
+            "schema_version": SCHEMA_VERSION,
+            "head_hash": self._reconstructed.head_hash,
+            "event_count": len(self._reconstructed.events),
+        }
+        tmp = self._committed_head_path.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, self._committed_head_path)
+        self._restrict_file(self._committed_head_path)
+
+    def _read_committed_head(self) -> tuple[str, int] | None:
+        """Return the recorded ``(head_hash, event_count)`` or ``None``.
+
+        A missing or unparseable sidecar yields ``None`` (lenient: the journal
+        remains the base authority and reconstruction falls back to it).
+        """
+
+        try:
+            data = json.loads(self._committed_head_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        head = data.get("head_hash")
+        count = data.get("event_count")
+        if type(head) is not str or _HEX64_RE.match(head) is None:
+            return None
+        if type(count) is not int or count < 0:
+            return None
+        return head, count
+
+    def _validate_committed_head(self, r: _Reconstructed) -> None:
+        """Detect silent truncation of a complete trailing event.
+
+        Because the committed head is written only after the journal is
+        fsynced, a valid journal never holds fewer events than the committed
+        count. A smaller rebuilt count therefore proves a trailing event was
+        removed; an equal count with a different head proves tampering.
+        """
+
+        committed = self._read_committed_head()
+        if committed is None:
+            return
+        committed_head, committed_count = committed
+        rebuilt_count = len(r.events)
+        if rebuilt_count < committed_count:
+            raise SessionError(CODE_INTEGRITY, safe_detail="journal truncated")
+        if rebuilt_count == committed_count and r.head_hash != committed_head:
+            raise SessionError(CODE_INTEGRITY, safe_detail="head hash mismatch")
+        # A rebuilt count greater than the committed count means the journal
+        # holds a freshly fsynced event whose committed head has not yet caught
+        # up (mid-append or crash recovery); the journal is authority, so this
+        # is accepted and the next mutation/open refreshes the sidecar.
+
     # -- locking + permissions --------------------------------------------- #
 
     def _acquire(self) -> None:
@@ -1078,6 +1239,8 @@ class SessionStore:
         except Timeout:
             raise SessionLockTimeoutError(owner=self._read_owner()) from None
         if self._lock.lock_counter == 1:
+            # Restrict the lock file created by filelock to owner-only access.
+            self._restrict_file(self._lock_path)
             self._write_owner()
 
     def _release(self) -> None:
