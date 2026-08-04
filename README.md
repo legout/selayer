@@ -342,8 +342,8 @@ for the API workflow.
 
 ```bash
 uv run pytest -q
-uv run ruff check src tests examples
-uv run pyright src tests examples
+uv run ruff check src tests examples packages/selayer-discovery
+uv run pyright src tests examples packages/selayer-discovery
 uv build
 ```
 
