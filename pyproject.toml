@@ -20,6 +20,9 @@ selayer = "selayer.cli:run"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.uv.workspace]
+members = ["packages/selayer-discovery"]
+
 [project.optional-dependencies]
 s3 = ["boto3>=1.40,<2"]
 delta = ["deltalake>=1.6.2,<2"]
@@ -57,11 +60,15 @@ pythonVersion = "3.13"
 extraPaths = [
   "src",
   "tests/sources",
+  "packages/selayer-discovery/src",
+  "packages/selayer-discovery/tests",
   ".venv/lib/python3.13/site-packages",
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "packages/selayer-discovery/tests"]
+addopts = "--import-mode=importlib"
+pythonpath = ["."]
 markers = [
   "integration: tests requiring an external service such as Docker or MinIO",
 ]
