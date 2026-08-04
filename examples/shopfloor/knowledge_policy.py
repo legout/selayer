@@ -121,7 +121,7 @@ def _parse_query_body(body: str) -> object:
     parse/recursion/encoding failure as a deterministic ``ValueError`` so the
     caller can convert it to a safe :class:`ShopfloorKnowledgeError`.
     """
-    if len(body) > _MAX_QUERY_BODY_BYTES:
+    if len(body.encode("utf-8")) > _MAX_QUERY_BODY_BYTES:
         raise ValueError("query request exceeds maximum size")
     try:
         return json.loads(

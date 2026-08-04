@@ -1051,18 +1051,25 @@ def test_shopfloor_policy_rejects_deeply_nested_json(tmp_path: Path) -> None:
     )
 
 
-def test_shopfloor_policy_rejects_duplicate_json_keys(tmp_path: Path) -> None:
-    """Duplicate JSON object keys must be rejected, not silently accepted."""
+def test_shopfloor_policy_rejects_oversized_multibyte_body(tmp_path: Path) -> None:
+    """A multibyte body over the byte limit must be rejected, not accepted.
+
+    The byte limit is enforced on UTF-8 encoded length, not Unicode character
+    count, so a short character string that expands past the bound is still
+    rejected without raising an unhandled exception.
+    """
     bundle = _composed_shopfloor_bundle(tmp_path)
     layer = _shopfloor_layer()
-    dup_block = (
+    # Each snowman character is one code point but three UTF-8 bytes.
+    # 1400 characters => 4200 bytes > 4096 byte cap, but 1400 < 4096 characters.
+    oversized = "\u2603" * 1400
+    bad_block = (
         "```json selayer-query\n"
-        '{"metrics":["component_count"],"metrics":["component_count"],'
-        '"dimensions":["drive_serial_number"],"filters":{}}\n'
-        "```"
+        + f'{{"metrics":["component_count"],"oversized":"{oversized}"}}'
+        + "\n```"
     )
     concept = bundle.concepts["metrics/component_count"]
-    modified = _replace_section(concept, "Examples", dup_block)
+    modified = _replace_section(concept, "Examples", bad_block)
     concepts = dict(bundle.concepts)
     concepts["metrics/component_count"] = modified
     changed = dataclass_replace(bundle, concepts=MappingProxyType(concepts))
