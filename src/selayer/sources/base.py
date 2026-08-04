@@ -43,6 +43,7 @@ __all__ = [
     "QueryBinding",
     "ReloadResult",
     "SourceAdapter",
+    "SourceConsistency",
     "SourceFilter",
     "SourceFilterOperator",
     "SourceHandle",
@@ -207,6 +208,23 @@ def _repr_health(value: object) -> str:
     return "<redacted>"
 
 
+def _repr_consistency(value: object) -> str:
+    """Render a :class:`SourceConsistency` value, redacting any forged object.
+
+    Only an *exact* ``SourceConsistency`` instance may expose its ``.value``:
+    a genuine member's ``.value`` is one of the closed set
+    (``reopenable_snapshot`` / ``transaction_snapshot`` / ``live``), all safe
+    lowercase tokens that render unchanged.  The guard runs *before* any
+    ``.value`` access and uses ``type(value) is SourceConsistency`` (not
+    ``isinstance``) so a hostile subclass whose ``.value`` could return a
+    secret is redacted rather than evaluated.
+    """
+
+    if type(value) is SourceConsistency:
+        return value.value
+    return "<redacted>"
+
+
 def _render(name: str, fields: list[tuple[str, object]]) -> str:
     """Render a ``Name(field=value, ...)`` repr from pre-sanitized field values."""
 
@@ -225,6 +243,29 @@ class SourceHealth(StrEnum):
     READY = "ready"
     STALE = "stale"
     UNHEALTHY = "unhealthy"
+
+
+class SourceConsistency(StrEnum):
+    """Scan-consistency guarantee a prepared source advertises.
+
+    The single canonical adapter token carried on
+    :class:`SourceHandle.consistency`.  :class:`~selayer.sources.scan.SourceSnapshot`
+    (the public scan-session view) is *derived* from this value plus the
+    handle's snapshot token and schema fingerprint; it is not a second
+    consistency authority.
+
+    Members:
+        REOPENABLE_SNAPSHOT: a file-set / immutable snapshot that can be
+            re-opened by name (e.g. an Iceberg snapshot-id or Delta version).
+        TRANSACTION_SNAPSHOT: a snapshot taken inside a single transaction
+            (e.g. a Postgres/DuckDB transaction id).
+        LIVE: a live, non-snapshotted relation (e.g. a Parquet/Csv dataset
+            or a programmatic PyArrow provider) with no stable snapshot id.
+    """
+
+    REOPENABLE_SNAPSHOT = "reopenable_snapshot"
+    TRANSACTION_SNAPSHOT = "transaction_snapshot"
+    LIVE = "live"
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +430,13 @@ class SourceHandle:
     schema: TableSchema = field(repr=False)
     snapshot: str | None = None
     query_scoped: bool = False
+    # The one canonical adapter-consistency token.  ``SourceSnapshot`` (the
+    # public scan-session view) is *derived* from this field plus the schema
+    # fingerprint; it is not a second snapshot authority.  Defaulting to
+    # ``LIVE`` keeps every existing adapter honest until Task 5 populates real
+    # consistency/snapshot values.  Rendered via the closed-set enum ``.value``
+    # so only a safe lowercase token surfaces in diagnostics.
+    consistency: SourceConsistency = SourceConsistency.LIVE
     cleanup: Callable[[], None] | None = field(default=None, repr=False)
 
     def __repr__(self) -> str:
@@ -399,6 +447,7 @@ class SourceHandle:
                 ("connector", _repr_source_name(self.connector)),
                 ("snapshot", _repr_literal(self.snapshot)),
                 ("query_scoped", _repr_literal(self.query_scoped)),
+                ("consistency", _repr_consistency(self.consistency)),
             ],
         )
 

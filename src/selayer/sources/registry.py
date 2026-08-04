@@ -34,11 +34,13 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from threading import RLock
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
+
+import pyarrow as pa
 
 from selayer.expressions.validation import references
 from selayer.sources.adapters.arrow import ArrowDatasetAdapter
@@ -53,6 +55,7 @@ from selayer.sources.base import (
     QueryBinding,
     ReloadResult,
     SourceAdapter,
+    SourceConsistency,
     SourceFilter,
     SourceHandle,
     SourceScanRequirement,
@@ -70,13 +73,76 @@ from selayer.sources.profiles import (
     ArrowProviderResolver,
     RuntimeProfileResolver,
 )
+from selayer.sources.scan import SourceScanSession, SourceSnapshot
 from selayer.sources.schema import TableSchema, compare_schemas, schema_fingerprint
+from selayer.compilation.duckdb import quote_identifier
+
+
+# Default target row count for streamed scan-session batches.  Callers may
+# override per session via ``open_scan_session(batch_size=...)``.
+_DEFAULT_SCAN_BATCH_SIZE = 1024
 
 
 def _dependency_code(error: BaseException) -> str | None:
     """Return a sanitized known dependency code, if present."""
 
     return error.code if isinstance(error, SourceDependencyError) else None
+
+
+# ---------------------------------------------------------------------------
+# Scan-session internal helpers (no caller SQL)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_scan_columns(
+    schema: TableSchema,
+    columns: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Return the physical columns to project for a scan session.
+
+    Defaults to every declared schema column (in declaration order) when
+    ``columns`` is empty.  Each requested column must be present in the
+    observed schema; an unknown column raises ``ValueError`` (the public
+    :meth:`SourceRegistry.open_scan_session` surface sanitizes that into a
+    ``scan_failed`` :class:`SourceError`).
+    """
+
+    if not columns:
+        return tuple(field.name for field in schema.fields)
+    known = {field.name for field in schema.fields}
+    resolved = tuple(columns)
+    for column in resolved:
+        if column not in known:
+            raise ValueError("unknown column")
+    return resolved
+
+
+def _validate_batch_size(batch_size: int) -> None:
+    """Validate ``batch_size`` is a positive builtin ``int``.
+
+    A ``bool`` (which subclasses ``int``), a ``float``, a ``str``, and every
+    other non-int type are rejected via an *exact* ``type(...) is int`` guard
+    so they can never reach DuckDB.  ``type(...) is int`` is used rather than
+    ``isinstance`` because ``type(True) is bool`` (not ``int``): a bare
+    ``isinstance(..., int)`` would silently accept ``True``.
+    """
+
+    if type(batch_size) is not int or batch_size <= 0:
+        raise ValueError("batch_size must be a positive int")
+
+
+def _build_select_sql(source_id: str, selected: tuple[str, ...]) -> str:
+    """Build a parameter-free SELECT projecting quoted columns internally.
+
+    Every identifier — the requested columns and the source's stable name — is
+    double-quoted with embedded quotes doubled through the shared
+    :func:`~selayer.compilation.duckdb.quote_identifier` helper.  No caller
+    supplies SQL: the only interpolated text is the validated, quoted
+    identifiers, so a SQL fragment or credential can never reach the engine.
+    """
+
+    column_list = ", ".join(quote_identifier(column) for column in selected)
+    return f"SELECT {column_list} FROM {quote_identifier(source_id)}"
 
 
 if TYPE_CHECKING:
@@ -656,46 +722,39 @@ class SourceRegistry:
     # -- query binding -----------------------------------------------------
 
     @contextmanager
-    def bind_requirements(
+    def _bind_requirements_locked(
         self,
         requirements: Mapping[str, SourceScanRequirement],
     ) -> Iterator[None]:
-        """Hold the registry lock and bind the query-scoped sources in a
-        requirement map.
+        """Private requirement-binding context; the caller MUST hold the lock.
 
-        Persistent sources need no per-query binding.  Each query-scoped source
-        named in ``requirements`` is bound once via ``adapter.bind_query``
-        (which creates a fresh reader, registers it, and returns a cleanup) so
-        the reload lock cannot swap a handle mid-query.  When ``bind_query``
-        returns ``None`` the registry falls back to preparing and registering a
-        fresh handle from the adapter's provider.
+        The single shared requirement-binding path used by both query plans
+        (:meth:`bind_requirements`) and scan sessions
+        (:meth:`open_scan_session`).  It binds every query-scoped source named
+        in ``requirements`` once via ``adapter.bind_query`` (which creates a
+        fresh reader, registers it, and returns a cleanup) so the reload lock
+        cannot swap a handle mid-query; when ``bind_query`` returns ``None`` it
+        falls back to preparing and registering a fresh handle from the
+        adapter's provider.  Query-scoped adapter preparation logic is *not*
+        duplicated elsewhere.
 
         Sources are visited in sorted ID order; a binding failure on one
-        source aborts the remaining bindings.  Every query-time binding
-        failure (a raw PyIceberg/Arrow/registration exception from
-        ``bind_query`` or the fallback prepare/register) is caught here and
-        surfaced as a sanitized
+        source aborts the remaining bindings.  Every binding failure (a raw
+        PyIceberg/Arrow/registration exception from ``bind_query`` or the
+        fallback prepare/register) is caught and surfaced as a sanitized
         :class:`~selayer.sources.errors.SourceConnectionError` (code
         ``bind_failed``) raised *outside* the active ``except`` scope so no
-        driver-derived detail — authenticated locations, credentials, opaque
-        handles — can ever surface, and ``__cause__``/``__context__`` remain
-        ``None``.
+        driver-derived detail can surface and
+        ``__cause__``/``__context__`` remain ``None``.
 
-        Cleanup (every binding's ``QueryBinding.cleanup`` plus the prepared
-        fallback resources) runs in reverse and is hardened the same way: a
-        connector cleanup exception is never allowed to escape raw, never
-        aborts the remaining cleanups, and never skips the registry lock
-        release.  The first failing binding is recorded and surfaced as a
-        sanitized :class:`~selayer.sources.errors.SourceConnectionError`
-        (code ``cleanup_failed``), again raised *outside* the active
-        ``except`` scope; a binding failure (if any) still takes priority as
-        the reported error.  The success path stays silent when cleanup
-        succeeds; the audit path stays secret-safe (a cleanup failure adapts
-        to an ``unavailable`` outcome via the audit's existing ``SourceError``
-        handler) when it does not.
+        Cleanup runs in reverse and is hardened the same way: a connector
+        cleanup exception never escapes raw, never aborts the remaining
+        cleanups, and never skips the (caller-owned) lock release.  The first
+        failing binding is surfaced as a sanitized
+        ``cleanup_failed`` error, again raised *outside* the active
+        ``except`` scope; a binding failure (if any) takes priority.
         """
 
-        self._lock.acquire()
         prepared: list[tuple[SourceAdapter, SourceHandle, str]] = []
         bindings: list[QueryBinding] = []
         bind_failed_source: str | None = None
@@ -737,15 +796,15 @@ class SourceRegistry:
         finally:
             # Cleanup runs in reverse and must never let a connector cleanup
             # exception escape raw, never abort the remaining cleanups, and
-            # never skip the lock release.  The first failing binding's source
-            # is recorded (outside this except scope) so a sanitized
-            # ``cleanup_failed`` error can be raised below with
+            # never skip the caller-owned lock release.  The first failing
+            # binding's source is recorded (outside this except scope) so a
+            # sanitized ``cleanup_failed`` error can be raised below with
             # ``__cause__``/``__context__`` left ``None``; a binding failure
             # (if any) still takes priority as the reported error.  The
             # prepared-resource cleanup already runs through the quiet helpers
             # (``unregister_quietly``/``close_quietly``) which suppress per the
-            # established cleanup convention, so it cannot abort the lock
-            # release either.
+            # established cleanup convention, so it cannot abort the remaining
+            # cleanups either.
             for binding in reversed(bindings):
                 try:
                     binding.cleanup()
@@ -755,7 +814,6 @@ class SourceRegistry:
             for adapter, fresh, source_id in reversed(prepared):
                 unregister_quietly(self._connection, source_id)
                 close_quietly(adapter, fresh)
-            self._lock.release()
         if bind_failed_source is not None:
             # Constructed and raised outside the active ``except`` scope so
             # ``__cause__`` and ``__context__`` remain ``None`` and the constant
@@ -779,6 +837,24 @@ class SourceRegistry:
                 "cleanup_failed",
                 "the source could not be cleaned up after the query",
             )
+
+    @contextmanager
+    def bind_requirements(
+        self,
+        requirements: Mapping[str, SourceScanRequirement],
+    ) -> Iterator[None]:
+        """Hold the registry lock and bind the query-scoped sources in a
+        requirement map.
+
+        Thin wrapper over the shared private :meth:`_bind_requirements_locked`
+        context (which performs the actual binding and cleanup) that surrounds
+        it with the registry lifecycle lock.  See that method for the binding,
+        cleanup, and sanitization guarantees.
+        """
+
+        with self._lock:
+            with self._bind_requirements_locked(requirements):
+                yield
 
     @contextmanager
     def bind(self, plan: QueryPlan) -> Iterator[None]:
@@ -815,6 +891,209 @@ class SourceRegistry:
 
         with self._lock:
             return self._connection.execute(sql, parameters)
+
+    # -- scan sessions ----------------------------------------------------
+
+    def open_scan_session(
+        self,
+        source_id: str,
+        *,
+        columns: tuple[str, ...] = (),
+        batch_size: int = _DEFAULT_SCAN_BATCH_SIZE,
+    ) -> SourceScanSession:
+        """Open a bounded, context-managed scan session over one source.
+
+        Acquires the registry lifecycle lock for the *full* session lifetime
+        (from this call until the returned session's context-manager exit),
+        binds only the requested source through the same private
+        requirement-binding path query plans use
+        (:meth:`_bind_requirements_locked` — query-scoped adapters are
+        materialized once, never duplicated), validates the selected columns
+        against the observed schema, quotes every identifier internally, and
+        streams typed :class:`pyarrow.RecordBatch` objects from the source's
+        registered stable name.
+
+        **No caller supplies SQL or credentials.**  Identifiers are quoted
+        internally and the :class:`~selayer.sources.profiles.RuntimeProfileResolver`
+        bound when the registry was constructed is reused; ``open_scan_session``
+        accepts no credential override and the returned session exposes no
+        resolved profile value.
+
+        **The lock blocks the same registry.**  While a scan session is open,
+        :meth:`reload_source`, :meth:`reload_all`, :meth:`close`,
+        :meth:`bind`, and :meth:`execute` on *this* registry block until the
+        session closes.  ``selayer-discovery`` profiling must therefore
+        construct a dedicated registry and connection from the charter's
+        runtime profile resolver; proposal verification must construct another
+        fresh registry and never run inside an open profile session.
+
+        Every DuckDB and adapter failure (unknown source, unknown column,
+        invalid batch size, binding failure, reader creation failure) is
+        surfaced as a sanitized :class:`~selayer.sources.errors.SourceError`
+        constructed *outside* an active ``except`` scope so
+        ``__cause__``/``__context__`` remain ``None``; bindings and the lock
+        are released exactly once on any failure.
+
+        Args:
+            source_id: stable identifier of the source to scan.
+            columns: physical columns to project; defaults to every declared
+                schema column.  Each must be present in the observed schema.
+            batch_size: target :class:`pyarrow.RecordBatch` row count; must be
+                a positive ``int``.
+
+        Returns:
+            A :class:`~selayer.sources.scan.SourceScanSession` ready to stream.
+        """
+
+        self._lock.acquire()
+        binding_ctx: Any = None
+        binding_entered = False
+        reader: pa.RecordBatchReader | None = None
+        handle: SourceHandle | None = None
+        # ``pending`` holds a sanitized SourceError constructed outside an
+        # active ``except`` scope; it is raised after any partial teardown so
+        # ``__cause__``/``__context__`` stay ``None``.
+        pending: SourceConnectionError | SourceDependencyError | None = None
+        try:
+            self._ensure_open(source_id)
+            registration = self._registrations.get(source_id)
+            if registration is None:
+                pending = SourceConnectionError(
+                    source_id, "connect_failed", "unknown source"
+                )
+            else:
+                handle = registration.handle
+                try:
+                    selected = _resolve_scan_columns(handle.schema, columns)
+                    _validate_batch_size(batch_size)
+                    requirement = SourceScanRequirement(columns=selected)
+                except ValueError:
+                    pending = SourceConnectionError(
+                        source_id, "scan_failed", "invalid scan parameters"
+                    )
+                    requirement = None
+                    selected = ()
+                if pending is None:
+                    assert requirement is not None
+                    binding_ctx = self._bind_requirements_locked(
+                        {source_id: requirement}
+                    )
+                    try:
+                        binding_ctx.__enter__()
+                        binding_entered = True
+                    except SourceConnectionError as error:
+                        # Already sanitized by the binding context.
+                        pending = error
+                    if pending is None:
+                        sql = _build_select_sql(source_id, selected)
+                        try:
+                            reader = self._connection.execute(sql).to_arrow_reader(
+                                batch_size=batch_size
+                            )
+                        except Exception:  # noqa: BLE001 - sanitize DuckDB failure
+                            pending = SourceConnectionError(
+                                source_id,
+                                "scan_failed",
+                                "the source could not be scanned",
+                            )
+        except BaseException:  # noqa: BLE001 - unexpected setup failure
+            if pending is None:
+                pending = SourceConnectionError(
+                    source_id, "scan_failed", "the source could not be scanned"
+                )
+        if pending is not None:
+            # Teardown whatever was acquired, release the lock exactly once,
+            # then surface the sanitized error outside every ``except`` scope.
+            if binding_entered and binding_ctx is not None:
+                with suppress(BaseException):  # noqa: BLE001 - best-effort
+                    binding_ctx.__exit__(None, None, None)
+            self._lock.release()
+            raise pending
+        assert handle is not None
+        assert reader is not None
+
+        # Idempotent release: closes the reader (if still open), exits the
+        # query-scoped binding context, and releases the lock exactly once.
+        # Every step suppresses so a connector cleanup exception can never
+        # escape raw or skip the lock release.
+        released = [False]
+
+        def _release() -> None:
+            if released[0]:
+                return
+            released[0] = True
+            if reader is not None:
+                with suppress(Exception):  # noqa: BLE001 - best-effort close
+                    reader.close()
+            if binding_ctx is not None:
+                with suppress(BaseException):  # noqa: BLE001 - best-effort
+                    binding_ctx.__exit__(None, None, None)
+            self._lock.release()
+
+        def _recheck() -> SourceSnapshot:
+            return self._recheck_source(source_id)
+
+        return SourceScanSession(
+            source_id=source_id,
+            schema=handle.schema,
+            consistency=handle.consistency,
+            snapshot_id=handle.snapshot,
+            reader=reader,
+            release=_release,
+            recheck=_recheck,
+        )
+
+    def _recheck_source(self, source_id: str) -> SourceSnapshot:
+        """Prepare a fresh candidate and return its derived snapshot view.
+
+        Reuses :meth:`_prepare_candidate` (the same adapter path reload uses)
+        so recheck observes exactly what a reload would.  The fresh candidate
+        is closed before returning; the session's own stream is unaffected.
+        Called while the scan session holds the lifecycle lock.
+        """
+
+        registration = self._registrations.get(source_id)
+        if registration is None:
+            # Constructed outside any ``except`` scope.
+            raise SourceConnectionError(
+                source_id, "connect_failed", "unknown source"
+            )
+        adapter = registration.adapter
+        source = self._sources[source_id]
+        candidate: SourceHandle | None = None
+        observed: TableSchema | None = None
+        preparation_failure: _CandidatePreparationFailed | None = None
+        try:
+            candidate, observed = self._prepare_candidate(adapter, source)
+        except _CandidatePreparationFailed as failure:
+            preparation_failure = failure
+            if failure.candidate is not None:
+                close_quietly(adapter, failure.candidate)
+        if (
+            preparation_failure is not None
+            or candidate is None
+            or observed is None
+        ):
+            assert observed is None
+            if (
+                preparation_failure is not None
+                and preparation_failure.dependency_code is not None
+            ):
+                raise SourceDependencyError(
+                    source_id,
+                    preparation_failure.dependency_code,
+                    "a source dependency is unavailable",
+                )
+            raise SourceConnectionError(
+                source_id, "scan_failed", "the source could not be scanned"
+            )
+        snapshot = SourceSnapshot(
+            consistency=candidate.consistency,
+            snapshot_id=candidate.snapshot,
+            schema_fingerprint=schema_fingerprint(observed),
+        )
+        close_quietly(adapter, candidate)
+        return snapshot
 
     # -- internals ---------------------------------------------------------
 
