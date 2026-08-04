@@ -31,6 +31,8 @@ from examples.shopfloor.generate_data import main as generate_main
 from examples.shopfloor.run_example import _layer_for_paths, run_walkthrough
 from examples.shopfloor.run_example import main as run_main
 from selayer import QueryEngine, QueryPlanningError, SemanticLayer
+from selayer.planning.types import QueryRequest
+from selayer.verification import CompatibilityCheck, PhysicalCheck, verify
 
 _REPO = Path(__file__).parents[2]
 SHOPFLOOR_ROOT = _REPO / "examples" / "shopfloor"
@@ -427,3 +429,157 @@ def test_shopfloor_docs_match_the_runnable_contract() -> None:
     assert "JSON" in shopfloor_readme
     assert "DuckLake" in shopfloor_readme
     assert "examples/shopfloor/README.md" in root_readme
+
+
+#: Exact expected row counts per generated source, asserted both by the physical
+#: grain audit and the direct fixture reads below.
+_EXPECTED_SOURCE_ROWS: dict[str, int] = {
+    "customer_orders": 2,
+    "production_orders": 3,
+    "serialized_drives": 3,
+    "component_consumption": 6,
+    "component_lot_inspections": 5,
+    "operation_executions": 7,
+    "machine_telemetry": 4,
+    "eol_test_runs": 3,
+}
+
+
+def test_shopfloor_physical_audit_passes(tmp_path: Path) -> None:
+    """Every declared grain and relationship passes an exact full-scan audit."""
+    paths = generate_shopfloor_data(tmp_path / "data")
+    layer = _layer_for_paths(SemanticLayer.load(SHOPFLOOR_CATALOG), paths)
+    report = verify(layer, PhysicalCheck())
+
+    assert report.complete
+    assert report.passed
+    assert all(outcome.scope == "full_scan" for outcome in report.outcomes)
+
+    grain_outcomes = {
+        outcome.check_id: outcome
+        for outcome in report.outcomes
+        if outcome.check_id.startswith("source.")
+    }
+    assert set(grain_outcomes) == {
+        f"source.{name}.grain" for name in _EXPECTED_SOURCE_ROWS
+    }
+
+    # Exact source row counts, and clean grain for every source.
+    for name, expected_rows in _EXPECTED_SOURCE_ROWS.items():
+        outcome = grain_outcomes[f"source.{name}.grain"]
+        assert outcome.status == "passed"
+        assert outcome.evidence["row_count"] == expected_rows
+        assert outcome.evidence["null_grain_rows"] == 0
+        assert outcome.evidence["duplicate_grain_groups"] == 0
+
+    relationship_outcomes = [
+        outcome
+        for outcome in report.outcomes
+        if outcome.check_id.startswith("relationship.")
+    ]
+    # The catalog declares exactly six safe relationships.
+    assert len(relationship_outcomes) == 6
+    for outcome in relationship_outcomes:
+        assert outcome.status == "passed"
+        assert outcome.evidence["orphan_non_null_rows"] == 0
+
+
+def test_shopfloor_business_rules_hold_in_generated_data(tmp_path: Path) -> None:
+    """Fixture-level data semantics not expressed by catalog version 1."""
+    paths = generate_shopfloor_data(tmp_path / "data")
+
+    # Production orders (SQLite): completed cannot exceed planned; schedule
+    # domain is exactly the documented status set.
+    with sqlite3.connect(paths.production_orders_db) as connection:
+        connection.row_factory = sqlite3.Row
+        production_orders = [
+            (row["planned_units"], row["completed_units"], row["schedule_status"])
+            for row in connection.execute(
+                "select planned_units, completed_units, schedule_status "
+                "from production_orders"
+            )
+        ]
+    assert all(completed <= planned for planned, completed, _ in production_orders)
+    assert {status for _, _, status in production_orders} <= {
+        "on_time",
+        "late",
+        "open",
+    }
+
+    # Serialized drives (DuckDB, read-only): shipment domain.
+    with duckdb.connect(str(paths.shopfloor_db), read_only=True) as connection:
+        shipment_statuses = [
+            row[0]
+            for row in connection.execute(
+                "select shipment_status from serialized_drives"
+            ).fetchall()
+        ]
+    assert set(shipment_statuses) <= {"shipped", "in_stock"}
+
+    # End-of-line attempts (Delta): attempt numbering, uniqueness, first-pass
+    # marker logic, and result domain.
+    eol_runs = DeltaTable(paths.eol_test_runs).to_pyarrow_table().to_pylist()
+    assert all(cast("int", row["attempt"]) >= 1 for row in eol_runs)
+    assert len(
+        {
+            (cast("str", row["serial_number"]), cast("int", row["attempt"]))
+            for row in eol_runs
+        }
+    ) == len(eol_runs)
+    assert all(
+        row["is_first_pass"]
+        == (cast("int", row["attempt"]) == 1 and row["result"] == "pass")
+        for row in eol_runs
+    )
+    assert {cast("str", row["result"]) for row in eol_runs} <= {"pass", "fail"}
+
+    # Operation executions (Parquet): result domain.
+    operation_executions = pq.read_table(paths.operation_executions).to_pylist()
+    assert {
+        cast("str", row["result"]) for row in operation_executions
+    } <= {"pass", "fail"}
+
+    # Machine telemetry (Parquet): machine-state domain.
+    telemetry = pq.read_table(paths.machine_telemetry).to_pylist()
+    assert {
+        cast("str", row["machine_state"]) for row in telemetry
+    } <= {"running", "idle", "alarm"}
+
+    # Component lot inspections (Parquet): incoming result maps to disposition.
+    inspections = pq.read_table(paths.component_lot_inspections).to_pylist()
+    assert all(
+        (row["incoming_result"], row["disposition"])
+        in {("pass", "released"), ("fail", "quarantined")}
+        for row in inspections
+    )
+
+
+def test_shopfloor_compatibility_check_records_planner_rejections(
+    tmp_path: Path,
+) -> None:
+    """A documented mixed-grain rejection is an observed planner result.
+
+    The verification check completes (``passed``) even when a request is
+    incompatible: the outcome records ``compatible: False`` with the stable
+    ``planner_code`` instead of failing the report.
+    """
+    paths = generate_shopfloor_data(tmp_path / "data")
+    layer = _layer_for_paths(SemanticLayer.load(SHOPFLOOR_CATALOG), paths)
+    report = verify(
+        layer,
+        CompatibilityCheck(
+            query_cases=(
+                QueryRequest(["component_count"], ["drive_serial_number"]),
+                QueryRequest(["average_cycle_seconds"], ["operation_machine_id"]),
+                QueryRequest(["average_temperature_c"], ["telemetry_machine_id"]),
+                QueryRequest(["average_cycle_seconds", "eol_attempt_pass_rate"]),
+            )
+        ),
+    )
+
+    assert report.complete
+    assert report.passed
+    assert any(
+        item.evidence.get("planner_code") == "mixed_grain"
+        for item in report.outcomes
+    )
