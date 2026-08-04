@@ -13,8 +13,11 @@ uv add selayer
 For local development:
 
 ```bash
-uv sync
+uv sync --all-packages
 ```
+
+`--all-packages` also installs the `selayer-discovery` workspace member;
+plain `uv sync` only installs the root `selayer` package.
 
 ## Example catalog
 

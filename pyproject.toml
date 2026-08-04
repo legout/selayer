@@ -68,7 +68,7 @@ extraPaths = [
 [tool.pytest.ini_options]
 testpaths = ["tests", "packages/selayer-discovery/tests"]
 addopts = "--import-mode=importlib"
-pythonpath = ["."]
+pythonpath = [".", "packages/selayer-discovery/src"]
 markers = [
   "integration: tests requiring an external service such as Docker or MinIO",
 ]

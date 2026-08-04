@@ -17,11 +17,11 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           version: latest
-      - run: uv sync --all-extras
+      - run: uv sync --all-extras --all-packages
       - run: uv run --all-extras pytest -q
-      - run: uv run ruff check src tests examples
-      - run: uv run ruff format --check src tests examples
-      - run: uv run pyright src tests examples
+      - run: uv run ruff check src tests examples packages/selayer-discovery
+      - run: uv run ruff format --check src tests examples packages/selayer-discovery
+      - run: uv run pyright src tests examples packages/selayer-discovery
       - run: uv run python examples/e_commerce/selayer1.py
       - run: rm -rf dist && uv build
       - name: Verify wheel contents
