@@ -211,6 +211,7 @@ class _ScanAdapter:
         self.closed: list[str] = []
         self.bind_count = 0
         self.reopen_count = 0
+        self.reopen_snapshots: list[str | None] = []
         self.reopen_raise: BaseException | None = None
         self.bind_raise: BaseException | None = None
 
@@ -244,6 +245,7 @@ class _ScanAdapter:
         snapshot_id: str | None,
     ) -> SourceHandle:
         self.reopen_count += 1
+        self.reopen_snapshots.append(snapshot_id)
         if self.reopen_raise is not None:
             failure = self.reopen_raise
             self.reopen_raise = None
@@ -797,11 +799,13 @@ def test_recheck_reopens_versioned_adapter_at_baseline_snapshot() -> None:
         consistency=SourceConsistency.REOPENABLE_SNAPSHOT, snapshot="v1"
     )
     with registry.open_scan_session("events", columns=("id",)) as session:
+        adapter.snapshot = "v2"
         fresh = session.recheck_snapshot()
     assert fresh.consistency is SourceConsistency.REOPENABLE_SNAPSHOT
     assert fresh.snapshot_id == "v1"
     assert adapter.prepare_count == 1
     assert adapter.reopen_count == 1
+    assert adapter.reopen_snapshots == ["v1"]
     assert adapter.closed.count("events") == 1
 
 

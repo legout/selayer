@@ -56,6 +56,7 @@ class _RecordingScan:
     def __init__(self) -> None:
         self.selected_fields: tuple[str, ...] | None = None
         self.row_filter: str | None = None
+        self.snapshot_ids: list[int | None] = []
         self.reader_count: int = 0
         self.close_count: int = 0
         self.scan_error: BaseException | None = None
@@ -118,6 +119,10 @@ class _RecordingTable:
         )
         raw_filter = kwargs.get("row_filter")
         self._recording.row_filter = raw_filter if isinstance(raw_filter, str) else None
+        raw_snapshot = kwargs.get("snapshot_id")
+        self._recording.snapshot_ids.append(
+            raw_snapshot if isinstance(raw_snapshot, int) else None
+        )
         self._recording.reader_count += 1
         return _RecordingScanBuilder(
             self._inner.scan(**kwargs),  # type: ignore[attr-defined]
@@ -474,6 +479,19 @@ def test_normalize_arrow_schema_recurses_into_nested_types() -> None:
 # ---------------------------------------------------------------------------
 # Main test from the brief
 # ---------------------------------------------------------------------------
+
+
+def test_iceberg_scan_stays_on_baseline_after_append(
+    iceberg_table_fixture: _IcebergFixture,
+) -> None:
+    fixture = iceberg_table_fixture
+    with QueryEngine(fixture.layer, profiles=fixture.profiles) as engine:
+        baseline = engine.source_status("events").snapshot
+        assert baseline is not None
+        fixture.append_snapshot()
+        result = engine.query(["total_value"])
+    assert result["total_value"].sum() == 15
+    assert fixture.recording.snapshot_ids[-1] == int(baseline)
 
 
 def test_iceberg_binding_uses_fresh_scan_with_projection_and_filter(
