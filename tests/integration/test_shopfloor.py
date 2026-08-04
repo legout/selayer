@@ -1035,7 +1035,7 @@ def test_shopfloor_policy_rejects_deeply_nested_json(tmp_path: Path) -> None:
     """Deeply nested JSON must not raise an unhandled exception."""
     bundle = _composed_shopfloor_bundle(tmp_path)
     layer = _shopfloor_layer()
-    deep = "\"x\":" * 200 + "1" + "}" * 200
+    deep = '"x":' * 200 + "1" + "}" * 200
     deep = "{" + deep
     bad_block = f"```json selayer-query\n{deep}\n```"
     concept = bundle.concepts["metrics/component_count"]

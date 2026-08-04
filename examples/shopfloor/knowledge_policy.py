@@ -273,8 +273,7 @@ def _check_metric_queries(
                         code="shopfloor.query.invalid",
                         path=concept_id,
                         message=(
-                            "metric query request must name only "
-                            f"'{metric_name}'"
+                            f"metric query request must name only '{metric_name}'"
                         ),
                     )
                 )
