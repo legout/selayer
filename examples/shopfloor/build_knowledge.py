@@ -49,18 +49,30 @@ class ShopfloorKnowledgeBuildError(Exception):
         return self._issues
 
 
+def _reject_symlink_ancestors(path: Path) -> None:
+    """Reject any existing symlink in the lexical parent chain of ``path``.
+
+    Walks ancestors without resolving through symlinks so a symlinked
+    parent cannot redirect output to an unintended target.
+    """
+    for ancestor in path.parents:
+        if ancestor.is_symlink():
+            raise ValueError("path component must not be a symbolic link")
+
+
 def _require_absent_or_empty(destination: Path) -> None:
-    """Reject files, symlinks, and non-empty directories."""
+    """Reject symlinks and every non-directory filesystem object.
+
+    Only an absent path or an empty directory is accepted.  Symlinks
+    (including broken links), regular files, FIFOs, sockets, and devices
+    are rejected before any staging directory is created.
+    """
     if destination.is_symlink():
-        raise ValueError(
-            f"output directory '{destination}' must not be a symbolic link"
-        )
-    if destination.is_file():
-        raise ValueError(f"output directory '{destination}' must not be a file")
-    if destination.is_dir():
-        children = list(destination.iterdir())
-        if children:
-            raise ValueError(f"output directory '{destination}' must be empty")
+        raise ValueError("output path must not be a symbolic link")
+    if destination.exists() and not destination.is_dir():
+        raise ValueError("output path must not be a non-directory filesystem object")
+    if destination.is_dir() and any(destination.iterdir()):
+        raise ValueError("output directory must be empty")
 
 
 def build_knowledge(output_dir: Path) -> OkfBundle:
@@ -73,9 +85,10 @@ def build_knowledge(output_dir: Path) -> OkfBundle:
     publishing partial output.
     """
     layer = SemanticLayer.load(CATALOG)
-    if output_dir.is_symlink():
-        raise ValueError(f"output directory '{output_dir}' must not be a symbolic link")
-    destination = output_dir.resolve()
+    # Preserve the lexical absolute path without resolving symlinks so a
+    # symlinked ancestor cannot redirect output to an unintended target.
+    destination = output_dir.absolute()
+    _reject_symlink_ancestors(destination)
     _require_absent_or_empty(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(
@@ -92,8 +105,9 @@ def build_knowledge(output_dir: Path) -> OkfBundle:
         issues = validate_shopfloor_knowledge(bundle, layer)
         if issues:
             raise ShopfloorKnowledgeBuildError(issues)
-        if destination.exists():
-            destination.rmdir()
+        # Single atomic rename: os.replace atomically replaces an existing
+        # empty directory on the same filesystem, so the destination is
+        # preserved (not removed first) if the rename fails.
         candidate.replace(destination)
     return OkfBundle.load(destination, layer=layer, strict=True)
 
@@ -111,8 +125,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
         bundle = build_knowledge(arguments.output_dir)
-    except (OSError, ValueError, ShopfloorKnowledgeBuildError) as error:
+    except ShopfloorKnowledgeBuildError as error:
+        # Policy issues carry only deterministic codes and paths.
         print(f"error: {error}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError):
+        # Fixed, secret-safe envelope: never echo arbitrary exception text.
+        print("error: shopfloor knowledge build failed", file=sys.stderr)
         return 1
     print(
         json.dumps(

@@ -11,8 +11,11 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import re
+import shutil
 import sqlite3
+import stat
 import subprocess
 import tempfile
 from dataclasses import replace as dataclass_replace
@@ -36,6 +39,7 @@ from examples.shopfloor.generate_data import (
 from examples.shopfloor.generate_data import main as generate_main
 from examples.shopfloor.knowledge_policy import (
     _MAX_QUERY_BODY_BYTES,
+    ShopfloorKnowledgeIssue,
     validate_shopfloor_knowledge,
 )
 from examples.shopfloor.run_example import _layer_for_paths, run_walkthrough
@@ -1204,16 +1208,22 @@ def test_build_knowledge_rejects_symlink_output(tmp_path: Path) -> None:
 def test_build_knowledge_malformed_overlay_publishes_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A malformed overlay must exit 1 and leave no output."""
-    overlay = SHOPFLOOR_ROOT / "okf_overlays" / "metrics" / "component_count.md"
-    original = overlay.read_text(encoding="utf-8")
-    overlay.write_text("---\nbad: yaml: frontmatter\n---\n# broken", encoding="utf-8")
+    """A malformed overlay must exit 1 and leave no output.
+
+    The overlay tree is copied into an isolated temporary directory so the
+    repository source files are never mutated.
+    """
+    overlays_copy = tmp_path / "okf_overlays"
+    shutil.copytree(SHOPFLOOR_ROOT / "okf_overlays", overlays_copy)
+    (overlays_copy / "metrics" / "component_count.md").write_text(
+        "---\nbad: yaml: frontmatter\n---\n# broken", encoding="utf-8"
+    )
+    import examples.shopfloor.build_knowledge as bk
+
+    monkeypatch.setattr(bk, "OVERLAYS_DIR", overlays_copy)
     output = tmp_path / "knowledge"
-    try:
-        assert build_knowledge_main(["--output-dir", str(output)]) == 1
-        assert not output.exists()
-    finally:
-        overlay.write_text(original, encoding="utf-8")
+    assert build_knowledge_main(["--output-dir", str(output)]) == 1
+    assert not output.exists()
 
 
 def test_build_knowledge_no_staging_dirs_after_success(tmp_path: Path) -> None:
@@ -1238,15 +1248,24 @@ def test_build_knowledge_no_staging_dirs_after_failure(tmp_path: Path) -> None:
     assert siblings == []
 
 
-def test_build_knowledge_rename_failure_cleans_candidate(
+def test_build_knowledge_rename_failure_preserves_destination(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A rename failure must clean up the candidate directory."""
+    """A final rename failure must preserve an existing empty destination."""
     output = tmp_path / "knowledge"
+    output.mkdir()
     original_replace = Path.replace
 
     def failing_replace(self: Path, target: Path) -> Path:
-        if target.name == "knowledge" and ".candidate-" in str(self):
+        # Intercept only the final candidate-to-destination rename (the
+        # candidate lives inside a ``.knowledge.candidate-`` directory and
+        # its target is the user-supplied output), not the inner
+        # OkfBundle.build staging rename whose target is the candidate.
+        if (
+            self.name == "knowledge"
+            and ".candidate-" in self.parent.name
+            and target == output
+        ):
             raise OSError("simulated rename failure")
         return original_replace(self, target)
 
@@ -1254,11 +1273,53 @@ def test_build_knowledge_rename_failure_cleans_candidate(
 
     monkeypatch.setattr(bk.Path, "replace", failing_replace)
     assert build_knowledge_main(["--output-dir", str(output)]) == 1
+    # The pre-existing empty destination must survive (no rmdir-before-rename).
+    assert output.exists()
+    assert not any(output.iterdir())
+    siblings = [
+        p for p in tmp_path.iterdir() if p.name.startswith(".knowledge.candidate-")
+    ]
+    assert siblings == []
+
+
+def test_build_knowledge_policy_failure_publishes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A policy failure after candidate creation must publish nothing."""
+    issue = ShopfloorKnowledgeIssue(
+        code="shopfloor.example.unplannable",
+        path="metrics/component_count",
+        message="deterministic policy failure",
+    )
+    import examples.shopfloor.build_knowledge as bk
+
+    monkeypatch.setattr(bk, "validate_shopfloor_knowledge", lambda *_: (issue,))
+    output = tmp_path / "knowledge"
+    assert build_knowledge_main(["--output-dir", str(output)]) == 1
     assert not output.exists()
     siblings = [
         p for p in tmp_path.iterdir() if p.name.startswith(".knowledge.candidate-")
     ]
     assert siblings == []
+
+
+def test_build_knowledge_rejects_symlinked_parent(tmp_path: Path) -> None:
+    """A symlinked ancestor directory must be rejected without writing its target."""
+    real = tmp_path / "real"
+    real.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(real)
+    output = linked / "knowledge"
+    assert build_knowledge_main(["--output-dir", str(output)]) == 1
+    assert not (real / "knowledge").exists()
+
+
+def test_build_knowledge_rejects_special_file_output(tmp_path: Path) -> None:
+    """A non-directory filesystem object (FIFO) at the output must be rejected."""
+    output = tmp_path / "knowledge"
+    os.mkfifo(output)
+    assert build_knowledge_main(["--output-dir", str(output)]) == 1
+    assert stat.S_ISFIFO(output.stat().st_mode)
 
 
 def test_build_knowledge_default_output_is_generated_knowledge(
