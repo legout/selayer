@@ -10,6 +10,8 @@ grain-safe planner boundary.  No external services are required.
 from __future__ import annotations
 
 import csv
+import json
+import re
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -641,3 +643,108 @@ def test_every_metric_has_complete_curated_overlay(tmp_path: Path) -> None:
         assert sections["Examples"]
         assert sections["Caveats"]
         assert sections["Related Concepts"]
+
+
+_QUERY_FENCE = re.compile(
+    r"```json selayer-query\n(?P<body>.*?)\n```",
+    re.DOTALL,
+)
+_ALLOWED_QUERY_KEYS = frozenset({"metrics", "dimensions", "filters"})
+
+#: Exact expected query dimensions per headline metric overlay.
+_EXPECTED_METRIC_DIMENSIONS: dict[str, list[str]] = {
+    "production_completion_rate": ["schedule_status", "requested_ship_date"],
+    "shipped_unit_count": ["customer_region", "product_model"],
+    "component_count": ["drive_serial_number", "component_lot_id"],
+    "incoming_acceptance_rate": ["supplier_name", "component_type"],
+    "average_cycle_seconds": [
+        "operation_line_id",
+        "operation_machine_id",
+        "shift",
+        "operation_name",
+    ],
+    "operation_count": [
+        "operation_line_id",
+        "operation_machine_id",
+        "shift",
+        "operation_name",
+    ],
+    "rework_rate": [
+        "operation_line_id",
+        "operation_machine_id",
+        "shift",
+        "operation_name",
+    ],
+    "energy_per_operation_kwh": [
+        "operation_line_id",
+        "operation_machine_id",
+        "shift",
+        "operation_name",
+    ],
+    "eol_attempt_pass_rate": [
+        "drive_serial_number",
+        "station_id",
+        "product_model",
+        "firmware_revision",
+    ],
+    "first_pass_yield": [
+        "drive_serial_number",
+        "station_id",
+        "product_model",
+        "firmware_revision",
+    ],
+    "alarm_event_count": [
+        "telemetry_line_id",
+        "telemetry_machine_id",
+        "machine_state",
+    ],
+    "average_temperature_c": [
+        "telemetry_line_id",
+        "telemetry_machine_id",
+        "machine_state",
+    ],
+}
+
+
+def test_metric_overlay_query_blocks_are_valid_and_exact(tmp_path: Path) -> None:
+    """Each metric overlay Examples section has exactly one safe query request.
+
+    Declarative validation only: parses the fenced ``json selayer-query`` block
+    in each composed metric concept and asserts a well-formed request with the
+    exact expected grouping dimensions. No query execution occurs.
+    """
+    output = tmp_path / "knowledge"
+    layer = SemanticLayer.load(SHOPFLOOR_CATALOG)
+    bundle = OkfBundle.build(
+        layer,
+        output,
+        references_dir=SHOPFLOOR_ROOT / "business_context",
+        overlays_dir=SHOPFLOOR_ROOT / "okf_overlays",
+    )
+    for metric_name in sorted(layer.metrics):
+        concept = bundle.concepts[f"metrics/{metric_name}"]
+        examples = next(
+            section.content
+            for section in concept.sections
+            if section.title == "Examples"
+        )
+        matches = tuple(_QUERY_FENCE.finditer(examples))
+        assert len(matches) == 1, f"{metric_name} must contain one query request"
+        payload = json.loads(matches[0].group("body"))
+        assert type(payload) is dict, f"{metric_name} query must be a JSON object"
+        assert set(payload) - _ALLOWED_QUERY_KEYS == set(), (
+            f"{metric_name} query has invalid keys"
+        )
+        metrics = payload["metrics"]
+        assert (
+            type(metrics) is list and metrics and all(type(m) is str for m in metrics)
+        ), f"{metric_name} metrics must be a non-empty list of strings"
+        dimensions = payload["dimensions"]
+        assert type(dimensions) is list and all(type(d) is str for d in dimensions), (
+            f"{metric_name} dimensions must be a list of strings"
+        )
+        assert type(payload["filters"]) is dict, f"{metric_name} filters must be a dict"
+        expected = _EXPECTED_METRIC_DIMENSIONS[metric_name]
+        assert dimensions == expected, (
+            f"{metric_name} dimensions {dimensions} != {expected}"
+        )

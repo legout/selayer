@@ -13,7 +13,7 @@ metric counts distinct shipped drives, not customer orders or planned units.
 # Examples
 
 ```json selayer-query
-{"metrics":["shipped_unit_count"],"dimensions":["customer_region"],"filters":{}}
+{"metrics":["shipped_unit_count"],"dimensions":["customer_region","product_model"],"filters":{}}
 ```
 
 # Caveats

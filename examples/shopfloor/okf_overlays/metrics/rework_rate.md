@@ -14,7 +14,7 @@ grain.
 # Examples
 
 ```json selayer-query
-{"metrics":["rework_rate"],"dimensions":["operation_machine_id"],"filters":{}}
+{"metrics":["rework_rate"],"dimensions":["operation_line_id","operation_machine_id","shift","operation_name"],"filters":{}}
 ```
 
 # Caveats

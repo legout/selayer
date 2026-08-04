@@ -15,7 +15,7 @@ drives with an attempt one.
 # Examples
 
 ```json selayer-query
-{"metrics":["first_pass_yield"],"dimensions":["drive_serial_number"],"filters":{}}
+{"metrics":["first_pass_yield"],"dimensions":["drive_serial_number","station_id","product_model","firmware_revision"],"filters":{}}
 ```
 
 # Caveats

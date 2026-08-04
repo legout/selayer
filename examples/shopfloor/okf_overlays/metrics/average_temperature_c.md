@@ -13,7 +13,7 @@ telemetry events.
 # Examples
 
 ```json selayer-query
-{"metrics":["average_temperature_c"],"dimensions":["telemetry_machine_id"],"filters":{}}
+{"metrics":["average_temperature_c"],"dimensions":["telemetry_line_id","telemetry_machine_id","machine_state"],"filters":{}}
 ```
 
 # Caveats

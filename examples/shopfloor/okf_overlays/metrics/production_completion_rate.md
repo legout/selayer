@@ -14,7 +14,7 @@ planned schedule.
 # Examples
 
 ```json selayer-query
-{"metrics":["production_completion_rate"],"dimensions":["schedule_status"],"filters":{}}
+{"metrics":["production_completion_rate"],"dimensions":["schedule_status","requested_ship_date"],"filters":{}}
 ```
 
 # Caveats

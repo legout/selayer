@@ -13,7 +13,7 @@ IDs, not drives; a single drive may have several operations including rework.
 # Examples
 
 ```json selayer-query
-{"metrics":["operation_count"],"dimensions":["operation_machine_id"],"filters":{}}
+{"metrics":["operation_count"],"dimensions":["operation_line_id","operation_machine_id","shift","operation_name"],"filters":{}}
 ```
 
 # Caveats

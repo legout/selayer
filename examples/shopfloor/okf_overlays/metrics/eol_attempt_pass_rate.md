@@ -14,7 +14,7 @@ passing attempts divided by all attempts at the EOL-attempt grain.
 # Examples
 
 ```json selayer-query
-{"metrics":["eol_attempt_pass_rate"],"dimensions":["drive_serial_number"],"filters":{}}
+{"metrics":["eol_attempt_pass_rate"],"dimensions":["drive_serial_number","station_id","product_model","firmware_revision"],"filters":{}}
 ```
 
 # Caveats

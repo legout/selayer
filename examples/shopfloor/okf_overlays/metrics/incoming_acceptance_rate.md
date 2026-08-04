@@ -14,7 +14,7 @@ This ratio is computed at the component-lot grain.
 # Examples
 
 ```json selayer-query
-{"metrics":["incoming_acceptance_rate"],"dimensions":["supplier_name"],"filters":{}}
+{"metrics":["incoming_acceptance_rate"],"dimensions":["supplier_name","component_type"],"filters":{}}
 ```
 
 # Caveats

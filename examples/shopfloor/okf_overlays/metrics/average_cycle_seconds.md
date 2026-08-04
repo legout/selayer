@@ -14,7 +14,7 @@ average when group sizes differ.
 # Examples
 
 ```json selayer-query
-{"metrics":["average_cycle_seconds"],"dimensions":["operation_machine_id"],"filters":{}}
+{"metrics":["average_cycle_seconds"],"dimensions":["operation_line_id","operation_machine_id","shift","operation_name"],"filters":{}}
 ```
 
 # Caveats

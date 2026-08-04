@@ -13,7 +13,7 @@ metric counts telemetry rows where the machine state is alarm.
 # Examples
 
 ```json selayer-query
-{"metrics":["alarm_event_count"],"dimensions":["telemetry_machine_id"],"filters":{}}
+{"metrics":["alarm_event_count"],"dimensions":["telemetry_line_id","telemetry_machine_id","machine_state"],"filters":{}}
 ```
 
 # Caveats

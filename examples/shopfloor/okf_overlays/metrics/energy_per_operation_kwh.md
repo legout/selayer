@@ -13,7 +13,7 @@ This metric is a ratio of total operation energy to distinct operation count.
 # Examples
 
 ```json selayer-query
-{"metrics":["energy_per_operation_kwh"],"dimensions":["operation_machine_id"],"filters":{}}
+{"metrics":["energy_per_operation_kwh"],"dimensions":["operation_line_id","operation_machine_id","shift","operation_name"],"filters":{}}
 ```
 
 # Caveats

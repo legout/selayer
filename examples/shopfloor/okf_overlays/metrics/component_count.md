@@ -14,7 +14,7 @@ identity.
 # Examples
 
 ```json selayer-query
-{"metrics":["component_count"],"dimensions":["drive_serial_number"],"filters":{}}
+{"metrics":["component_count"],"dimensions":["drive_serial_number","component_lot_id"],"filters":{}}
 ```
 
 # Caveats
