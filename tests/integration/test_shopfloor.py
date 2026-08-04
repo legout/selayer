@@ -535,15 +535,18 @@ def test_shopfloor_business_rules_hold_in_generated_data(tmp_path: Path) -> None
 
     # Operation executions (Parquet): result domain.
     operation_executions = pq.read_table(paths.operation_executions).to_pylist()
-    assert {
-        cast("str", row["result"]) for row in operation_executions
-    } <= {"pass", "fail"}
+    assert {cast("str", row["result"]) for row in operation_executions} <= {
+        "pass",
+        "fail",
+    }
 
     # Machine telemetry (Parquet): machine-state domain.
     telemetry = pq.read_table(paths.machine_telemetry).to_pylist()
-    assert {
-        cast("str", row["machine_state"]) for row in telemetry
-    } <= {"running", "idle", "alarm"}
+    assert {cast("str", row["machine_state"]) for row in telemetry} <= {
+        "running",
+        "idle",
+        "alarm",
+    }
 
     # Component lot inspections (Parquet): incoming result maps to disposition.
     inspections = pq.read_table(paths.component_lot_inspections).to_pylist()
@@ -580,6 +583,5 @@ def test_shopfloor_compatibility_check_records_planner_rejections(
     assert report.complete
     assert report.passed
     assert any(
-        item.evidence.get("planner_code") == "mixed_grain"
-        for item in report.outcomes
+        item.evidence.get("planner_code") == "mixed_grain" for item in report.outcomes
     )
