@@ -1399,6 +1399,36 @@ def test_catalog_rejects_replaced_by_on_active_object(tmp_path: Path) -> None:
     )
 
 
+def test_catalog_rejects_null_status(tmp_path: Path) -> None:
+    # An explicitly-supplied YAML null is a malformed status value, not an
+    # absent field: only a missing ``status`` key receives the active default.
+    path = _write(tmp_path, _minimal_metric_catalog("status: null"))
+    with pytest.raises(CatalogValidationError) as caught:
+        SemanticLayer.load(path)
+    assert any(
+        issue.path == "metrics.rate.status"
+        and "status must be a string" in issue.message
+        for issue in caught.value.issues
+    )
+
+
+def test_catalog_rejects_null_replaced_by(tmp_path: Path) -> None:
+    # An explicitly-supplied YAML null is a malformed replacement value, not
+    # an absent field: only a missing ``replaced_by`` key receives the None
+    # default.
+    path = _write(
+        tmp_path,
+        _minimal_metric_catalog("status: deprecated\n    replaced_by: null"),
+    )
+    with pytest.raises(CatalogValidationError) as caught:
+        SemanticLayer.load(path)
+    assert any(
+        issue.path == "metrics.rate.replaced_by"
+        and "replaced_by must be a string" in issue.message
+        for issue in caught.value.issues
+    )
+
+
 def test_catalog_defaults_missing_status_to_active(valid_catalog_path: Path) -> None:
     # A catalog that declares no deprecation metadata must resolve every
     # semantic object to ACTIVE with no replacement target.

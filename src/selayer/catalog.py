@@ -357,10 +357,18 @@ def _semantic_metadata(
     A single shared helper used by every section validator (to collect issues)
     and the model builder (to construct typed values) so the deprecation rule
     has exactly one definition. ``status`` defaults to
-    :data:`~selayer.model.SemanticStatus.ACTIVE` when absent or null and
-    accepts only the values of :data:`_SEMANTIC_STATUS_VALUES`. ``replaced_by``
-    must be a string when present, and is rejected on a validly-active object
-    (a replacement target is only meaningful once the object is deprecated).
+    :data:`~selayer.model.SemanticStatus.ACTIVE` only when the field is absent
+    (``"status" not in raw``); an explicitly-supplied null or other non-string
+    is a malformed value and is rejected rather than ignored. It accepts only
+    the values of :data:`_SEMANTIC_STATUS_VALUES`. ``replaced_by`` defaults to
+    ``None`` only when absent; when present it must be a string, and is rejected
+    on a validly-active object (a replacement target is only meaningful once the
+    object is deprecated).
+
+    Field presence is checked with ``in`` rather than truthiness on
+    ``raw.get(...)`` so that an explicitly-supplied YAML ``null`` (which parses
+    to ``None``) is treated as a present, malformed value instead of being
+    silently coerced to the default.
 
     Returns the resolved ``(status, replaced_by)`` plus any issues rooted at
     ``base``; malformed fields always yield an issue and never silently fall
@@ -372,8 +380,8 @@ def _semantic_metadata(
 
     status: SemanticStatus = SemanticStatus.ACTIVE
     status_known = True
-    status_raw = raw.get("status")
-    if status_raw is not None:
+    if "status" in raw:
+        status_raw = raw["status"]
         if not isinstance(status_raw, str):
             issues.append(CatalogIssue(f"{base}.status", "status must be a string"))
             status_known = False
@@ -386,8 +394,8 @@ def _semantic_metadata(
             status = SemanticStatus(status_raw)
 
     replaced_by: str | None = None
-    replaced_by_raw = raw.get("replaced_by")
-    if replaced_by_raw is not None:
+    if "replaced_by" in raw:
+        replaced_by_raw = raw["replaced_by"]
         if not isinstance(replaced_by_raw, str):
             issues.append(
                 CatalogIssue(f"{base}.replaced_by", "replaced_by must be a string")
