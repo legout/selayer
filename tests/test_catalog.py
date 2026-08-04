@@ -25,7 +25,9 @@ from selayer import (
     Metric,
     Relationship,
     SemanticLayer,
+    SemanticStatus,
 )
+from selayer.expressions import parse_expression
 from selayer.sources.config import ParquetConfig
 from selayer.sources.schema import FieldSchema, ScalarType, TableSchema
 
@@ -1123,3 +1125,294 @@ def test_catalog_rejects_measure_sum_of_string_fact(tmp_path: Path) -> None:
     assert "catalog.measure.invalid_aggregation_type" in {
         issue.code for issue in caught.value.issues
     }
+
+
+# ---------------------------------------------------------------------------
+# Semantic deprecation metadata (model fields)
+# ---------------------------------------------------------------------------
+
+
+def test_semantic_status_enum_is_string_with_two_members() -> None:
+    # SemanticStatus is a closed StrEnum so it serializes as its value and is
+    # constructable from the canonical status strings.
+    assert SemanticStatus.ACTIVE == "active"
+    assert SemanticStatus.DEPRECATED == "deprecated"
+    assert SemanticStatus("active") is SemanticStatus.ACTIVE
+    assert SemanticStatus("deprecated") is SemanticStatus.DEPRECATED
+    assert {member.value for member in SemanticStatus} == {"active", "deprecated"}
+
+
+def test_semantic_objects_default_to_active_with_no_replacement() -> None:
+    expr = parse_expression("orders.amount")
+    objects = [
+        DataSource("s", _source().connector, _source().schema, ("id",)),
+        Dimension("d", "orders", "id", "string"),
+        Fact("f", "orders", expr, "decimal"),
+        Measure("m", "f", "sum"),
+        Metric("r", expr, ("m",)),
+        Relationship("rel", "a", "b", "one_to_one", "id", "id"),
+    ]
+    for obj in objects:
+        assert obj.status is SemanticStatus.ACTIVE
+        assert obj.replaced_by is None
+
+
+def test_semantic_objects_carry_explicit_deprecation_metadata() -> None:
+    expr = parse_expression("orders.amount")
+    source = DataSource(
+        "s",
+        _source().connector,
+        _source().schema,
+        ("id",),
+        status=SemanticStatus.DEPRECATED,
+        replaced_by="source.t",
+    )
+    dimension = Dimension(
+        "d",
+        "orders",
+        "id",
+        "string",
+        status=SemanticStatus.DEPRECATED,
+        replaced_by="dimension.t",
+    )
+    fact = Fact(
+        "f",
+        "orders",
+        expr,
+        "decimal",
+        status=SemanticStatus.DEPRECATED,
+        replaced_by="fact.t",
+    )
+    measure = Measure(
+        "m", "f", "sum", status=SemanticStatus.DEPRECATED, replaced_by="measure.t"
+    )
+    metric = Metric(
+        "r", expr, ("m",), status=SemanticStatus.DEPRECATED, replaced_by="metric.t"
+    )
+    relationship = Relationship(
+        "rel",
+        "a",
+        "b",
+        "one_to_one",
+        "id",
+        "id",
+        status=SemanticStatus.DEPRECATED,
+        replaced_by="relationship.t",
+    )
+
+    for obj in (source, dimension, fact, measure, metric, relationship):
+        assert obj.status is SemanticStatus.DEPRECATED
+        assert obj.replaced_by is not None
+
+
+def test_deprecation_metadata_fields_are_frozen() -> None:
+    source = DataSource("s", _source().connector, _source().schema, ("id",))
+    with pytest.raises((AttributeError, TypeError)):
+        source.status = SemanticStatus.DEPRECATED  # type: ignore[misc]
+    with pytest.raises((AttributeError, TypeError)):
+        source.replaced_by = "source.t"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Semantic deprecation metadata (catalog parsing)
+# ---------------------------------------------------------------------------
+
+# A catalog exercising every semantic kind with a deprecated/active pair so the
+# loader is proven to parse metadata for sources, dimensions, facts, measures,
+# metrics, and relationships.
+_DEPRECATED_CATALOG_YAML = """\
+version: 1
+name: deprecated
+data_sources:
+  old_source:
+    type: parquet
+    location: old.parquet
+    grain: [id]
+    schema:
+      fields:
+        - {name: id, type: utf8, nullable: false}
+        - {name: amount, type: float64, nullable: true}
+    status: deprecated
+    replaced_by: source.new_source
+  new_source:
+    type: parquet
+    location: new.parquet
+    grain: [id]
+    schema:
+      fields:
+        - {name: id, type: utf8, nullable: false}
+        - {name: amount, type: float64, nullable: true}
+dimensions:
+  old_dimension:
+    source: old_source
+    column: amount
+    data_type: float
+    status: deprecated
+    replaced_by: dimension.new_dimension
+  new_dimension:
+    source: new_source
+    column: amount
+    data_type: float
+facts:
+  old_fact:
+    source: old_source
+    expression: old_source.amount
+    data_type: decimal
+    status: deprecated
+    replaced_by: fact.new_fact
+  new_fact:
+    source: new_source
+    expression: new_source.amount
+    data_type: decimal
+measures:
+  old_measure:
+    fact: old_fact
+    aggregation: sum
+    status: deprecated
+    replaced_by: measure.new_measure
+  new_measure:
+    fact: new_fact
+    aggregation: sum
+metrics:
+  old_rate:
+    expression: old_measure
+    measures: [old_measure]
+    status: deprecated
+    replaced_by: metric.new_rate
+  new_rate:
+    expression: new_measure
+    measures: [new_measure]
+relationships:
+  old_relationship:
+    source: old_source
+    target: new_source
+    type: one_to_one
+    source_column: id
+    target_column: id
+    status: deprecated
+    replaced_by: relationship.new_relationship
+  new_relationship:
+    source: old_source
+    target: new_source
+    type: one_to_one
+    source_column: id
+    target_column: id
+"""
+
+
+def _catalog_with_deprecations(tmp_path: Path) -> Path:
+    return _write(tmp_path, _DEPRECATED_CATALOG_YAML)
+
+
+def test_catalog_parses_deprecation_metadata(tmp_path: Path) -> None:
+    layer = SemanticLayer.load(_catalog_with_deprecations(tmp_path))
+
+    # source
+    assert layer.source("old_source").status is SemanticStatus.DEPRECATED
+    assert layer.source("old_source").replaced_by == "source.new_source"
+    assert layer.source("new_source").status is SemanticStatus.ACTIVE
+    assert layer.source("new_source").replaced_by is None
+    # dimension
+    assert layer.dimension("old_dimension").status is SemanticStatus.DEPRECATED
+    assert layer.dimension("old_dimension").replaced_by == "dimension.new_dimension"
+    assert layer.dimension("new_dimension").status is SemanticStatus.ACTIVE
+    assert layer.dimension("new_dimension").replaced_by is None
+    # fact
+    assert layer.fact("old_fact").status is SemanticStatus.DEPRECATED
+    assert layer.fact("old_fact").replaced_by == "fact.new_fact"
+    assert layer.fact("new_fact").status is SemanticStatus.ACTIVE
+    assert layer.fact("new_fact").replaced_by is None
+    # measure
+    assert layer.measure("old_measure").status is SemanticStatus.DEPRECATED
+    assert layer.measure("old_measure").replaced_by == "measure.new_measure"
+    assert layer.measure("new_measure").status is SemanticStatus.ACTIVE
+    assert layer.measure("new_measure").replaced_by is None
+    # metric (the brief's example)
+    assert layer.metric("old_rate").status is SemanticStatus.DEPRECATED
+    assert layer.metric("old_rate").replaced_by == "metric.new_rate"
+    assert layer.metric("new_rate").status is SemanticStatus.ACTIVE
+    assert layer.metric("new_rate").replaced_by is None
+    # relationship
+    assert layer.relationship("old_relationship").status is SemanticStatus.DEPRECATED
+    assert (
+        layer.relationship("old_relationship").replaced_by
+        == "relationship.new_relationship"
+    )
+    assert layer.relationship("new_relationship").status is SemanticStatus.ACTIVE
+    assert layer.relationship("new_relationship").replaced_by is None
+
+
+def _minimal_metric_catalog(metric_extra: str) -> str:
+    """A minimal valid catalog with one metric; inject extra metric fields.
+
+    ``metric_extra`` is interpolated verbatim into the metric body so each
+    metadata-failure test can target a single malformed field on a metric.
+    """
+    return (
+        "version: 1\nname: minimal\ndata_sources:\n"
+        "  orders:\n    type: parquet\n    location: orders.parquet\n    grain: [id]\n"
+        "    schema:\n      fields:\n"
+        "        - {name: id, type: utf8, nullable: false}\n"
+        "        - {name: amount, type: float64, nullable: true}\n"
+        "facts:\n  amount:\n    source: orders\n    expression: orders.amount\n"
+        "    data_type: decimal\n"
+        "measures:\n  total:\n    fact: amount\n    aggregation: sum\n"
+        "metrics:\n  rate:\n    expression: total\n    measures: [total]\n"
+        f"    {metric_extra}\n"
+    )
+
+
+def test_catalog_rejects_unknown_status(tmp_path: Path) -> None:
+    path = _write(tmp_path, _minimal_metric_catalog("status: archived"))
+    with pytest.raises(CatalogValidationError) as caught:
+        SemanticLayer.load(path)
+    assert any(
+        issue.path == "metrics.rate.status" and "unsupported status" in issue.message
+        for issue in caught.value.issues
+    )
+
+
+def test_catalog_rejects_non_string_replaced_by(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        _minimal_metric_catalog("status: deprecated\n    replaced_by: 5"),
+    )
+    with pytest.raises(CatalogValidationError) as caught:
+        SemanticLayer.load(path)
+    assert any(
+        issue.path == "metrics.rate.replaced_by"
+        and "replaced_by must be a string" in issue.message
+        for issue in caught.value.issues
+    )
+
+
+def test_catalog_rejects_replaced_by_on_active_object(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        _minimal_metric_catalog("status: active\n    replaced_by: metric.other"),
+    )
+    with pytest.raises(CatalogValidationError) as caught:
+        SemanticLayer.load(path)
+    assert any(
+        issue.path == "metrics.rate.replaced_by" and "deprecated" in issue.message
+        for issue in caught.value.issues
+    )
+
+
+def test_catalog_defaults_missing_status_to_active(valid_catalog_path: Path) -> None:
+    # A catalog that declares no deprecation metadata must resolve every
+    # semantic object to ACTIVE with no replacement target.
+    layer = SemanticLayer.load(valid_catalog_path)
+    for obj in layer.semantic_objects().values():
+        assert obj.status is SemanticStatus.ACTIVE
+        assert obj.replaced_by is None
+
+
+def test_deprecated_catalog_is_still_a_valid_model(tmp_path: Path) -> None:
+    # A catalog that does carry deprecation metadata must not produce any
+    # model-rule issues: the deprecation fields are orthogonal to declaration
+    # validation.
+    from selayer.catalog import collect_model_issues
+
+    layer = SemanticLayer.load(_catalog_with_deprecations(tmp_path))
+    assert collect_model_issues(layer) == ()

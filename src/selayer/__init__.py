@@ -11,6 +11,7 @@ from selayer.model import (
     Measure,
     Metric,
     Relationship,
+    SemanticStatus,
 )
 from selayer.planning import QueryPlan, QueryPlanningError
 from selayer.query import QueryEngine
@@ -46,6 +47,7 @@ __all__ = [
     "Relationship",
     "ReloadResult",
     "SemanticLayer",
+    "SemanticStatus",
     "SourceConnectionError",
     "SourceDependencyError",
     "SourceError",

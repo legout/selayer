@@ -28,7 +28,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, get_args
+from typing import Any, TypedDict, get_args
 
 import yaml
 
@@ -50,6 +50,7 @@ from selayer.model import (
     Relationship,
     SemanticLayer,
     SemanticObject,
+    SemanticStatus,
 )
 from selayer.sources.catalog import (
     ParsedSource,
@@ -71,6 +72,12 @@ _AGGREGATIONS: frozenset[str] = frozenset(
 )
 _CARDINALITIES: frozenset[str] = frozenset(
     get_args(getattr(Cardinality, "__value__", Cardinality))
+)
+# Canonical string values accepted for the ``status`` metadata field. Built
+# from :class:`~selayer.model.SemanticStatus` so the catalog parser and the
+# model cannot drift on the accepted status set.
+_SEMANTIC_STATUS_VALUES: frozenset[str] = frozenset(
+    member.value for member in SemanticStatus
 )
 
 # Semantic data_type -> set of compatible logical type "kinds".  A dimension
@@ -342,6 +349,111 @@ def _validate_identifier_key(
         collector.add(base_path, f"{kind} key '{key}' must match [a-z][a-z0-9_]*")
 
 
+def _semantic_metadata(
+    raw: Mapping[str, Any], base: str
+) -> tuple[SemanticStatus, str | None, list[CatalogIssue]]:
+    """Validate and parse ``(status, replaced_by)`` for one semantic object.
+
+    A single shared helper used by every section validator (to collect issues)
+    and the model builder (to construct typed values) so the deprecation rule
+    has exactly one definition. ``status`` defaults to
+    :data:`~selayer.model.SemanticStatus.ACTIVE` when absent or null and
+    accepts only the values of :data:`_SEMANTIC_STATUS_VALUES`. ``replaced_by``
+    must be a string when present, and is rejected on a validly-active object
+    (a replacement target is only meaningful once the object is deprecated).
+
+    Returns the resolved ``(status, replaced_by)`` plus any issues rooted at
+    ``base``; malformed fields always yield an issue and never silently fall
+    through. When the ``status`` field itself is malformed the replacement
+    check is skipped because the object's lifecycle state is undecided and the
+    status issue already reported is sufficient.
+    """
+    issues: list[CatalogIssue] = []
+
+    status: SemanticStatus = SemanticStatus.ACTIVE
+    status_known = True
+    status_raw = raw.get("status")
+    if status_raw is not None:
+        if not isinstance(status_raw, str):
+            issues.append(CatalogIssue(f"{base}.status", "status must be a string"))
+            status_known = False
+        elif status_raw not in _SEMANTIC_STATUS_VALUES:
+            issues.append(
+                CatalogIssue(f"{base}.status", f"unsupported status {status_raw!r}")
+            )
+            status_known = False
+        else:
+            status = SemanticStatus(status_raw)
+
+    replaced_by: str | None = None
+    replaced_by_raw = raw.get("replaced_by")
+    if replaced_by_raw is not None:
+        if not isinstance(replaced_by_raw, str):
+            issues.append(
+                CatalogIssue(f"{base}.replaced_by", "replaced_by must be a string")
+            )
+        else:
+            replaced_by = replaced_by_raw
+
+    if status_known and status is SemanticStatus.ACTIVE and replaced_by is not None:
+        issues.append(
+            CatalogIssue(
+                f"{base}.replaced_by",
+                "replaced_by is only allowed on deprecated objects",
+            )
+        )
+
+    return status, replaced_by, issues
+
+
+# Semantic metadata keys owned by :func:`_semantic_metadata`. They are not
+# connector fields and must be stripped from a raw source declaration before
+# it reaches the closed connector-field validator, which would otherwise
+# reject them as unknown fields.
+_SOURCE_METADATA_KEYS: frozenset[str] = frozenset({"status", "replaced_by"})
+
+
+class _MetadataKwargs(TypedDict):
+    """Precisely-typed ``status``/``replaced_by`` constructor kwargs.
+
+    A ``TypedDict`` (rather than a plain ``dict``) so ``**_metadata_kwargs(...)``
+    splats keep each key's exact type at the call site instead of widening to
+    a common value union.
+    """
+
+    status: SemanticStatus
+    replaced_by: str | None
+
+
+def _strip_source_metadata(raw: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Return ``raw`` without semantic metadata keys.
+
+    The deprecation metadata is validated and parsed separately by
+    :func:`_semantic_metadata`; it is never a connector option, so it is
+    removed before the declaration is handed to the connector field validator
+    (and parser) in :mod:`selayer.sources.catalog`. A new mapping is built only
+    when a metadata key is actually present.
+    """
+    if not any(key in raw for key in _SOURCE_METADATA_KEYS):
+        return raw
+    return {
+        key: value for key, value in raw.items() if key not in _SOURCE_METADATA_KEYS
+    }
+
+
+def _metadata_kwargs(raw: Mapping[str, Any], base: str) -> _MetadataKwargs:
+    """Resolve ``status``/``replaced_by`` constructor kwargs for one object.
+
+    Safe to call at build time: by the time :func:`_build_layer` runs,
+    validation has already collected (and raised on) every malformed metadata
+    field, so the returned values are guaranteed well-formed. Re-running the
+    single shared helper keeps the deprecation rule in one place rather than
+    re-deriving the defaults inline.
+    """
+    status, replaced_by, _ = _semantic_metadata(raw, base)
+    return {"status": status, "replaced_by": replaced_by}
+
+
 # ---------------------------------------------------------------------------
 # YAML parsing and duplicate-key detection
 # ---------------------------------------------------------------------------
@@ -432,10 +544,20 @@ def _validate_data_sources(
     so dependent checks are skipped deterministically.
     """
 
-    for key in sources:
+    # Semantic metadata (status/replaced_by) is validated here and stripped
+    # before the declaration reaches the closed connector-field validator,
+    # which would otherwise reject it as an unknown field.
+    connector_decls: dict[str, Any] = {}
+    for key, raw in sources.items():
         base = f"data_sources.{key}"
         _validate_identifier_key(key, base, "data source", collector)
-    source_issues = validate_source_declarations(sources, catalog_path)
+        if isinstance(raw, Mapping):
+            _, _, meta_issues = _semantic_metadata(raw, base)
+            collector.issues.extend(meta_issues)
+            connector_decls[key] = _strip_source_metadata(raw)
+        else:
+            connector_decls[key] = raw
+    source_issues = validate_source_declarations(connector_decls, catalog_path)
     for issue in source_issues:
         collector.add(issue.path, issue.message)
     if source_issues:
@@ -443,7 +565,7 @@ def _validate_data_sources(
         # operate on an unparseable model, so return an empty mapping.
         return {}
     try:
-        parsed = parse_source_declarations(sources, catalog_path)
+        parsed = parse_source_declarations(connector_decls, catalog_path)
     except Exception:  # noqa: BLE001 - parse only runs after validation
         return {}
     for name, source in parsed.items():
@@ -463,6 +585,8 @@ def _validate_dimensions(
         if not isinstance(raw, Mapping):
             collector.add(base, "dimension must be a mapping")
             continue
+        _, _, meta_issues = _semantic_metadata(raw, base)
+        collector.issues.extend(meta_issues)
         _require(raw, "source", base, collector)
         _require(raw, "column", base, collector)
         _require(raw, "data_type", base, collector)
@@ -495,6 +619,8 @@ def _validate_facts(
         if not isinstance(raw, Mapping):
             collector.add(base, "fact must be a mapping")
             continue
+        _, _, meta_issues = _semantic_metadata(raw, base)
+        collector.issues.extend(meta_issues)
         _require(raw, "source", base, collector)
         _require(raw, "data_type", base, collector)
         _require(raw, "expression", base, collector)
@@ -552,6 +678,8 @@ def _validate_measures(
         if not isinstance(raw, Mapping):
             collector.add(base, "measure must be a mapping")
             continue
+        _, _, meta_issues = _semantic_metadata(raw, base)
+        collector.issues.extend(meta_issues)
         _require(raw, "fact", base, collector)
         _require(raw, "aggregation", base, collector)
         _check_optional_string(raw, "fact", base, collector)
@@ -588,6 +716,8 @@ def _validate_metrics(
         if not isinstance(raw, Mapping):
             collector.add(base, "metric must be a mapping")
             continue
+        _, _, meta_issues = _semantic_metadata(raw, base)
+        collector.issues.extend(meta_issues)
         _require(raw, "expression", base, collector)
         _require(raw, "measures", base, collector)
         _check_optional_string(raw, "expression", base, collector)
@@ -627,6 +757,8 @@ def _validate_relationships(
         if not isinstance(raw, Mapping):
             collector.add(base, "relationship must be a mapping")
             continue
+        _, _, meta_issues = _semantic_metadata(raw, base)
+        collector.issues.extend(meta_issues)
         _require(raw, "source", base, collector)
         _require(raw, "target", base, collector)
         _require(raw, "type", base, collector)
@@ -1336,8 +1468,13 @@ def _build_layer(
                     connector=parsed.connector,
                     schema=parsed.schema,
                     grain=parsed.grain,
+                    **_metadata_kwargs(
+                        raw if isinstance(raw, Mapping) else {},
+                        f"data_sources.{key}",
+                    ),
                 )
                 for key, parsed in parsed_sources.items()
+                for raw in (_collection(data, "data_sources").get(key),)
             }
         ),
         dimensions=MappingProxyType(
@@ -1348,6 +1485,7 @@ def _build_layer(
                     column=raw["column"],
                     data_type=raw["data_type"],
                     description=str(raw.get("description") or ""),
+                    **_metadata_kwargs(raw, f"dimensions.{key}"),
                 )
                 for key, raw in dimensions.items()
             }
@@ -1360,6 +1498,7 @@ def _build_layer(
                     expression=fact_expressions[key],
                     data_type=raw["data_type"],
                     description=str(raw.get("description") or ""),
+                    **_metadata_kwargs(raw, f"facts.{key}"),
                 )
                 for key, raw in facts.items()
             }
@@ -1371,6 +1510,7 @@ def _build_layer(
                     fact=raw["fact"],
                     aggregation=raw["aggregation"],
                     description=str(raw.get("description") or ""),
+                    **_metadata_kwargs(raw, f"measures.{key}"),
                 )
                 for key, raw in measures.items()
             }
@@ -1382,6 +1522,7 @@ def _build_layer(
                     expression=metric_expressions[key],
                     measures=tuple(raw["measures"]),
                     description=str(raw.get("description") or ""),
+                    **_metadata_kwargs(raw, f"metrics.{key}"),
                 )
                 for key, raw in metrics.items()
             }
@@ -1395,6 +1536,7 @@ def _build_layer(
                     type=raw["type"],
                     source_column=raw["source_column"],
                     target_column=raw["target_column"],
+                    **_metadata_kwargs(raw, f"relationships.{key}"),
                 )
                 for key, raw in relationships.items()
             }

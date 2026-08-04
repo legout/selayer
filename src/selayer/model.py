@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, Self
@@ -30,6 +31,20 @@ from selayer.sources.schema import TableSchema
 type Aggregation = Literal["sum", "avg", "min", "max", "count", "count_distinct"]
 
 type Cardinality = Literal["one_to_one", "one_to_many", "many_to_one", "many_to_many"]
+
+
+class SemanticStatus(StrEnum):
+    """Lifecycle status of a catalog semantic object.
+
+    ``ACTIVE`` is the implicit default for every object that does not declare
+    a status. ``DEPRECATED`` marks an object superseded by another; its
+    replacement target is recorded in :attr:`replaced_by`. The enum is a
+    :class:`~enum.StrEnum` so its members serialize as their canonical
+    lowercase values (``"active"`` / ``"deprecated"``).
+    """
+
+    ACTIVE = "active"
+    DEPRECATED = "deprecated"
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +62,8 @@ class DataSource:
     connector: SourceConnector
     schema: TableSchema
     grain: tuple[str, ...]
+    status: SemanticStatus = SemanticStatus.ACTIVE
+    replaced_by: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +75,8 @@ class Dimension:
     column: str
     data_type: str
     description: str = ""
+    status: SemanticStatus = SemanticStatus.ACTIVE
+    replaced_by: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +93,8 @@ class Fact:
     expression: Expression
     data_type: str
     description: str = ""
+    status: SemanticStatus = SemanticStatus.ACTIVE
+    replaced_by: str | None = None
 
     @classmethod
     def from_expression(
@@ -96,6 +117,8 @@ class Measure:
     fact: str
     aggregation: Aggregation
     description: str = ""
+    status: SemanticStatus = SemanticStatus.ACTIVE
+    replaced_by: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +133,8 @@ class Metric:
     expression: Expression
     measures: tuple[str, ...]
     description: str = ""
+    status: SemanticStatus = SemanticStatus.ACTIVE
+    replaced_by: str | None = None
 
     @classmethod
     def from_expression(
@@ -139,6 +164,8 @@ class Relationship:
     type: Cardinality
     source_column: str
     target_column: str
+    status: SemanticStatus = SemanticStatus.ACTIVE
+    replaced_by: str | None = None
 
 
 type SemanticObject = DataSource | Dimension | Fact | Measure | Metric | Relationship
@@ -246,4 +273,5 @@ __all__ = [
     "Relationship",
     "SemanticLayer",
     "SemanticObject",
+    "SemanticStatus",
 ]
