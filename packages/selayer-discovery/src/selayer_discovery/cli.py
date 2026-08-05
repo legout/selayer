@@ -804,12 +804,14 @@ def _handle_profile_activate_policy(args: argparse.Namespace) -> int:
     charter = SessionStore.open(session_dir).charter
     charter_approver = normalize_actor_identity(charter.approver)
     override = args.approver
-    if override:
+    if override is not None:
         # Global constraints require every approval actor to match the
         # charter's normalized named approver. Export verifies the charter
         # approver and has no override, so a non-matching activation could
         # never be used; reject it up front with the stable actor-mismatch
-        # diagnostic. A blank/whitespace override is also non-matching.
+        # diagnostic. A blank/whitespace override is also rejected: it is an
+        # explicit override (``--approver ""``), never the omitted default
+        # (``None``), so it fails closed instead of silently falling back.
         try:
             candidate = normalize_actor_identity(override)
         except DiscoveryError:

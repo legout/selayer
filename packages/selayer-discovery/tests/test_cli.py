@@ -1235,6 +1235,28 @@ def test_activate_policy_accepts_matching_approver_override(
     assert out["fingerprint"]
 
 
+def test_activate_policy_rejects_empty_approver_override(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An explicitly supplied empty ``--approver ""`` is rejected, not defaulted.
+
+    An explicit override must fail closed with the stable actor-mismatch
+    diagnostic even when blank, instead of silently falling back to the charter
+    approver as if the option had been omitted. Only a genuinely omitted
+    ``--approver`` (``None``) preserves the charter-approver default.
+    """
+
+    _init_policy_session(tmp_path, capsys)
+    profile = _policy_profile(tmp_path)
+    profile_path = _write_profile(tmp_path, profile)
+    _propose_and_write_policy(tmp_path, capsys, profile_path)
+    code = main(_activate_policy_args(tmp_path, profile_path, approver=""))
+    assert code == 1
+    err = json.loads(capsys.readouterr().err)
+    assert err["code"] == "discovery.profile.actor_mismatch"
+    assert err["safe_detail"] == "approver"
+
+
 def test_activate_policy_unknown_session_fails(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
