@@ -90,6 +90,7 @@ from selayer_discovery.proposal import (
     reconstruct_candidate,
     render_review_preview,
     render_review_summary,
+    verify_proposal,
     write_candidate,
 )
 from selayer_discovery.session import (
@@ -1205,6 +1206,93 @@ def _handle_proposal_show(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+#: The immutable verification report filename, written inside the Git-ignored
+#: proposal workspace and bound to the proposal's input hashes.
+_VERIFICATION_FILENAME: str = "verification.json"
+
+
+def _handle_proposal_verify(args: argparse.Namespace) -> int:
+    project = _project_root(args.project)
+    session_id = _validate_session_id(args.session_id)
+    session_dir = _require_session(project, session_id)
+    proposal_id = (
+        _validate_proposal_id(args.proposal)
+        if args.proposal
+        else _latest_proposal_id(session_dir)
+    )
+    record = _read_proposal_record(session_dir, proposal_id)
+    # Reconstruct a fresh candidate from the stored typed operations so the
+    # verification verdict reflects the current base catalog, authored
+    # knowledge roots, and stored operations — never a stale candidate.
+    proposal = build_proposal(
+        {
+            "proposal_id": record.get("proposal_id"),
+            "title": record.get("title"),
+            "groups": record.get("groups", []),
+        }
+    )
+    base_catalog_text = _session_base_catalog_text(project, session_dir)
+    base_references, base_overlays = _authored_knowledge_bases(project)
+    candidate = reconstruct_candidate(
+        base_catalog_text=base_catalog_text,
+        base_references=base_references,
+        base_overlays=base_overlays,
+        operations=proposal.operations,
+    )
+    proposal_dir = _proposal_root(session_dir) / proposal.proposal_id
+    # Materialize the reconstructed candidate inside the Git-ignored workspace
+    # and strict-load it so the physical, compatibility, and OKF checks run
+    # against the exact catalog that apply would produce.
+    candidate_scratch = proposal_dir / "verify-candidate"
+    candidate_path = write_candidate(candidate, candidate_scratch)
+    candidate_layer = SemanticLayer.load(candidate_path)
+    # Open the session stores for gate, claim, and conflict readiness.
+    session_store = SessionStore.open(session_dir)
+    evidence_store = EvidenceStore.create(_evidence_root(session_dir))
+    claim_store = ClaimStore.create(session_store, evidence_store)
+    interview_store = InterviewStore.create(session_store)
+    okf_output_dir = proposal_dir / "verify-okf"
+    bundle = verify_proposal(
+        proposal=proposal,
+        candidate=candidate,
+        candidate_layer=candidate_layer,
+        okf_output_dir=okf_output_dir,
+        interview_store=interview_store,
+        claim_store=claim_store,
+        evidence_store=evidence_store,
+    )
+    # Persist an immutable, sorted, safe report bound to the input hashes. The
+    # content is a pure function of the inputs, so a repeated run with
+    # unchanged inputs writes identical bytes (idempotent); the atomic
+    # replace never leaves a partial file.
+    record_path = proposal_dir / _VERIFICATION_FILENAME
+    tmp = record_path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(bundle.to_dict(), handle, sort_keys=True)
+    os.replace(tmp, record_path)
+    _restrict_file(record_path)
+    # Emit metadata only: stable ids, a content-addressed fingerprint, the
+    # input hashes the verdict was derived from, and per-group mandatory
+    # checks and readiness. Raw values, document bodies, SQL, and error text
+    # never reach the terminal.
+    _emit_json(
+        {
+            "proposal_id": bundle.proposal_id,
+            "fingerprint": bundle.fingerprint,
+            "input_hashes": dict(bundle.input_hashes),
+            "groups": [
+                {
+                    "group_id": group.group_id,
+                    "checks": [check.to_dict() for check in group.checks],
+                    "ready": group.readiness.ready,
+                }
+                for group in bundle.groups
+            ],
+        }
+    )
+    return EXIT_OK
+
+
 # --------------------------------------------------------------------------- #
 # Sample-policy helpers                                                       #
 # --------------------------------------------------------------------------- #
@@ -1918,6 +2006,21 @@ def _parser() -> argparse.ArgumentParser:
         "--proposal", dest="proposal", help="Proposal id (default: latest)."
     )
     proposal_show_parser.set_defaults(func=_handle_proposal_show)
+
+    proposal_verify_parser = proposal_sub.add_parser(
+        "verify",
+        help="Verify proposal readiness and write a hash-bound report.",
+    )
+    proposal_verify_parser.add_argument(
+        "--session-id", dest="session_id", required=True, help="Session id."
+    )
+    proposal_verify_parser.add_argument(
+        "--project", help="Project root (default: cwd)."
+    )
+    proposal_verify_parser.add_argument(
+        "--proposal", dest="proposal", help="Proposal id (default: latest)."
+    )
+    proposal_verify_parser.set_defaults(func=_handle_proposal_verify)
 
     return parser
 

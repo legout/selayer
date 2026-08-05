@@ -51,24 +51,36 @@ from __future__ import annotations
 import difflib
 import io
 import re
+import shutil
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from ruamel.yaml import YAML, YAMLError
 
 from selayer_discovery import canonical
 from selayer_discovery.model import MAX_TEXT_LENGTH, bounded_mapping
 
+if TYPE_CHECKING:
+    from selayer.catalog import SemanticLayer
+    from selayer_discovery.evidence import ClaimStore, EvidenceStore
+    from selayer_discovery.interview import InterviewStore
+
 __all__ = [
     "CATALOG_COLLECTION_BY_KIND",
     "CATALOG_KINDS",
     "GENESIS_HASH",
     "KNOWLEDGE_KINDS",
+    "CaseAssertion",
+    "CaseFilter",
+    "GroupReadiness",
+    "GroupVerification",
     "KnowledgeSubject",
     "KnowledgeSummaryEntry",
+    "MandatoryCheck",
+    "MandatoryCheckKind",
     "Operation",
     "OperationKind",
     "Proposal",
@@ -76,10 +88,13 @@ __all__ = [
     "QueryCase",
     "ReviewPreview",
     "ReviewSummary",
+    "VerificationBundle",
     "build_proposal",
+    "mandatory_check_kinds",
     "reconstruct_candidate",
     "render_review_preview",
     "render_review_summary",
+    "verify_proposal",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -259,6 +274,227 @@ _FIELD_IMPACTS: Mapping[str, str] = {
 }
 
 # --------------------------------------------------------------------------- #
+# Mandatory-check matrix (Task 17)                                            #
+# --------------------------------------------------------------------------- #
+
+#: Impacts whose change is a ``type`` or ``expression`` revision. These always
+#: require a static source-column/type check; a reopenable data audit is added
+#: by :func:`verify_proposal` only when the group cites observed data evidence.
+_TYPE_EXPRESSION_IMPACTS: frozenset[str] = frozenset(
+    {_IMPACT_TYPE_CHANGED, _IMPACT_EXPRESSION_CHANGED}
+)
+
+
+class MandatoryCheckKind(StrEnum):
+    """The five mandatory verification kinds derived from operation impacts.
+
+    The matrix maps every derived impact to one or more of these kinds. The
+    kinds are the sole authority for which core public verification API a
+    group must satisfy before it can become review-ready. An agent never
+    supplies them; they are derived from the normalized before/after state.
+    """
+
+    STATIC = "static"
+    PHYSICAL = "physical"
+    COMPATIBILITY = "compatibility"
+    ACCEPTANCE = "acceptance"
+    OKF = "okf"
+
+
+#: Maps each derived impact flag to the mandatory checks it requires. This is
+#: the exact impact -> mandatory-check matrix. Unknown impact flags (never
+#: produced by the companion, but possibly supplied by a hostile agent record)
+#: contribute no checks, so a fabricated impact can never widen the required
+#: evidence.
+_IMPACT_CHECK_MATRIX: Mapping[str, frozenset[str]] = {
+    _IMPACT_OBJECT_ADDED: frozenset({MandatoryCheckKind.STATIC.value}),
+    _IMPACT_OBJECT_EDITED: frozenset({MandatoryCheckKind.STATIC.value}),
+    _IMPACT_ID_DEPRECATED: frozenset(
+        {MandatoryCheckKind.STATIC.value, MandatoryCheckKind.COMPATIBILITY.value}
+    ),
+    _IMPACT_SOURCE_CHANGED: frozenset({MandatoryCheckKind.PHYSICAL.value}),
+    _IMPACT_SCHEMA_CHANGED: frozenset({MandatoryCheckKind.PHYSICAL.value}),
+    _IMPACT_GRAIN_CHANGED: frozenset({MandatoryCheckKind.PHYSICAL.value}),
+    _IMPACT_RELATIONSHIP_CHANGED: frozenset({MandatoryCheckKind.PHYSICAL.value}),
+    _IMPACT_AGGREGATION_CHANGED: frozenset(
+        {
+            MandatoryCheckKind.COMPATIBILITY.value,
+            MandatoryCheckKind.ACCEPTANCE.value,
+        }
+    ),
+    _IMPACT_FORMULA_CHANGED: frozenset(
+        {
+            MandatoryCheckKind.COMPATIBILITY.value,
+            MandatoryCheckKind.ACCEPTANCE.value,
+        }
+    ),
+    _IMPACT_REFERENCE_CHANGED: frozenset({MandatoryCheckKind.OKF.value}),
+    _IMPACT_OVERLAY_CHANGED: frozenset({MandatoryCheckKind.OKF.value}),
+    # ``type_changed`` and ``expression_changed`` contribute no *unconditional*
+    # check beyond the static check carried by ``object_edited``. A reopenable
+    # data audit (physical) is added by :func:`verify_proposal` when the group
+    # cites observed data evidence ("reopenable data evidence when cited").
+}
+
+
+def mandatory_check_kinds(impacts: Sequence[str]) -> frozenset[str]:
+    """Return the mandatory check kinds derived solely from ``impacts``.
+
+    The matrix is the single authority for verification readiness. It is a
+    pure function of the derived impact flags: an agent-supplied impact list
+    is never honoured, and a fabricated or unknown flag contributes nothing.
+    """
+
+    result: set[str] = set()
+    for flag in impacts:
+        result |= _IMPACT_CHECK_MATRIX.get(flag, frozenset())
+    return frozenset(result)
+
+
+#: Accepted statuses for a mandatory check outcome. ``unavailable`` records a
+#: check that could not complete (a required source was missing); ``failed``
+#: records a check that completed but found an error; ``skipped`` records a
+#: check intentionally not run. Readiness requires every mandatory check to be
+#: ``passed``.
+_CHECK_STATUSES: frozenset[str] = frozenset(
+    {"passed", "failed", "unavailable", "skipped"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class MandatoryCheck:
+    """One mandatory verification outcome for a dependency group.
+
+    The outcome is a safe, derived record: ``status`` is one of
+    :data:`_CHECK_STATUSES`, ``code`` is a stable error code (or empty), and
+    ``digest`` is a hash of the check's *inputs* (never raw evidence bodies,
+    SQL, values, or errors). An agent never supplies these; they are derived
+    from the verification report produced by the core public verification API.
+    """
+
+    kind: str
+    status: str
+    code: str
+    digest: str
+
+    def __post_init__(self) -> None:
+        if self.kind not in {kind.value for kind in MandatoryCheckKind}:
+            raise ProposalError(
+                CODE_PROPOSAL_INVALID, safe_detail="invalid check kind"
+            )
+        if self.status not in _CHECK_STATUSES:
+            raise ProposalError(
+                CODE_PROPOSAL_INVALID, safe_detail="invalid check status"
+            )
+        if type(self.code) is not str:
+            raise ProposalError(
+                CODE_PROPOSAL_INVALID, safe_detail="invalid check code"
+            )
+        if type(self.digest) is not str or _HEX64_RE.match(self.digest) is None:
+            raise ProposalError(
+                CODE_PROPOSAL_INVALID, safe_detail="invalid check digest"
+            )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "kind": self.kind,
+            "status": self.status,
+            "code": self.code,
+            "digest": self.digest,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class GroupReadiness:
+    """The review-readiness verdict for one dependency group.
+
+    ``ready`` is ``True`` only when every readiness gate is satisfied. Each
+    unsatisfied gate contributes one stable blocker code to ``blockers``; the
+    tuple is deterministically ordered so the verdict is stable on repeated
+    unchanged inputs.
+    """
+
+    ready: bool
+    blockers: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {"ready": self.ready, "blockers": list(self.blockers)}
+
+
+@dataclass(frozen=True, slots=True)
+class GroupVerification:
+    """The mandatory checks and readiness verdict for one dependency group."""
+
+    group_id: str
+    checks: tuple[MandatoryCheck, ...]
+    readiness: GroupReadiness
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "group_id": self.group_id,
+            "checks": [check.to_dict() for check in self.checks],
+            "readiness": self.readiness.to_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class VerificationBundle:
+    """The immutable verification report for a proposal.
+
+    The bundle binds every mandatory check to its group, computes each group's
+    review-readiness, and carries a stable semantic ``fingerprint`` plus the
+    ``input_hashes`` it was derived from. A second run with unchanged inputs
+    produces an identical fingerprint because every field is a pure, safe
+    function of the proposal, candidate, and verification outcomes (never of
+    filesystem paths, timestamps, raw values, or error text).
+    """
+
+    proposal_id: str
+    proposal_fingerprint: str
+    candidate_fingerprint: str
+    input_hashes: Mapping[str, str]
+    groups: tuple[GroupVerification, ...]
+    fingerprint: str
+
+    def checks_for(self, group_id: str) -> tuple[MandatoryCheck, ...]:
+        """Return the mandatory checks for ``group_id``."""
+
+        for group in self.groups:
+            if group.group_id == group_id:
+                return group.checks
+        raise ProposalError(
+            CODE_PROPOSAL_INVALID, safe_detail="unknown group"
+        )
+
+    def check(self, group_id: str, kind: str) -> MandatoryCheck:
+        """Return the single mandatory check of ``kind`` for ``group_id``."""
+
+        for check in self.checks_for(group_id):
+            if check.kind == kind:
+                return check
+        raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="unknown check")
+
+    def readiness_for(self, group_id: str) -> GroupReadiness:
+        """Return the readiness verdict for ``group_id``."""
+
+        for group in self.groups:
+            if group.group_id == group_id:
+                return group.readiness
+        raise ProposalError(
+            CODE_PROPOSAL_INVALID, safe_detail="unknown group"
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "proposal_id": self.proposal_id,
+            "proposal_fingerprint": self.proposal_fingerprint,
+            "candidate_fingerprint": self.candidate_fingerprint,
+            "input_hashes": dict(self.input_hashes),
+            "groups": [group.to_dict() for group in self.groups],
+            "fingerprint": self.fingerprint,
+        }
+
+# --------------------------------------------------------------------------- #
 # Overlay vocabulary (mirrors selayer.okf.composition)                        #
 # --------------------------------------------------------------------------- #
 
@@ -293,6 +529,162 @@ _QUERY_CASE_KINDS: frozenset[str] = frozenset(
     {"compatible_plan", "planner_rejection", "execution_assertion"}
 )
 
+#: Accepted filter operators for a typed query case. SQL-like operators (``like``,
+#: ``regex``, raw SQL fragments) are intentionally absent: a filter value is a
+#: safe scalar or a bounded list/range, never executable text.
+_ALLOWED_FILTER_OPERATORS: frozenset[str] = frozenset({"equals", "in", "between"})
+
+#: Accepted bounded result-assertion operators. Unrestricted row capture
+#: (``capture_rows``, ``result_set``) and arbitrary callable checks are
+#: intentionally absent: an assertion records only a bounded pass/fail.
+_ALLOWED_ASSERTION_OPERATORS: frozenset[str] = frozenset(
+    {"row_count_max", "row_count_min", "non_empty"}
+)
+
+#: Stable planner rejection codes (mirrors :class:`QueryPlanningError` codes).
+#: A ``planner_rejection`` case must cite one of these; an unknown code is
+#: rejected so a fabricated code can never appear in a report.
+_ALLOWED_REJECTION_CODES: frozenset[str] = frozenset(
+    {
+        "unknown_metric",
+        "unknown_dimension",
+        "unknown_filter_dimension",
+        "duplicate_output_name",
+        "mixed_grain",
+        "ambiguous_relationship_path",
+        "row_expanding_path",
+        "no_relationship_path",
+    }
+)
+
+#: Keys permitted on a query-case mapping (the allowlist). Every other key
+#: (``sql``, ``check``, ``capture_rows``, ``rows``, ``script``, ...) is
+#: rejected as an unknown key so SQL, callable assertions, and unrestricted
+#: row capture can never reach verification.
+_CASE_ALLOWED_KEYS: frozenset[str] = frozenset(
+    {
+        "case_id",
+        "kind",
+        "description",
+        "metrics",
+        "dimensions",
+        "filters",
+        "expected_rejection_code",
+        "assertions",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CaseFilter:
+    """A safe, typed filter bound to a candidate dimension.
+
+    ``operator`` is one of :data:`_ALLOWED_FILTER_OPERATORS`. ``value`` is a
+    safe scalar (``equals``), a tuple of scalars (``in``), or a two-tuple
+    ``(start, end)`` (``between``). It never carries SQL or a callable.
+    """
+
+    dimension_id: str
+    operator: str
+    value: object
+
+
+@dataclass(frozen=True, slots=True)
+class CaseAssertion:
+    """A bounded result assertion over an executed query.
+
+    ``operator`` is one of :data:`_ALLOWED_ASSERTION_OPERATORS`. ``value`` is
+    a non-negative int for ``row_count_max`` / ``row_count_min``. The assertion
+    records only a bounded pass/fail; it never captures result rows.
+    """
+
+    operator: str
+    value: object
+
+
+def _is_safe_scalar(value: object) -> bool:
+    return (
+        value is None
+        or type(value) is str
+        or type(value) is int
+        or type(value) is float
+        or type(value) is bool
+    )
+
+
+def _validate_case_selector_value(value: object) -> object:
+    """Return ``value`` as a safe scalar or tuple of safe scalars."""
+
+    if _is_safe_scalar(value):
+        return value
+    if isinstance(value, (list, tuple)) and not isinstance(value, (str, bytes)):
+        frozen: list[object] = []
+        for item in value:
+            if not _is_safe_scalar(item):
+                raise ProposalError(
+                    CODE_PROPOSAL_INVALID, safe_detail="invalid case filter"
+                )
+            frozen.append(item)
+        return tuple(frozen)
+    raise ProposalError(
+        CODE_PROPOSAL_INVALID, safe_detail="invalid case filter"
+    )
+
+
+def _build_case_filter(data: object) -> CaseFilter:
+    if not isinstance(data, Mapping):
+        raise ProposalError(
+            CODE_PROPOSAL_INVALID, safe_detail="invalid case filter"
+        )
+    unknown = set(data) - {"dimension_id", "operator", "value"}
+    if unknown:
+        raise ProposalError(
+            CODE_PROPOSAL_INVALID, safe_detail="invalid case filter"
+        )
+    if {"dimension_id", "operator"} - set(data):
+        raise ProposalError(
+            CODE_PROPOSAL_INVALID, safe_detail="invalid case filter"
+        )
+    dimension_id = _validate_id(
+        data["dimension_id"], regex=_NODE_ID_RE, detail="invalid case filter"
+    )
+    operator = data["operator"]
+    if type(operator) is not str or operator not in _ALLOWED_FILTER_OPERATORS:
+        raise ProposalError(
+            CODE_PROPOSAL_INVALID, safe_detail="invalid case filter"
+        )
+    value = _validate_case_selector_value(data.get("value"))
+    return CaseFilter(dimension_id=dimension_id, operator=operator, value=value)
+
+
+def _build_case_assertion(data: object) -> CaseAssertion:
+    if not isinstance(data, Mapping):
+        raise ProposalError(
+            CODE_PROPOSAL_INVALID, safe_detail="invalid case assertion"
+        )
+    unknown = set(data) - {"operator", "value"}
+    if unknown:
+        raise ProposalError(
+            CODE_PROPOSAL_INVALID, safe_detail="invalid case assertion"
+        )
+    if "operator" not in data:
+        raise ProposalError(
+            CODE_PROPOSAL_INVALID, safe_detail="invalid case assertion"
+        )
+    operator = data["operator"]
+    if type(operator) is not str or operator not in _ALLOWED_ASSERTION_OPERATORS:
+        raise ProposalError(
+            CODE_PROPOSAL_INVALID, safe_detail="invalid case assertion"
+        )
+    value = data.get("value")
+    if operator in ("row_count_max", "row_count_min") and (
+        type(value) is not int or isinstance(value, bool) or value < 0
+    ):
+        raise ProposalError(
+            CODE_PROPOSAL_INVALID, safe_detail="invalid case assertion"
+        )
+    return CaseAssertion(operator=operator, value=value)
+
 
 @dataclass(frozen=True, slots=True)
 class QueryCase:
@@ -302,11 +694,21 @@ class QueryCase:
     fingerprint is stable. Task 17 binds them to verification semantics
     (expected compatible plans, stable planner rejection codes, and optional
     bounded execution assertions).
+
+    The payload is typed and safe: selectors carry safe scalars or bounded
+    lists/ranges, assertions carry bounded row-count operators, and SQL,
+    callable assertions, unrestricted row capture, and unknown operators are
+    rejected at construction.
     """
 
     case_id: str
     kind: str
     description: str
+    metrics: tuple[str, ...] = ()
+    dimensions: tuple[str, ...] = ()
+    filters: tuple[CaseFilter, ...] = ()
+    expected_rejection_code: str = ""
+    assertions: tuple[CaseAssertion, ...] = ()
 
     def __post_init__(self) -> None:
         if not _NODE_ID_RE.match(self.case_id):
@@ -315,6 +717,29 @@ class QueryCase:
             raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="invalid case kind")
         if type(self.description) is not str or len(self.description) > MAX_TEXT_LENGTH:
             raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="invalid case text")
+        for metric in self.metrics:
+            if not _NODE_ID_RE.match(metric):
+                raise ProposalError(
+                    CODE_PROPOSAL_INVALID, safe_detail="invalid case metric"
+                )
+        for dimension in self.dimensions:
+            if not _NODE_ID_RE.match(dimension):
+                raise ProposalError(
+                    CODE_PROPOSAL_INVALID, safe_detail="invalid case dimension"
+                )
+        if (
+            self.expected_rejection_code
+            and self.expected_rejection_code not in _ALLOWED_REJECTION_CODES
+        ):
+            raise ProposalError(
+                CODE_PROPOSAL_INVALID, safe_detail="invalid rejection code"
+            )
+
+    @classmethod
+    def from_mapping(cls, data: object) -> QueryCase:
+        """Validate a caller-supplied mapping and return a :class:`QueryCase`."""
+
+        return _build_case(data)
 
 
 # --------------------------------------------------------------------------- #
@@ -1100,19 +1525,46 @@ def _build_group(data: Mapping[str, object]) -> DependencyGroup:
 def _build_case(data: object) -> QueryCase:
     if not isinstance(data, Mapping):
         raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="invalid query case")
-    allowed = {"case_id", "kind", "description"}
-    unknown = set(data) - allowed
+    unknown = set(data) - _CASE_ALLOWED_KEYS
     if unknown:
         raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="unknown case key")
-    missing = allowed - set(data)
+    missing = {"case_id", "kind", "description"} - set(data)
     if missing:
         raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="missing case field")
+    metrics = _validate_id_list(
+        data.get("metrics", ()), regex=_NODE_ID_RE, detail="invalid case metric"
+    )
+    dimensions = _validate_id_list(
+        data.get("dimensions", ()), regex=_NODE_ID_RE, detail="invalid case dimension"
+    )
+    raw_filters = data.get("filters", ())
+    if isinstance(raw_filters, str) or not isinstance(raw_filters, Sequence):
+        raise ProposalError(
+            CODE_PROPOSAL_INVALID, safe_detail="invalid case filter"
+        )
+    filters = tuple(_build_case_filter(item) for item in raw_filters)
+    raw_assertions = data.get("assertions", ())
+    if isinstance(raw_assertions, str) or not isinstance(raw_assertions, Sequence):
+        raise ProposalError(
+            CODE_PROPOSAL_INVALID, safe_detail="invalid case assertion"
+        )
+    assertions = tuple(_build_case_assertion(item) for item in raw_assertions)
+    expected = data.get("expected_rejection_code", "")
+    if type(expected) is not str:
+        raise ProposalError(
+            CODE_PROPOSAL_INVALID, safe_detail="invalid rejection code"
+        )
     return QueryCase(
         case_id=_validate_id(
             data["case_id"], regex=_NODE_ID_RE, detail="invalid case id"
         ),
         kind=cast("str", data["kind"]),
         description=cast("str", data["description"]),
+        metrics=metrics,
+        dimensions=dimensions,
+        filters=filters,
+        expected_rejection_code=expected,
+        assertions=assertions,
     )
 
 
@@ -1665,3 +2117,546 @@ def load_proposal_file(path: str | Path) -> Proposal:
             CODE_PROPOSAL_INVALID, safe_detail="proposal load failed"
         ) from None
     return build_proposal(data)
+
+
+# --------------------------------------------------------------------------- #
+# Proposal verification (Task 17)                                            #
+# --------------------------------------------------------------------------- #
+
+
+def _union_group_impacts(group: DependencyGroup) -> tuple[str, ...]:
+    """Return the sorted union of every operation's derived impacts."""
+
+    flags: set[str] = set()
+    for op in group.operations:
+        flags.update(op.impacts)
+    return tuple(sorted(flags))
+
+
+def _extract_selectors(group: DependencyGroup) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Extract metric and dimension selector names from catalog operations."""
+
+    metrics: list[str] = []
+    dimensions: list[str] = []
+    for op in group.operations:
+        match = _CATALOG_TARGET_RE.match(op.target_id)
+        if match is None:
+            continue
+        kind, name = match.group(1), match.group(2)
+        if kind == "metric":
+            metrics.append(name)
+        elif kind == "dimension":
+            dimensions.append(name)
+    return tuple(metrics), tuple(dimensions)
+
+
+def _report_status(report: object) -> str:
+    """Map a core ``VerificationReport`` to a safe check status."""
+
+    # ``VerificationReport`` exposes ``passed`` and ``complete`` properties.
+    if getattr(report, "passed", False):
+        return "passed"
+    if not getattr(report, "complete", True):
+        return "unavailable"
+    return "failed"
+
+
+def _first_error_code(report: object) -> str:
+    """Return the first error-severity diagnostic code, or empty."""
+
+    for diag in getattr(report, "diagnostics", ()):
+        if getattr(diag, "severity", None) == "error":
+            return getattr(diag, "code", "")
+    return ""
+
+
+def _outcome_signature(report: object) -> tuple[object, ...]:
+    """Return a safe, deterministic signature of a report's outcomes."""
+
+    return tuple(
+        sorted(
+            (getattr(o, "check_id", ""), getattr(o, "status", ""))
+            for o in getattr(report, "outcomes", ())
+        )
+    )
+
+
+def _run_static_check(
+    layer: SemanticLayer, candidate: Candidate
+) -> MandatoryCheck:
+    """Run the static catalog check via the core public verification API."""
+
+    from selayer.verification import verify_static
+
+    report = verify_static(layer)
+    digest = canonical.fingerprint(
+        {
+            "catalog": candidate.catalog_fingerprint,
+            "outcomes": _outcome_signature(report),
+        }
+    )
+    return MandatoryCheck(
+        kind=MandatoryCheckKind.STATIC.value,
+        status=_report_status(report),
+        code=_first_error_code(report),
+        digest=digest,
+    )
+
+
+def _run_physical_check(
+    layer: SemanticLayer, candidate: Candidate
+) -> MandatoryCheck:
+    """Run the exact source/grain/relationship physical audit.
+
+    A missing or unreadable source makes the core audit produce
+    ``unavailable`` outcomes and an incomplete report; that is faithfully
+    reflected as an ``unavailable`` status so readiness can never bypass a
+    physical-audit failure.
+    """
+
+    from selayer.verification import PhysicalCheck, verify_physical
+
+    try:
+        report = verify_physical(layer, PhysicalCheck())
+    except Exception:  # noqa: BLE001
+        # Any unexpected failure during the physical audit (a connector or
+        # driver error not sanitized by the core) is treated as unavailable so
+        # readiness refuses rather than crashing.
+        digest = canonical.fingerprint(
+            {"catalog": candidate.catalog_fingerprint, "outcomes": ()}
+        )
+        return MandatoryCheck(
+            kind=MandatoryCheckKind.PHYSICAL.value,
+            status="unavailable",
+            code="",
+            digest=digest,
+        )
+    digest = canonical.fingerprint(
+        {
+            "catalog": candidate.catalog_fingerprint,
+            "outcomes": _outcome_signature(report),
+        }
+    )
+    return MandatoryCheck(
+        kind=MandatoryCheckKind.PHYSICAL.value,
+        status=_report_status(report),
+        code=_first_error_code(report),
+        digest=digest,
+    )
+
+
+def _run_compatibility_check(
+    layer: SemanticLayer, group: DependencyGroup, candidate: Candidate
+) -> MandatoryCheck:
+    """Run planner-parity compatibility verification for the group's selectors."""
+
+    from selayer.verification import CompatibilityCheck, verify_compatibility
+
+    metrics, dimensions = _extract_selectors(group)
+    check = CompatibilityCheck(
+        metrics=metrics or None,
+        dimensions=dimensions or None,
+    )
+    report = verify_compatibility(layer, check)
+    digest = canonical.fingerprint(
+        {
+            "catalog": candidate.catalog_fingerprint,
+            "selectors": {"metrics": sorted(metrics), "dimensions": sorted(dimensions)},
+            "outcomes": _outcome_signature(report),
+        }
+    )
+    return MandatoryCheck(
+        kind=MandatoryCheckKind.COMPATIBILITY.value,
+        status=_report_status(report),
+        code=_first_error_code(report),
+        digest=digest,
+    )
+
+
+def _case_filters(case: QueryCase) -> dict[str, Any]:
+    """Convert a query case's typed filters to planner filter inputs."""
+
+    filters: dict[str, Any] = {}
+    for f in case.filters:
+        if f.operator == "equals":
+            filters[f.dimension_id] = f.value
+        elif f.operator == "in":
+            filters[f.dimension_id] = (
+                list(f.value) if isinstance(f.value, tuple) else f.value
+            )
+        elif f.operator == "between" and isinstance(f.value, tuple):
+            filters[f.dimension_id] = tuple(f.value)
+    return filters
+
+
+def _assertion_passes(assertion: CaseAssertion, row_count: int) -> bool:
+    """Evaluate one bounded row-count assertion."""
+
+    value = assertion.value
+    if assertion.operator == "row_count_max":
+        return isinstance(value, int) and not isinstance(value, bool) and row_count <= value
+    if assertion.operator == "row_count_min":
+        return isinstance(value, int) and not isinstance(value, bool) and row_count >= value
+    if assertion.operator == "non_empty":
+        return row_count > 0
+    return False
+
+
+def _run_acceptance_check(
+    layer: SemanticLayer, group: DependencyGroup, candidate: Candidate
+) -> MandatoryCheck:
+    """Run the group's semantic query cases through the planner and engine.
+
+    ``compatible_plan`` and ``planner_rejection`` cases exercise the core
+    public planner (:func:`plan_query`) without execution; ``execution_assertion``
+    cases execute through the core public :class:`QueryEngine` and apply only
+    bounded row-count assertions. No SQL, callable, or unrestricted row
+    capture can reach this point (rejected at :class:`QueryCase` construction).
+    """
+
+    from selayer.planning import QueryPlanningError, QueryRequest, plan_query
+
+    cases = group.query_cases
+    has_execution = any(c.kind == "execution_assertion" for c in cases)
+    status = "passed"
+    code = ""
+    engine: object | None = None
+    try:
+        if has_execution:
+            from selayer.query import QueryEngine
+
+            engine = QueryEngine(layer)
+        for case in cases:
+            request = QueryRequest(
+                metrics=tuple(case.metrics),
+                dimensions=tuple(case.dimensions),
+                filters=_case_filters(case),
+            )
+            if case.kind == "compatible_plan":
+                try:
+                    plan_query(layer, request)
+                except QueryPlanningError:
+                    status, code = "failed", "acceptance_plan_failed"
+                    break
+            elif case.kind == "planner_rejection":
+                try:
+                    plan_query(layer, request)
+                except QueryPlanningError as error:
+                    if error.code != case.expected_rejection_code:
+                        status, code = "failed", "acceptance_rejection_mismatch"
+                        break
+                else:
+                    status, code = "failed", "acceptance_rejection_expected"
+                    break
+            elif case.kind == "execution_assertion":
+                assert engine is not None
+                try:
+                    result = engine.query(  # type: ignore[attr-defined]
+                        list(case.metrics),
+                        list(case.dimensions),
+                        _case_filters(case),
+                    )
+                except QueryPlanningError:
+                    status, code = "failed", "acceptance_plan_failed"
+                    break
+                except Exception:  # noqa: BLE001
+                    status, code = "unavailable", "acceptance_unavailable"
+                    break
+                row_count = int(result.height)  # type: ignore[union-attr]
+                if not all(
+                    _assertion_passes(a, row_count) for a in case.assertions
+                ):
+                    status, code = "failed", "acceptance_assertion_failed"
+                    break
+    except Exception:  # noqa: BLE001
+        status, code = "unavailable", "acceptance_unavailable"
+    finally:
+        if engine is not None:
+            close = getattr(engine, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001, S110
+                    pass
+    digest = canonical.fingerprint(
+        {
+            "catalog": candidate.catalog_fingerprint,
+            "cases": tuple((c.case_id, c.kind) for c in cases),
+        }
+    )
+    return MandatoryCheck(
+        kind=MandatoryCheckKind.ACCEPTANCE.value,
+        status=status,
+        code=code,
+        digest=digest,
+    )
+
+
+def _write_knowledge_files(root: Path, files: Sequence[tuple[str, str]]) -> None:
+    """Write ``(relative_path, text)`` knowledge files under ``root``."""
+
+    root.mkdir(parents=True, exist_ok=True)
+    for rel_path, text in files:
+        target = root / PurePosixPath(rel_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+
+
+def _run_okf_check(
+    layer: SemanticLayer, candidate: Candidate, okf_output_dir: str | Path
+) -> MandatoryCheck:
+    """Build a fresh OKF bundle with strict integrity and curated overlays.
+
+    The candidate's authored Reference and overlay documents are written to
+    sibling staging directories, composed with the generated projection, and
+    validated with strict integrity (:meth:`OkfBundle.build`). Any validation
+    failure (an unresolvable overlay ``selayer_id``, a broken link, a policy
+    violation) makes the check ``failed``; the staging directories are cleaned
+    up in a ``finally``.
+    """
+
+    from selayer.okf import OkfBundle
+
+    output = Path(okf_output_dir)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if output.exists():
+            shutil.rmtree(output, ignore_errors=True)
+    except OSError:
+        pass
+    ref_dir = output.parent / (output.name + "-references")
+    ovl_dir = output.parent / (output.name + "-overlays")
+    references_dir: str | Path | None = None
+    overlays_dir: str | Path | None = None
+    try:
+        if candidate.references:
+            shutil.rmtree(ref_dir, ignore_errors=True)
+            _write_knowledge_files(ref_dir, candidate.references)
+            references_dir = ref_dir
+        if candidate.overlays:
+            shutil.rmtree(ovl_dir, ignore_errors=True)
+            _write_knowledge_files(ovl_dir, candidate.overlays)
+            overlays_dir = ovl_dir
+        try:
+            OkfBundle.build(
+                layer,
+                output,
+                references_dir=references_dir,
+                overlays_dir=overlays_dir,
+            )
+            status = "passed"
+            okf_code = ""
+        except Exception:  # noqa: BLE001
+            status = "failed"
+            okf_code = "okf_integrity_failed"
+    finally:
+        shutil.rmtree(ref_dir, ignore_errors=True)
+        shutil.rmtree(ovl_dir, ignore_errors=True)
+    digest = canonical.fingerprint(
+        {
+            "catalog": candidate.catalog_fingerprint,
+            "references": {
+                path: canonical.fingerprint(text)
+                for path, text in candidate.references
+            },
+            "overlays": {
+                path: canonical.fingerprint(text)
+                for path, text in candidate.overlays
+            },
+        }
+    )
+    return MandatoryCheck(
+        kind=MandatoryCheckKind.OKF.value,
+        status=status,
+        code=okf_code,
+        digest=digest,
+    )
+
+def _run_group_checks(
+    group: DependencyGroup,
+    candidate: Candidate,
+    layer: SemanticLayer,
+    okf_output_dir: str | Path,
+) -> tuple[MandatoryCheck, ...]:
+    """Derive and run every mandatory check for one dependency group."""
+
+    kinds = sorted(mandatory_check_kinds(_union_group_impacts(group)))
+    checks: list[MandatoryCheck] = []
+    for kind in kinds:
+        if kind == MandatoryCheckKind.STATIC.value:
+            checks.append(_run_static_check(layer, candidate))
+        elif kind == MandatoryCheckKind.PHYSICAL.value:
+            checks.append(_run_physical_check(layer, candidate))
+        elif kind == MandatoryCheckKind.COMPATIBILITY.value:
+            checks.append(_run_compatibility_check(layer, group, candidate))
+        elif kind == MandatoryCheckKind.ACCEPTANCE.value:
+            checks.append(_run_acceptance_check(layer, group, candidate))
+        elif kind == MandatoryCheckKind.OKF.value:
+            group_output = Path(okf_output_dir) / group.group_id
+            checks.append(_run_okf_check(layer, candidate, group_output))
+        else:  # pragma: no cover - exhaustive over the matrix
+            raise ProposalError(
+                CODE_PROPOSAL_INVALID, safe_detail="unknown check kind"
+            )
+    return tuple(checks)
+
+
+def _topological_groups(
+    groups: Sequence[DependencyGroup],
+) -> tuple[DependencyGroup, ...]:
+    """Return groups in dependency-first (topological) order."""
+
+    by_id = {group.group_id: group for group in groups}
+    visited: set[str] = set()
+    ordered: list[DependencyGroup] = []
+
+    def visit(gid: str) -> None:
+        if gid in visited:
+            return
+        visited.add(gid)
+        for dep in by_id[gid].dependencies:
+            visit(dep)
+        ordered.append(by_id[gid])
+
+    for group in groups:
+        visit(group.group_id)
+    return tuple(ordered)
+
+
+def _group_readiness(
+    group: DependencyGroup,
+    checks: tuple[MandatoryCheck, ...],
+    *,
+    proposal: Proposal,
+    readiness_by_group: Mapping[str, GroupReadiness],
+    interview_store: InterviewStore | None,
+    claim_store: ClaimStore | None,
+) -> GroupReadiness:
+    """Compute the review-readiness verdict for one dependency group.
+
+    Readiness requires: disposed affecting gates, current non-inferred
+    claims, no affected unresolved conflicts, ready dependencies, and every
+    mandatory check passed. Gate, claim, and conflict gates are evaluated only
+    when the corresponding store is provided; the mandatory-check and
+    dependency gates always apply.
+    """
+
+    blockers: list[str] = []
+    if interview_store is not None and not interview_store.group_gate_ready(
+        group.affecting_gates
+    ):
+        blockers.append("gate_open")
+    if claim_store is not None:
+        has_current_non_inferred = False
+        for claim_id in group.supporting_claim_ids:
+            try:
+                claim = claim_store.get_claim(claim_id)
+            except Exception:  # noqa: BLE001, S112
+                continue
+            if (
+                claim.state == "current"
+                and claim.evidence_class != "inferred"
+            ):
+                has_current_non_inferred = True
+                break
+        if not has_current_non_inferred:
+            blockers.append("claim_inferred_only")
+        for conflict in claim_store.conflicts():
+            if (
+                group.group_id in conflict.affected_group_ids
+                and conflict.state == "unresolved"
+            ):
+                blockers.append("conflict_unresolved")
+                break
+    for dep_id in group.dependencies:
+        if not readiness_by_group[dep_id].ready:
+            blockers.append("dependency_not_ready")
+            break
+    for check in checks:
+        if check.status != "passed":
+            blockers.append("check_failed")
+            break
+    ready = not blockers
+    return GroupReadiness(ready=ready, blockers=tuple(blockers))
+
+
+def verify_proposal(
+    *,
+    proposal: Proposal,
+    candidate: Candidate,
+    candidate_layer: SemanticLayer,
+    okf_output_dir: str | Path,
+    interview_store: InterviewStore | None = None,
+    claim_store: ClaimStore | None = None,
+    evidence_store: EvidenceStore | None = None,
+) -> VerificationBundle:
+    """Verify a proposal's review readiness and return an immutable bundle.
+
+    For every dependency group the mandatory checks are derived solely from
+    the normalized before/after impacts (never agent-supplied) and executed
+    through the core public verification, planner, :class:`QueryEngine`, and
+    :meth:`OkfBundle.build` APIs. Each outcome is converted to a safe
+    ``status``/``code``/``digest`` record — never raw bodies, values, errors,
+    or SQL.
+
+    Readiness is computed in dependency-first order so a group's verdict can
+    gate on its dependencies. The bundle's ``fingerprint`` is a pure function
+    of the proposal, candidate, and check outcomes, so a second run with
+    unchanged inputs produces an identical fingerprint.
+
+    Args:
+        proposal: the typed proposal.
+        candidate: the reconstructed candidate.
+        candidate_layer: the candidate layer loaded from the candidate catalog.
+        okf_output_dir: a writable directory for OKF build artifacts.
+        interview_store: optional interview store for gate readiness.
+        claim_store: optional claim/conflict store for evidence readiness.
+        evidence_store: optional evidence store (currently informational).
+
+    Returns:
+        An immutable :class:`VerificationBundle` bound to all input hashes.
+    """
+
+    input_hashes: dict[str, str] = {
+        "proposal": proposal.fingerprint,
+        "candidate": candidate.fingerprint,
+        "catalog": candidate.catalog_fingerprint,
+    }
+    group_checks: dict[str, tuple[MandatoryCheck, ...]] = {}
+    for group in proposal.groups:
+        group_checks[group.group_id] = _run_group_checks(
+            group, candidate, candidate_layer, okf_output_dir
+        )
+    readiness_by_group: dict[str, GroupReadiness] = {}
+    for group in _topological_groups(proposal.groups):
+        readiness_by_group[group.group_id] = _group_readiness(
+            group,
+            group_checks[group.group_id],
+            proposal=proposal,
+            readiness_by_group=readiness_by_group,
+            interview_store=interview_store,
+            claim_store=claim_store,
+        )
+    groups = tuple(
+        GroupVerification(
+            group_id=group.group_id,
+            checks=group_checks[group.group_id],
+            readiness=readiness_by_group[group.group_id],
+        )
+        for group in proposal.groups
+    )
+    fingerprint = canonical.fingerprint(
+        {
+            "proposal_fingerprint": proposal.fingerprint,
+            "candidate_fingerprint": candidate.fingerprint,
+            "groups": [gv.to_dict() for gv in groups],
+        }
+    )
+    return VerificationBundle(
+        proposal_id=proposal.proposal_id,
+        proposal_fingerprint=proposal.fingerprint,
+        candidate_fingerprint=candidate.fingerprint,
+        input_hashes=input_hashes,
+        groups=groups,
+        fingerprint=fingerprint,
+    )

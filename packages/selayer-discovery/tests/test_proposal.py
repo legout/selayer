@@ -27,6 +27,7 @@ These tests pin the Task 16 typed-proposal contract:
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -122,7 +123,7 @@ def _write_parquet(path: Path) -> None:
             [
                 pa.field("id", pa.string(), nullable=False),
                 pa.field("customer_id", pa.string()),
-                pa.field("status", pa.string()),
+                pa.field("status", pa.string(), nullable=False),
                 pa.field("amount", pa.float64()),
             ]
         ),
@@ -247,7 +248,7 @@ def _group(**overrides: Any) -> dict[str, Any]:
         "supporting_claim_ids": ["claim-c1"],
         "inferred_claim_ids": [],
         "conflict_ids": [],
-        "affecting_gates": ["gate-grain"],
+        "affecting_gates": ["gate-grains"],
         "query_cases": [],
         "operations": [_op()],
     }
@@ -1038,7 +1039,7 @@ class TestDependencyGroups:
         assert group.group_id == "group-001"
         assert group.rationale
         assert group.supporting_claim_ids == ("claim-c1",)
-        assert group.affecting_gates == ("gate-grain",)
+        assert group.affecting_gates == ("gate-grains",)
         assert group.conflict_ids == ()
         assert len(group.operations) == 1
 
@@ -1688,3 +1689,1352 @@ def test_catalog_collection_map_is_complete() -> None:
 def test_knowledge_subjects_known() -> None:
     assert KnowledgeSubject.REFERENCE
     assert KnowledgeSubject.OVERLAY
+
+
+# --------------------------------------------------------------------------- #
+# Task 17: impact-derived verification readiness                              #
+# --------------------------------------------------------------------------- #
+#
+# These tests pin the Task 17 verification-readiness contract:
+#
+# * the mandatory-check matrix is derived solely from normalized before/after
+#   impacts (never agent-supplied) and maps every impact to its required
+#   evidence exactly;
+# * typed safe semantic query cases carry expected compatible plans, stable
+#   planner rejection codes, and optional bounded execution assertions, and
+#   reject SQL, callable assertions, unrestricted row capture, and unknown
+#   result operators;
+# * readiness gates over affecting gates, current non-inferred claims,
+#   conflicts, dependency groups, reopenable evidence, and mandatory-check
+#   outcomes;
+# * ``proposal verify`` reconstructs a fresh candidate and writes an immutable
+#   report bound to all input hashes whose semantic fingerprint is stable on
+#   repeated unchanged inputs.
+
+from selayer_discovery.proposal import (
+    MandatoryCheckKind,
+    mandatory_check_kinds,
+    verify_proposal,
+)
+
+# Impact flag vocabulary (mirrors proposal._IMPACT_* constants).
+_IMPACT_OBJECT_ADDED = "object_added"
+_IMPACT_OBJECT_EDITED = "object_edited"
+_IMPACT_ID_DEPRECATED = "id_deprecated"
+_IMPACT_SOURCE_CHANGED = "source_changed"
+_IMPACT_SCHEMA_CHANGED = "schema_changed"
+_IMPACT_GRAIN_CHANGED = "grain_changed"
+_IMPACT_RELATIONSHIP_CHANGED = "relationship_changed"
+_IMPACT_TYPE_CHANGED = "type_changed"
+_IMPACT_EXPRESSION_CHANGED = "expression_changed"
+_IMPACT_AGGREGATION_CHANGED = "aggregation_changed"
+_IMPACT_FORMULA_CHANGED = "formula_changed"
+_IMPACT_REFERENCE_CHANGED = "reference_changed"
+_IMPACT_OVERLAY_CHANGED = "overlay_changed"
+
+
+# -- operation factories producing each impact family ---------------------- #
+
+
+def _metric_add_op(**overrides: Any) -> dict[str, Any]:
+    after = {
+        "expression": "total_order_amount",
+        "measures": ["total_order_amount"],
+        "description": "Total order revenue",
+    }
+    base: dict[str, Any] = {
+        "operation_id": "op-metric-add",
+        "kind": "catalog.add",
+        "target_id": "metric.total_revenue",
+        "before": None,
+        "before_hash": GENESIS_HASH,
+        "after": after,
+        "claim_ids": ["claim-c1"],
+        "group_ids": ["group-001"],
+    }
+    base.update(overrides)
+    return base
+
+
+def _measure_aggregation_edit_op(**overrides: Any) -> dict[str, Any]:
+    before = {
+        "fact": "order_amount",
+        "aggregation": "sum",
+        "description": "Total order amount",
+    }
+    after = {
+        "fact": "order_amount",
+        "aggregation": "max",
+        "description": "Total order amount",
+    }
+    base: dict[str, Any] = {
+        "operation_id": "op-measure-edit",
+        "kind": "catalog.edit",
+        "target_id": "measure.total_order_amount",
+        "before": before,
+        "before_hash": _hash(before),
+        "after": after,
+        "claim_ids": ["claim-c1"],
+        "group_ids": ["group-001"],
+    }
+    base.update(overrides)
+    return base
+
+
+#: Full orders source schema matching the fixture catalog so a candidate
+#: ``source.orders`` edit always loads through ``SemanticLayer.load`` and the
+#: grain ``[id, status]`` resolves to declared columns.
+_ORDERS_SCHEMA_FIELDS: list[dict[str, Any]] = [
+    {"name": "id", "type": "utf8", "nullable": False},
+    {"name": "customer_id", "type": "utf8", "nullable": True},
+    # ``status`` is non-nullable so it can serve as a grain column: the
+    # production catalog loader rejects nullable grain columns, and the core
+    # physical audit requires the declared shape to match the parquet file.
+    {"name": "status", "type": "utf8", "nullable": False},
+    {"name": "amount", "type": "float64", "nullable": True},
+]
+
+
+def _orders_source(location: str, grain: Sequence[str]) -> dict[str, Any]:
+    """Return a complete orders data-source state for a given location."""
+
+    return {
+        "type": "parquet",
+        "location": location,
+        "grain": list(grain),
+        "schema": {"fields": [dict(field) for field in _ORDERS_SCHEMA_FIELDS]},
+    }
+
+
+def _orders_grain_after(location: str) -> dict[str, Any]:
+    """Return the after state for a source-grain edit.
+
+    The fixture widens the grain from ``[id]`` to ``[id, status]`` only: the
+    schema fields come unchanged from ``_ORDERS_SCHEMA_FIELDS`` (where
+    ``status`` is non-nullable so it can serve as a grain column). Production
+    source-shape validation is preserved unchanged and the derived
+    ``grain_changed`` impact triggers the physical audit. The ``location``
+    threads the authored source-location semantics through to the after state
+    so a real parquet path makes the physical audit pass (the candidate shape
+    matches the file) and a missing path makes it unavailable.
+    """
+
+    fields = [dict(field) for field in _ORDERS_SCHEMA_FIELDS]
+    return {
+        "type": "parquet",
+        "location": location,
+        "grain": ["id", "status"],
+        "schema": {"fields": fields},
+    }
+
+
+def _source_grain_edit_op(**overrides: Any) -> dict[str, Any]:
+    # ``before`` is popped so the derived ``after`` and ``before_hash`` always
+    # stay consistent with whatever state a test supplies (a missing-file
+    # location, a real parquet location, etc.). The default carries the full
+    # orders schema so the candidate is a valid, loadable source. The after
+    # state widens the grain to ``[id, status]`` keeping the fixture's schema
+    # fields (``status`` is non-nullable so the grain loads and matches the
+    # parquet file).
+    before = dict(
+        overrides.pop("before", _orders_source("data/orders.parquet", ["id"]))
+    )
+    after_override = overrides.pop("after", None)
+    after = (
+        after_override
+        if after_override is not None
+        else _orders_grain_after(str(before["location"]))
+    )
+    base: dict[str, Any] = {
+        "operation_id": "op-source-grain",
+        "kind": "catalog.edit",
+        "target_id": "source.orders",
+        "before": before,
+        "before_hash": _hash(before),
+        "after": after,
+        "claim_ids": ["claim-c1"],
+        "group_ids": ["group-001"],
+    }
+    base.update(overrides)
+    return base
+
+
+def _relationship_add_op(**overrides: Any) -> dict[str, Any]:
+    after = {
+        "source": "products",
+        "target": "orders",
+        "type": "one_to_many",
+        "source_column": "id",
+        "target_column": "customer_id",
+    }
+    base: dict[str, Any] = {
+        "operation_id": "op-rel-add",
+        "kind": "catalog.add",
+        "target_id": "relationship.product_orders_v2",
+        "before": None,
+        "before_hash": GENESIS_HASH,
+        "after": after,
+        "claim_ids": ["claim-c1"],
+        "group_ids": ["group-001"],
+    }
+    base.update(overrides)
+    return base
+
+
+def _dimension_type_edit_op(**overrides: Any) -> dict[str, Any]:
+    before = {
+        "source": "orders",
+        "column": "status",
+        "data_type": "string",
+        "description": "Order status",
+    }
+    after = dict(before)
+    after["data_type"] = "integer"
+    base: dict[str, Any] = {
+        "operation_id": "op-dim-type",
+        "kind": "catalog.edit",
+        "target_id": "dimension.order_status",
+        "before": before,
+        "before_hash": _hash(before),
+        "after": after,
+        "claim_ids": ["claim-c1"],
+        "group_ids": ["group-001"],
+    }
+    base.update(overrides)
+    return base
+
+
+def _deprecate_op(**overrides: Any) -> dict[str, Any]:
+    before = {
+        "source": "orders",
+        "column": "status",
+        "data_type": "string",
+        "description": "Order status",
+    }
+    after = dict(before)
+    after["status"] = "deprecated"
+    after["replaced_by"] = "dimension.order_state"
+    base: dict[str, Any] = {
+        "operation_id": "op-deprecate",
+        "kind": "catalog.deprecate",
+        "target_id": "dimension.order_status",
+        "before": before,
+        "before_hash": _hash(before),
+        "after": after,
+        "claim_ids": ["claim-c1"],
+        "group_ids": ["group-001"],
+    }
+    base.update(overrides)
+    return base
+
+
+def _overlay_create_op(**overrides: Any) -> dict[str, Any]:
+    # OKF overlays use level-1 (``#``) section headings; the curated
+    # ``Usage Guidance`` section is one of the allowed overlay sections and
+    # its ``selayer_id`` resolves to a catalog object.
+    after = (
+        "---\nselayer_id: dimension.order_status\n---\n"
+        "# Usage Guidance\nUse for status filtering.\n"
+    )
+    base: dict[str, Any] = {
+        "operation_id": "op-overlay",
+        "kind": "overlay.create",
+        "target_id": "dimensions/order_status.md",
+        "before": None,
+        "before_hash": GENESIS_HASH,
+        "after": after,
+        "claim_ids": ["claim-c1"],
+        "group_ids": ["group-001"],
+    }
+    base.update(overrides)
+    return base
+
+
+def _reference_create_op(**overrides: Any) -> dict[str, Any]:
+    after = "---\nselayer_id: dimension.order_status\n---\n# Order status\n"
+    base: dict[str, Any] = {
+        "operation_id": "op-reference",
+        "kind": "reference.create",
+        "target_id": "dimensions/order_status.md",
+        "before": None,
+        "before_hash": GENESIS_HASH,
+        "after": after,
+        "claim_ids": ["claim-c1"],
+        "group_ids": ["group-001"],
+    }
+    base.update(overrides)
+    return base
+
+
+def _query_case(**overrides: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "case_id": "case-001",
+        "kind": "compatible_plan",
+        "description": "The new metric plans with the status dimension.",
+        "metrics": ["total_revenue"],
+        "dimensions": ["order_status"],
+    }
+    base.update(overrides)
+    return base
+
+
+# -- reconstruction + verify helper ---------------------------------------- #
+
+
+def _reconstruct_and_load(
+    proposal_mapping: dict[str, Any],
+    base_catalog_text: str,
+    tmp_path: Path,
+) -> tuple[Any, Any, Any, Path]:
+    """Build, reconstruct, write, and load a candidate layer."""
+
+    from selayer_discovery.proposal import (
+        build_proposal,
+        reconstruct_candidate,
+        write_candidate,
+    )
+
+    proposal = build_proposal(proposal_mapping)
+    candidate = reconstruct_candidate(
+        base_catalog_text=base_catalog_text,
+        base_references={},
+        base_overlays={},
+        operations=proposal.operations,
+    )
+    candidate_dir = tmp_path / "candidate"
+    catalog_path = write_candidate(candidate, candidate_dir)
+    layer = SemanticLayer.load(catalog_path)
+    return proposal, candidate, layer, candidate_dir
+
+
+# --------------------------------------------------------------------------- #
+# Step 1: exact impact -> mandatory-check matrix                              #
+# --------------------------------------------------------------------------- #
+
+
+class TestMandatoryMatrix:
+    """The mandatory-check matrix is derived solely from derived impacts."""
+
+    def test_dimension_add_requires_static(self) -> None:
+        kinds = mandatory_check_kinds((_IMPACT_OBJECT_ADDED,))
+        assert MandatoryCheckKind.STATIC.value in kinds
+
+    def test_dimension_type_edit_requires_static(self) -> None:
+        kinds = mandatory_check_kinds((_IMPACT_OBJECT_EDITED, _IMPACT_TYPE_CHANGED))
+        assert MandatoryCheckKind.STATIC.value in kinds
+        assert MandatoryCheckKind.PHYSICAL.value not in kinds
+
+    def test_source_add_requires_static_and_physical(self) -> None:
+        kinds = mandatory_check_kinds(
+            (_IMPACT_OBJECT_ADDED, _IMPACT_SOURCE_CHANGED, _IMPACT_SCHEMA_CHANGED)
+        )
+        assert MandatoryCheckKind.STATIC.value in kinds
+        assert MandatoryCheckKind.PHYSICAL.value in kinds
+
+    def test_source_grain_edit_requires_physical(self) -> None:
+        kinds = mandatory_check_kinds((_IMPACT_OBJECT_EDITED, _IMPACT_GRAIN_CHANGED))
+        assert MandatoryCheckKind.PHYSICAL.value in kinds
+
+    def test_relationship_add_requires_physical(self) -> None:
+        kinds = mandatory_check_kinds(
+            (_IMPACT_OBJECT_ADDED, _IMPACT_RELATIONSHIP_CHANGED)
+        )
+        assert MandatoryCheckKind.PHYSICAL.value in kinds
+
+    def test_measure_aggregation_edit_requires_compatibility_and_acceptance(
+        self,
+    ) -> None:
+        kinds = mandatory_check_kinds(
+            (_IMPACT_OBJECT_EDITED, _IMPACT_AGGREGATION_CHANGED)
+        )
+        assert MandatoryCheckKind.COMPATIBILITY.value in kinds
+        assert MandatoryCheckKind.ACCEPTANCE.value in kinds
+
+    def test_metric_formula_requires_compatibility_and_acceptance(self) -> None:
+        kinds = mandatory_check_kinds(
+            (_IMPACT_OBJECT_ADDED, _IMPACT_EXPRESSION_CHANGED, _IMPACT_FORMULA_CHANGED)
+        )
+        assert MandatoryCheckKind.COMPATIBILITY.value in kinds
+        assert MandatoryCheckKind.ACCEPTANCE.value in kinds
+
+    def test_deprecation_requires_static_and_compatibility(self) -> None:
+        kinds = mandatory_check_kinds((_IMPACT_ID_DEPRECATED, _IMPACT_OBJECT_EDITED))
+        assert MandatoryCheckKind.STATIC.value in kinds
+        assert MandatoryCheckKind.COMPATIBILITY.value in kinds
+
+    def test_reference_change_requires_okf(self) -> None:
+        kinds = mandatory_check_kinds((_IMPACT_REFERENCE_CHANGED,))
+        assert kinds == frozenset({MandatoryCheckKind.OKF.value})
+
+    def test_overlay_change_requires_okf(self) -> None:
+        kinds = mandatory_check_kinds((_IMPACT_OVERLAY_CHANGED,))
+        assert kinds == frozenset({MandatoryCheckKind.OKF.value})
+
+    def test_matrix_derived_from_operation_impacts_not_agent(self) -> None:
+        # The mandatory kinds for a group are derived from the operation's
+        # derived impacts, never from an agent-supplied list.
+        op = Operation.from_mapping(_source_grain_edit_op())
+        kinds = mandatory_check_kinds(op.impacts)
+        assert MandatoryCheckKind.PHYSICAL.value in kinds
+        # A hostile agent-supplied impact is never honoured.
+        assert "agent_only_impact" not in kinds
+
+
+# --------------------------------------------------------------------------- #
+# Step 2: typed safe semantic query cases                                    #
+# --------------------------------------------------------------------------- #
+
+
+class TestQueryCases:
+    """Query cases carry typed safe payloads and reject unsafe inputs."""
+
+    def test_compatible_plan_case_carries_selectors(self) -> None:
+        case = QueryCase.from_mapping(_query_case())
+        assert case.metrics == ("total_revenue",)
+        assert case.dimensions == ("order_status",)
+
+    def test_planner_rejection_case_carries_expected_code(self) -> None:
+        case = QueryCase.from_mapping(
+            _query_case(
+                case_id="case-rej",
+                kind="planner_rejection",
+                description="Unknown metric is rejected.",
+                metrics=["nonexistent"],
+                expected_rejection_code="unknown_metric",
+            )
+        )
+        assert case.expected_rejection_code == "unknown_metric"
+
+    def test_execution_assertion_case_carries_bounded_assertion(self) -> None:
+        case = QueryCase.from_mapping(
+            _query_case(
+                case_id="case-exec",
+                kind="execution_assertion",
+                description="Bounded row count.",
+                assertions=[{"operator": "row_count_max", "value": 100}],
+            )
+        )
+        assert len(case.assertions) == 1
+        assert case.assertions[0].operator == "row_count_max"
+
+    def test_filter_carries_safe_value(self) -> None:
+        case = QueryCase.from_mapping(
+            _query_case(
+                filters=[
+                    {"dimension_id": "order_status", "operator": "equals", "value": "open"}
+                ],
+            )
+        )
+        assert case.filters[0].dimension_id == "order_status"
+        assert case.filters[0].value == "open"
+
+    def test_rejects_sql_assertion(self) -> None:
+        with pytest.raises(ProposalError):
+            QueryCase.from_mapping(
+                _query_case(
+                    assertions=[{"operator": "row_count_max", "value": 1, "sql": "SELECT 1"}],
+                )
+            )
+
+    def test_rejects_callable_assertion(self) -> None:
+        with pytest.raises(ProposalError):
+            QueryCase.from_mapping(
+                _query_case(
+                    assertions=[
+                        {"operator": "row_count_max", "value": 1, "check": "len"}
+                    ],
+                )
+            )
+
+    def test_rejects_unrestricted_row_capture(self) -> None:
+        with pytest.raises(ProposalError):
+            QueryCase.from_mapping(
+                _query_case(
+                    assertions=[
+                        {"operator": "row_count_max", "value": 1, "capture_rows": True}
+                    ],
+                )
+            )
+
+    def test_rejects_unknown_result_operator(self) -> None:
+        with pytest.raises(ProposalError):
+            QueryCase.from_mapping(
+                _query_case(
+                    assertions=[{"operator": "sum_equals", "value": 42}],
+                )
+            )
+
+    def test_rejects_unknown_filter_operator(self) -> None:
+        with pytest.raises(ProposalError):
+            QueryCase.from_mapping(
+                _query_case(
+                    filters=[
+                        {"dimension_id": "order_status", "operator": "like", "value": "%"}
+                    ],
+                )
+            )
+
+    def test_rejects_sql_key_in_case(self) -> None:
+        with pytest.raises(ProposalError):
+            QueryCase.from_mapping(
+                _query_case(sql="SELECT * FROM orders")
+            )
+
+    def test_rejects_unknown_rejection_code(self) -> None:
+        with pytest.raises(ProposalError):
+            QueryCase.from_mapping(
+                _query_case(
+                    kind="planner_rejection",
+                    expected_rejection_code="made_up_code",
+                )
+            )
+
+    def test_rejects_callable_value_in_filter(self) -> None:
+        with pytest.raises(ProposalError):
+            QueryCase.from_mapping(
+                _query_case(
+                    filters=[
+                        {"dimension_id": "order_status", "operator": "equals", "check": print}
+                    ],
+                )
+            )
+
+
+# --------------------------------------------------------------------------- #
+# Step 3 + 4: verification delegation and readiness                          #
+# --------------------------------------------------------------------------- #
+
+
+class TestVerificationChecks:
+    """verify_proposal delegates to core public APIs per the matrix."""
+
+    def test_static_check_runs_for_catalog_add(
+        self, base_catalog_text: str, tmp_path: Path
+    ) -> None:
+        mapping = _proposal_mapping()
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+        )
+        checks = bundle.checks_for("group-001")
+        kinds = {c.kind for c in checks}
+        assert MandatoryCheckKind.STATIC.value in kinds
+        static = bundle.check("group-001", MandatoryCheckKind.STATIC.value)
+        assert static.status == "passed"
+
+    def test_physical_check_runs_for_source_impact(
+        self, catalog_dir: Path, base_catalog_text: str, tmp_path: Path
+    ) -> None:
+        orders_path = catalog_dir / "data" / "orders.parquet"
+        op = _source_grain_edit_op(
+            before=_orders_source(str(orders_path), ["id"]),
+        )
+        mapping = _proposal_mapping(
+            groups=[
+                _group(
+                    title="Edit order grain",
+                    rationale="Grain revision.",
+                    operations=[op],
+                )
+            ]
+        )
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+        )
+        kinds = {c.kind for c in bundle.checks_for("group-001")}
+        assert MandatoryCheckKind.PHYSICAL.value in kinds
+        physical = bundle.check("group-001", MandatoryCheckKind.PHYSICAL.value)
+        assert physical.status == "passed"
+
+    def test_physical_check_unavailable_when_source_missing(
+        self, tmp_path: Path
+    ) -> None:
+        # A candidate source pointing at a nonexistent file makes the physical
+        # audit unavailable: readiness must refuse it, never bypass.
+        data = tmp_path / "data"
+        data.mkdir()
+        missing = data / "missing.parquet"
+        catalog_text = f"""\
+version: 1
+name: empty
+label: Empty
+description: empty
+data_sources:
+  orders:
+    type: parquet
+    location: {missing!s}
+    grain: [id]
+    schema:
+      fields:
+        - {{name: id, type: utf8, nullable: false}}
+"""
+        op = _source_grain_edit_op(
+            before=_orders_source(str(missing), ["id"]),
+        )
+        mapping = _proposal_mapping(
+            groups=[
+                _group(
+                    title="Edit grain",
+                    rationale="Grain revision.",
+                    operations=[op],
+                )
+            ]
+        )
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, catalog_text, tmp_path
+        )
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+        )
+        physical = bundle.check("group-001", MandatoryCheckKind.PHYSICAL.value)
+        assert physical.status == "unavailable"
+        readiness = bundle.readiness_for("group-001")
+        assert readiness.ready is False
+        assert "check_failed" in readiness.blockers
+
+    def test_compatibility_and_acceptance_for_formula_impact(
+        self, base_catalog_text: str, tmp_path: Path
+    ) -> None:
+        op = _metric_add_op()
+        case = _query_case(
+            case_id="case-compatible",
+            kind="compatible_plan",
+            description="The new metric plans.",
+            metrics=["total_revenue"],
+            dimensions=["order_status"],
+        )
+        mapping = _proposal_mapping(
+            groups=[
+                _group(
+                    title="Add revenue metric",
+                    rationale="Revenue rollup.",
+                    operations=[op],
+                    query_cases=[case],
+                )
+            ]
+        )
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+        )
+        kinds = {c.kind for c in bundle.checks_for("group-001")}
+        assert MandatoryCheckKind.COMPATIBILITY.value in kinds
+        assert MandatoryCheckKind.ACCEPTANCE.value in kinds
+        acceptance = bundle.check("group-001", MandatoryCheckKind.ACCEPTANCE.value)
+        assert acceptance.status == "passed"
+
+    def test_acceptance_rejection_case_passes_with_matching_code(
+        self, base_catalog_text: str, tmp_path: Path
+    ) -> None:
+        op = _metric_add_op()
+        case = _query_case(
+            case_id="case-rej",
+            kind="planner_rejection",
+            description="Unknown metric is rejected.",
+            metrics=["nonexistent"],
+            expected_rejection_code="unknown_metric",
+        )
+        mapping = _proposal_mapping(
+            groups=[
+                _group(
+                    title="Add revenue metric",
+                    rationale="Revenue rollup.",
+                    operations=[op],
+                    query_cases=[case],
+                )
+            ]
+        )
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+        )
+        acceptance = bundle.check("group-001", MandatoryCheckKind.ACCEPTANCE.value)
+        assert acceptance.status == "passed"
+
+    def test_acceptance_execution_assertion_bounded(
+        self, base_catalog_text: str, tmp_path: Path
+    ) -> None:
+        op = _metric_add_op()
+        case = _query_case(
+            case_id="case-exec",
+            kind="execution_assertion",
+            description="Bounded row count.",
+            metrics=["total_revenue"],
+            dimensions=["order_status"],
+            assertions=[{"operator": "row_count_max", "value": 100}],
+        )
+        mapping = _proposal_mapping(
+            groups=[
+                _group(
+                    title="Add revenue metric",
+                    rationale="Revenue rollup.",
+                    operations=[op],
+                    query_cases=[case],
+                )
+            ]
+        )
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+        )
+        acceptance = bundle.check("group-001", MandatoryCheckKind.ACCEPTANCE.value)
+        assert acceptance.status == "passed"
+
+    def test_okf_check_runs_for_overlay(
+        self, base_catalog_text: str, tmp_path: Path
+    ) -> None:
+        op = _overlay_create_op()
+        mapping = _proposal_mapping(
+            groups=[
+                _group(
+                    title="Add overlay",
+                    rationale="Curated guidance.",
+                    operations=[op],
+                )
+            ]
+        )
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+        )
+        kinds = {c.kind for c in bundle.checks_for("group-001")}
+        assert MandatoryCheckKind.OKF.value in kinds
+        okf = bundle.check("group-001", MandatoryCheckKind.OKF.value)
+        assert okf.status == "passed"
+
+    def test_okf_check_fails_for_invalid_overlay(
+        self, base_catalog_text: str, tmp_path: Path
+    ) -> None:
+        # An overlay whose selayer_id does not match a catalog object fails
+        # strict OKF integrity on load.
+        after = (
+            "---\nselayer_id: dimension.nonexistent\n---\n"
+            "# Usage Guidance\nGuidance.\n"
+        )
+        op = _overlay_create_op(after=after)
+        mapping = _proposal_mapping(
+            groups=[
+                _group(
+                    title="Add overlay",
+                    rationale="Curated guidance.",
+                    operations=[op],
+                )
+            ]
+        )
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+        )
+        okf = bundle.check("group-001", MandatoryCheckKind.OKF.value)
+        assert okf.status == "failed"
+
+    def test_bundle_fingerprint_stable_on_repeat(
+        self, base_catalog_text: str, tmp_path: Path
+    ) -> None:
+        mapping = _proposal_mapping()
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        first = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf-1",
+        )
+        second = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf-2",
+        )
+        assert first.fingerprint == second.fingerprint
+        assert first.input_hashes == second.input_hashes
+
+    def test_bundle_has_no_raw_values(
+        self, base_catalog_text: str, tmp_path: Path
+    ) -> None:
+        mapping = _proposal_mapping()
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+        )
+        rendered = json.dumps(bundle.to_dict(), sort_keys=True)
+        # No SQL, no raw evidence bodies, no document prose leak into the report.
+        assert "SELECT" not in rendered
+        assert "product_category" not in rendered
+        assert "Order status" not in rendered
+
+
+# --------------------------------------------------------------------------- #
+# Step 4: readiness gating                                                    #
+# --------------------------------------------------------------------------- #
+
+
+class TestReadiness:
+    """Readiness gates over gates, claims, conflicts, deps, evidence, checks."""
+
+    @staticmethod
+    def _stores(catalog_dir: Path) -> Any:
+        """Open session, evidence, claim, and interview stores."""
+
+        from selayer_discovery.evidence import ClaimStore, EvidenceStore
+        from selayer_discovery.interview import InterviewStore
+        from selayer_discovery.session import SessionStore
+
+        session_dir = (
+            catalog_dir / ".selayer" / "discovery" / "sessions" / "session-001"
+        )
+        session_store = SessionStore.open(session_dir)
+        evidence = EvidenceStore.create(session_dir / "evidence")
+        claims = ClaimStore.create(session_store, evidence)
+        interview = InterviewStore.create(session_store)
+        return session_store, evidence, claims, interview
+
+    @staticmethod
+    def _add_observed_claim(
+        claims: Any,
+        evidence: Any,
+        session_store: Any,
+        project: Path,
+        actor: str,
+        *,
+        claim_id: str = "claim-c1",
+        evidence_class: Any = None,
+    ) -> Any:
+        from selayer_discovery.evidence import (
+            DocumentLineSelector,
+        )
+        from selayer_discovery.model import EvidenceClass
+
+        doc = project / "spec.md"
+        doc.write_text("grain evidence line one\nline two\n", encoding="utf-8")
+        record = evidence.add_document(doc, allowed_roots=(project,))
+        selector = DocumentLineSelector(
+            record_id=record.record_id,
+            content_hash=record.content_hash,
+            revision=record.revision,
+            start_line=1,
+            end_line=1,
+        )
+        session_store.record_artifact(
+            "answer-gate-grain", content_hash="a" * 64, actor=actor
+        )
+        return claims.add_claim(
+            claim_id=claim_id,
+            subject="source.shopfloor.orders",
+            statement="The grain is one row per order.",
+            evidence_class=evidence_class or EvidenceClass.OBSERVED,
+            selectors=(selector,),
+            creator_event="answer-gate-grain",
+            actor=actor,
+        )
+
+    def test_ready_when_all_satisfied(
+        self,
+        catalog_dir: Path,
+        base_catalog_text: str,
+        tmp_path: Path,
+    ) -> None:
+        _init_session(catalog_dir)
+        session_store, evidence, claims, interview = self._stores(catalog_dir)
+        actor = session_store.charter.approver
+        self._add_observed_claim(claims, evidence, session_store, tmp_path, actor)
+        # Dispose the affecting gate.
+        interview.answer(gate="gate-grains", text="Yes.", actor=actor)
+        mapping = _proposal_mapping()
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+            interview_store=interview,
+            claim_store=claims,
+            evidence_store=evidence,
+        )
+        readiness = bundle.readiness_for("group-001")
+        assert readiness.ready is True
+        assert readiness.blockers == ()
+
+    def test_blocked_by_open_gate(
+        self,
+        catalog_dir: Path,
+        base_catalog_text: str,
+        tmp_path: Path,
+    ) -> None:
+        _init_session(catalog_dir)
+        session_store, evidence, claims, interview = self._stores(catalog_dir)
+        actor = session_store.charter.approver
+        self._add_observed_claim(claims, evidence, session_store, tmp_path, actor)
+        # Gate left undisposed.
+        mapping = _proposal_mapping()
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+            interview_store=interview,
+            claim_store=claims,
+            evidence_store=evidence,
+        )
+        readiness = bundle.readiness_for("group-001")
+        assert readiness.ready is False
+        assert "gate_open" in readiness.blockers
+
+    def test_blocked_by_inferred_only_claim(
+        self,
+        catalog_dir: Path,
+        base_catalog_text: str,
+        tmp_path: Path,
+    ) -> None:
+        from selayer_discovery.model import EvidenceClass
+
+        _init_session(catalog_dir)
+        session_store, evidence, claims, interview = self._stores(catalog_dir)
+        actor = session_store.charter.approver
+        self._add_observed_claim(
+            claims,
+            evidence,
+            session_store,
+            tmp_path,
+            actor,
+            evidence_class=EvidenceClass.INFERRED,
+        )
+        interview.answer(gate="gate-grains", text="Yes.", actor=actor)
+        mapping = _proposal_mapping()
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+            interview_store=interview,
+            claim_store=claims,
+            evidence_store=evidence,
+        )
+        readiness = bundle.readiness_for("group-001")
+        assert readiness.ready is False
+        assert "claim_inferred_only" in readiness.blockers
+
+    def test_blocked_by_unresolved_conflict(
+        self,
+        catalog_dir: Path,
+        base_catalog_text: str,
+        tmp_path: Path,
+    ) -> None:
+        from selayer_discovery.evidence import ConflictKind
+
+        _init_session(catalog_dir)
+        session_store, evidence, claims, interview = self._stores(catalog_dir)
+        actor = session_store.charter.approver
+        self._add_observed_claim(claims, evidence, session_store, tmp_path, actor)
+        self._add_observed_claim(
+            claims,
+            evidence,
+            session_store,
+            tmp_path,
+            actor,
+            claim_id="claim-c2",
+        )
+        claims.add_conflict(
+            conflict_id="conflict-grain",
+            kind=ConflictKind.SEMANTIC,
+            subject="source.shopfloor.orders",
+            involved_claim_ids=("claim-c1", "claim-c2"),
+            affected_group_ids=("group-001",),
+            reason="Sources disagree.",
+            actor=actor,
+        )
+        interview.answer(gate="gate-grains", text="Yes.", actor=actor)
+        mapping = _proposal_mapping()
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+            interview_store=interview,
+            claim_store=claims,
+            evidence_store=evidence,
+        )
+        readiness = bundle.readiness_for("group-001")
+        assert readiness.ready is False
+        assert "conflict_unresolved" in readiness.blockers
+
+    def test_blocked_by_dependency_not_ready(
+        self,
+        catalog_dir: Path,
+        base_catalog_text: str,
+        tmp_path: Path,
+    ) -> None:
+        _init_session(catalog_dir)
+        session_store, evidence, claims, interview = self._stores(catalog_dir)
+        actor = session_store.charter.approver
+        self._add_observed_claim(claims, evidence, session_store, tmp_path, actor)
+        interview.answer(gate="gate-grains", text="Yes.", actor=actor)
+        # group-001 depends on group-002; group-002 has an open gate
+        # (``gate-other``) so it is not ready, which must block group-001 via
+        # the dependency gate. g2 targets a distinct semantic target
+        # (``dimension.product_segment``) so the test exercises dependency
+        # readiness, not the cross-group overlap guard.
+        g1 = _group(
+            group_id="group-001",
+            dependencies=["group-002"],
+            affecting_gates=["gate-grains"],
+        )
+        g2 = _group(
+            group_id="group-002",
+            title="Dependent",
+            rationale="Depends.",
+            dependencies=[],
+            affecting_gates=["gate-other"],
+            supporting_claim_ids=["claim-c1"],
+            operations=[
+                _op(
+                    operation_id="op-002",
+                    target_id="dimension.product_segment",
+                    after={
+                        "source": "products",
+                        "column": "category",
+                        "data_type": "string",
+                        "description": "Product segment",
+                    },
+                )
+            ],
+        )
+        mapping = _proposal_mapping(groups=[g1, g2])
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+            interview_store=interview,
+            claim_store=claims,
+            evidence_store=evidence,
+        )
+        readiness = bundle.readiness_for("group-001")
+        assert readiness.ready is False
+        assert "dependency_not_ready" in readiness.blockers
+
+    def test_blocked_by_failed_mandatory_check(
+        self, tmp_path: Path
+    ) -> None:
+        # A candidate whose source is missing fails the physical check; even
+        # with a disposed gate and a current claim, readiness is blocked.
+        _init_session_with_catalog(tmp_path)
+        session_store, evidence, claims, interview = self._stores(tmp_path)
+        actor = session_store.charter.approver
+        self._add_observed_claim(claims, evidence, session_store, tmp_path, actor)
+        interview.answer(gate="gate-grains", text="Yes.", actor=actor)
+        op = _source_grain_edit_op(
+            before=_orders_source(str(tmp_path / "nope.parquet"), ["id"]),
+        )
+        mapping = _proposal_mapping(
+            groups=[
+                _group(
+                    title="Edit grain",
+                    rationale="Grain revision.",
+                    operations=[op],
+                )
+            ]
+        )
+        catalog_text = _missing_source_catalog(tmp_path)
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, catalog_text, tmp_path
+        )
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+            interview_store=interview,
+            claim_store=claims,
+            evidence_store=evidence,
+        )
+        readiness = bundle.readiness_for("group-001")
+        assert readiness.ready is False
+        assert "check_failed" in readiness.blockers
+
+
+# --------------------------------------------------------------------------- #
+# Step 5: CLI proposal verify                                                 #
+# --------------------------------------------------------------------------- #
+
+
+class TestProposalVerifyCli:
+    """``proposal verify`` writes an immutable hash-bound report."""
+
+    def test_verify_emits_hash_bound_report(
+        self,
+        catalog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from selayer_discovery.cli import main
+
+        _init_session(catalog_dir)
+        capsys.readouterr()
+        proposal_path = catalog_dir / "proposal.yaml"
+        _write_proposal_yaml(proposal_path, _proposal_mapping())
+        assert (
+            main(
+                [
+                    "proposal",
+                    "import",
+                    "--session-id",
+                    "session-001",
+                    "--project",
+                    str(catalog_dir),
+                    "--proposal",
+                    str(proposal_path),
+                ]
+            )
+            == 0
+        )
+        capsys.readouterr()
+        rc = main(
+            [
+                "proposal",
+                "verify",
+                "--session-id",
+                "session-001",
+                "--project",
+                str(catalog_dir),
+            ]
+        )
+        assert rc == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["proposal_id"] == "proposal-001"
+        assert out["fingerprint"]
+        assert out["input_hashes"]
+        assert isinstance(out["groups"], list)
+        group = out["groups"][0]
+        assert group["group_id"] == "group-001"
+        assert isinstance(group["checks"], list)
+        assert isinstance(group["ready"], bool)
+
+    def test_verify_fingerprint_stable_on_repeat(
+        self,
+        catalog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from selayer_discovery.cli import main
+
+        _init_session(catalog_dir)
+        capsys.readouterr()
+        proposal_path = catalog_dir / "proposal.yaml"
+        _write_proposal_yaml(proposal_path, _proposal_mapping())
+        main(
+            [
+                "proposal",
+                "import",
+                "--session-id",
+                "session-001",
+                "--project",
+                str(catalog_dir),
+                "--proposal",
+                str(proposal_path),
+            ]
+        )
+        capsys.readouterr()
+        main(
+            [
+                "proposal",
+                "verify",
+                "--session-id",
+                "session-001",
+                "--project",
+                str(catalog_dir),
+            ]
+        )
+        first = json.loads(capsys.readouterr().out)
+        main(
+            [
+                "proposal",
+                "verify",
+                "--session-id",
+                "session-001",
+                "--project",
+                str(catalog_dir),
+            ]
+        )
+        second = json.loads(capsys.readouterr().out)
+        assert first["fingerprint"] == second["fingerprint"]
+        assert first["input_hashes"] == second["input_hashes"]
+
+    def test_verify_output_has_no_raw_values(
+        self,
+        catalog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from selayer_discovery.cli import main
+
+        _init_session(catalog_dir)
+        capsys.readouterr()
+        proposal_path = catalog_dir / "proposal.yaml"
+        _write_proposal_yaml(proposal_path, _proposal_mapping())
+        main(
+            [
+                "proposal",
+                "import",
+                "--session-id",
+                "session-001",
+                "--project",
+                str(catalog_dir),
+                "--proposal",
+                str(proposal_path),
+            ]
+        )
+        capsys.readouterr()
+        main(
+            [
+                "proposal",
+                "verify",
+                "--session-id",
+                "session-001",
+                "--project",
+                str(catalog_dir),
+            ]
+        )
+        captured = capsys.readouterr()
+        out = json.loads(captured.out)
+        rendered = json.dumps(out, sort_keys=True)
+        assert "SELECT" not in rendered
+        assert "product_category" not in rendered
+        # No raw evidence/document body text leaks.
+        assert "Order status" not in rendered
+
+    def test_verify_rejects_missing_proposal(
+        self,
+        catalog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from selayer_discovery.cli import main
+
+        _init_session(catalog_dir)
+        capsys.readouterr()
+        rc = main(
+            [
+                "proposal",
+                "verify",
+                "--session-id",
+                "session-001",
+                "--project",
+                str(catalog_dir),
+                "--proposal",
+                "proposal-missing",
+            ]
+        )
+        assert rc == 1
+        err = json.loads(capsys.readouterr().err)
+        assert err["code"]
+
+
+# -- catalog helpers for missing-source readiness test --------------------- #
+
+
+def _missing_source_catalog(tmp_path: Path) -> str:
+    return (
+        "version: 1\n"
+        "name: empty\n"
+        "label: Empty\n"
+        "description: empty\n"
+        "data_sources:\n"
+        "  orders:\n"
+        "    type: parquet\n"
+        f"    location: {tmp_path / 'nope.parquet'}\n"
+        "    grain: [id]\n"
+        "    schema:\n"
+        "      fields:\n"
+        "        - {name: id, type: utf8, nullable: false}\n"
+    )
+
+
+def _init_session_with_catalog(tmp_path: Path) -> Path:
+    from ruamel.yaml import YAML as _YAML
+    from selayer_discovery.cli import main
+
+    catalog = tmp_path / "catalog.yaml"
+    catalog.write_text(_missing_source_catalog(tmp_path), encoding="utf-8")
+    charter = tmp_path / "charter.yaml"
+    charter_data = {
+        "business_question": "Is the grain one row per order?",
+        "approver": "Dr. Alice Okonkwo",
+        "catalog_fingerprint": "a" * 64,
+        "inclusions": ["source.shopfloor.orders"],
+        "exclusions": ["domain.finance"],
+        "acceptance_questions": ["Does the grain pass the audit?"],
+    }
+    buf = StringIO()
+    _YAML().dump(charter_data, buf)
+    charter.write_text(buf.getvalue(), encoding="utf-8")
+    main(
+        [
+            "session",
+            "init",
+            "--charter",
+            str(charter),
+            "--project",
+            str(tmp_path),
+            "--catalog-path",
+            "catalog.yaml",
+            "--session-id",
+            "session-001",
+        ]
+    )
+    return tmp_path
