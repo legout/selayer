@@ -197,23 +197,96 @@ conflict requires the charter's named approver.
 
 ### 5. Proposals, verification, approval, and apply (downstream stages)
 
-Continue only through companion commands. You draft typed operations and
-curated prose; the companion reconstructs candidates, runs mandatory
-verification, and enforces readiness.
+Continue only through the companion commands below, in this order. You draft
+typed operations and curated prose; the companion reconstructs candidates,
+runs mandatory verification, and enforces readiness. Each command fails closed
+(exit `1`) and returns a sorted JSON diagnostic on any readiness, policy, or
+verification failure.
 
-- Import and review typed proposals through the `proposal` commands.
-- Request deterministic verification (`proposal verify`). A group becomes
-  ready only when every affecting gate is disposed, current non-inferred
-  claims exist, conflicts are resolved, dependencies are ready, snapshots are
-  reopenable where required, and every mandatory check passes.
-- Explain ready, blocked, rejected, and unavailable outcomes. Never mark a
-  proposal or check verified from your own reasoning.
-- Obtain a group decision attestation, then prepare an explicit
-  dependency-closed, non-overlapping apply batch and obtain the apply-batch
-  attestation — both from the named approver. No group decision and
-  apply-batch attestation, no apply.
-- Invoke apply only after a separate explicit user request; then show changed
-  files and verification results without committing them.
+1. Import typed operations from a structured proposal file:
+
+   ```bash
+   selayer-discovery proposal import --session-id <id> \
+     --proposal <proposal.yaml>
+   ```
+
+2. Review the reconstructed candidate and its derived impacts:
+
+   ```bash
+   selayer-discovery proposal show --session-id <id> [--proposal <proposal-id>]
+   ```
+
+3. Request deterministic verification. The companion reconstructs a fresh
+   candidate and writes an immutable report bound to all input hashes; a
+   second run with unchanged inputs has the same semantic fingerprint:
+
+   ```bash
+   selayer-discovery proposal verify --session-id <id> \
+     [--proposal <proposal-id>]
+   ```
+
+   A group becomes ready only when every affecting gate is disposed, current
+   non-inferred claims exist, conflicts are resolved, dependencies are ready,
+   snapshots are reopenable where required, and every mandatory check passes.
+   Explain ready, blocked, rejected, and unavailable outcomes. Never mark a
+   proposal or check verified from your own reasoning.
+
+4. Obtain a group decision attestation from the charter's named approver:
+
+   ```bash
+   selayer-discovery proposal attest --session-id <id> \
+     --group <group-id> --actor <approver>
+   ```
+
+5. Prepare an explicit, ordered, dependency-closed, non-overlapping apply
+   batch from accepted groups sharing a common base:
+
+   ```bash
+   selayer-discovery proposal prepare-apply --session-id <id> \
+     --group <group-id> [...] --base <base-hash>
+   ```
+
+6. Obtain the apply-batch attestation from the current named approver against
+   the exact prepared-batch hash. Changing the group selection requires a new
+   prepare and a new attestation:
+
+   ```bash
+   selayer-discovery proposal attest-apply --session-id <id> \
+     --batch <batch-hash> --actor <approver>
+   ```
+
+7. Export the approved-summary preview (safe metadata only) bound to the
+   batch hash:
+
+   ```bash
+   selayer-discovery proposal export-preview --session-id <id> \
+     --batch <batch-hash>
+   ```
+
+8. Invoke apply only after a separate explicit user request. Apply accepts
+   one current batch attestation, reruns mandatory verification, reacquires
+   reopenable snapshots, and writes only the catalog, authored References,
+   overlays, and approved summary — leaving generated OKF untouched:
+
+   ```bash
+   selayer-discovery proposal apply --session-id <id> \
+     --batch <batch-hash> --actor <approver>
+   ```
+
+   No group decision and apply-batch attestation, no apply. After apply, show
+   changed files and verification results without committing them.
+
+Recovery is explicit and top-level. A pending write-ahead journal makes every
+mutation command return a recovery-required diagnostic until you run:
+
+```bash
+selayer-discovery recover --project <root>
+```
+
+`recover` is idempotent: without a valid success marker it always rolls back;
+with a valid marker it verifies new hashes and finalizes a missing applied
+event. If recovery is ambiguous, it stops and retains every backup rather than
+guessing.
 
 ## Error behavior
 
@@ -223,9 +296,11 @@ Every companion command returns:
 - `1`: a validation, policy, readiness, verification, or apply failure;
 - `2`: a command usage error.
 
-A failure emits a sorted JSON diagnostic with stable codes and safe metadata —
-never credentials, document bodies, interview answers, sample values, or raw
-source locations. When a check is `failed`, `skipped`, or `unavailable`, the
+A failure emits a sorted JSON diagnostic with stable codes and safe metadata
+only — never credentials, document bodies, interview answers, sample values,
+or raw source locations, and never raw sessions, full transcripts, provider
+bodies, backup paths, journals, or driver errors. When a check is `failed`,
+`skipped`, or `unavailable`, the
 affected group stays blocked: stop, report it, and propose follow-up work. Do
 not retry a deterministic failure by attestation or by rewording.
 
@@ -238,5 +313,6 @@ not retry a deterministic failure by attestation or by rewording.
 - Apply without both the group and the batch attestation.
 - Expand the charter silently (record out-of-scope findings as follow-up
   suggestions only).
-- Expose or echo raw values, credentials, evidence bodies, or interview
-  answers.
+- Expose or echo raw sessions, full transcripts, provider bodies, backup
+  paths, journals, driver errors, credentials, document bodies, interview
+  answers, sample values, or raw source locations.

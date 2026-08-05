@@ -23,6 +23,7 @@ from __future__ import annotations
 import re
 import subprocess
 import zipfile
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -203,6 +204,96 @@ def test_workflow_orders_policy_activation_before_context_export(
     assert activate_idx != -1, "canonical skill does not reference `activate-policy`"
     assert export_idx != -1, "canonical skill does not reference `export-context`"
     assert activate_idx < export_idx
+
+
+# --------------------------------------------------------------------------- #
+# Downstream proposal / apply / recover command flow                         #
+# --------------------------------------------------------------------------- #
+
+
+_DOWNSTREAM_COMMANDS = [
+    "proposal import",
+    "proposal show",
+    "proposal verify",
+    "proposal attest",
+    "proposal prepare-apply",
+    "proposal attest-apply",
+    "proposal export-preview",
+    "proposal apply",
+    "recover",
+]
+
+
+@pytest.mark.parametrize("command", _DOWNSTREAM_COMMANDS)
+def test_skill_names_each_downstream_command(canonical: str, command: str) -> None:
+    """Every deterministic downstream command is named explicitly in the skill."""
+
+    assert command in canonical, (
+        f"canonical skill does not name the `{command}` command"
+    )
+
+
+def test_skill_orders_downstream_command_flow(canonical: str) -> None:
+    """The proposal lifecycle is a deterministic ordered command flow."""
+
+    ordered = [
+        "proposal import",
+        "proposal show",
+        "proposal verify",
+        "proposal attest",
+        "proposal prepare-apply",
+        "proposal attest-apply",
+        "proposal export-preview",
+        "proposal apply",
+    ]
+    positions: dict[str, int] = {}
+    for command in ordered:
+        idx = canonical.find(command)
+        assert idx != -1, f"canonical skill does not name `{command}`"
+        positions[command] = idx
+    # Each command must appear after the one it depends on.
+    for earlier, later in pairwise(ordered):
+        assert positions[earlier] < positions[later], (
+            f"`{later}` must follow `{earlier}` in the canonical flow"
+        )
+
+
+def test_skill_requires_explicit_user_request_for_apply(canonical: str) -> None:
+    """Apply must not run without a separate explicit user request."""
+
+    text = _lower(canonical)
+    assert "apply" in text
+    assert "explicit" in text
+    assert "user request" in text or "user authorization" in text
+
+
+# --------------------------------------------------------------------------- #
+# Error / safety: no leakage of sensitive categories                         #
+# --------------------------------------------------------------------------- #
+
+
+_LEAKAGE_CATEGORIES = [
+    "credentials",
+    "document bodies",
+    "interview answers",
+    "sample values",
+    "source locations",
+    "raw sessions",
+    "full transcripts",
+    "provider bodies",
+    "backup paths",
+    "journals",
+    "driver errors",
+]
+
+
+@pytest.mark.parametrize("category", _LEAKAGE_CATEGORIES)
+def test_skill_forbids_leakage_of(canonical: str, category: str) -> None:
+    """The skill must name every sensitive category it forbids exposing."""
+
+    assert category in _lower(canonical), (
+        f"canonical skill does not forbid leaking `{category}`"
+    )
 
 
 # --------------------------------------------------------------------------- #
