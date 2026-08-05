@@ -60,6 +60,7 @@ from selayer_discovery.evidence import (
 )
 from selayer_discovery.model import SCHEMA_VERSION, normalize_actor_identity
 from selayer_discovery.profiling import (
+    PolicyActivation,
     ProfilePolicyError,
     ProfileRunner,
     SamplePolicy,
@@ -67,6 +68,7 @@ from selayer_discovery.profiling import (
     activate_policy,
     build_context_export,
     propose_policy,
+    verify_activation,
 )
 from selayer_discovery.session import (
     CODE_NOT_INITIALIZED,
@@ -100,6 +102,7 @@ CODE_PATH_NOT_CONTAINED = "discovery.cli.path_not_contained"
 CODE_SESSION_ID_INVALID = "discovery.cli.session_id_invalid"
 CODE_PROFILE_LOAD = "discovery.profile.load_failed"
 CODE_PROFILE_SALT = "discovery.profile.salt_missing"
+CODE_PROFILE_STALE = "discovery.profile.policy_stale"
 CODE_INTERNAL = "discovery.cli.internal"
 
 # Stable session-id grammar (mirrors the session node-id shape so an id is safe
@@ -534,6 +537,7 @@ def _read_stdin_bytes() -> bytes:
 _POLICY_REL = "policy"
 _SALT_NAME = "salt"
 _CONTEXT_PREFIX = "context"
+_ACTIVATION_PREFIX = "activation"
 
 #: A single safe filesystem path component (letters, digits, dot, hyphen,
 #: underscore). Used to derive an export filename from a source id without
@@ -596,6 +600,97 @@ def _safe_file_name(value: str) -> str:
 
     cleaned = _SAFE_FILE_RE.sub("-", value).strip("-")[:128]
     return cleaned or "source"
+
+
+def _activation_path(session_dir: Path, source_id: str) -> Path:
+    """Return the owner-only activation artifact path for one source.
+
+    The activation binds the activated policy to its exact profile/schema/
+    session/approver inputs; ``export-context`` loads and re-verifies it so a
+    missing or changed binding fails closed.
+    """
+
+    return _policy_dir(session_dir) / f"{_ACTIVATION_PREFIX}-{_safe_file_name(source_id)}.json"
+
+
+def _write_activation(
+    session_dir: Path, source_id: str, activation: PolicyActivation
+) -> Path:
+    """Persist an activation artifact atomically with owner-only permissions."""
+
+    path = _activation_path(session_dir, source_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, json.dumps(activation.to_dict(), sort_keys=True).encode("utf-8"))
+    finally:
+        os.close(fd)
+    _restrict_file(path)
+    return path
+
+
+def _load_activation(
+    session_dir: Path, source_id: str
+) -> PolicyActivation | None:
+    """Load a persisted activation for ``source_id`` (``None`` if absent)."""
+
+    path = _activation_path(session_dir, source_id)
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        raise _CliError(CODE_PROFILE_LOAD) from None
+    if not isinstance(data, Mapping):
+        raise _CliError(CODE_PROFILE_LOAD) from None
+    try:
+        return PolicyActivation.from_dict(dict(data))
+    except ProfilePolicyError:
+        raise _CliError(CODE_PROFILE_LOAD) from None
+
+
+def _normalized_approver(session_dir: Path, override: str | None) -> str:
+    """Return the normalized current approver (override or charter approver)."""
+
+    charter = SessionStore.open(session_dir).charter
+    raw = override if override else charter.approver
+    return normalize_actor_identity(raw)
+
+
+def _context_export_path(session_dir: Path, source_id: str) -> Path:
+    """Return the context export artifact path for one source."""
+
+    return _policy_dir(session_dir) / f"{_CONTEXT_PREFIX}-{_safe_file_name(source_id)}.json"
+
+
+def _session_context_bytes_used(session_dir: Path) -> int:
+    """Sum the bytes of every persisted context export in the session.
+
+    Derives prior session export usage from the Git-ignored workspace so the
+    ``bytes_per_session`` cap is enforced across multiple exports. Best-effort:
+    a corrupt or unreadable file contributes zero (it cannot inflate the cap).
+    """
+
+    policy_dir = _policy_dir(session_dir)
+    if not policy_dir.exists():
+        return 0
+    total = 0
+    for entry in policy_dir.iterdir():
+        if not entry.is_file():
+            continue
+        if not entry.name.startswith(f"{_CONTEXT_PREFIX}-") or not entry.name.endswith(".json"):
+            continue
+        try:
+            with entry.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, Mapping):
+            raw = data.get("bytes")
+            if type(raw) is int:
+                total += raw
+    return total
 
 
 def _load_json_mapping(project: Path, raw_path: str, *, kind: str) -> dict[str, object]:
@@ -688,6 +783,9 @@ def _handle_profile_activate_policy(args: argparse.Namespace) -> int:
         approver=approver,
         activated_at=activated_at,
     )
+    # Persist a safe activation artifact under the ignored session policy
+    # directory so export-context can load and re-verify the current bindings.
+    _write_activation(session_dir, profile.source_id, activation)
     _emit_json(activation.to_dict())
     return EXIT_OK
 
@@ -700,6 +798,27 @@ def _handle_profile_export_context(args: argparse.Namespace) -> int:
     profile = _load_profile_file(project, args.profile)
     policy = _load_policy_file(project, args.policy)
     salt = _load_salt(session_dir)
+    # Fail closed when no activation artifact exists for this source, or when
+    # any current binding (normalized charter approver, session/source ids,
+    # policy/profile/schema fingerprints, snapshot, grain) no longer matches the
+    # persisted activation.
+    activation = _load_activation(session_dir, args.source_id)
+    if activation is None:
+        raise ProfilePolicyError(
+            CODE_PROFILE_STALE, safe_detail="activation"
+        ) from None
+    approver = _normalized_approver(session_dir, None)
+    verify_activation(
+        activation,
+        policy,
+        profile,
+        session_id=session_id,
+        source_id=args.source_id,
+        approver=approver,
+    )
+    # Enforce the session cap across multiple exports by summing the bytes of
+    # every prior context export persisted in the ignored session workspace.
+    session_bytes_used = _session_context_bytes_used(session_dir)
     _, _, registry = _open_registry(project, session_dir)
     try:
         with registry.open_scan_session(
@@ -708,33 +827,32 @@ def _handle_profile_export_context(args: argparse.Namespace) -> int:
             batch_size=args.batch_size,
         ) as session:
             export = build_context_export(
-                session, policy, profile, salt, session_id=session_id
+                session,
+                policy,
+                profile,
+                salt,
+                session_id=session_id,
+                session_bytes_used=session_bytes_used,
             )
     finally:
         registry.close()
-    out_dir = _policy_dir(session_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{_CONTEXT_PREFIX}-{_safe_file_name(args.source_id)}.json"
+    out_path = _context_export_path(session_dir, args.source_id)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         os.write(fd, json.dumps(export.to_dict(), sort_keys=True).encode("utf-8"))
     finally:
         os.close(fd)
     _restrict_file(out_path)
+    # Emit only a safe path plus binding fingerprints/hashes. No source/session
+    # identifiers, counts, byte count, or canary status reach stdout.
     _emit_json(
         {
-            "session_id": session_id,
-            "source_id": export.source_id,
             "path": out_path.relative_to(project_abs).as_posix(),
             "fingerprint": export.fingerprint,
             "policy_fingerprint": export.policy_fingerprint,
             "profile_fingerprint": export.profile_fingerprint,
             "schema_fingerprint": export.schema_fingerprint,
-            "snapshot_id": export.snapshot_id,
-            "row_count": export.row_count,
-            "field_count": export.field_count,
-            "bytes": export.bytes,
-            "canary_scan": export.canary_scan,
         }
     )
     return EXIT_OK

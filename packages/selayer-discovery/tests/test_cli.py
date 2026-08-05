@@ -9,10 +9,15 @@ from typing import Any
 
 import pyarrow as pa
 import pytest
+import selayer_discovery.cli as cli_module
 from ruamel.yaml import YAML
 from selayer_discovery import __version__
 from selayer_discovery.cli import main
-from selayer_discovery.profiling import ProfileRunner, SourceProfile
+from selayer_discovery.profiling import (
+    PolicyActivation,
+    ProfileRunner,
+    SourceProfile,
+)
 from selayer_discovery.session import SessionStore
 
 from selayer.sources.base import SourceConsistency
@@ -857,8 +862,8 @@ _POLICY_SCHEMA = pa.schema(
 )
 
 
-def _policy_profile(tmp_path: Path) -> SourceProfile:
-    """Build a completed (available) profile from a small in-memory scan."""
+def _policy_scan_session() -> SourceScanSession:
+    """Build a fresh in-memory scan session for the policy test source."""
 
     rows = [
         {"id": 1, "amount": 100, "customer_name": "Alice", "access_token": "tok-1"},
@@ -868,7 +873,7 @@ def _policy_profile(tmp_path: Path) -> SourceProfile:
     table_schema = table_schema_from_arrow(_POLICY_SCHEMA)
     fp = schema_fingerprint(table_schema)
     reader = pa.RecordBatchReader.from_batches(_POLICY_SCHEMA, [batch])
-    session = SourceScanSession(
+    return SourceScanSession(
         source_id="orders",
         schema=table_schema,
         consistency=SourceConsistency.REOPENABLE_SNAPSHOT,
@@ -879,6 +884,12 @@ def _policy_profile(tmp_path: Path) -> SourceProfile:
             SourceConsistency.REOPENABLE_SNAPSHOT, "snap-1", fp
         ),
     )
+
+
+def _policy_profile(tmp_path: Path) -> SourceProfile:
+    """Build a completed (available) profile from a small in-memory scan."""
+
+    session = _policy_scan_session()
     return ProfileRunner(session, tmp_path / "spill", grain=("id",)).run()
 
 
@@ -1349,3 +1360,185 @@ def test_export_context_policy_path_escape_fails(
     assert code == 1
     err = json.loads(capsys.readouterr().err)
     assert err["code"] == "discovery.cli.path_not_contained"
+
+
+def _activate_policy_for_cli(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> tuple[Path, Path, dict[str, Any]]:
+    profile = _policy_profile(tmp_path)
+    profile_path = _write_profile(tmp_path, profile)
+    policy_out = _propose_and_write_policy(tmp_path, capsys, profile_path)
+    assert (
+        main(
+            [
+                "profile",
+                "activate-policy",
+                "--session-id",
+                "session-policy-001",
+                "--project",
+                str(tmp_path),
+                "--profile",
+                str(profile_path),
+                "--policy",
+                str(tmp_path / "policy.json"),
+                "--activated-at",
+                "2026-01-01",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    return profile_path, tmp_path / "policy.json", policy_out
+
+
+def test_activate_policy_persists_activation_artifact(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _init_policy_session(tmp_path, capsys)
+    profile_path, _, _ = _activate_policy_for_cli(tmp_path, capsys)
+    session_dir = cli_module._session_dir(
+        tmp_path.resolve(), "session-policy-001"
+    )
+    activation_path = cli_module._activation_path(session_dir, "orders")
+    assert activation_path.is_file()
+    activation = PolicyActivation.from_dict(json.loads(activation_path.read_text()))
+    profile = _policy_profile(tmp_path)
+    assert activation.session_id == "session-policy-001"
+    assert activation.source_id == "orders"
+    assert activation.profile_fingerprint == profile.fingerprint
+    assert profile_path.is_file()
+
+
+def test_export_context_fails_without_activation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _init_policy_session(tmp_path, capsys)
+    profile = _policy_profile(tmp_path)
+    profile_path = _write_profile(tmp_path, profile)
+    _propose_and_write_policy(tmp_path, capsys, profile_path)
+    code = main(
+        [
+            "profile",
+            "export-context",
+            "--session-id",
+            "session-policy-001",
+            "--project",
+            str(tmp_path),
+            "--source-id",
+            "orders",
+            "--profile",
+            str(profile_path),
+            "--policy",
+            str(tmp_path / "policy.json"),
+        ]
+    )
+    assert code == 1
+    err = json.loads(capsys.readouterr().err)
+    assert err["code"] == "discovery.profile.policy_stale"
+    assert err["safe_detail"] == "activation"
+
+
+def test_export_context_fails_when_policy_changes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _init_policy_session(tmp_path, capsys)
+    profile_path, policy_path, _ = _activate_policy_for_cli(tmp_path, capsys)
+    policy = json.loads(policy_path.read_text())
+    next(field for field in policy["fields"] if field["name"] == "amount")[
+        "transform"
+    ] = "hash"
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    code = main(
+        [
+            "profile",
+            "export-context",
+            "--session-id",
+            "session-policy-001",
+            "--project",
+            str(tmp_path),
+            "--source-id",
+            "orders",
+            "--profile",
+            str(profile_path),
+            "--policy",
+            str(policy_path),
+        ]
+    )
+    assert code == 1
+    err = json.loads(capsys.readouterr().err)
+    assert err["code"] == "discovery.profile.policy_stale"
+    assert err["safe_detail"] == "policy"
+
+
+def test_session_context_bytes_used_sums_valid_context_exports(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _init_policy_session(tmp_path, capsys)
+    session_dir = cli_module._session_dir(
+        tmp_path.resolve(), "session-policy-001"
+    )
+    policy_dir = cli_module._policy_dir(session_dir)
+    policy_dir.mkdir(parents=True, exist_ok=True)
+    (policy_dir / "context-a.json").write_text('{"bytes": 100}', encoding="utf-8")
+    (policy_dir / "context-b.json").write_text('{"bytes": 200}', encoding="utf-8")
+    (policy_dir / "context-bad.json").write_text("not json", encoding="utf-8")
+    (policy_dir / "context-string.json").write_text(
+        '{"bytes": "300"}', encoding="utf-8"
+    )
+    (policy_dir / "activation-orders.json").write_text(
+        '{"bytes": 400}', encoding="utf-8"
+    )
+    assert cli_module._session_context_bytes_used(session_dir) == 300
+
+
+def test_export_context_stdout_contains_only_safe_summary(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_policy_session(tmp_path, capsys)
+    profile_path, policy_path, _ = _activate_policy_for_cli(tmp_path, capsys)
+
+    class FakeRegistry:
+        def open_scan_session(self, *_args: object, **_kwargs: object) -> SourceScanSession:
+            return _policy_scan_session()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        cli_module,
+        "_open_registry",
+        lambda _project, _session_dir: (None, None, FakeRegistry()),
+    )
+    assert (
+        main(
+            [
+                "profile",
+                "export-context",
+                "--session-id",
+                "session-policy-001",
+                "--project",
+                str(tmp_path),
+                "--source-id",
+                "orders",
+                "--profile",
+                str(profile_path),
+                "--policy",
+                str(policy_path),
+            ]
+        )
+        == 0
+    )
+    summary = json.loads(capsys.readouterr().out)
+    assert set(summary) == {
+        "path",
+        "fingerprint",
+        "policy_fingerprint",
+        "profile_fingerprint",
+        "schema_fingerprint",
+    }
+    assert "session_id" not in summary
+    assert "source_id" not in summary
+    assert "bytes" not in summary
+    assert "canary_scan" not in summary

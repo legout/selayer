@@ -112,6 +112,7 @@ __all__ = [
     "hard_deny_scan",
     "propose_policy",
     "select_sample_rows",
+    "verify_activation",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -1762,6 +1763,16 @@ def activate_policy(
             exposed += 1
         if field.transform is FieldTransform.REVEAL:
             col = columns[field.name]
+            # Hard-deny is *derived* from the profile field name/type, never
+            # trusted from the policy payload: an untrusted policy that claims
+            # ``hard_denied=False`` on a credential/private-key field cannot
+            # reveal it. The diagnostic carries no raw value.
+            if classify_field(col.name, col.type_name).hard_denied:
+                raise ProfilePolicyError(
+                    CODE_PROFILE_INVALID,
+                    safe_detail="hard-denied field cannot reveal",
+                    safe_ids=(field.name,),
+                ) from None
             distinct = col.distinct_count
             if distinct is None or distinct > policy.caps.revealed_values:
                 raise ProfilePolicyError(
@@ -1792,6 +1803,42 @@ def activate_policy(
         grain=policy.grain,
         activated_at=activated_at,
     )
+
+
+def verify_activation(
+    activation: PolicyActivation,
+    policy: SamplePolicy,
+    profile: SourceProfile,
+    *,
+    session_id: str,
+    source_id: str,
+    approver: str,
+) -> None:
+    """Verify an activation binds the *current* policy/profile/session inputs.
+
+    Every bound field is checked against the current values; any mismatch
+    fails closed with :data:`CODE_PROFILE_STALE` and a constant (value-free)
+    ``safe_detail`` naming the stale binding.  Used by the export command to
+    reject a context export whose policy, profile, schema, snapshot, grain,
+    session/source ids, or normalized approver no longer match the persisted
+    activation artifact.
+    """
+
+    checks: tuple[tuple[bool, str], ...] = (
+        (activation.session_id == session_id, "session"),
+        (activation.source_id == source_id, "source"),
+        (activation.approver == approver, "approver"),
+        (activation.policy_fingerprint == policy.fingerprint, "policy"),
+        (activation.profile_fingerprint == profile.fingerprint, "profile"),
+        (activation.schema_fingerprint == profile.schema_fingerprint, "schema"),
+        (activation.snapshot_id == profile.snapshot_id, "snapshot"),
+        (activation.grain == policy.grain, "grain"),
+    )
+    for ok, detail in checks:
+        if not ok:
+            raise ProfilePolicyError(
+                CODE_PROFILE_STALE, safe_detail=detail
+            ) from None
 
 
 # --------------------------------------------------------------------------- #
@@ -1992,6 +2039,25 @@ def hard_deny_scan(payload: bytes) -> str | None:
     return None
 
 
+def _reveal_value_matches_hard_deny(value: object) -> str | None:
+    """Return a constant pattern label if a revealed raw value is sensitive.
+
+    Conservative per-value shape check applied to ``reveal`` outputs only: a
+    raw value that matches a credential/private-key/token shape under an
+    innocuous field name must never be published, even when the field name is
+    not itself classified as hard-denied.  Returns ``None`` when the value is
+    safe to reveal.  The matched label is a constant; no raw value is returned.
+    """
+
+    text = _canonical_value_str(value)
+    if not text:
+        return None
+    for index, pattern in enumerate(_HARD_DENY_PATTERNS):
+        if pattern.search(text) is not None:
+            return f"hard_deny_{index}"
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class RedactedSampleExport:
     """Model-safe redacted sample export for one source.
@@ -2084,13 +2150,34 @@ def build_context_export(
         for name in exposed_names:
             field = field_map[name]
             col = columns[name]
+            if field.transform is FieldTransform.REVEAL:
+                # Hard-deny is derived from the profile field name/type, never
+                # trusted from the policy payload: an untrusted policy claiming
+                # ``hard_denied=False`` on a credential/private-key field
+                # cannot reveal it. The diagnostic carries no raw value.
+                if classify_field(col.name, col.type_name).hard_denied:
+                    raise ContextExportError(
+                        CODE_PROFILE_INVALID,
+                        safe_detail="hard-denied field cannot reveal",
+                        safe_ids=(profile.source_id,),
+                    ) from None
+                # Conservative per-value shape check: a raw value that matches a
+                # credential/private-key/token shape under an innocuous name
+                # must never be revealed, regardless of the field name.
+                matched = _reveal_value_matches_hard_deny(row.get(name))
+                if matched is not None:
+                    raise ContextExportError(
+                        CODE_PROFILE_CANARY,
+                        safe_detail=matched,
+                        safe_ids=(profile.source_id,),
+                    ) from None
             included, value = _transform_value(
                 row.get(name), field.transform, name, salt, col
             )
             if included:
                 out[name] = value
         transformed.append(out)
-    # Enforce per-source byte cap by trimming rows from the largest hash end.
+    # Enforce per-source byte cap by trimming rows from the largest-hash end.
     payload_bytes = _payload_size(transformed, policy.grain)
     while (
         payload_bytes > policy.caps.bytes_per_source
@@ -2098,13 +2185,33 @@ def build_context_export(
     ):
         transformed.pop()
         payload_bytes = _payload_size(transformed, policy.grain)
-    if (
-        payload_bytes + session_bytes_used
-    ) > policy.caps.bytes_per_session and transformed:
-        budget = max(policy.caps.bytes_per_session - session_bytes_used, 0)
-        while transformed and _payload_size(transformed, policy.grain) > budget:
-            transformed.pop()
-        payload_bytes = _payload_size(transformed, policy.grain)
+    # A single remaining row that still exceeds the per-source cap cannot be
+    # reduced by trimming; reject it rather than publish an over-cap row.
+    if payload_bytes > policy.caps.bytes_per_source:
+        raise ContextExportError(
+            CODE_PROFILE_CAP,
+            safe_detail="bytes_per_source",
+            safe_ids=(profile.source_id,),
+        ) from None
+    # Enforce the session cap across multiple exports. Reject when the prior
+    # usage has already exhausted the budget, and when a single row cannot fit
+    # the remaining budget (mirrors the per-source single-row rule).
+    if session_bytes_used >= policy.caps.bytes_per_session:
+        raise ContextExportError(
+            CODE_PROFILE_CAP,
+            safe_detail="bytes_per_session",
+            safe_ids=(profile.source_id,),
+        ) from None
+    budget = policy.caps.bytes_per_session - session_bytes_used
+    while len(transformed) > 1 and _payload_size(transformed, policy.grain) > budget:
+        transformed.pop()
+    payload_bytes = _payload_size(transformed, policy.grain)
+    if payload_bytes > budget:
+        raise ContextExportError(
+            CODE_PROFILE_CAP,
+            safe_detail="bytes_per_session",
+            safe_ids=(profile.source_id,),
+        ) from None
     # Final canary/hard-deny scan over the value-bearing payload.
     payload_raw = _payload_bytes(transformed, policy.grain)
     matched = hard_deny_scan(payload_raw)

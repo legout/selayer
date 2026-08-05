@@ -702,6 +702,7 @@ from selayer_discovery.profiling import (
     hard_deny_scan,
     propose_policy,
     select_sample_rows,
+    verify_activation,
 )
 
 _TEST_SALT: bytes = b"task11-test-salt-0123456789abcdef"
@@ -1286,3 +1287,332 @@ def test_export_fingerprint_excludes_audit_date(tmp_path: Path) -> None:
     # Fingerprint is stable over the value-bearing payload only.
     assert export.fingerprint == export.fingerprint
     assert "salt" not in json.dumps(export.to_dict(), sort_keys=True).lower()
+
+
+# =========================================================================== #
+# Task 11 fix round 1: hard-deny re-derivation, value-shape checks, caps,    #
+# and activation verification.                                               #
+# =========================================================================== #
+
+
+def _credential_reveal_policy(
+    profile: SourceProfile, *, name: str = "access_token"
+) -> SamplePolicy:
+    """Build a policy that (wrongly) requests reveal on a credential-named
+    field while claiming ``hard_denied=False`` — simulating an untrusted policy."""
+
+    fields: list[FieldPolicy] = []
+    for col in profile.columns:
+        transform = (
+            FieldTransform.REVEAL if col.name == name else FieldTransform.OMIT
+        )
+        fields.append(
+            FieldPolicy(name=col.name, transform=transform, hard_denied=False)
+        )
+    return SamplePolicy(
+        source_id=profile.source_id,
+        grain=("id",),
+        salt_id=_TEST_SALT_ID,
+        fields=tuple(fields),
+    )
+
+
+def _benign_credential_profile(
+    tmp_path: Path,
+) -> tuple[pa.Schema, list[pa.RecordBatch], SourceProfile]:
+    """Profile two rows whose credential-named column holds a benign value."""
+
+    schema = pa.schema([("id", pa.int64()), ("access_token", pa.utf8())])
+    batches = [
+        pa.RecordBatch.from_pylist(
+            [
+                {"id": 1, "access_token": "benign-token-value"},
+                {"id": 2, "access_token": "benign-token-value"},
+            ],
+            schema=schema,
+        )
+    ]
+    session = _make_session(
+        batches, source_id="creds", schema=table_schema_from_arrow(schema)
+    )
+    profile = ProfileRunner(session, tmp_path / "spill", grain=("id",)).run()
+    return schema, batches, profile
+
+
+# --- Finding 1 & 5: hard-deny re-derivation + value-shape checks ------------- #
+
+
+def test_activate_policy_re_derives_hard_deny_from_credential_name(
+    tmp_path: Path,
+) -> None:
+    profile = _canary_profile(tmp_path)
+    policy = _credential_reveal_policy(profile, name="access_token")
+    with pytest.raises(ProfilePolicyError) as raised:
+        activate_policy(policy, profile, session_id="s", approver="A", activated_at="d")
+    assert raised.value.code == "discovery.profile.policy_invalid"
+    _assert_no_canary(str(raised.value))
+
+
+def test_activate_policy_re_derives_hard_deny_from_private_key_name(
+    tmp_path: Path,
+) -> None:
+    profile = _canary_profile(tmp_path)
+    policy = _credential_reveal_policy(profile, name="priv_key")
+    with pytest.raises(ProfilePolicyError) as raised:
+        activate_policy(policy, profile, session_id="s", approver="A", activated_at="d")
+    assert raised.value.code == "discovery.profile.policy_invalid"
+
+
+def test_build_context_export_rejects_reveal_of_credential_named_field(
+    tmp_path: Path,
+) -> None:
+    schema, batches, profile = _benign_credential_profile(tmp_path)
+    policy = SamplePolicy(
+        source_id="creds",
+        grain=("id",),
+        salt_id=_TEST_SALT_ID,
+        fields=(
+            FieldPolicy(name="id", transform=FieldTransform.REVEAL, hard_denied=False),
+            FieldPolicy(
+                name="access_token",
+                transform=FieldTransform.REVEAL,
+                hard_denied=False,
+            ),
+        ),
+    )
+    export_session = _make_session(
+        batches, source_id="creds", schema=table_schema_from_arrow(schema)
+    )
+    with pytest.raises(ProfilePolicyError) as raised:
+        build_context_export(export_session, policy, profile, _TEST_SALT, session_id="s")
+    assert raised.value.code == "discovery.profile.policy_invalid"
+    _assert_no_canary(str(raised.value))
+
+
+def test_build_context_export_keeps_hash_and_redact_for_credential_field(
+    tmp_path: Path,
+) -> None:
+    # A credential-named field under HASH/REDACT must still produce usable
+    # tokens (never rejected), and no raw value leaks.
+    schema, batches, profile = _benign_credential_profile(tmp_path)
+    policy = SamplePolicy(
+        source_id="creds",
+        grain=("id",),
+        salt_id=_TEST_SALT_ID,
+        fields=(
+            FieldPolicy(name="id", transform=FieldTransform.OMIT),
+            FieldPolicy(
+                name="access_token", transform=FieldTransform.HASH, hard_denied=False
+            ),
+        ),
+    )
+    export_session = _make_session(
+        batches, source_id="creds", schema=table_schema_from_arrow(schema)
+    )
+    export = build_context_export(
+        export_session, policy, profile, _TEST_SALT, session_id="s"
+    )
+    row = dict(export.rows[0])
+    assert isinstance(row["access_token"], str) and len(row["access_token"]) == 64
+    _assert_no_canary(json.dumps(export.to_dict(), sort_keys=True))
+
+
+def test_reveal_value_shape_detects_credentials() -> None:
+    from selayer_discovery.profiling import _reveal_value_matches_hard_deny
+
+    assert _reveal_value_matches_hard_deny(_CANARY_PRIV_KEY) is not None
+    assert _reveal_value_matches_hard_deny(_CANARY_AWS_KEY) is not None
+    assert _reveal_value_matches_hard_deny("normal value") is None
+    assert _reveal_value_matches_hard_deny(123) is None
+    assert _reveal_value_matches_hard_deny(None) is None
+
+
+def test_build_context_export_rejects_sensitive_value_under_innocuous_name(
+    tmp_path: Path,
+) -> None:
+    # An innocuously-named field whose revealed raw value matches a credential
+    # shape must fail closed (explicit value-shape check, value-free diagnostic).
+    schema = pa.schema([("id", pa.int64()), ("comment", pa.utf8())])
+    batches = [
+        pa.RecordBatch.from_pylist(
+            [{"id": 1, "comment": _CANARY_AWS_KEY}], schema=schema
+        )
+    ]
+    session = _make_session(
+        batches, source_id="c", schema=table_schema_from_arrow(schema)
+    )
+    profile = ProfileRunner(session, tmp_path / "spill", grain=("id",)).run()
+    policy = SamplePolicy(
+        source_id="c",
+        grain=("id",),
+        salt_id=_TEST_SALT_ID,
+        fields=(
+            FieldPolicy(name="id", transform=FieldTransform.OMIT),
+            FieldPolicy(name="comment", transform=FieldTransform.REVEAL, hard_denied=False),
+        ),
+    )
+    export_session = _make_session(
+        batches, source_id="c", schema=table_schema_from_arrow(schema)
+    )
+    with pytest.raises(ContextExportError) as raised:
+        build_context_export(export_session, policy, profile, _TEST_SALT, session_id="s")
+    assert raised.value.code == "discovery.profile.canary_leak"
+    _assert_no_canary(str(raised.value))
+
+
+# --- Finding 3: single-row over per-source cap ----------------------------- #
+
+
+def test_build_context_export_rejects_single_row_over_bytes_cap(
+    tmp_path: Path,
+) -> None:
+    schema = pa.schema([("id", pa.int64()), ("payload", pa.utf8())])
+    big = "y" * (MAX_SAMPLE_BYTES_PER_SOURCE + 4096)
+    rows = [{"id": 1, "payload": big}]
+    batches = [pa.RecordBatch.from_pylist(rows, schema=schema)]
+    session = _make_session(
+        batches, source_id="huge", schema=table_schema_from_arrow(schema)
+    )
+    profile = ProfileRunner(session, tmp_path / "spill", grain=("id",)).run()
+    policy = SamplePolicy(
+        source_id="huge",
+        grain=("id",),
+        salt_id=_TEST_SALT_ID,
+        fields=(
+            FieldPolicy(name="id", transform=FieldTransform.REVEAL),
+            FieldPolicy(name="payload", transform=FieldTransform.REVEAL),
+        ),
+    )
+    export_session = _make_session(
+        batches, source_id="huge", schema=table_schema_from_arrow(schema)
+    )
+    with pytest.raises(ContextExportError) as raised:
+        build_context_export(export_session, policy, profile, _TEST_SALT, session_id="s")
+    assert raised.value.code == "discovery.profile.cap_exceeded"
+
+
+# --- Finding 4: session budget across exports ------------------------------ #
+
+
+def test_build_context_export_rejects_when_session_budget_exhausted(
+    tmp_path: Path,
+) -> None:
+    profile = _canary_profile(tmp_path)
+    policy = _build_policy(profile, {"customer_name": FieldTransform.REVEAL})
+    session = _canary_session()
+    with pytest.raises(ContextExportError) as raised:
+        build_context_export(
+        session,
+            policy,
+            profile,
+            _TEST_SALT,
+            session_id="s",
+            session_bytes_used=MAX_SAMPLE_BYTES_PER_SESSION,
+        )
+    assert raised.value.code == "discovery.profile.cap_exceeded"
+
+
+def test_build_context_export_rejects_single_row_over_remaining_session_budget(
+    tmp_path: Path,
+) -> None:
+    schema = pa.schema([("id", pa.int64()), ("payload", pa.utf8())])
+    big = "z" * 4000  # fits the 64 KiB per-source cap but not a tiny budget
+    rows = [{"id": 1, "payload": big}]
+    batches = [pa.RecordBatch.from_pylist(rows, schema=schema)]
+    session = _make_session(
+        batches, source_id="mid", schema=table_schema_from_arrow(schema)
+    )
+    profile = ProfileRunner(session, tmp_path / "spill", grain=("id",)).run()
+    policy = SamplePolicy(
+        source_id="mid",
+        grain=("id",),
+        salt_id=_TEST_SALT_ID,
+        fields=(
+            FieldPolicy(name="id", transform=FieldTransform.REVEAL),
+            FieldPolicy(name="payload", transform=FieldTransform.REVEAL),
+        ),
+        caps=SampleCaps(bytes_per_session=2000),
+    )
+    export_session = _make_session(
+        batches, source_id="mid", schema=table_schema_from_arrow(schema)
+    )
+    with pytest.raises(ContextExportError) as raised:
+        build_context_export(
+            export_session, policy, profile, _TEST_SALT, session_id="s"
+        )
+    assert raised.value.code == "discovery.profile.cap_exceeded"
+
+
+# --- Finding 2: activation verification ----------------------------------- #
+
+
+def test_verify_activation_matches_current_inputs(tmp_path: Path) -> None:
+    profile = _canary_profile(tmp_path)
+    policy = _build_policy(profile, {"amount": FieldTransform.REVEAL})
+    activation = activate_policy(
+        policy, profile, session_id="s", approver="Alice", activated_at="d"
+    )
+    # Matching inputs verify without raising.
+    verify_activation(
+        activation,
+        policy,
+        profile,
+        session_id="s",
+        source_id="customers",
+        approver="Alice",
+    )
+
+
+def test_verify_activation_rejects_changed_policy(tmp_path: Path) -> None:
+    profile = _canary_profile(tmp_path)
+    policy = _build_policy(profile, {"amount": FieldTransform.REVEAL})
+    activation = activate_policy(
+        policy, profile, session_id="s", approver="Alice", activated_at="d"
+    )
+    changed = _build_policy(profile, {"amount": FieldTransform.HASH})
+    with pytest.raises(ProfilePolicyError) as raised:
+        verify_activation(
+            activation,
+            changed,
+            profile,
+            session_id="s",
+            source_id="customers",
+            approver="Alice",
+        )
+    assert raised.value.code == "discovery.profile.policy_stale"
+
+
+def test_verify_activation_rejects_changed_approver(tmp_path: Path) -> None:
+    profile = _canary_profile(tmp_path)
+    policy = _build_policy(profile, {})
+    activation = activate_policy(
+        policy, profile, session_id="s", approver="Alice", activated_at="d"
+    )
+    with pytest.raises(ProfilePolicyError) as raised:
+        verify_activation(
+            activation,
+            policy,
+            profile,
+            session_id="s",
+            source_id="customers",
+            approver="Bob",
+        )
+    assert raised.value.code == "discovery.profile.policy_stale"
+
+
+def test_verify_activation_rejects_session_source_mismatch(tmp_path: Path) -> None:
+    profile = _canary_profile(tmp_path)
+    policy = _build_policy(profile, {})
+    activation = activate_policy(
+        policy, profile, session_id="s", approver="Alice", activated_at="d"
+    )
+    with pytest.raises(ProfilePolicyError) as raised:
+        verify_activation(
+            activation,
+            policy,
+            profile,
+            session_id="other",
+            source_id="customers",
+            approver="Alice",
+        )
+    assert raised.value.code == "discovery.profile.policy_stale"
