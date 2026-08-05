@@ -24,5 +24,11 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/selayer_discovery"]
 
+# Ship the single canonical Agent Skill body inside the wheel. The
+# repository-level ``.agents/skills/semantic-discovery`` skill only forwards
+# here, so the wheel is the one source of truth for the skill text.
+[tool.hatch.build.targets.wheel.force-include]
+"skills/semantic-discovery" = "skills/semantic-discovery"
+
 [tool.uv.sources]
 selayer = { workspace = true }
