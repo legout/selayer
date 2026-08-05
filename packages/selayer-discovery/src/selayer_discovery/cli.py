@@ -84,6 +84,13 @@ from selayer_discovery.profiling import (
     propose_policy,
     verify_activation,
 )
+from selayer_discovery.proposal import (
+    ProposalError,
+    build_proposal,
+    reconstruct_candidate,
+    render_review_preview,
+    write_candidate,
+)
 from selayer_discovery.session import (
     CODE_NOT_INITIALIZED,
     SessionCharter,
@@ -198,6 +205,11 @@ def _error_payload(exc: BaseException) -> dict[str, object]:
         return {"code": exc.code, "source_id": _safe_id(exc.source_id)}
     if isinstance(exc, (ProfilePolicyError, DiscoveryError)):
         return exc.to_dict()
+    if isinstance(exc, ProposalError):
+        payload: dict[str, object] = {"code": exc.code}
+        if exc.safe_detail is not None:
+            payload["safe_detail"] = exc.safe_detail
+        return payload
     return {"code": CODE_INTERNAL}
 
 
@@ -911,6 +923,190 @@ def _handle_evidence_resolve_conflict(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Proposal handlers                                                          #
+# --------------------------------------------------------------------------- #
+
+#: Proposals and reconstructed candidates live inside the Git-ignored session
+#: workspace. Apply (Task 20) owns writing repository files; import only ever
+#: writes inside the ignored workspace.
+_PROPOSAL_REL = "proposals"
+
+
+def _proposal_root(session_dir: Path) -> Path:
+    """Return the proposal store root for a session directory."""
+
+    return session_dir / _PROPOSAL_REL
+
+
+def _load_proposal_mapping(project: Path, raw_path: str) -> dict[str, object]:
+    """Load a proposal YAML/JSON file from a project-contained path."""
+
+    abs_path = _assert_contained(project, Path(raw_path), kind="proposal")
+    yaml = YAML(typ="safe")
+    try:
+        with abs_path.open("r", encoding="utf-8") as handle:
+            data = yaml.load(handle)
+    except (OSError, YAMLError):
+        raise _CliError(CODE_PROFILE_LOAD) from None
+    if not isinstance(data, Mapping):
+        raise _CliError(CODE_PROFILE_LOAD) from None
+    return dict(data)
+
+
+def _session_base_catalog_text(project: Path, session_dir: Path) -> str:
+    """Read the base catalog text bound to the session charter."""
+
+    charter = SessionStore.open(session_dir).charter
+    catalog_abs = _assert_contained(
+        project, project / charter.catalog_path, kind="catalog"
+    )
+    try:
+        return catalog_abs.read_text(encoding="utf-8")
+    except OSError:
+        raise _CliError(CODE_PROFILE_LOAD) from None
+
+
+def _handle_proposal_import(args: argparse.Namespace) -> int:
+    project = _project_root(args.project)
+    session_id = _validate_session_id(args.session_id)
+    session_dir = _require_session(project, session_id)
+    data = _load_proposal_mapping(project, args.proposal)
+    proposal = build_proposal(data)
+    base_catalog_text = _session_base_catalog_text(project, session_dir)
+    candidate = reconstruct_candidate(
+        base_catalog_text=base_catalog_text,
+        base_references={},
+        base_overlays={},
+        operations=proposal.operations,
+    )
+    preview = render_review_preview(
+        base_catalog_text=base_catalog_text,
+        base_references={},
+        base_overlays={},
+        candidate=candidate,
+    )
+    # Persist the reconstructed candidate and the proposal record inside the
+    # Git-ignored session workspace. Apply (Task 20) owns writing repository
+    # files; import never writes outside the ignored workspace.
+    proposal_dir = _proposal_root(session_dir) / proposal.proposal_id
+    proposal_dir.mkdir(parents=True, exist_ok=True)
+    write_candidate(candidate, proposal_dir / "candidate")
+    record = {
+        "schema_version": SCHEMA_VERSION,
+        "proposal_id": proposal.proposal_id,
+        "title": proposal.title,
+        "proposal_fingerprint": proposal.fingerprint,
+        "candidate_fingerprint": candidate.fingerprint,
+        "preview_fingerprint": preview.fingerprint,
+        "groups": [group.to_dict() for group in proposal.groups],
+        "operations": [op.to_dict() for op in proposal.operations],
+    }
+    record_path = proposal_dir / "proposal.json"
+    tmp = record_path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(record, handle, sort_keys=True)
+    os.replace(tmp, record_path)
+    _restrict_file(record_path)
+    _emit_json(
+        {
+            "proposal_id": proposal.proposal_id,
+            "proposal_fingerprint": proposal.fingerprint,
+            "candidate_fingerprint": candidate.fingerprint,
+            "preview_fingerprint": preview.fingerprint,
+            "operations": len(proposal.operations),
+            "groups": [group.group_id for group in proposal.groups],
+            "workspace": _workspace_rel(session_id)
+            + f"/{_PROPOSAL_REL}/{proposal.proposal_id}",
+        }
+    )
+    return EXIT_OK
+
+
+def _read_proposal_record(session_dir: Path, proposal_id: str) -> dict[str, object]:
+    """Load a stored proposal record, or raise a sanitized CLI error."""
+
+    record_path = (
+        _proposal_root(session_dir) / proposal_id / "proposal.json"
+    )
+    if not record_path.exists():
+        raise _CliError(
+            CODE_NOT_INITIALIZED, safe_ids=(proposal_id,)
+        )
+    try:
+        with record_path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        raise _CliError(CODE_INTERNAL) from None
+    if not isinstance(data, Mapping):
+        raise _CliError(CODE_INTERNAL) from None
+    return dict(data)
+
+
+def _latest_proposal_id(session_dir: Path) -> str:
+    """Return the lexicographically-largest stored proposal id."""
+
+    root = _proposal_root(session_dir)
+    ids = [
+        child.name
+        for child in root.iterdir()
+        if child.is_dir() and (child / "proposal.json").exists()
+    ] if root.exists() else []
+    if not ids:
+        raise _CliError(CODE_NOT_INITIALIZED, safe_detail="no proposal")
+    return max(ids)
+
+
+def _handle_proposal_show(args: argparse.Namespace) -> int:
+    project = _project_root(args.project)
+    session_id = _validate_session_id(args.session_id)
+    session_dir = _require_session(project, session_id)
+    proposal_id = args.proposal if args.proposal else _latest_proposal_id(session_dir)
+    record = _read_proposal_record(session_dir, proposal_id)
+    # Reconstruct a fresh candidate from the stored typed operations and render
+    # a fresh preview. Previews are renderings only and are never verify or
+    # apply authority.
+    raw_groups = record.get("groups", [])
+    proposal = build_proposal(
+        {
+            "proposal_id": record.get("proposal_id"),
+            "title": record.get("title"),
+            "groups": raw_groups,
+        }
+    )
+    base_catalog_text = _session_base_catalog_text(project, session_dir)
+    candidate = reconstruct_candidate(
+        base_catalog_text=base_catalog_text,
+        base_references={},
+        base_overlays={},
+        operations=proposal.operations,
+    )
+    preview = render_review_preview(
+        base_catalog_text=base_catalog_text,
+        base_references={},
+        base_overlays={},
+        candidate=candidate,
+    )
+    _emit_json(
+        {
+            "proposal_id": proposal.proposal_id,
+            "proposal_fingerprint": proposal.fingerprint,
+            "candidate_fingerprint": candidate.fingerprint,
+            "preview_fingerprint": preview.fingerprint,
+            "catalog_patch": preview.catalog_patch,
+            "reference_diffs": [
+                {"path": path, "diff": diff}
+                for path, diff in preview.reference_diffs
+            ],
+            "overlay_diffs": [
+                {"path": path, "diff": diff}
+                for path, diff in preview.overlay_diffs
+            ],
+        }
+    )
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------- #
 # Sample-policy helpers                                                       #
 # --------------------------------------------------------------------------- #
 
@@ -1585,6 +1781,45 @@ def _parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--columns", action="append", default=[])
     export_parser.set_defaults(func=_handle_profile_export_context)
 
+    proposal_parser = subparsers.add_parser(
+        "proposal", help="Import and review typed semantic proposals."
+    )
+    proposal_sub = proposal_parser.add_subparsers(
+        dest="proposal_command", required=True
+    )
+
+    proposal_import_parser = proposal_sub.add_parser(
+        "import",
+        help="Import typed operations and reconstruct a candidate.",
+    )
+    proposal_import_parser.add_argument(
+        "--session-id", dest="session_id", required=True, help="Session id."
+    )
+    proposal_import_parser.add_argument(
+        "--project", help="Project root (default: cwd)."
+    )
+    proposal_import_parser.add_argument(
+        "--proposal",
+        required=True,
+        help="Proposal YAML/JSON file (must be project-contained).",
+    )
+    proposal_import_parser.set_defaults(func=_handle_proposal_import)
+
+    proposal_show_parser = proposal_sub.add_parser(
+        "show",
+        help="Render deterministic review previews for a proposal.",
+    )
+    proposal_show_parser.add_argument(
+        "--session-id", dest="session_id", required=True, help="Session id."
+    )
+    proposal_show_parser.add_argument(
+        "--project", help="Project root (default: cwd)."
+    )
+    proposal_show_parser.add_argument(
+        "--proposal", dest="proposal", help="Proposal id (default: latest)."
+    )
+    proposal_show_parser.set_defaults(func=_handle_proposal_show)
+
     return parser
 
 
@@ -1608,6 +1843,7 @@ def _run(handler: object, args: argparse.Namespace) -> int:
         KnowledgeError,
         ProfilePolicyError,
         DiscoveryError,
+        ProposalError,
     ) as exc:
         _emit_error(exc)
         return EXIT_ERROR
