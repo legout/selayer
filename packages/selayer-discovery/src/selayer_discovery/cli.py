@@ -31,8 +31,11 @@ store touches the filesystem.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import re
+import secrets
 import sys
 import uuid
 from collections.abc import Mapping, Sequence
@@ -48,14 +51,23 @@ from selayer.sources.profiles import (
     MappingProfileResolver,
 )
 from selayer.sources.registry import SourceRegistry
+from selayer_discovery.diagnostics import DiscoveryError
 from selayer_discovery.evidence import (
     MEDIA_TEXT_MARKDOWN,
     MEDIA_TEXT_PLAIN,
     EvidenceError,
     EvidenceStore,
 )
-from selayer_discovery.model import SCHEMA_VERSION
-from selayer_discovery.profiling import ProfileRunner
+from selayer_discovery.model import SCHEMA_VERSION, normalize_actor_identity
+from selayer_discovery.profiling import (
+    ProfilePolicyError,
+    ProfileRunner,
+    SamplePolicy,
+    SourceProfile,
+    activate_policy,
+    build_context_export,
+    propose_policy,
+)
 from selayer_discovery.session import (
     CODE_NOT_INITIALIZED,
     SessionCharter,
@@ -86,6 +98,8 @@ CODE_CHARTER_INVALID = "discovery.cli.charter_invalid"
 CODE_CHARTER_LOAD = "discovery.cli.charter_load_failed"
 CODE_PATH_NOT_CONTAINED = "discovery.cli.path_not_contained"
 CODE_SESSION_ID_INVALID = "discovery.cli.session_id_invalid"
+CODE_PROFILE_LOAD = "discovery.profile.load_failed"
+CODE_PROFILE_SALT = "discovery.profile.salt_missing"
 CODE_INTERNAL = "discovery.cli.internal"
 
 # Stable session-id grammar (mirrors the session node-id shape so an id is safe
@@ -161,6 +175,8 @@ def _error_payload(exc: BaseException) -> dict[str, object]:
         return exc.to_dict()
     if isinstance(exc, SourceError):
         return {"code": exc.code, "source_id": _safe_id(exc.source_id)}
+    if isinstance(exc, (ProfilePolicyError, DiscoveryError)):
+        return exc.to_dict()
     return {"code": CODE_INTERNAL}
 
 
@@ -508,6 +524,225 @@ def _read_stdin_bytes() -> bytes:
 
 
 # --------------------------------------------------------------------------- #
+# Sample-policy helpers                                                       #
+# --------------------------------------------------------------------------- #
+
+#: Policy artifacts (session salt, context export) live inside the Git-ignored
+#: session workspace and never surface in Git-visible output. The salt itself
+#: is never rendered; only its SHA-256 identifier (``salt_id``) appears in a
+#: proposed policy.
+_POLICY_REL = "policy"
+_SALT_NAME = "salt"
+_CONTEXT_PREFIX = "context"
+
+#: A single safe filesystem path component (letters, digits, dot, hyphen,
+#: underscore). Used to derive an export filename from a source id without
+#: ever trusting it as a raw path.
+_SAFE_FILE_RE: re.Pattern[str] = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _policy_dir(session_dir: Path) -> Path:
+    """Return the policy artifact directory for a session."""
+
+    return session_dir / _POLICY_REL
+
+
+def _restrict_file(path: Path) -> None:
+    """Apply owner-only permissions on POSIX (best-effort elsewhere)."""
+
+    if os.name == "posix":
+        os.chmod(path, 0o600)
+
+
+def _salt_path(session_dir: Path) -> Path:
+    """Return the session salt path (inside the ignored workspace)."""
+
+    return _policy_dir(session_dir) / _SALT_NAME
+
+
+def _load_or_create_salt(session_dir: Path) -> bytes:
+    """Load the session salt, generating and persisting it on first use.
+
+    The salt stays in the Git-ignored workspace; only its SHA-256 identifier
+    ever appears in policy output. Created atomically with owner-only
+    permissions so a concurrent reader never observes a partial write.
+    """
+
+    path = _salt_path(session_dir)
+    if path.exists():
+        return path.read_bytes()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    salt = secrets.token_bytes(32)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, salt)
+    finally:
+        os.close(fd)
+    _restrict_file(path)
+    return salt
+
+
+def _load_salt(session_dir: Path) -> bytes:
+    """Load an existing session salt (errors if absent)."""
+
+    path = _salt_path(session_dir)
+    if not path.exists():
+        raise _CliError(CODE_PROFILE_SALT) from None
+    return path.read_bytes()
+
+
+def _safe_file_name(value: str) -> str:
+    """Return a filesystem-safe single path component from ``value``."""
+
+    cleaned = _SAFE_FILE_RE.sub("-", value).strip("-")[:128]
+    return cleaned or "source"
+
+
+def _load_json_mapping(
+    project: Path, raw_path: str, *, kind: str
+) -> dict[str, object]:
+    """Load a JSON mapping from a project-contained path (never leaks content)."""
+
+    abs_path = _assert_contained(project, Path(raw_path), kind=kind)
+    try:
+        with abs_path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        raise _CliError(CODE_PROFILE_LOAD) from None
+    if not isinstance(data, Mapping):
+        raise _CliError(CODE_PROFILE_LOAD) from None
+    return dict(data)
+
+
+def _load_profile_file(project: Path, raw_path: str) -> SourceProfile:
+    """Load a :class:`SourceProfile` from a project-contained JSON file."""
+
+    data = _load_json_mapping(project, raw_path, kind="profile")
+    try:
+        return SourceProfile.from_dict(data)
+    except ProfilePolicyError:
+        raise _CliError(CODE_PROFILE_LOAD) from None
+
+
+def _load_policy_file(project: Path, raw_path: str) -> SamplePolicy:
+    """Load a :class:`SamplePolicy` from a project-contained JSON file."""
+
+    data = _load_json_mapping(project, raw_path, kind="policy")
+    try:
+        return SamplePolicy.from_dict(data)
+    except ProfilePolicyError:
+        raise _CliError(CODE_PROFILE_LOAD) from None
+
+
+def _open_registry(
+    project: Path, session_dir: Path
+) -> tuple[SemanticLayer, duckdb.DuckDBPyConnection, SourceRegistry]:
+    """Open the source catalog and registry for a session."""
+
+    charter = SessionStore.open(session_dir).charter
+    catalog_abs = _assert_contained(
+        project, project / charter.catalog_path, kind="catalog"
+    )
+    layer = SemanticLayer.load(catalog_abs)
+    connection = duckdb.connect(":memory:")
+    registry = SourceRegistry.create(
+        layer,
+        connection,
+        MappingProfileResolver({}),
+        MappingArrowProviderResolver({}),
+    )
+    return layer, connection, registry
+
+
+# --------------------------------------------------------------------------- #
+# Sample-policy command handlers                                             #
+# --------------------------------------------------------------------------- #
+
+
+def _handle_profile_propose_policy(args: argparse.Namespace) -> int:
+    project = _project_root(args.project)
+    session_id = _validate_session_id(args.session_id)
+    session_dir = _require_session(project, session_id)
+    profile = _load_profile_file(project, args.profile)
+    grain = tuple(args.grain)
+    salt = _load_or_create_salt(session_dir)
+    salt_id = hashlib.sha256(salt).hexdigest()
+    policy, classifications = propose_policy(profile, grain, salt_id=salt_id)
+    payload = policy.to_dict()
+    payload["classifications"] = [item.to_dict() for item in classifications]
+    _emit_json(payload)
+    return EXIT_OK
+
+
+def _handle_profile_activate_policy(args: argparse.Namespace) -> int:
+    project = _project_root(args.project)
+    session_id = _validate_session_id(args.session_id)
+    session_dir = _require_session(project, session_id)
+    profile = _load_profile_file(project, args.profile)
+    policy = _load_policy_file(project, args.policy)
+    charter = SessionStore.open(session_dir).charter
+    approver = normalize_actor_identity(args.approver or charter.approver)
+    activated_at = args.activated_at or ""
+    activation = activate_policy(
+        policy,
+        profile,
+        session_id=session_id,
+        approver=approver,
+        activated_at=activated_at,
+    )
+    _emit_json(activation.to_dict())
+    return EXIT_OK
+
+
+def _handle_profile_export_context(args: argparse.Namespace) -> int:
+    project = _project_root(args.project)
+    project_abs = project.resolve()
+    session_id = _validate_session_id(args.session_id)
+    session_dir = _require_session(project, session_id)
+    profile = _load_profile_file(project, args.profile)
+    policy = _load_policy_file(project, args.policy)
+    salt = _load_salt(session_dir)
+    _, _, registry = _open_registry(project, session_dir)
+    try:
+        with registry.open_scan_session(
+            args.source_id,
+            columns=tuple(args.columns),
+            batch_size=args.batch_size,
+        ) as session:
+            export = build_context_export(
+                session, policy, profile, salt, session_id=session_id
+            )
+    finally:
+        registry.close()
+    out_dir = _policy_dir(session_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{_CONTEXT_PREFIX}-{_safe_file_name(args.source_id)}.json"
+    fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, json.dumps(export.to_dict(), sort_keys=True).encode("utf-8"))
+    finally:
+        os.close(fd)
+    _restrict_file(out_path)
+    _emit_json(
+        {
+            "session_id": session_id,
+            "source_id": export.source_id,
+            "path": out_path.relative_to(project_abs).as_posix(),
+            "fingerprint": export.fingerprint,
+            "policy_fingerprint": export.policy_fingerprint,
+            "profile_fingerprint": export.profile_fingerprint,
+            "schema_fingerprint": export.schema_fingerprint,
+            "snapshot_id": export.snapshot_id,
+            "row_count": export.row_count,
+            "field_count": export.field_count,
+            "bytes": export.bytes,
+            "canary_scan": export.canary_scan,
+        }
+    )
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------- #
 # Argument parser                                                             #
 # --------------------------------------------------------------------------- #
 
@@ -631,6 +866,39 @@ def _parser() -> argparse.ArgumentParser:
     scan_parser.add_argument("--columns", action="append", default=[])
     scan_parser.set_defaults(func=_handle_profile_scan)
 
+    propose_parser = profile_sub.add_parser(
+        "propose-policy", help="Propose a conservative sample policy."
+    )
+    propose_parser.add_argument("--session-id", required=True)
+    propose_parser.add_argument("--project", help="Project root (default: cwd).")
+    propose_parser.add_argument("--profile", required=True)
+    propose_parser.add_argument("--grain", action="append", default=[])
+    propose_parser.set_defaults(func=_handle_profile_propose_policy)
+
+    activate_parser = profile_sub.add_parser(
+        "activate-policy", help="Activate a named sample policy."
+    )
+    activate_parser.add_argument("--session-id", required=True)
+    activate_parser.add_argument("--project", help="Project root (default: cwd).")
+    activate_parser.add_argument("--profile", required=True)
+    activate_parser.add_argument("--policy", required=True)
+    activate_parser.add_argument("--approver")
+    activate_parser.add_argument("--activated-at", default="")
+    activate_parser.set_defaults(func=_handle_profile_activate_policy)
+
+    export_parser = profile_sub.add_parser(
+        "export-context", help="Export bounded transformed context metadata."
+    )
+    export_parser.add_argument("--session-id", required=True)
+    export_parser.add_argument("--source-id", required=True)
+    export_parser.add_argument("--project", help="Project root (default: cwd).")
+    export_parser.add_argument("--profile", required=True)
+    export_parser.add_argument("--policy", required=True)
+    export_parser.add_argument("--timeout", type=float, default=900.0)
+    export_parser.add_argument("--batch-size", type=int, default=1024)
+    export_parser.add_argument("--columns", action="append", default=[])
+    export_parser.set_defaults(func=_handle_profile_export_context)
+
     return parser
 
 
@@ -646,7 +914,13 @@ def _run(handler: object, args: argparse.Namespace) -> int:
         return handler(args)  # type: ignore[operator]
     except SystemExit:
         raise
-    except (SessionError, EvidenceError, _CliError) as exc:
+    except (
+        SessionError,
+        EvidenceError,
+        _CliError,
+        ProfilePolicyError,
+        DiscoveryError,
+    ) as exc:
         _emit_error(exc)
         return EXIT_ERROR
     except Exception:
