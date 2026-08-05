@@ -59,6 +59,10 @@ from selayer_discovery.evidence import (
     EvidenceError,
     EvidenceStore,
 )
+from selayer_discovery.interview import (
+    InterviewError,
+    InterviewStore,
+)
 from selayer_discovery.knowledge import (
     CODE_KNOWLEDGE_DUPLICATE_PROVIDER,
     CODE_KNOWLEDGE_PROVIDER_UNKNOWN,
@@ -183,6 +187,8 @@ def _error_payload(exc: BaseException) -> dict[str, object]:
     if isinstance(exc, SessionError):
         return exc.to_dict()
     if isinstance(exc, EvidenceError):
+        return exc.to_dict()
+    if isinstance(exc, InterviewError):
         return exc.to_dict()
     if isinstance(exc, KnowledgeError):
         return exc.to_dict()
@@ -463,8 +469,12 @@ def _require_session(project: Path, session_id: str) -> Path:
 
 _PROVIDER_CONFIG_KEY_RE = re.compile(r"\A[a-z][a-z0-9_.-]{0,63}\Z")
 _ENV_REF_RE = re.compile(r"\A[A-Z][A-Z0-9_]{0,127}\Z")
-_SECRET_KEY_PARTS = frozenset({"password", "passwd", "token", "secret", "credential", "apikey", "private_key"})
-_FORBIDDEN_PROVIDER_KEYS = frozenset({"command", "executable", "shell", "subprocess", "process"})
+_SECRET_KEY_PARTS = frozenset(
+    {"password", "passwd", "token", "secret", "credential", "apikey", "private_key"}
+)
+_FORBIDDEN_PROVIDER_KEYS = frozenset(
+    {"command", "executable", "shell", "subprocess", "process"}
+)
 
 
 def _parse_assignments(values: Sequence[str]) -> dict[str, str]:
@@ -497,22 +507,30 @@ def _validate_provider_configuration(
     if _PROVIDER_CONFIG_KEY_RE.match(provider_name) is None:
         raise KnowledgeError("discovery.knowledge.invalid_configuration") from None
     if _PROVIDER_CONFIG_KEY_RE.match(provider_type) is None:
-        raise KnowledgeError(CODE_KNOWLEDGE_PROVIDER_UNKNOWN, safe_provider=provider_type) from None
+        raise KnowledgeError(
+            CODE_KNOWLEDGE_PROVIDER_UNKNOWN, safe_provider=provider_type
+        ) from None
     if provider_type not in ProviderRegistry.discover_types():
-        raise KnowledgeError(CODE_KNOWLEDGE_PROVIDER_UNKNOWN, safe_provider=provider_type) from None
+        raise KnowledgeError(
+            CODE_KNOWLEDGE_PROVIDER_UNKNOWN, safe_provider=provider_type
+        ) from None
     parsed_options = _parse_assignments(options)
     parsed_env = _parse_assignments(env_refs)
     safe_options: dict[str, object] = {}
     for key, value in parsed_options.items():
         lowered = key.lower()
-        if lowered in _FORBIDDEN_PROVIDER_KEYS or any(part in lowered for part in _SECRET_KEY_PARTS):
+        if lowered in _FORBIDDEN_PROVIDER_KEYS or any(
+            part in lowered for part in _SECRET_KEY_PARTS
+        ):
             raise KnowledgeError("discovery.knowledge.invalid_configuration") from None
         if "://" in value or "@" in value or "\\x00" in value:
             raise KnowledgeError("discovery.knowledge.invalid_configuration") from None
         safe_options[key] = value
     safe_env: dict[str, str] = {}
     for key, value in parsed_env.items():
-        if key.lower() in _FORBIDDEN_PROVIDER_KEYS or any(part in key.lower() for part in _SECRET_KEY_PARTS):
+        if key.lower() in _FORBIDDEN_PROVIDER_KEYS or any(
+            part in key.lower() for part in _SECRET_KEY_PARTS
+        ):
             raise KnowledgeError("discovery.knowledge.invalid_configuration") from None
         if _ENV_REF_RE.match(value) is None:
             raise KnowledgeError("discovery.knowledge.invalid_configuration") from None
@@ -634,7 +652,9 @@ def _handle_intake_snapshot(args: argparse.Namespace) -> int:
             raise KnowledgeError("discovery.knowledge.invalid_resource") from None
         if _PROVIDER_CONFIG_KEY_RE.match(provider_name) is None:
             raise KnowledgeError("discovery.knowledge.invalid_resource") from None
-        if resource_id.count(":") != 1 or not resource_id.startswith(f"{provider_name}:"):
+        if resource_id.count(":") != 1 or not resource_id.startswith(
+            f"{provider_name}:"
+        ):
             raise KnowledgeError("discovery.knowledge.invalid_resource") from None
         if _HEX64_RE.match(revision) is None:
             raise KnowledgeError("discovery.knowledge.invalid_resource") from None
@@ -649,7 +669,9 @@ def _handle_intake_snapshot(args: argparse.Namespace) -> int:
             raise KnowledgeError(
                 CODE_KNOWLEDGE_PROVIDER_UNKNOWN, safe_provider=provider_name
             ) from None
-        source = args.source or f"provider/{provider_name}/{_safe_file_name(resource_id)}"
+        source = (
+            args.source or f"provider/{provider_name}/{_safe_file_name(resource_id)}"
+        )
     else:
         source = args.source
         if not source:
@@ -694,6 +716,120 @@ def _read_stdin_bytes() -> bytes:
     if handle is None:
         raise EvidenceError("discovery.evidence.invalid_encoding") from None
     return handle.read()
+
+
+# --------------------------------------------------------------------------- #
+# Interview handlers                                                         #
+# --------------------------------------------------------------------------- #
+
+#: Interview store lives inside the Git-ignored session workspace.
+_INTERVIEW_REL = "interview"
+
+
+def _interview_root(session_dir: Path) -> Path:
+    """Return the interview store root for a session directory."""
+
+    return session_dir / _INTERVIEW_REL
+
+
+def _interview_actor(store: SessionStore, override: str | None) -> str:
+    """Return the normalized actor (override or charter approver)."""
+
+    return override if override else store.charter.approver
+
+
+def _json_str_field(data: Mapping[str, object], key: str) -> str:
+    """Extract a string field from a loaded JSON mapping (default empty)."""
+
+    value = data.get(key, "")
+    return value if type(value) is str else ""
+
+
+def _json_seq_field(data: Mapping[str, object], key: str) -> list[str]:
+    """Extract a string-list field from a loaded JSON mapping (default empty)."""
+
+    value = data.get(key)
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, str)]
+    return []
+
+
+def _handle_interview_ask(args: argparse.Namespace) -> int:
+    project = _project_root(args.project)
+    session_id = _validate_session_id(args.session_id)
+    session_dir = _require_session(project, session_id)
+    store = SessionStore.open(session_dir)
+    data = _load_json_mapping(project, args.question, kind="question")
+    interview = InterviewStore.create(store)
+    actor = _interview_actor(store, args.actor)
+    question = interview.ask(
+        gate=_json_str_field(data, "gate"),
+        text=_json_str_field(data, "text"),
+        evidence_ids=_json_seq_field(data, "evidence_ids"),
+        subjects=_json_seq_field(data, "subjects"),
+        actor=actor,
+    )
+    _emit_json(question.safe_dict())
+    return EXIT_OK
+
+
+def _handle_interview_answer(args: argparse.Namespace) -> int:
+    project = _project_root(args.project)
+    session_id = _validate_session_id(args.session_id)
+    session_dir = _require_session(project, session_id)
+    store = SessionStore.open(session_dir)
+    data = _load_json_mapping(project, args.answer, kind="answer")
+    interview = InterviewStore.create(store)
+    actor = _interview_actor(store, args.actor)
+    result = interview.answer(
+        gate=_json_str_field(data, "gate"),
+        text=_json_str_field(data, "text"),
+        actor=actor,
+    )
+    payload = result.answer.safe_dict()
+    payload["stale_targets"] = list(result.stale_targets)
+    _emit_json(payload)
+    return EXIT_OK
+
+
+def _handle_interview_correct(args: argparse.Namespace) -> int:
+    project = _project_root(args.project)
+    session_id = _validate_session_id(args.session_id)
+    session_dir = _require_session(project, session_id)
+    store = SessionStore.open(session_dir)
+    data = _load_json_mapping(project, args.correction, kind="correction")
+    interview = InterviewStore.create(store)
+    actor = _interview_actor(store, args.actor)
+    result = interview.correct(
+        answer_id=_json_str_field(data, "answer_id"),
+        reason=_json_str_field(data, "reason"),
+        replacement=_json_str_field(data, "replacement"),
+        actor=actor,
+    )
+    payload = result.correction.safe_dict()
+    payload["stale_targets"] = list(result.stale_targets)
+    _emit_json(payload)
+    return EXIT_OK
+
+
+def _handle_interview_set_gate(args: argparse.Namespace) -> int:
+    project = _project_root(args.project)
+    session_id = _validate_session_id(args.session_id)
+    session_dir = _require_session(project, session_id)
+    store = SessionStore.open(session_dir)
+    data = _load_json_mapping(project, args.disposition, kind="gate_disposition")
+    interview = InterviewStore.create(store)
+    actor = _interview_actor(store, args.actor)
+    record = interview.set_gate(
+        gate=args.gate,
+        disposition=_json_str_field(data, "disposition"),
+        reason=_json_str_field(data, "reason") or None,
+        conflict_ids=_json_seq_field(data, "conflict_ids"),
+        affected_group_ids=_json_seq_field(data, "affected_group_ids"),
+        actor=actor,
+    )
+    _emit_json(record.safe_dict())
+    return EXIT_OK
 
 
 # --------------------------------------------------------------------------- #
@@ -780,7 +916,10 @@ def _activation_path(session_dir: Path, source_id: str) -> Path:
     missing or changed binding fails closed.
     """
 
-    return _policy_dir(session_dir) / f"{_ACTIVATION_PREFIX}-{_safe_file_name(source_id)}.json"
+    return (
+        _policy_dir(session_dir)
+        / f"{_ACTIVATION_PREFIX}-{_safe_file_name(source_id)}.json"
+    )
 
 
 def _write_activation(
@@ -799,9 +938,7 @@ def _write_activation(
     return path
 
 
-def _load_activation(
-    session_dir: Path, source_id: str
-) -> PolicyActivation | None:
+def _load_activation(session_dir: Path, source_id: str) -> PolicyActivation | None:
     """Load a persisted activation for ``source_id`` (``None`` if absent)."""
 
     path = _activation_path(session_dir, source_id)
@@ -876,7 +1013,9 @@ def _session_context_bytes_used(session_dir: Path) -> int:
     for entry in policy_dir.iterdir():
         if not entry.is_file():
             continue
-        if not entry.name.startswith(f"{_CONTEXT_PREFIX}-") or not entry.name.endswith(".json"):
+        if not entry.name.startswith(f"{_CONTEXT_PREFIX}-") or not entry.name.endswith(
+            ".json"
+        ):
             continue
         try:
             with entry.open("r", encoding="utf-8") as handle:
@@ -1023,9 +1162,7 @@ def _handle_profile_export_context(args: argparse.Namespace) -> int:
     # persisted activation.
     activation = _load_activation(session_dir, args.source_id)
     if activation is None:
-        raise ProfilePolicyError(
-            CODE_PROFILE_STALE, safe_detail="activation"
-        ) from None
+        raise ProfilePolicyError(CODE_PROFILE_STALE, safe_detail="activation") from None
     approver = _normalized_approver(session_dir, None)
     verify_activation(
         activation,
@@ -1164,9 +1301,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     provider_parser.add_argument("--session-id", required=True)
     provider_parser.add_argument("--project", help="Project root (default: cwd).")
-    provider_parser.add_argument("--name", required=True, help="Configured provider name.")
+    provider_parser.add_argument(
+        "--name", required=True, help="Configured provider name."
+    )
     provider_parser.add_argument("--type", dest="provider_type", required=True)
-    provider_parser.add_argument("--root", help="Contained root for filesystem providers.")
+    provider_parser.add_argument(
+        "--root", help="Contained root for filesystem providers."
+    )
     provider_parser.add_argument("--option", action="append", default=[])
     provider_parser.add_argument("--env", action="append", default=[])
     provider_parser.add_argument("--actor")
@@ -1180,8 +1321,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     snapshot_parser.add_argument("--project", help="Project root (default: cwd).")
     snapshot_parser.add_argument("--source", help="Source label for the snapshot.")
-    snapshot_parser.add_argument("--provider", help="Provider name for a provider snapshot.")
-    snapshot_parser.add_argument("--resource-id", help="Namespaced provider resource id.")
+    snapshot_parser.add_argument(
+        "--provider", help="Provider name for a provider snapshot."
+    )
+    snapshot_parser.add_argument(
+        "--resource-id", help="Namespaced provider resource id."
+    )
     snapshot_parser.add_argument("--revision", help="Immutable provider revision hash.")
     snapshot_parser.add_argument("--selector", help="Bounded provider selector.")
     snapshot_parser.add_argument("--actor")
@@ -1192,6 +1337,70 @@ def _parser() -> argparse.ArgumentParser:
         help="Media type (text/markdown or text/plain).",
     )
     snapshot_parser.set_defaults(func=_handle_intake_snapshot)
+
+    interview_parser = subparsers.add_parser(
+        "interview", help="Record adaptive interview gates and corrections."
+    )
+    interview_sub = interview_parser.add_subparsers(
+        dest="interview_command", required=True
+    )
+
+    ask_parser = interview_sub.add_parser(
+        "ask", help="Open a question citing one gate and motivating evidence."
+    )
+    ask_parser.add_argument(
+        "--session-id", dest="session_id", required=True, help="Session id."
+    )
+    ask_parser.add_argument("--project", help="Project root (default: cwd).")
+    ask_parser.add_argument(
+        "--question", required=True, help="Question JSON file (project-contained)."
+    )
+    ask_parser.add_argument("--actor", help="Actor identity (default: approver).")
+    ask_parser.set_defaults(func=_handle_interview_ask)
+
+    answer_parser = interview_sub.add_parser(
+        "answer", help="Record an answer to a gate and dispose it as answered."
+    )
+    answer_parser.add_argument(
+        "--session-id", dest="session_id", required=True, help="Session id."
+    )
+    answer_parser.add_argument("--project", help="Project root (default: cwd).")
+    answer_parser.add_argument(
+        "--answer", required=True, help="Answer JSON file (project-contained)."
+    )
+    answer_parser.add_argument("--actor", help="Actor identity (default: approver).")
+    answer_parser.set_defaults(func=_handle_interview_answer)
+
+    correct_parser = interview_sub.add_parser(
+        "correct", help="Supersede a current answer with a typed correction."
+    )
+    correct_parser.add_argument(
+        "--session-id", dest="session_id", required=True, help="Session id."
+    )
+    correct_parser.add_argument("--project", help="Project root (default: cwd).")
+    correct_parser.add_argument(
+        "--correction",
+        required=True,
+        help="Correction JSON file (project-contained).",
+    )
+    correct_parser.add_argument("--actor", help="Actor identity (default: approver).")
+    correct_parser.set_defaults(func=_handle_interview_correct)
+
+    set_gate_parser = interview_sub.add_parser(
+        "set-gate", help="Record a terminal gate disposition."
+    )
+    set_gate_parser.add_argument(
+        "--session-id", dest="session_id", required=True, help="Session id."
+    )
+    set_gate_parser.add_argument("--project", help="Project root (default: cwd).")
+    set_gate_parser.add_argument("--gate", required=True, help="Gate id.")
+    set_gate_parser.add_argument(
+        "--disposition",
+        required=True,
+        help="Disposition JSON file (project-contained).",
+    )
+    set_gate_parser.add_argument("--actor", help="Actor identity (default: approver).")
+    set_gate_parser.set_defaults(func=_handle_interview_set_gate)
 
     profile_parser = subparsers.add_parser(
         "profile", help="Profile a bounded source scan."
@@ -1260,6 +1469,7 @@ def _run(handler: object, args: argparse.Namespace) -> int:
     except (
         SessionError,
         EvidenceError,
+        InterviewError,
         _CliError,
         KnowledgeError,
         ProfilePolicyError,
