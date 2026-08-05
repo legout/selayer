@@ -2614,16 +2614,43 @@ def _snapshots_reopenable(
 ) -> bool:
     """Return whether every referenced snapshot content exists and reopens.
 
-    Uses the content-addressed :meth:`EvidenceStore.snapshot_path` to confirm
-    the on-disk snapshot backing each retained selector is present. This is a
-    live/non-reopenable check (path existence only); it never reads a body or
-    value and never duplicates the physical audit.
+    Reopens each retained selector's content-addressed snapshot via
+    :meth:`EvidenceStore.reopen_snapshot`, which verifies the on-disk bytes
+    are a regular file within the configured size bound and that the re-hash
+    matches the recorded content hash. A missing, unreadable, oversized, or
+    tampered snapshot fails closed. This is a genuine reopenability check, not
+    a path-existence probe, yet it never reads or surfaces a body or value and
+    never duplicates the physical audit.
     """
 
     for claim in claims:
         for selector in claim.selectors:
-            if not evidence_store.snapshot_path(selector.content_hash).is_file():
+            try:
+                evidence_store.reopen_snapshot(selector.content_hash)
+            except Exception:  # noqa: BLE001
                 return False
+    return True
+
+
+def _claims_declared_selectors_present(
+    claims: Sequence[ClaimRecord],
+) -> bool:
+    """Return whether every current non-inferred claim carries its selectors.
+
+    A legacy or tampered journal payload may declare ``selector_kinds`` while
+    persisting no typed ``selectors``. Such a record cannot be revalidated
+    against the current evidence revision, so readiness must fail closed
+    rather than vacuously passing the selector gates over an empty tuple.
+    """
+
+    for claim in claims:
+        if (
+            claim.state == "current"
+            and claim.evidence_class != "inferred"
+            and claim.selector_kinds
+            and not claim.selectors
+        ):
+            return False
     return True
 
 
@@ -2664,6 +2691,13 @@ def _group_readiness(
         )
         if not has_current_non_inferred:
             blockers.append("claim_inferred_only")
+        # A current non-inferred claim that declares selector kinds but
+        # carries no persisted selectors (a legacy/tampered journal payload)
+        # cannot be revalidated against the evidence revision: fail closed
+        # with the stable selector code rather than vacuously passing the
+        # selector gates over an empty tuple.
+        if not _claims_declared_selectors_present(supporting):
+            blockers.append("evidence_selector_stale")
         # Revalidate every retained supporting selector against the current
         # evidence revision: a stale or missing selector blocks readiness.
         if evidence_store is not None and not _selectors_current(

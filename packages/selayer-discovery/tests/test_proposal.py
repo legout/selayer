@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -3220,6 +3221,117 @@ class TestEvidenceReadinessGates:
         readiness = bundle.readiness_for("group-001")
         assert readiness.ready is True
         assert readiness.blockers == ()
+
+    def test_tampered_evidence_snapshot_blocks_readiness(
+        self,
+        catalog_dir: Path,
+        base_catalog_text: str,
+        tmp_path: Path,
+    ) -> None:
+        # Overwriting a content-addressed snapshot with different bytes must
+        # block readiness: the snapshot "exists" but no longer reopens to the
+        # recorded content hash, so the reopenability gate fails closed.
+        _init_session(catalog_dir)
+        session_store, evidence, claims, interview = TestReadiness._stores(
+            catalog_dir
+        )
+        actor = session_store.charter.approver
+        claim = TestReadiness._add_observed_claim(
+            claims, evidence, session_store, tmp_path, actor
+        )
+        interview.answer(gate="gate-grains", text="Yes.", actor=actor)
+        orders_path = catalog_dir / "data" / "orders.parquet"
+        op = _source_grain_edit_op(
+            before=_orders_source(str(orders_path), ["id"]),
+        )
+        mapping = _proposal_mapping(
+            groups=[
+                _group(
+                    title="Edit order grain",
+                    rationale="Grain revision.",
+                    operations=[op],
+                )
+            ]
+        )
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        # Tamper: overwrite the snapshot bytes so the content hash no longer
+        # matches its content-addressed filename.
+        evidence.snapshot_path(claim.selectors[0].content_hash).write_bytes(
+            b"tampered snapshot bytes\n"
+        )
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+            interview_store=interview,
+            claim_store=claims,
+            evidence_store=evidence,
+        )
+        readiness = bundle.readiness_for("group-001")
+        assert readiness.ready is False
+        assert "evidence_not_reopenable" in readiness.blockers
+
+    def test_legacy_claim_without_selectors_blocks_readiness(
+        self,
+        catalog_dir: Path,
+        base_catalog_text: str,
+        tmp_path: Path,
+    ) -> None:
+        # A legacy journal payload may declare selector_kinds but persist no
+        # typed selectors (pre-typed-selector format). Such a claim cannot be
+        # revalidated against the evidence revision: readiness fails closed
+        # with evidence_selector_stale rather than vacuously passing the
+        # selector gates over an empty tuple.
+        _init_session(catalog_dir)
+        session_store, evidence, claims, interview = TestReadiness._stores(
+            catalog_dir
+        )
+        actor = session_store.charter.approver
+        # Inject a legacy claim journal line: selector_kinds nonempty but no
+        # persisted ``selectors`` field, then reopen the store to reconstruct.
+        legacy_payload = {
+            "claim_id": "claim-legacy",
+            "subject": "source.shopfloor.orders",
+            "statement": "A legacy claim with no persisted selectors.",
+            "evidence_class": "observed",
+            "creator_event": "answer-gate-grain",
+            "contradicts": [],
+            "selector_kinds": ["document_line_range"],
+            "actor": actor,
+            "timestamp": datetime.now(UTC).isoformat(timespec="microseconds"),
+            "state": "current",
+        }
+        journal = claims.root / "claims.jsonl"
+        with journal.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(legacy_payload, sort_keys=True) + "\n")
+        from selayer_discovery.evidence import ClaimStore
+
+        claims = ClaimStore.open(session_store, evidence)
+        legacy = claims.get_claim("claim-legacy")
+        assert legacy.selector_kinds == ("document_line_range",)
+        assert legacy.selectors == ()
+        interview.answer(gate="gate-grains", text="Yes.", actor=actor)
+        mapping = _proposal_mapping(
+            groups=[_group(supporting_claim_ids=["claim-legacy"])]
+        )
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+            interview_store=interview,
+            claim_store=claims,
+            evidence_store=evidence,
+        )
+        readiness = bundle.readiness_for("group-001")
+        assert readiness.ready is False
+        assert "evidence_selector_stale" in readiness.blockers
 
 
 # --------------------------------------------------------------------------- #

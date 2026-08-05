@@ -749,6 +749,38 @@ class EvidenceStore:
             raise EvidenceError(CODE_EVIDENCE_NOT_FOUND) from None
         return self._snapshots / content_hash
 
+    def reopen_snapshot(self, content_hash: str) -> None:
+        """Reopen and verify a content-addressed snapshot by content hash.
+
+        Confirms the on-disk snapshot backing ``content_hash`` is a regular
+        file, reads at most ``max_document_bytes + 1`` bytes, and verifies the
+        re-hash matches ``content_hash``. Fails safely (raising
+        :class:`EvidenceError`) when the snapshot is missing, unreadable,
+        oversized, or tampered (the on-disk hash differs). This is a genuine
+        reopenability check -- never a mere path-existence probe -- yet it
+        never exposes a path, body, or raw exception cause: only stable
+        evidence error codes surface.
+        """
+
+        if type(content_hash) is not str or _HEX64_RE.match(content_hash) is None:
+            raise EvidenceError(CODE_EVIDENCE_NOT_FOUND) from None
+        target = self._snapshots / content_hash
+        try:
+            info = os.stat(target)
+        except OSError:
+            raise EvidenceError(CODE_EVIDENCE_NOT_FOUND) from None
+        if not stat.S_ISREG(info.st_mode):
+            raise EvidenceError(CODE_EVIDENCE_NOT_REGULAR) from None
+        try:
+            with target.open("rb") as handle:
+                raw = handle.read(self._limits.max_document_bytes + 1)
+        except OSError:
+            raise EvidenceError(CODE_EVIDENCE_STORE_CORRUPT) from None
+        if len(raw) > self._limits.max_document_bytes:
+            raise EvidenceError(CODE_EVIDENCE_TOO_LARGE) from None
+        if _content_hash(raw) != content_hash:
+            raise EvidenceError(CODE_EVIDENCE_STORE_CORRUPT) from None
+
     def total_bytes(self) -> int:
         """Return the cumulative size of all distinct snapshots."""
 

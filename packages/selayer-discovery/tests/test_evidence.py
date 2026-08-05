@@ -44,6 +44,7 @@ from selayer_discovery.evidence import (
     CODE_EVIDENCE_PATH_TOO_DEEP,
     CODE_EVIDENCE_SELECTOR_OUT_OF_RANGE,
     CODE_EVIDENCE_SELECTOR_STALE,
+    CODE_EVIDENCE_STORE_CORRUPT,
     CODE_EVIDENCE_TOO_LARGE,
     CODE_EVIDENCE_TOO_MANY,
     CODE_EVIDENCE_UNSUPPORTED_SUFFIX,
@@ -480,6 +481,73 @@ def test_add_snapshot_rejects_credential_and_url_sources(tmp_path: Path) -> None
         with pytest.raises(EvidenceError) as raised:
             store.add_snapshot(b"x\n", media_type=MEDIA_TEXT_PLAIN, source=bad)
         assert raised.value.code == CODE_EVIDENCE_INVALID_SOURCE
+
+
+# --------------------------------------------------------------------------- #
+# Task 17 re-review: bounded snapshot reopenability                          #
+# --------------------------------------------------------------------------- #
+
+
+def test_reopen_snapshot_passes_for_valid_content(tmp_path: Path) -> None:
+    store = EvidenceStore.create(tmp_path / "evidence")
+    record = store.add_snapshot(
+        b"payload\n", media_type=MEDIA_TEXT_PLAIN, source="s1"
+    )
+    # A valid, untouched content-addressed snapshot reopens without raising.
+    store.reopen_snapshot(record.content_hash)
+
+
+def test_reopen_snapshot_rejects_tampered_content(tmp_path: Path) -> None:
+    store = EvidenceStore.create(tmp_path / "evidence")
+    record = store.add_snapshot(
+        b"payload\n", media_type=MEDIA_TEXT_PLAIN, source="s1"
+    )
+    # Overwrite the content-addressed snapshot with different bytes: the
+    # re-hash no longer matches the recorded content_hash (tampering).
+    store.snapshot_path(record.content_hash).write_bytes(b"tampered different\n")
+    with pytest.raises(EvidenceError) as raised:
+        store.reopen_snapshot(record.content_hash)
+    assert raised.value.code == CODE_EVIDENCE_STORE_CORRUPT
+
+
+def test_reopen_snapshot_rejects_missing_file(tmp_path: Path) -> None:
+    store = EvidenceStore.create(tmp_path / "evidence")
+    # A well-formed hash with no backing snapshot fails safely as not found.
+    with pytest.raises(EvidenceError) as raised:
+        store.reopen_snapshot("0" * 64)
+    assert raised.value.code == CODE_EVIDENCE_NOT_FOUND
+
+
+def test_reopen_snapshot_rejects_oversized_file(tmp_path: Path) -> None:
+    store = EvidenceStore.create(
+        tmp_path / "evidence", limits=EvidenceLimits(max_document_bytes=8)
+    )
+    record = store.add_snapshot(
+        b"short\n", media_type=MEDIA_TEXT_PLAIN, source="s1"
+    )
+    # Grow the snapshot past the configured bound in place; the bounded read
+    # catches the overflow before any hash comparison.
+    store.snapshot_path(record.content_hash).write_bytes(b"x" * 16)
+    with pytest.raises(EvidenceError) as raised:
+        store.reopen_snapshot(record.content_hash)
+    assert raised.value.code == CODE_EVIDENCE_TOO_LARGE
+
+
+def test_reopen_snapshot_never_exposes_path_or_body(tmp_path: Path) -> None:
+    store = EvidenceStore.create(tmp_path / "evidence")
+    record = store.add_snapshot(
+        b"SECRET-MARKER\n", media_type=MEDIA_TEXT_PLAIN, source="s1"
+    )
+    store.snapshot_path(record.content_hash).write_bytes(b"tampered\n")
+    with pytest.raises(EvidenceError) as raised:
+        store.reopen_snapshot(record.content_hash)
+    rendered = repr(raised.value) + json.dumps(
+        raised.value.to_dict(), sort_keys=True
+    )
+    # Neither the on-disk path nor any body bytes surface in the diagnostic.
+    assert str(store.snapshot_path(record.content_hash)) not in rendered
+    assert "tampered" not in rendered
+    assert "SECRET-MARKER" not in rendered
 
 
 # --------------------------------------------------------------------------- #
