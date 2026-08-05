@@ -550,6 +550,34 @@ def test_reopen_snapshot_never_exposes_path_or_body(tmp_path: Path) -> None:
     assert "SECRET-MARKER" not in rendered
 
 
+def test_reopen_snapshot_rejects_symlink_to_valid_external_file(
+    tmp_path: Path,
+) -> None:
+    store = EvidenceStore.create(tmp_path / "evidence")
+    record = store.add_snapshot(
+        b"payload\n", media_type=MEDIA_TEXT_PLAIN, source="s1"
+    )
+    # Copy the genuine (normalized) snapshot bytes to an external file whose
+    # content hashes to the recorded content_hash, then replace the snapshot
+    # path with a symlink to it. A symlink-following stat would read this
+    # external file and the hash check would pass -- a silent substitution.
+    snapshot = store.snapshot_path(record.content_hash)
+    genuine = snapshot.read_bytes()
+    external = tmp_path / "external.bin"
+    external.write_bytes(genuine)
+    snapshot.unlink()
+    snapshot.symlink_to(external)
+    with pytest.raises(EvidenceError) as raised:
+        store.reopen_snapshot(record.content_hash)
+    assert raised.value.code == CODE_EVIDENCE_NOT_REGULAR
+    # The symlink target path and the substituted body never surface.
+    rendered = repr(raised.value) + json.dumps(
+        raised.value.to_dict(), sort_keys=True
+    )
+    assert str(external) not in rendered
+    assert "payload" not in rendered
+
+
 # --------------------------------------------------------------------------- #
 # Secrecy: no body in repr, diagnostics, or JSON                              #
 # --------------------------------------------------------------------------- #

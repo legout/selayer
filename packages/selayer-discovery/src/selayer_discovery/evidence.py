@@ -753,23 +753,30 @@ class EvidenceStore:
         """Reopen and verify a content-addressed snapshot by content hash.
 
         Confirms the on-disk snapshot backing ``content_hash`` is a regular
-        file, reads at most ``max_document_bytes + 1`` bytes, and verifies the
-        re-hash matches ``content_hash``. Fails safely (raising
-        :class:`EvidenceError`) when the snapshot is missing, unreadable,
-        oversized, or tampered (the on-disk hash differs). This is a genuine
-        reopenability check -- never a mere path-existence probe -- yet it
-        never exposes a path, body, or raw exception cause: only stable
-        evidence error codes surface.
+        file (inspected with ``lstat`` so a substituted symlink is never
+        followed), reads at most ``max_document_bytes + 1`` bytes, and verifies
+        the re-hash matches ``content_hash``. Fails safely (raising
+        :class:`EvidenceError`) when the snapshot is missing, a symlink or
+        non-regular file, unreadable, oversized, or tampered (the on-disk hash
+        differs). This is a genuine reopenability check -- never a mere
+        path-existence probe -- yet it never exposes a path, body, or raw
+        exception cause: only stable evidence error codes surface.
         """
 
         if type(content_hash) is not str or _HEX64_RE.match(content_hash) is None:
             raise EvidenceError(CODE_EVIDENCE_NOT_FOUND) from None
         target = self._snapshots / content_hash
         try:
-            info = os.stat(target)
+            info = os.lstat(target)
         except OSError:
             raise EvidenceError(CODE_EVIDENCE_NOT_FOUND) from None
-        if not stat.S_ISREG(info.st_mode):
+        mode = info.st_mode
+        # Reject symbolic links explicitly (lstat does not follow them),
+        # mirroring _preflight_stat, so a symlink swapped in for the snapshot
+        # cannot be resolved and read as a substitute.
+        if stat.S_ISLNK(mode):
+            raise EvidenceError(CODE_EVIDENCE_NOT_REGULAR) from None
+        if not stat.S_ISREG(mode):
             raise EvidenceError(CODE_EVIDENCE_NOT_REGULAR) from None
         try:
             with target.open("rb") as handle:
