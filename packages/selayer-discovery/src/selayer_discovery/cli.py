@@ -598,9 +598,7 @@ def _safe_file_name(value: str) -> str:
     return cleaned or "source"
 
 
-def _load_json_mapping(
-    project: Path, raw_path: str, *, kind: str
-) -> dict[str, object]:
+def _load_json_mapping(project: Path, raw_path: str, *, kind: str) -> dict[str, object]:
     """Load a JSON mapping from a project-contained path (never leaks content)."""
 
     abs_path = _assert_contained(project, Path(raw_path), kind=kind)
@@ -806,9 +804,7 @@ def _parser() -> argparse.ArgumentParser:
     intake_parser = subparsers.add_parser(
         "intake", help="Capture normalized evidence into a session."
     )
-    intake_sub = intake_parser.add_subparsers(
-        dest="intake_command", required=True
-    )
+    intake_sub = intake_parser.add_subparsers(dest="intake_command", required=True)
 
     add_document_parser = intake_sub.add_parser(
         "add-document", help="Ingest a Markdown or plain-text document."
@@ -816,9 +812,7 @@ def _parser() -> argparse.ArgumentParser:
     add_document_parser.add_argument(
         "--session-id", dest="session_id", required=True, help="Session id."
     )
-    add_document_parser.add_argument(
-        "--project", help="Project root (default: cwd)."
-    )
+    add_document_parser.add_argument("--project", help="Project root (default: cwd).")
     add_document_parser.add_argument(
         "--path", required=True, help="Document path (must be project-contained)."
     )
@@ -834,9 +828,7 @@ def _parser() -> argparse.ArgumentParser:
     snapshot_parser.add_argument(
         "--session-id", dest="session_id", required=True, help="Session id."
     )
-    snapshot_parser.add_argument(
-        "--project", help="Project root (default: cwd)."
-    )
+    snapshot_parser.add_argument("--project", help="Project root (default: cwd).")
     snapshot_parser.add_argument(
         "--source", required=True, help="Source label for the snapshot."
     )
@@ -851,9 +843,7 @@ def _parser() -> argparse.ArgumentParser:
     profile_parser = subparsers.add_parser(
         "profile", help="Profile a bounded source scan."
     )
-    profile_sub = profile_parser.add_subparsers(
-        dest="profile_command", required=True
-    )
+    profile_sub = profile_parser.add_subparsers(dest="profile_command", required=True)
     scan_parser = profile_sub.add_parser(
         "scan", help="Compute exact aggregate profile metadata."
     )

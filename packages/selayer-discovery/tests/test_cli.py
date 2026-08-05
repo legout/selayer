@@ -7,11 +7,17 @@ from io import StringIO
 from pathlib import Path
 from typing import Any
 
+import pyarrow as pa
 import pytest
 from ruamel.yaml import YAML
 from selayer_discovery import __version__
 from selayer_discovery.cli import main
+from selayer_discovery.profiling import ProfileRunner, SourceProfile
 from selayer_discovery.session import SessionStore
+
+from selayer.sources.base import SourceConsistency
+from selayer.sources.scan import SourceScanSession, SourceSnapshot
+from selayer.sources.schema import schema_fingerprint, table_schema_from_arrow
 
 
 def test_package_version_is_defined() -> None:
@@ -835,3 +841,511 @@ def test_status_rejects_invalid_session_id(
     assert code == 1
     err = json.loads(capsys.readouterr().err)
     assert err["code"] == "discovery.cli.session_id_invalid"
+
+
+# --------------------------------------------------------------------------- #
+# Sample-policy CLI tests (Task 11)                                          #
+# --------------------------------------------------------------------------- #
+
+_POLICY_SCHEMA = pa.schema(
+    [
+        ("id", pa.int64()),
+        ("amount", pa.int64()),
+        ("customer_name", pa.utf8()),
+        ("access_token", pa.utf8()),
+    ]
+)
+
+
+def _policy_profile(tmp_path: Path) -> SourceProfile:
+    """Build a completed (available) profile from a small in-memory scan."""
+
+    rows = [
+        {"id": 1, "amount": 100, "customer_name": "Alice", "access_token": "tok-1"},
+        {"id": 2, "amount": 200, "customer_name": "Bob", "access_token": "tok-2"},
+    ]
+    batch = pa.RecordBatch.from_pylist(rows, schema=_POLICY_SCHEMA)
+    table_schema = table_schema_from_arrow(_POLICY_SCHEMA)
+    fp = schema_fingerprint(table_schema)
+    reader = pa.RecordBatchReader.from_batches(_POLICY_SCHEMA, [batch])
+    session = SourceScanSession(
+        source_id="orders",
+        schema=table_schema,
+        consistency=SourceConsistency.REOPENABLE_SNAPSHOT,
+        snapshot_id="snap-1",
+        reader=reader,
+        release=lambda: None,
+        recheck=lambda: SourceSnapshot(
+            SourceConsistency.REOPENABLE_SNAPSHOT, "snap-1", fp
+        ),
+    )
+    return ProfileRunner(session, tmp_path / "spill", grain=("id",)).run()
+
+
+def _write_profile(tmp_path: Path, profile: SourceProfile) -> Path:
+    path = tmp_path / "profile.json"
+    path.write_text(json.dumps(profile.to_dict()), encoding="utf-8")
+    return path
+
+
+def _init_policy_session(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    _init_git_repo(tmp_path)
+    _init_session(tmp_path, capsys, session_id="session-policy-001")
+    capsys.readouterr()  # clear init output
+
+
+# --- propose-policy -------------------------------------------------------- #
+
+
+def test_propose_policy_emits_omit_default_policy(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _init_policy_session(tmp_path, capsys)
+    profile = _policy_profile(tmp_path)
+    profile_path = _write_profile(tmp_path, profile)
+    code = main(
+        [
+            "profile",
+            "propose-policy",
+            "--session-id",
+            "session-policy-001",
+            "--project",
+            str(tmp_path),
+            "--profile",
+            str(profile_path),
+            "--grain",
+            "id",
+        ]
+    )
+    assert code == 0
+    out = json.loads(capsys.readouterr().out)
+    # Every field defaults to omit.
+    assert all(field["transform"] == "omit" for field in out["fields"])
+    # Credential fields are hard-denied.
+    token_field = next(f for f in out["fields"] if f["name"] == "access_token")
+    assert token_field["hard_denied"] is True
+    amount_field = next(f for f in out["fields"] if f["name"] == "amount")
+    assert amount_field["hard_denied"] is False
+    # salt_id is a 64-hex identifier; fingerprint present.
+    assert len(out["salt_id"]) == 64
+    assert out["fingerprint"]
+    assert out["classifications"]
+
+
+def test_propose_policy_never_leaks_raw_values(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _init_policy_session(tmp_path, capsys)
+    profile = _policy_profile(tmp_path)
+    profile_path = _write_profile(tmp_path, profile)
+    main(
+        [
+            "profile",
+            "propose-policy",
+            "--session-id",
+            "session-policy-001",
+            "--project",
+            str(tmp_path),
+            "--profile",
+            str(profile_path),
+        ]
+    )
+    raw = capsys.readouterr().out
+    assert "Alice" not in raw
+    assert "Bob" not in raw
+    assert "tok-1" not in raw
+    assert "tok-2" not in raw
+
+
+def test_propose_policy_persists_and_reuses_salt(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _init_policy_session(tmp_path, capsys)
+    profile = _policy_profile(tmp_path)
+    profile_path = _write_profile(tmp_path, profile)
+    main(
+        [
+            "profile",
+            "propose-policy",
+            "--session-id",
+            "session-policy-001",
+            "--project",
+            str(tmp_path),
+            "--profile",
+            str(profile_path),
+        ]
+    )
+    out1 = json.loads(capsys.readouterr().out)
+    main(
+        [
+            "profile",
+            "propose-policy",
+            "--session-id",
+            "session-policy-001",
+            "--project",
+            str(tmp_path),
+            "--profile",
+            str(profile_path),
+        ]
+    )
+    out2 = json.loads(capsys.readouterr().out)
+    assert out1["salt_id"] == out2["salt_id"]
+    assert out1["fingerprint"] == out2["fingerprint"]
+
+
+def test_propose_policy_unknown_session_fails(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _init_git_repo(tmp_path)
+    code = main(
+        [
+            "profile",
+            "propose-policy",
+            "--session-id",
+            "session-missing",
+            "--project",
+            str(tmp_path),
+            "--profile",
+            str(tmp_path / "profile.json"),
+        ]
+    )
+    assert code == 1
+    err = json.loads(capsys.readouterr().err)
+    assert err["code"] == "discovery.session.not_initialized"
+
+
+def test_propose_policy_profile_path_escape_fails(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _init_policy_session(tmp_path, capsys)
+    code = main(
+        [
+            "profile",
+            "propose-policy",
+            "--session-id",
+            "session-policy-001",
+            "--project",
+            str(tmp_path),
+            "--profile",
+            "../../leaked.json",
+        ]
+    )
+    assert code == 1
+    err = json.loads(capsys.readouterr().err)
+    assert err["code"] == "discovery.cli.path_not_contained"
+
+
+def test_propose_policy_missing_profile_file_fails(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _init_policy_session(tmp_path, capsys)
+    code = main(
+        [
+            "profile",
+            "propose-policy",
+            "--session-id",
+            "session-policy-001",
+            "--project",
+            str(tmp_path),
+            "--profile",
+            str(tmp_path / "missing.json"),
+        ]
+    )
+    assert code == 1
+    err = json.loads(capsys.readouterr().err)
+    assert err["code"] == "discovery.profile.load_failed"
+
+
+def test_propose_policy_unavailable_profile_fails(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _init_policy_session(tmp_path, capsys)
+    unavailable = {
+        "source_id": "orders",
+        "schema_fingerprint": "a" * 64,
+        "consistency": "reopenable_snapshot",
+        "snapshot_id": "snap-1",
+        "mode": "reopenable",
+        "outcome": "unavailable",
+        "unavailable_reason": "unsupported_type",
+        "row_count": None,
+        "batch_count": 0,
+        "batch_hashes": [],
+        "grain_duplicate_count": None,
+        "columns": [],
+    }
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(unavailable), encoding="utf-8")
+    code = main(
+        [
+            "profile",
+            "propose-policy",
+            "--session-id",
+            "session-policy-001",
+            "--project",
+            str(tmp_path),
+            "--profile",
+            str(profile_path),
+        ]
+    )
+    assert code == 1
+    err = json.loads(capsys.readouterr().err)
+    assert err["code"] == "discovery.profile.not_available"
+
+
+# --- activate-policy ------------------------------------------------------- #
+
+
+def _propose_and_write_policy(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], profile_path: Path
+) -> dict[str, Any]:
+    """Run propose-policy and return the policy dict, writing it to a file."""
+
+    main(
+        [
+            "profile",
+            "propose-policy",
+            "--session-id",
+            "session-policy-001",
+            "--project",
+            str(tmp_path),
+            "--profile",
+            str(profile_path),
+            "--grain",
+            "id",
+        ]
+    )
+    policy_out = json.loads(capsys.readouterr().out)
+    policy_path = tmp_path / "policy.json"
+    policy_dict = {k: v for k, v in policy_out.items() if k != "classifications"}
+    policy_path.write_text(json.dumps(policy_dict), encoding="utf-8")
+    return policy_out
+
+
+def test_activate_policy_emits_activation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _init_policy_session(tmp_path, capsys)
+    profile = _policy_profile(tmp_path)
+    profile_path = _write_profile(tmp_path, profile)
+    policy_out = _propose_and_write_policy(tmp_path, capsys, profile_path)
+    code = main(
+        [
+            "profile",
+            "activate-policy",
+            "--session-id",
+            "session-policy-001",
+            "--project",
+            str(tmp_path),
+            "--profile",
+            str(profile_path),
+            "--policy",
+            str(tmp_path / "policy.json"),
+            "--activated-at",
+            "2026-01-01",
+        ]
+    )
+    assert code == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["session_id"] == "session-policy-001"
+    assert out["policy_fingerprint"] == policy_out["fingerprint"]
+    assert out["profile_fingerprint"]
+    assert out["schema_fingerprint"]
+    assert out["fingerprint"]  # activation binding fingerprint
+    assert out["approver"]  # normalized charter approver
+    assert out["activated_at"] == "2026-01-01"
+
+
+def test_activate_policy_changed_approver_changes_fingerprint(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _init_policy_session(tmp_path, capsys)
+    profile = _policy_profile(tmp_path)
+    profile_path = _write_profile(tmp_path, profile)
+    _propose_and_write_policy(tmp_path, capsys, profile_path)
+    policy_arg = str(tmp_path / "policy.json")
+    common = [
+        "profile",
+        "activate-policy",
+        "--session-id",
+        "session-policy-001",
+        "--project",
+        str(tmp_path),
+        "--profile",
+        str(profile_path),
+        "--policy",
+        policy_arg,
+    ]
+    main(common + ["--approver", "Alice One", "--activated-at", "2026-01-01"])
+    fp1 = json.loads(capsys.readouterr().out)["fingerprint"]
+    main(common + ["--approver", "Bob Two", "--activated-at", "2026-01-01"])
+    fp2 = json.loads(capsys.readouterr().out)["fingerprint"]
+    assert fp1 != fp2
+
+
+def test_activate_policy_unknown_session_fails(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _init_git_repo(tmp_path)
+    code = main(
+        [
+            "profile",
+            "activate-policy",
+            "--session-id",
+            "session-missing",
+            "--project",
+            str(tmp_path),
+            "--profile",
+            str(tmp_path / "profile.json"),
+            "--policy",
+            str(tmp_path / "policy.json"),
+        ]
+    )
+    assert code == 1
+    err = json.loads(capsys.readouterr().err)
+    assert err["code"] == "discovery.session.not_initialized"
+
+
+def test_activate_policy_policy_path_escape_fails(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _init_policy_session(tmp_path, capsys)
+    profile = _policy_profile(tmp_path)
+    profile_path = _write_profile(tmp_path, profile)
+    code = main(
+        [
+            "profile",
+            "activate-policy",
+            "--session-id",
+            "session-policy-001",
+            "--project",
+            str(tmp_path),
+            "--profile",
+            str(profile_path),
+            "--policy",
+            "../../leaked.json",
+        ]
+    )
+    assert code == 1
+    err = json.loads(capsys.readouterr().err)
+    assert err["code"] == "discovery.cli.path_not_contained"
+
+
+def test_activate_policy_missing_policy_file_fails(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _init_policy_session(tmp_path, capsys)
+    profile = _policy_profile(tmp_path)
+    profile_path = _write_profile(tmp_path, profile)
+    code = main(
+        [
+            "profile",
+            "activate-policy",
+            "--session-id",
+            "session-policy-001",
+            "--project",
+            str(tmp_path),
+            "--profile",
+            str(profile_path),
+            "--policy",
+            str(tmp_path / "missing.json"),
+        ]
+    )
+    assert code == 1
+    err = json.loads(capsys.readouterr().err)
+    assert err["code"] == "discovery.profile.load_failed"
+
+
+# --- export-context -------------------------------------------------------- #
+
+
+def test_export_context_missing_salt_fails(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _init_policy_session(tmp_path, capsys)
+    profile = _policy_profile(tmp_path)
+    profile_path = _write_profile(tmp_path, profile)
+    # Build a valid policy file but never create the session salt.
+    _propose_and_write_policy(tmp_path, capsys, profile_path)
+    # Remove the salt so export-context sees it missing.
+    salt_path = (
+        tmp_path
+        / ".selayer"
+        / "discovery"
+        / "sessions"
+        / "session-policy-001"
+        / "policy"
+        / "salt"
+    )
+    salt_path.unlink()
+    code = main(
+        [
+            "profile",
+            "export-context",
+            "--session-id",
+            "session-policy-001",
+            "--project",
+            str(tmp_path),
+            "--source-id",
+            "orders",
+            "--profile",
+            str(profile_path),
+            "--policy",
+            str(tmp_path / "policy.json"),
+        ]
+    )
+    assert code == 1
+    err = json.loads(capsys.readouterr().err)
+    assert err["code"] == "discovery.profile.salt_missing"
+
+
+def test_export_context_unknown_session_fails(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _init_git_repo(tmp_path)
+    code = main(
+        [
+            "profile",
+            "export-context",
+            "--session-id",
+            "session-missing",
+            "--project",
+            str(tmp_path),
+            "--source-id",
+            "orders",
+            "--profile",
+            str(tmp_path / "profile.json"),
+            "--policy",
+            str(tmp_path / "policy.json"),
+        ]
+    )
+    assert code == 1
+    err = json.loads(capsys.readouterr().err)
+    assert err["code"] == "discovery.session.not_initialized"
+
+
+def test_export_context_policy_path_escape_fails(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _init_policy_session(tmp_path, capsys)
+    profile = _policy_profile(tmp_path)
+    profile_path = _write_profile(tmp_path, profile)
+    code = main(
+        [
+            "profile",
+            "export-context",
+            "--session-id",
+            "session-policy-001",
+            "--project",
+            str(tmp_path),
+            "--source-id",
+            "orders",
+            "--profile",
+            str(profile_path),
+            "--policy",
+            "../../leaked.json",
+        ]
+    )
+    assert code == 1
+    err = json.loads(capsys.readouterr().err)
+    assert err["code"] == "discovery.cli.path_not_contained"
