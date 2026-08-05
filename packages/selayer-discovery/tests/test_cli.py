@@ -1167,15 +1167,12 @@ def test_activate_policy_emits_activation(
     assert out["activated_at"] == "2026-01-01"
 
 
-def test_activate_policy_changed_approver_changes_fingerprint(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    _init_policy_session(tmp_path, capsys)
-    profile = _policy_profile(tmp_path)
-    profile_path = _write_profile(tmp_path, profile)
-    _propose_and_write_policy(tmp_path, capsys, profile_path)
-    policy_arg = str(tmp_path / "policy.json")
-    common = [
+def _activate_policy_args(
+    tmp_path: Path, profile_path: Path, *, approver: str | None = None
+) -> list[str]:
+    """Build a common activate-policy argv (optional --approver override)."""
+
+    args = [
         "profile",
         "activate-policy",
         "--session-id",
@@ -1185,13 +1182,57 @@ def test_activate_policy_changed_approver_changes_fingerprint(
         "--profile",
         str(profile_path),
         "--policy",
-        policy_arg,
+        str(tmp_path / "policy.json"),
+        "--activated-at",
+        "2026-01-01",
     ]
-    main(common + ["--approver", "Alice One", "--activated-at", "2026-01-01"])
-    fp1 = json.loads(capsys.readouterr().out)["fingerprint"]
-    main(common + ["--approver", "Bob Two", "--activated-at", "2026-01-01"])
-    fp2 = json.loads(capsys.readouterr().out)["fingerprint"]
-    assert fp1 != fp2
+    if approver is not None:
+        args += ["--approver", approver]
+    return args
+
+
+def test_activate_policy_rejects_nonmatching_approver_override(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An --approver that does not match the charter approver is rejected.
+
+    Global constraints require every approval actor to match the charter's
+    normalized named approver. Export verifies the charter approver and has no
+    override, so a non-matching activation could never be used; reject it up
+    front with the stable actor-mismatch diagnostic.
+    """
+
+    _init_policy_session(tmp_path, capsys)
+    profile = _policy_profile(tmp_path)
+    profile_path = _write_profile(tmp_path, profile)
+    _propose_and_write_policy(tmp_path, capsys, profile_path)
+    # "Mallory Eve" does not match the charter approver "Dr. Alice Okonkwo".
+    code = main(_activate_policy_args(tmp_path, profile_path, approver="Mallory Eve"))
+    assert code == 1
+    err = json.loads(capsys.readouterr().err)
+    assert err["code"] == "discovery.profile.actor_mismatch"
+    assert err["safe_detail"] == "approver"
+
+
+def test_activate_policy_accepts_matching_approver_override(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A matching --approver (normalized charter approver) is accepted."""
+
+    _init_policy_session(tmp_path, capsys)
+    profile = _policy_profile(tmp_path)
+    profile_path = _write_profile(tmp_path, profile)
+    _propose_and_write_policy(tmp_path, capsys, profile_path)
+    # Extra interior whitespace collapses to the charter approver's identity.
+    code = main(
+        _activate_policy_args(
+            tmp_path, profile_path, approver="  Dr.   Alice  Okonkwo  "
+        )
+    )
+    assert code == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["approver"] == "Dr. Alice Okonkwo"
+    assert out["fingerprint"]
 
 
 def test_activate_policy_unknown_session_fails(
@@ -1542,3 +1583,125 @@ def test_export_context_stdout_contains_only_safe_summary(
     assert "source_id" not in summary
     assert "bytes" not in summary
     assert "canary_scan" not in summary
+
+
+class _FakeExportRegistry:
+    """Registry stub returning a fresh in-memory scan session for any source."""
+
+    def open_scan_session(self, *_args: object, **_kwargs: object) -> SourceScanSession:
+        return _policy_scan_session()
+
+    def close(self) -> None:
+        return None
+
+
+def _patch_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli_module,
+        "_open_registry",
+        lambda _project, _session_dir: (None, None, _FakeExportRegistry()),
+    )
+
+
+def _export_context_args(
+    tmp_path: Path, profile_path: Path, policy_path: Path
+) -> list[str]:
+    return [
+        "profile",
+        "export-context",
+        "--session-id",
+        "session-policy-001",
+        "--project",
+        str(tmp_path),
+        "--source-id",
+        "orders",
+        "--profile",
+        str(profile_path),
+        "--policy",
+        str(policy_path),
+    ]
+
+
+def test_export_context_same_source_exports_distinct_files_retain_usage(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two same-source exports produce distinct files and retain prior usage.
+
+    Regression for the context-export path collision: a fixed per-source path
+    meant repeated exports overwrote the prior context file, so the cumulative
+    session byte accounting only ever counted the latest export and the
+    ``bytes_per_session`` cap could be bypassed. Each successful export now
+    uses a distinct owner-only artifact path so every prior export is retained
+    and summed.
+    """
+
+    _init_policy_session(tmp_path, capsys)
+    profile_path, policy_path, _ = _activate_policy_for_cli(tmp_path, capsys)
+    _patch_registry(monkeypatch)
+    session_dir = cli_module._session_dir(tmp_path.resolve(), "session-policy-001")
+    export_args = _export_context_args(tmp_path, profile_path, policy_path)
+
+    # First export.
+    assert main(export_args) == 0
+    summary1 = json.loads(capsys.readouterr().out)
+    file1 = tmp_path / summary1["path"]
+    assert file1.is_file()
+    bytes1 = json.loads(file1.read_text(encoding="utf-8"))["bytes"]
+    # The first export is immediately retained in the session accounting, so
+    # the second export's computation sees it.
+    assert cli_module._session_context_bytes_used(session_dir) == bytes1
+
+    # Second export (same source).
+    assert main(export_args) == 0
+    summary2 = json.loads(capsys.readouterr().out)
+    file2 = tmp_path / summary2["path"]
+    assert file2.is_file()
+    bytes2 = json.loads(file2.read_text(encoding="utf-8"))["bytes"]
+
+    # Distinct files (the second never overwrote the first).
+    assert summary1["path"] != summary2["path"]
+    assert file1.is_file()
+    # Cumulative session usage retains both prior exports.
+    assert cli_module._session_context_bytes_used(session_dir) == bytes1 + bytes2
+
+
+def test_export_context_failcloses_on_approver_mismatch(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Export remains fail-closed: a wrong-approver activation cannot export.
+
+    Even if a non-matching activation artifact were persisted (e.g. from a
+    pre-fix run or tampering), export-context verifies the current charter
+    approver and has no override, so it fails closed with the stable stale
+    diagnostic naming the approver binding.
+    """
+
+    _init_policy_session(tmp_path, capsys)
+    profile = _policy_profile(tmp_path)
+    profile_path = _write_profile(tmp_path, profile)
+    policy_out = _propose_and_write_policy(tmp_path, capsys, profile_path)
+    # Manually persist an activation whose approver does not match the charter.
+    activation = PolicyActivation(
+        schema_version=1,
+        session_id="session-policy-001",
+        source_id="orders",
+        approver="Someone Else",
+        policy_fingerprint=policy_out["fingerprint"],
+        profile_fingerprint=profile.fingerprint,
+        schema_fingerprint=profile.schema_fingerprint,
+        snapshot_id=profile.snapshot_id,
+        grain=tuple(policy_out["grain"]),
+        activated_at="2026-01-01",
+    )
+    session_dir = cli_module._session_dir(tmp_path.resolve(), "session-policy-001")
+    cli_module._write_activation(session_dir, "orders", activation)
+    _patch_registry(monkeypatch)
+    code = main(_export_context_args(tmp_path, profile_path, tmp_path / "policy.json"))
+    assert code == 1
+    err = json.loads(capsys.readouterr().err)
+    assert err["code"] == "discovery.profile.policy_stale"
+    assert err["safe_detail"] == "approver"

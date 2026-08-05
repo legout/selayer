@@ -60,6 +60,7 @@ from selayer_discovery.evidence import (
 )
 from selayer_discovery.model import SCHEMA_VERSION, normalize_actor_identity
 from selayer_discovery.profiling import (
+    CODE_PROFILE_ACTOR,
     PolicyActivation,
     ProfilePolicyError,
     ProfileRunner,
@@ -658,10 +659,37 @@ def _normalized_approver(session_dir: Path, override: str | None) -> str:
     return normalize_actor_identity(raw)
 
 
-def _context_export_path(session_dir: Path, source_id: str) -> Path:
-    """Return the context export artifact path for one source."""
+def _next_context_export_path(session_dir: Path, source_id: str) -> Path:
+    """Return a distinct owner-only context export path for one source.
 
-    return _policy_dir(session_dir) / f"{_CONTEXT_PREFIX}-{_safe_file_name(source_id)}.json"
+    Each successful export is written to a distinct path so prior exports are
+    never overwritten and the cumulative session byte accounting always
+    retains every prior export. The path embeds a safe, monotonically
+    increasing 1-based sequence number scoped to the (sanitized) source id;
+    no raw value is ever used in the path. The sequence is derived by scanning
+    the existing context artifacts for the source, so it is deterministic for
+    a given workspace state.
+    """
+
+    safe = _safe_file_name(source_id)
+    prefix = f"{_CONTEXT_PREFIX}-{safe}-"
+    policy_dir = _policy_dir(session_dir)
+    next_seq = 1
+    if policy_dir.exists():
+        for entry in policy_dir.iterdir():
+            if not entry.is_file():
+                continue
+            name = entry.name
+            if not name.startswith(prefix) or not name.endswith(".json"):
+                continue
+            suffix = name[len(prefix) : -len(".json")]
+            try:
+                seq = int(suffix)
+            except ValueError:
+                continue
+            if seq >= next_seq:
+                next_seq = seq + 1
+    return policy_dir / f"{prefix}{next_seq:06d}.json"
 
 
 def _session_context_bytes_used(session_dir: Path) -> int:
@@ -774,7 +802,27 @@ def _handle_profile_activate_policy(args: argparse.Namespace) -> int:
     profile = _load_profile_file(project, args.profile)
     policy = _load_policy_file(project, args.policy)
     charter = SessionStore.open(session_dir).charter
-    approver = normalize_actor_identity(args.approver or charter.approver)
+    charter_approver = normalize_actor_identity(charter.approver)
+    override = args.approver
+    if override:
+        # Global constraints require every approval actor to match the
+        # charter's normalized named approver. Export verifies the charter
+        # approver and has no override, so a non-matching activation could
+        # never be used; reject it up front with the stable actor-mismatch
+        # diagnostic. A blank/whitespace override is also non-matching.
+        try:
+            candidate = normalize_actor_identity(override)
+        except DiscoveryError:
+            raise ProfilePolicyError(
+                CODE_PROFILE_ACTOR, safe_detail="approver"
+            ) from None
+        if candidate != charter_approver:
+            raise ProfilePolicyError(
+                CODE_PROFILE_ACTOR, safe_detail="approver"
+            ) from None
+        approver = candidate
+    else:
+        approver = charter_approver
     activated_at = args.activated_at or ""
     activation = activate_policy(
         policy,
@@ -836,7 +884,7 @@ def _handle_profile_export_context(args: argparse.Namespace) -> int:
             )
     finally:
         registry.close()
-    out_path = _context_export_path(session_dir, args.source_id)
+    out_path = _next_context_export_path(session_dir, args.source_id)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
