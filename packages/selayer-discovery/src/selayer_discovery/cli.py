@@ -56,8 +56,10 @@ from selayer_discovery.diagnostics import DiscoveryError
 from selayer_discovery.evidence import (
     MEDIA_TEXT_MARKDOWN,
     MEDIA_TEXT_PLAIN,
+    ClaimStore,
     EvidenceError,
     EvidenceStore,
+    selector_from_mapping,
 )
 from selayer_discovery.interview import (
     InterviewError,
@@ -833,6 +835,82 @@ def _handle_interview_set_gate(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Evidence claim/conflict handlers (Task 14)                                 #
+# --------------------------------------------------------------------------- #
+
+
+def _claim_store(session_dir: Path) -> tuple[SessionStore, ClaimStore]:
+    """Open the session and build a claim store over its evidence store."""
+
+    session_store = SessionStore.open(session_dir)
+    evidence_store = EvidenceStore.create(_evidence_root(session_dir))
+    return session_store, ClaimStore.create(session_store, evidence_store)
+
+
+def _handle_evidence_add_claim(args: argparse.Namespace) -> int:
+    project = _project_root(args.project)
+    session_id = _validate_session_id(args.session_id)
+    session_dir = _require_session(project, session_id)
+    data = _load_json_mapping(project, args.claim, kind="claim")
+    session_store, claims = _claim_store(session_dir)
+    raw_selectors = data.get("selectors")
+    if not isinstance(raw_selectors, list):
+        raw_selectors = []
+    selectors = tuple(selector_from_mapping(item) for item in raw_selectors)
+    actor = _interview_actor(session_store, args.actor)
+    record = claims.add_claim(
+        claim_id=_json_str_field(data, "claim_id"),
+        subject=_json_str_field(data, "subject"),
+        statement=_json_str_field(data, "statement"),
+        evidence_class=_json_str_field(data, "evidence_class"),
+        selectors=selectors,
+        creator_event=_json_str_field(data, "creator_event"),
+        contradicts=tuple(_json_seq_field(data, "contradicts")),
+        actor=actor,
+    )
+    _emit_json(record.safe_dict())
+    return EXIT_OK
+
+
+def _handle_evidence_add_conflict(args: argparse.Namespace) -> int:
+    project = _project_root(args.project)
+    session_id = _validate_session_id(args.session_id)
+    session_dir = _require_session(project, session_id)
+    data = _load_json_mapping(project, args.conflict, kind="conflict")
+    session_store, claims = _claim_store(session_dir)
+    actor = _interview_actor(session_store, args.actor)
+    record = claims.add_conflict(
+        conflict_id=_json_str_field(data, "conflict_id"),
+        kind=_json_str_field(data, "kind"),
+        subject=_json_str_field(data, "subject"),
+        involved_claim_ids=tuple(_json_seq_field(data, "involved_claim_ids")),
+        affected_group_ids=tuple(_json_seq_field(data, "affected_group_ids")),
+        reason=_json_str_field(data, "reason"),
+        actor=actor,
+    )
+    _emit_json(record.safe_dict())
+    return EXIT_OK
+
+
+def _handle_evidence_resolve_conflict(args: argparse.Namespace) -> int:
+    project = _project_root(args.project)
+    session_id = _validate_session_id(args.session_id)
+    session_dir = _require_session(project, session_id)
+    data = _load_json_mapping(project, args.resolution, kind="resolution")
+    session_store, claims = _claim_store(session_dir)
+    actor = _interview_actor(session_store, args.actor)
+    record = claims.resolve_conflict(
+        conflict_id=_json_str_field(data, "conflict_id"),
+        statement=_json_str_field(data, "statement"),
+        answer_id=_json_str_field(data, "answer_id"),
+        evidence_id=_json_str_field(data, "evidence_id"),
+        actor=actor,
+    )
+    _emit_json(record.safe_dict())
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------- #
 # Sample-policy helpers                                                       #
 # --------------------------------------------------------------------------- #
 
@@ -1401,6 +1479,62 @@ def _parser() -> argparse.ArgumentParser:
     )
     set_gate_parser.add_argument("--actor", help="Actor identity (default: approver).")
     set_gate_parser.set_defaults(func=_handle_interview_set_gate)
+
+    evidence_parser = subparsers.add_parser(
+        "evidence", help="Record typed evidence claims and conflicts."
+    )
+    evidence_sub = evidence_parser.add_subparsers(
+        dest="evidence_command", required=True
+    )
+
+    add_claim_parser = evidence_sub.add_parser(
+        "add-claim", help="Record a typed, evidence-backed claim."
+    )
+    add_claim_parser.add_argument(
+        "--session-id", dest="session_id", required=True, help="Session id."
+    )
+    add_claim_parser.add_argument("--project", help="Project root (default: cwd).")
+    add_claim_parser.add_argument(
+        "--claim", required=True, help="Claim JSON file (project-contained)."
+    )
+    add_claim_parser.add_argument("--actor", help="Actor identity (default: approver).")
+    add_claim_parser.set_defaults(func=_handle_evidence_add_claim)
+
+    add_conflict_parser = evidence_sub.add_parser(
+        "add-conflict", help="Record an unresolved evidence conflict."
+    )
+    add_conflict_parser.add_argument(
+        "--session-id", dest="session_id", required=True, help="Session id."
+    )
+    add_conflict_parser.add_argument(
+        "--project", help="Project root (default: cwd)."
+    )
+    add_conflict_parser.add_argument(
+        "--conflict", required=True, help="Conflict JSON file (project-contained)."
+    )
+    add_conflict_parser.add_argument(
+        "--actor", help="Actor identity (default: approver)."
+    )
+    add_conflict_parser.set_defaults(func=_handle_evidence_add_conflict)
+
+    resolve_conflict_parser = evidence_sub.add_parser(
+        "resolve-conflict", help="Resolve an evidence conflict."
+    )
+    resolve_conflict_parser.add_argument(
+        "--session-id", dest="session_id", required=True, help="Session id."
+    )
+    resolve_conflict_parser.add_argument(
+        "--project", help="Project root (default: cwd)."
+    )
+    resolve_conflict_parser.add_argument(
+        "--resolution",
+        required=True,
+        help="Resolution JSON file (project-contained).",
+    )
+    resolve_conflict_parser.add_argument(
+        "--actor", help="Actor identity (default: approver)."
+    )
+    resolve_conflict_parser.set_defaults(func=_handle_evidence_resolve_conflict)
 
     profile_parser = subparsers.add_parser(
         "profile", help="Profile a bounded source scan."

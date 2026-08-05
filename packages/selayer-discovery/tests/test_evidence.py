@@ -28,6 +28,13 @@ import pytest
 import yaml
 from selayer_discovery.cli import main
 from selayer_discovery.evidence import (
+    CODE_EVIDENCE_CLAIM_INFERRED_ONLY,
+    CODE_EVIDENCE_CLAIM_INVALID,
+    CODE_EVIDENCE_CLAIM_NOT_FOUND,
+    CODE_EVIDENCE_CONFLICT_ACTOR,
+    CODE_EVIDENCE_CONFLICT_ALREADY_RESOLVED,
+    CODE_EVIDENCE_CONFLICT_DETERMINISTIC,
+    CODE_EVIDENCE_CONFLICT_INVALID,
     CODE_EVIDENCE_INVALID_ENCODING,
     CODE_EVIDENCE_INVALID_MEDIA,
     CODE_EVIDENCE_INVALID_SOURCE,
@@ -45,6 +52,8 @@ from selayer_discovery.evidence import (
     MEDIA_TEXT_MARKDOWN,
     MEDIA_TEXT_PLAIN,
     CatalogPathSelector,
+    ClaimStore,
+    ConflictKind,
     DocumentLineSelector,
     EvidenceError,
     EvidenceLimits,
@@ -54,6 +63,8 @@ from selayer_discovery.evidence import (
     SourceFieldSelector,
     VerificationOutcomeSelector,
 )
+from selayer_discovery.model import EvidenceClass, normalize_actor_identity
+from selayer_discovery.session import SessionCharter, SessionStore
 
 posix_only = pytest.mark.skipif(os.name != "posix", reason="POSIX file semantics")
 
@@ -935,3 +946,969 @@ def test_records_returns_latest_revisions(tmp_path: Path) -> None:
     assert len(records) == 1
     assert records[0].record_id == r1.record_id
     assert records[0].revision == 2
+
+
+# --------------------------------------------------------------------------- #
+# Task 14: typed claims, conflicts, and transitive invalidation              #
+# --------------------------------------------------------------------------- #
+
+#: Subject identifier shape shared by claim/conflict tests.
+_SUBJECT = "source.shopfloor.orders"
+
+
+def _doc_selector(
+    evidence: EvidenceStore, project: Path, body: bytes = b"line one\nline two\n"
+) -> tuple[DocumentLineSelector, object]:
+    """Ingest a document and return a revision-bound line selector plus record."""
+
+    path = _doc(project, "spec.md", body)
+    record = evidence.add_document(path, allowed_roots=(project,))
+    selector = DocumentLineSelector(
+        record_id=record.record_id,
+        content_hash=record.content_hash,
+        revision=record.revision,
+        start_line=1,
+        end_line=1,
+    )
+    return selector, record
+
+
+def _claim_store(
+    session_root: Path, charter: SessionCharter, actor: str
+) -> tuple[SessionStore, EvidenceStore, ClaimStore]:
+    """Create a session, evidence store, and claim store wired together."""
+
+    store = SessionStore.create(session_root, charter=charter, actor=actor)
+    evidence = EvidenceStore.create(session_root / "evidence")
+    claims = ClaimStore.create(store, evidence)
+    return store, evidence, claims
+
+
+# --------------------------------------------------------------------------- #
+# Claim tests (Step 1)                                                        #
+# --------------------------------------------------------------------------- #
+
+
+def test_add_claim_requires_subject_statement_selectors_class_creator(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+    tmp_path: Path,
+) -> None:
+    store, evidence, claims = _claim_store(session_root, charter, actor)
+    project = tmp_path / "project"
+    project.mkdir()
+    selector, _ = _doc_selector(evidence, project)
+    store.record_artifact(
+        "answer-gate-grains", content_hash="a" * 64, actor=actor
+    )
+    base = {
+        "claim_id": "claim-grain-001",
+        "subject": _SUBJECT,
+        "statement": "The grain is one row per confirmed order.",
+        "evidence_class": EvidenceClass.ASSERTED,
+        "selectors": (selector,),
+        "creator_event": "answer-gate-grains",
+        "actor": actor,
+    }
+    # Omitting each required field raises the invalid-claim code.
+    for missing in ("subject", "statement", "evidence_class", "selectors", "creator_event"):
+        kwargs = dict(base)
+        if missing == "selectors":
+            kwargs[missing] = ()
+        elif missing == "evidence_class":
+            kwargs[missing] = "bogus"
+        elif missing in ("subject", "statement", "creator_event"):
+            kwargs[missing] = ""
+        with pytest.raises(EvidenceError) as raised:
+            claims.add_claim(**kwargs)
+        assert raised.value.code == CODE_EVIDENCE_CLAIM_INVALID
+
+
+def test_add_claim_rejects_unknown_evidence_class(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+    tmp_path: Path,
+) -> None:
+    store, evidence, claims = _claim_store(session_root, charter, actor)
+    project = tmp_path / "project"
+    project.mkdir()
+    selector, _ = _doc_selector(evidence, project)
+    store.record_artifact("answer-gate-grains", content_hash="a" * 64, actor=actor)
+    with pytest.raises(EvidenceError) as raised:
+        claims.add_claim(
+            claim_id="claim-x",
+            subject=_SUBJECT,
+            statement="A declarative claim.",
+            evidence_class="speculative",
+            selectors=(selector,),
+            creator_event="answer-gate-grains",
+            actor=actor,
+        )
+    assert raised.value.code == CODE_EVIDENCE_CLAIM_INVALID
+
+
+def test_add_claim_records_current_claim_with_selectors(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+    tmp_path: Path,
+) -> None:
+    store, evidence, claims = _claim_store(session_root, charter, actor)
+    project = tmp_path / "project"
+    project.mkdir()
+    selector, _ = _doc_selector(evidence, project)
+    store.record_artifact("answer-gate-grains", content_hash="a" * 64, actor=actor)
+    claim = claims.add_claim(
+        claim_id="claim-grain-001",
+        subject=_SUBJECT,
+        statement="The grain is one row per confirmed order.",
+        evidence_class=EvidenceClass.ASSERTED,
+        selectors=(selector,),
+        creator_event="answer-gate-grains",
+        contradicts=("claim-grain-002",),
+        actor=actor,
+    )
+    assert claim.claim_id == "claim-grain-001"
+    assert claim.subject == _SUBJECT
+    assert claim.evidence_class == EvidenceClass.ASSERTED.value
+    assert claim.state == "current"
+    assert claim.creator_event == "answer-gate-grains"
+    assert claim.contradicts == ("claim-grain-002",)
+    assert claims.get_claim("claim-grain-001") == claim
+
+
+def test_add_claim_rejects_stale_selector(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+    tmp_path: Path,
+) -> None:
+    store, evidence, claims = _claim_store(session_root, charter, actor)
+    project = tmp_path / "project"
+    project.mkdir()
+    selector, _ = _doc_selector(evidence, project, b"one\ntwo\n")
+    # Revise the document so the bound selector is now stale.
+    path = project / "docs" / "spec.md"
+    path.write_bytes(b"changed\nbody\nmore\n")
+    evidence.add_document(path, allowed_roots=(project,))
+    store.record_artifact("answer-gate-grains", content_hash="a" * 64, actor=actor)
+    with pytest.raises(EvidenceError) as raised:
+        claims.add_claim(
+            claim_id="claim-stale",
+            subject=_SUBJECT,
+            statement="A claim.",
+            evidence_class=EvidenceClass.OBSERVED,
+            selectors=(selector,),
+            creator_event="answer-gate-grains",
+            actor=actor,
+        )
+    assert raised.value.code == CODE_EVIDENCE_SELECTOR_STALE
+
+
+def test_assert_executable_evidence_rejects_inferred_only(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+    tmp_path: Path,
+) -> None:
+    store, evidence, claims = _claim_store(session_root, charter, actor)
+    project = tmp_path / "project"
+    project.mkdir()
+    selector, _ = _doc_selector(evidence, project)
+    store.record_artifact("answer-gate-grains", content_hash="a" * 64, actor=actor)
+    inferred = claims.add_claim(
+        claim_id="claim-inf",
+        subject=_SUBJECT,
+        statement="An agent hypothesis about the grain.",
+        evidence_class=EvidenceClass.INFERRED,
+        selectors=(selector,),
+        creator_event="answer-gate-grains",
+        actor=actor,
+    )
+    # Inferred-only evidence cannot satisfy an executable operation.
+    with pytest.raises(EvidenceError) as raised:
+        claims.assert_executable_evidence((inferred.claim_id,))
+    assert raised.value.code == CODE_EVIDENCE_CLAIM_INFERRED_ONLY
+
+
+def test_assert_executable_evidence_passes_with_observed(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+    tmp_path: Path,
+) -> None:
+    store, evidence, claims = _claim_store(session_root, charter, actor)
+    project = tmp_path / "project"
+    project.mkdir()
+    selector, _ = _doc_selector(evidence, project)
+    store.record_artifact("answer-gate-grains", content_hash="a" * 64, actor=actor)
+    observed = claims.add_claim(
+        claim_id="claim-obs",
+        subject=_SUBJECT,
+        statement="A measured uniqueness result.",
+        evidence_class=EvidenceClass.OBSERVED,
+        selectors=(selector,),
+        creator_event="answer-gate-grains",
+        actor=actor,
+    )
+    inferred = claims.add_claim(
+        claim_id="claim-inf",
+        subject=_SUBJECT,
+        statement="A hypothesis.",
+        evidence_class=EvidenceClass.INFERRED,
+        selectors=(selector,),
+        creator_event="answer-gate-grains",
+        actor=actor,
+    )
+    # A non-inferred claim present satisfies the executable requirement.
+    claims.assert_executable_evidence((observed.claim_id, inferred.claim_id))
+
+
+def test_assert_executable_evidence_rejects_unknown_claim(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+) -> None:
+    _store, _evidence, claims = _claim_store(session_root, charter, actor)
+    with pytest.raises(EvidenceError) as raised:
+        claims.assert_executable_evidence(("claim-missing",))
+    assert raised.value.code == CODE_EVIDENCE_CLAIM_NOT_FOUND
+
+
+def test_add_claim_tied_to_creator_event_stales_on_change(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+    hash_factory,  # type: ignore[no-untyped-def]
+    tmp_path: Path,
+) -> None:
+    store, evidence, claims = _claim_store(session_root, charter, actor)
+    project = tmp_path / "project"
+    project.mkdir()
+    selector, _ = _doc_selector(evidence, project)
+    # Register the creator event as a session artifact node.
+    store.record_artifact(
+        "answer-gate-grains", content_hash=hash_factory(1), actor=actor
+    )
+    claims.add_claim(
+        claim_id="claim-grain-001",
+        subject=_SUBJECT,
+        statement="The grain is one row per confirmed order.",
+        evidence_class=EvidenceClass.ASSERTED,
+        selectors=(selector,),
+        creator_event="answer-gate-grains",
+        actor=actor,
+    )
+    # Revising the creator event's hash emits the claim as a stale target.
+    result = store.record_artifact(
+        "answer-gate-grains", content_hash=hash_factory(2), actor=actor
+    )
+    assert "claim-grain-001" in result.stale_targets
+
+
+def test_add_claim_never_leaks_statement(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+    tmp_path: Path,
+) -> None:
+    store, evidence, claims = _claim_store(session_root, charter, actor)
+    project = tmp_path / "project"
+    project.mkdir()
+    selector, _ = _doc_selector(evidence, project)
+    store.record_artifact("answer-gate-grains", content_hash="a" * 64, actor=actor)
+    secret = "super-secret-business-rule-4242"
+    try:
+        claims.add_claim(
+            claim_id="claim-leak",
+            subject="",
+            statement=secret,
+            evidence_class=EvidenceClass.ASSERTED,
+            selectors=(selector,),
+            creator_event="answer-gate-grains",
+            actor=actor,
+        )
+    except EvidenceError as exc:
+        rendered = str(exc) + repr(exc) + json.dumps(exc.to_dict(), sort_keys=True)
+        assert secret not in rendered
+    else:
+        pytest.fail("expected EvidenceError")
+
+
+# --------------------------------------------------------------------------- #
+# Conflict tests (Step 2)                                                     #
+# --------------------------------------------------------------------------- #
+
+
+def _seed_two_claims(
+    claims: ClaimStore,
+    evidence: EvidenceStore,
+    store: SessionStore,
+    project: Path,
+    actor: str,
+) -> tuple[str, str]:
+    selector, _ = _doc_selector(evidence, project)
+    store.record_artifact("answer-gate-grains", content_hash="a" * 64, actor=actor)
+    a = claims.add_claim(
+        claim_id="claim-a",
+        subject=_SUBJECT,
+        statement="The grain is one row per confirmed order.",
+        evidence_class=EvidenceClass.ASSERTED,
+        selectors=(selector,),
+        creator_event="answer-gate-grains",
+        actor=actor,
+    )
+    b = claims.add_claim(
+        claim_id="claim-b",
+        subject=_SUBJECT,
+        statement="The grain is one row per cancelled order.",
+        evidence_class=EvidenceClass.ASSERTED,
+        selectors=(selector,),
+        creator_event="answer-gate-grains",
+        actor=actor,
+    )
+    return a.claim_id, b.claim_id
+
+
+def test_unresolved_conflict_blocks_only_affected_groups(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+    tmp_path: Path,
+) -> None:
+    store, evidence, claims = _claim_store(session_root, charter, actor)
+    project = tmp_path / "project"
+    project.mkdir()
+    a, b = _seed_two_claims(claims, evidence, store, project, actor)
+    claims.add_conflict(
+        conflict_id="conflict-grain",
+        kind=ConflictKind.SEMANTIC,
+        subject=_SUBJECT,
+        involved_claim_ids=(a, b),
+        affected_group_ids=("group-semantic-model",),
+        reason="Sources disagree on the grain.",
+        actor=actor,
+    )
+    # The affected group is blocked.
+    assert claims.group_blocked_by("group-semantic-model") == ("conflict-grain",)
+    # An independent group stays eligible (not blocked).
+    assert claims.group_blocked_by("group-measures") == ()
+
+
+def test_resolved_conflict_unblocks_group(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+    tmp_path: Path,
+) -> None:
+    store, evidence, claims = _claim_store(session_root, charter, actor)
+    project = tmp_path / "project"
+    project.mkdir()
+    a, b = _seed_two_claims(claims, evidence, store, project, actor)
+    claims.add_conflict(
+        conflict_id="conflict-grain",
+        kind=ConflictKind.SEMANTIC,
+        subject=_SUBJECT,
+        involved_claim_ids=(a, b),
+        affected_group_ids=("group-semantic-model",),
+        reason="Sources disagree.",
+        actor=actor,
+    )
+    claims.resolve_conflict(
+        conflict_id="conflict-grain",
+        statement="The process owner confirmed the confirmed-order grain.",
+        answer_id="answer-1",
+        actor=normalize_actor_identity(actor),
+    )
+    assert claims.group_blocked_by("group-semantic-model") == ()
+    assert claims.get_conflict("conflict-grain").state == "resolved"
+
+
+def test_semantic_resolution_requires_named_approver(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+    tmp_path: Path,
+) -> None:
+    store, evidence, claims = _claim_store(session_root, charter, actor)
+    project = tmp_path / "project"
+    project.mkdir()
+    a, b = _seed_two_claims(claims, evidence, store, project, actor)
+    claims.add_conflict(
+        conflict_id="conflict-grain",
+        kind=ConflictKind.SEMANTIC,
+        subject=_SUBJECT,
+        involved_claim_ids=(a, b),
+        affected_group_ids=("group-semantic-model",),
+        reason="Sources disagree.",
+        actor=actor,
+    )
+    # An actor that is not the charter approver cannot resolve a semantic conflict.
+    with pytest.raises(EvidenceError) as raised:
+        claims.resolve_conflict(
+            conflict_id="conflict-grain",
+            statement="Someone else resolves it.",
+            answer_id="answer-1",
+            actor="Dr. Bo Okafor",
+        )
+    assert raised.value.code == CODE_EVIDENCE_CONFLICT_ACTOR
+
+
+def test_deterministic_failure_cannot_be_resolved_by_attestation(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+    tmp_path: Path,
+) -> None:
+    store, evidence, claims = _claim_store(session_root, charter, actor)
+    project = tmp_path / "project"
+    project.mkdir()
+    a, b = _seed_two_claims(claims, evidence, store, project, actor)
+    claims.add_conflict(
+        conflict_id="conflict-fp",
+        kind=ConflictKind.DETERMINISTIC,
+        subject=_SUBJECT,
+        involved_claim_ids=(a, b),
+        affected_group_ids=("group-semantic-model",),
+        reason="A fingerprint mismatch.",
+        actor=actor,
+    )
+    # Attestation alone (statement + approver, no evidence id) is rejected.
+    with pytest.raises(EvidenceError) as raised:
+        claims.resolve_conflict(
+            conflict_id="conflict-fp",
+            statement="The approver attests it is fine.",
+            evidence_id="",
+            actor=normalize_actor_identity(actor),
+        )
+    assert raised.value.code == CODE_EVIDENCE_CONFLICT_DETERMINISTIC
+
+
+def test_deterministic_conflict_resolves_with_new_evidence(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+    tmp_path: Path,
+) -> None:
+    store, evidence, claims = _claim_store(session_root, charter, actor)
+    project = tmp_path / "project"
+    project.mkdir()
+    a, b = _seed_two_claims(claims, evidence, store, project, actor)
+    claims.add_conflict(
+        conflict_id="conflict-fp",
+        kind=ConflictKind.DETERMINISTIC,
+        subject=_SUBJECT,
+        involved_claim_ids=(a, b),
+        affected_group_ids=("group-semantic-model",),
+        reason="A fingerprint mismatch.",
+        actor=actor,
+    )
+    record = claims.resolve_conflict(
+        conflict_id="conflict-fp",
+        statement="New passing evidence resolves the mismatch.",
+        evidence_id="document-newpass",
+        actor=actor,
+    )
+    assert record.state == "resolved"
+    assert record.resolving_evidence_id == "document-newpass"
+
+
+def test_approver_change_stales_semantic_resolution(
+    session_root: Path,
+    make_charter,  # type: ignore[no-untyped-def]
+    charter: SessionCharter,
+    actor: str,
+    tmp_path: Path,
+) -> None:
+    store, evidence, claims = _claim_store(session_root, charter, actor)
+    project = tmp_path / "project"
+    project.mkdir()
+    a, b = _seed_two_claims(claims, evidence, store, project, actor)
+    claims.add_conflict(
+        conflict_id="conflict-grain",
+        kind=ConflictKind.SEMANTIC,
+        subject=_SUBJECT,
+        involved_claim_ids=(a, b),
+        affected_group_ids=("group-semantic-model",),
+        reason="Sources disagree.",
+        actor=actor,
+    )
+    claims.resolve_conflict(
+        conflict_id="conflict-grain",
+        statement="The process owner confirmed the grain.",
+        answer_id="answer-1",
+        actor=normalize_actor_identity(actor),
+    )
+    # Changing the named approver stales the semantic resolution.
+    revised = make_charter(approver="Dr. Bo Okafor")
+    result = store.revise_charter(revised, actor=actor)
+    assert "conflict-grain" in result.stale_targets
+
+
+def test_approver_change_does_not_stale_deterministic_resolution(
+    session_root: Path,
+    make_charter,  # type: ignore[no-untyped-def]
+    charter: SessionCharter,
+    actor: str,
+    tmp_path: Path,
+) -> None:
+    store, evidence, claims = _claim_store(session_root, charter, actor)
+    project = tmp_path / "project"
+    project.mkdir()
+    a, b = _seed_two_claims(claims, evidence, store, project, actor)
+    claims.add_conflict(
+        conflict_id="conflict-fp",
+        kind=ConflictKind.DETERMINISTIC,
+        subject=_SUBJECT,
+        involved_claim_ids=(a, b),
+        affected_group_ids=("group-semantic-model",),
+        reason="A fingerprint mismatch.",
+        actor=actor,
+    )
+    claims.resolve_conflict(
+        conflict_id="conflict-fp",
+        statement="New passing evidence resolves it.",
+        evidence_id="document-newpass",
+        actor=actor,
+    )
+    # A deterministic resolution depends on new evidence, not the approver, so
+    # an approver change must not stale it.
+    revised = make_charter(approver="Dr. Bo Okafor")
+    result = store.revise_charter(revised, actor=actor)
+    assert "conflict-fp" not in result.stale_targets
+
+
+def test_resolve_conflict_never_deletes_contradictory_claims(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+    tmp_path: Path,
+) -> None:
+    store, evidence, claims = _claim_store(session_root, charter, actor)
+    project = tmp_path / "project"
+    project.mkdir()
+    a, b = _seed_two_claims(claims, evidence, store, project, actor)
+    claims.add_conflict(
+        conflict_id="conflict-grain",
+        kind=ConflictKind.SEMANTIC,
+        subject=_SUBJECT,
+        involved_claim_ids=(a, b),
+        affected_group_ids=("group-semantic-model",),
+        reason="Sources disagree.",
+        actor=actor,
+    )
+    claims.resolve_conflict(
+        conflict_id="conflict-grain",
+        statement="The approver picks the confirmed-order grain.",
+        answer_id="answer-1",
+        actor=normalize_actor_identity(actor),
+    )
+    # Both contrary claims remain recorded (history is preserved).
+    assert claims.get_claim(a).claim_id == a
+    assert claims.get_claim(b).claim_id == b
+
+
+def test_resolve_conflict_rejects_already_resolved(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+    tmp_path: Path,
+) -> None:
+    store, evidence, claims = _claim_store(session_root, charter, actor)
+    project = tmp_path / "project"
+    project.mkdir()
+    a, b = _seed_two_claims(claims, evidence, store, project, actor)
+    claims.add_conflict(
+        conflict_id="conflict-grain",
+        kind=ConflictKind.SEMANTIC,
+        subject=_SUBJECT,
+        involved_claim_ids=(a, b),
+        affected_group_ids=("group-semantic-model",),
+        reason="Sources disagree.",
+        actor=actor,
+    )
+    claims.resolve_conflict(
+        conflict_id="conflict-grain",
+        statement="Resolved once.",
+        answer_id="answer-1",
+        actor=normalize_actor_identity(actor),
+    )
+    with pytest.raises(EvidenceError) as raised:
+        claims.resolve_conflict(
+            conflict_id="conflict-grain",
+            statement="Resolved again.",
+            answer_id="answer-2",
+            actor=normalize_actor_identity(actor),
+        )
+    assert raised.value.code == CODE_EVIDENCE_CONFLICT_ALREADY_RESOLVED
+
+
+def test_add_conflict_rejects_unknown_kind(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+    tmp_path: Path,
+) -> None:
+    store, evidence, claims = _claim_store(session_root, charter, actor)
+    project = tmp_path / "project"
+    project.mkdir()
+    a, b = _seed_two_claims(claims, evidence, store, project, actor)
+    with pytest.raises(EvidenceError) as raised:
+        claims.add_conflict(
+            conflict_id="conflict-bad",
+            kind="mysterious",
+            subject=_SUBJECT,
+            involved_claim_ids=(a, b),
+            affected_group_ids=("group-semantic-model",),
+            reason="x",
+            actor=actor,
+        )
+    assert raised.value.code == CODE_EVIDENCE_CONFLICT_INVALID
+
+
+# --------------------------------------------------------------------------- #
+# Persistence                                                                 #
+# --------------------------------------------------------------------------- #
+
+
+def test_claim_store_survives_reopen(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+    tmp_path: Path,
+) -> None:
+    store, evidence, claims = _claim_store(session_root, charter, actor)
+    project = tmp_path / "project"
+    project.mkdir()
+    selector, _ = _doc_selector(evidence, project)
+    store.record_artifact("answer-gate-grains", content_hash="a" * 64, actor=actor)
+    claims.add_claim(
+        claim_id="claim-grain-001",
+        subject=_SUBJECT,
+        statement="The grain is one row per confirmed order.",
+        evidence_class=EvidenceClass.ASSERTED,
+        selectors=(selector,),
+        creator_event="answer-gate-grains",
+        actor=actor,
+    )
+    claims.add_conflict(
+        conflict_id="conflict-grain",
+        kind=ConflictKind.SEMANTIC,
+        subject=_SUBJECT,
+        involved_claim_ids=("claim-grain-001",),
+        affected_group_ids=("group-semantic-model",),
+        reason="x",
+        actor=actor,
+    )
+    reopened_store = SessionStore.open(session_root)
+    reopened_evidence = EvidenceStore.open(session_root / "evidence")
+    reopened = ClaimStore.open(reopened_store, reopened_evidence)
+    assert reopened.get_claim("claim-grain-001").subject == _SUBJECT
+    assert reopened.get_conflict("conflict-grain").kind == ConflictKind.SEMANTIC.value
+
+
+# --------------------------------------------------------------------------- #
+# Evidence CLI commands (Step 4)                                              #
+# --------------------------------------------------------------------------- #
+
+
+def _write_claim_input(
+    project: Path, name: str, claim: dict[str, Any]
+) -> Path:
+    path = project / name
+    path.write_text(json.dumps(claim, sort_keys=True), encoding="utf-8")
+    return path
+
+
+def test_cli_evidence_add_claim(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    _init_session(project, capsys)
+    # Ingest a document to obtain a valid evidence record.
+    doc_path = _doc(project, "spec.md", b"line one\nline two\n")
+    main(
+        [
+            "intake",
+            "add-document",
+            "--session-id",
+            "session-evidence-001",
+            "--project",
+            str(project),
+            "--path",
+            str(doc_path),
+        ]
+    )
+    record_out = json.loads(capsys.readouterr().out)
+    claim_path = _write_claim_input(
+        project,
+        "claim.json",
+        {
+            "claim_id": "claim-grain-001",
+            "subject": _SUBJECT,
+            "statement": "The grain is one row per confirmed order.",
+            "evidence_class": "asserted",
+            "selectors": [
+                {
+                    "kind": "document_line_range",
+                    "record_id": record_out["record_id"],
+                    "content_hash": record_out["content_hash"],
+                    "revision": record_out["revision"],
+                    "start_line": 1,
+                    "end_line": 1,
+                }
+            ],
+            "creator_event": "answer-gate-grains",
+            "contradicts": [],
+        },
+    )
+    code = main(
+        [
+            "evidence",
+            "add-claim",
+            "--session-id",
+            "session-evidence-001",
+            "--project",
+            str(project),
+            "--claim",
+            str(claim_path),
+        ]
+    )
+    assert code == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["claim_id"] == "claim-grain-001"
+    assert out["evidence_class"] == "asserted"
+    assert out["state"] == "current"
+    assert out["creator_event"] == "answer-gate-grains"
+    assert "statement" not in out
+
+
+def test_cli_evidence_add_claim_output_sorted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    _init_session(project, capsys)
+    doc_path = _doc(project, "spec.md", b"line one\nline two\n")
+    main(
+        [
+            "intake",
+            "add-document",
+            "--session-id",
+            "session-evidence-001",
+            "--project",
+            str(project),
+            "--path",
+            str(doc_path),
+        ]
+    )
+    record_out = json.loads(capsys.readouterr().out)
+    claim_path = _write_claim_input(
+        project,
+        "claim.json",
+        {
+            "claim_id": "claim-grain-001",
+            "subject": _SUBJECT,
+            "statement": "x",
+            "evidence_class": "asserted",
+            "selectors": [
+                {
+                    "kind": "document_line_range",
+                    "record_id": record_out["record_id"],
+                    "content_hash": record_out["content_hash"],
+                    "revision": record_out["revision"],
+                    "start_line": 1,
+                    "end_line": 1,
+                }
+            ],
+            "creator_event": "answer-gate-grains",
+        },
+    )
+    main(
+        [
+            "evidence",
+            "add-claim",
+            "--session-id",
+            "session-evidence-001",
+            "--project",
+            str(project),
+            "--claim",
+            str(claim_path),
+        ]
+    )
+    raw = capsys.readouterr().out
+    assert raw == json.dumps(json.loads(raw), sort_keys=True) + "\n"
+
+
+def test_cli_evidence_add_conflict_and_resolve(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    _init_session(project, capsys)
+    doc_path = _doc(project, "spec.md", b"line one\nline two\n")
+    main(
+        [
+            "intake",
+            "add-document",
+            "--session-id",
+            "session-evidence-001",
+            "--project",
+            str(project),
+            "--path",
+            str(doc_path),
+        ]
+    )
+    record_out = json.loads(capsys.readouterr().out)
+    selector = {
+        "kind": "document_line_range",
+        "record_id": record_out["record_id"],
+        "content_hash": record_out["content_hash"],
+        "revision": record_out["revision"],
+        "start_line": 1,
+        "end_line": 1,
+    }
+    for cid in ("claim-a", "claim-b"):
+        cpath = _write_claim_input(
+            project,
+            f"{cid}.json",
+            {
+                "claim_id": cid,
+                "subject": _SUBJECT,
+                "statement": f"claim {cid}",
+                "evidence_class": "asserted",
+                "selectors": [selector],
+                "creator_event": "answer-gate-grains",
+            },
+        )
+        main(
+            [
+                "evidence",
+                "add-claim",
+                "--session-id",
+                "session-evidence-001",
+                "--project",
+                str(project),
+                "--claim",
+                str(cpath),
+            ]
+        )
+        capsys.readouterr()
+    conflict_path = _write_claim_input(
+        project,
+        "conflict.json",
+        {
+            "conflict_id": "conflict-grain",
+            "kind": "semantic",
+            "subject": _SUBJECT,
+            "involved_claim_ids": ["claim-a", "claim-b"],
+            "affected_group_ids": ["group-semantic-model"],
+            "reason": "Sources disagree on the grain.",
+        },
+    )
+    code = main(
+        [
+            "evidence",
+            "add-conflict",
+            "--session-id",
+            "session-evidence-001",
+            "--project",
+            str(project),
+            "--conflict",
+            str(conflict_path),
+        ]
+    )
+    assert code == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["conflict_id"] == "conflict-grain"
+    assert out["kind"] == "semantic"
+    assert out["state"] == "unresolved"
+    assert out["affected_group_ids"] == ["group-semantic-model"]
+    assert "reason" not in out
+    resolution_path = _write_claim_input(
+        project,
+        "resolution.json",
+        {
+            "conflict_id": "conflict-grain",
+            "statement": "The approver confirmed the grain.",
+            "answer_id": "answer-1",
+        },
+    )
+    code = main(
+        [
+            "evidence",
+            "resolve-conflict",
+            "--session-id",
+            "session-evidence-001",
+            "--project",
+            str(project),
+            "--resolution",
+            str(resolution_path),
+        ]
+    )
+    assert code == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["conflict_id"] == "conflict-grain"
+    assert out["state"] == "resolved"
+    assert out["resolving_answer_id"] == "answer-1"
+
+
+def test_cli_evidence_never_leaks_statement(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    _init_session(project, capsys)
+    doc_path = _doc(project, "spec.md", b"line one\nline two\n")
+    main(
+        [
+            "intake",
+            "add-document",
+            "--session-id",
+            "session-evidence-001",
+            "--project",
+            str(project),
+            "--path",
+            str(doc_path),
+        ]
+    )
+    record_out = json.loads(capsys.readouterr().out)
+    secret = "confidential-business-rule-7777"
+    claim_path = _write_claim_input(
+        project,
+        "claim.json",
+        {
+            "claim_id": "claim-secret",
+            "subject": _SUBJECT,
+            "statement": secret,
+            "evidence_class": "asserted",
+            "selectors": [
+                {
+                    "kind": "document_line_range",
+                    "record_id": record_out["record_id"],
+                    "content_hash": record_out["content_hash"],
+                    "revision": record_out["revision"],
+                    "start_line": 1,
+                    "end_line": 1,
+                }
+            ],
+            "creator_event": "answer-gate-grains",
+        },
+    )
+    main(
+        [
+            "evidence",
+            "add-claim",
+            "--session-id",
+            "session-evidence-001",
+            "--project",
+            str(project),
+            "--claim",
+            str(claim_path),
+        ]
+    )
+    raw = capsys.readouterr().out
+    assert secret not in raw

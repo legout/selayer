@@ -38,12 +38,36 @@ import os
 import re
 import stat
 from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 from filelock import FileLock, Timeout
 
+from selayer_discovery import canonical
+from selayer_discovery.model import (
+    MAX_TEXT_LENGTH,
+    EvidenceClass,
+    normalize_actor_identity,
+)
+
+if TYPE_CHECKING:
+    from selayer_discovery.session import SessionStore
+
 __all__ = [
+    "CODE_EVIDENCE_CLAIM_INFERRED_ONLY",
+    "CODE_EVIDENCE_CLAIM_INVALID",
+    "CODE_EVIDENCE_CLAIM_NOT_FOUND",
+    "CODE_EVIDENCE_CLAIM_NOT_INITIALIZED",
+    "CODE_EVIDENCE_CLAIM_STORE_CORRUPT",
+    "CODE_EVIDENCE_CONFLICT_ACTOR",
+    "CODE_EVIDENCE_CONFLICT_ALREADY_RESOLVED",
+    "CODE_EVIDENCE_CONFLICT_DETERMINISTIC",
+    "CODE_EVIDENCE_CONFLICT_INVALID",
+    "CODE_EVIDENCE_CONFLICT_NOT_FOUND",
     "CODE_EVIDENCE_INVALID_ENCODING",
     "CODE_EVIDENCE_INVALID_MEDIA",
     "CODE_EVIDENCE_INVALID_SOURCE",
@@ -65,6 +89,10 @@ __all__ = [
     "MEDIA_TEXT_MARKDOWN",
     "MEDIA_TEXT_PLAIN",
     "CatalogPathSelector",
+    "ClaimRecord",
+    "ClaimStore",
+    "ConflictKind",
+    "ConflictRecord",
     "DocumentLineSelector",
     "EvidenceError",
     "EvidenceLimits",
@@ -74,6 +102,7 @@ __all__ = [
     "ProviderSectionSelector",
     "SourceFieldSelector",
     "VerificationOutcomeSelector",
+    "selector_from_mapping",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -143,6 +172,20 @@ CODE_EVIDENCE_NOT_FOUND: str = "discovery.evidence.not_found"
 CODE_EVIDENCE_SELECTOR_STALE: str = "discovery.evidence.selector_stale"
 CODE_EVIDENCE_SELECTOR_OUT_OF_RANGE: str = "discovery.evidence.selector_out_of_range"
 CODE_EVIDENCE_STORE_CORRUPT: str = "discovery.evidence.store_corrupt"
+
+# Stable claim/conflict diagnostic codes (rendered; never leak raw causes).
+CODE_EVIDENCE_CLAIM_INVALID: str = "discovery.evidence.claim_invalid"
+CODE_EVIDENCE_CLAIM_NOT_FOUND: str = "discovery.evidence.claim_not_found"
+CODE_EVIDENCE_CLAIM_INFERRED_ONLY: str = "discovery.evidence.claim_inferred_only"
+CODE_EVIDENCE_CLAIM_NOT_INITIALIZED: str = "discovery.evidence.claim_not_initialized"
+CODE_EVIDENCE_CLAIM_STORE_CORRUPT: str = "discovery.evidence.claim_store_corrupt"
+CODE_EVIDENCE_CONFLICT_INVALID: str = "discovery.evidence.conflict_invalid"
+CODE_EVIDENCE_CONFLICT_NOT_FOUND: str = "discovery.evidence.conflict_not_found"
+CODE_EVIDENCE_CONFLICT_ALREADY_RESOLVED: str = (
+    "discovery.evidence.conflict_already_resolved"
+)
+CODE_EVIDENCE_CONFLICT_DETERMINISTIC: str = "discovery.evidence.conflict_deterministic"
+CODE_EVIDENCE_CONFLICT_ACTOR: str = "discovery.evidence.conflict_actor"
 
 #: Default ``filelock`` acquisition timeout in seconds.
 _DEFAULT_LOCK_TIMEOUT: float = 30.0
@@ -1213,3 +1256,939 @@ class _LockedContext:
 
 # Silence unused-import of Iterator (reserved for future bounded reads).
 _ = Iterator
+
+
+# --------------------------------------------------------------------------- #
+# Typed claims and conflicts (Task 14)                                       #
+# --------------------------------------------------------------------------- #
+
+#: Claim/conflict store layout (within the Git-ignored session workspace).
+_CLAIMS_DIR: str = "claims"
+_CLAIMS_JOURNAL: str = "claims.jsonl"
+_CONFLICTS_JOURNAL: str = "conflicts.jsonl"
+_CLAIMS_LOCK: str = "claims.lock"
+
+# Claim/conflict state labels (constants, not enum).
+_CLAIM_STATE_CURRENT: str = "current"
+_CONFLICT_STATE_UNRESOLVED: str = "unresolved"
+_CONFLICT_STATE_RESOLVED: str = "resolved"
+
+#: Allowed evidence-class values (mirrors :class:`EvidenceClass`).
+_EVIDENCE_CLASS_VALUES: frozenset[str] = frozenset(
+    {c.value for c in EvidenceClass}
+)
+
+
+class ConflictKind(StrEnum):
+    """Whether a conflict is resolved by named-approver authority or new evidence.
+
+    ``SEMANTIC`` conflicts (disagreements over meaning) require the charter's
+    current named approver to resolve; the resolution depends on the approver
+    node so a charter approver change stales it. ``DETERMINISTIC`` conflicts
+    (stale fingerprints, failed physical checks) cannot be resolved by
+    attestation alone — they require new passing evidence.
+    """
+
+    SEMANTIC = "semantic"
+    DETERMINISTIC = "deterministic"
+
+
+#: Allowed conflict-kind values.
+_CONFLICT_KIND_VALUES: frozenset[str] = frozenset(
+    {k.value for k in ConflictKind}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimRecord:
+    """Immutable view of a typed evidence claim.
+
+    Carries only safe, derived metadata. The declarative statement is held for
+    journal reconstruction and canonical hashing but is never echoed by
+    :meth:`safe_dict` or CLI output (it may carry sensitive business detail).
+    Source observation scope is kept explicit in the claim statement and the
+    bound selectors; the system never assigns a numeric confidence.
+    """
+
+    claim_id: str
+    subject: str
+    statement: str
+    evidence_class: str
+    creator_event: str
+    contradicts: tuple[str, ...]
+    selector_kinds: tuple[str, ...]
+    actor: str
+    timestamp: str
+    state: str
+
+    def safe_dict(self) -> dict[str, object]:
+        """Return a JSON-safe mapping without free-text content."""
+
+        return {
+            "claim_id": self.claim_id,
+            "subject": self.subject,
+            "evidence_class": self.evidence_class,
+            "creator_event": self.creator_event,
+            "contradicts": list(self.contradicts),
+            "selector_kinds": list(self.selector_kinds),
+            "state": self.state,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ConflictRecord:
+    """Immutable view of an evidence conflict and any resolution.
+
+    A resolution records a statement, a resolving answer or evidence id, the
+    resolver identity, and a timestamp. It never deletes the involved (contrary)
+    claims; they remain in history. The resolution statement is held for
+    journal reconstruction but never echoed by :meth:`safe_dict`.
+    """
+
+    conflict_id: str
+    kind: str
+    subject: str
+    involved_claim_ids: tuple[str, ...]
+    affected_group_ids: tuple[str, ...]
+    state: str
+    resolution_statement: str | None
+    resolving_answer_id: str | None
+    resolving_evidence_id: str | None
+    resolver: str | None
+    resolved_at: str | None
+    actor: str
+    timestamp: str
+
+    def safe_dict(self) -> dict[str, object]:
+        """Return a JSON-safe mapping without free-text content."""
+
+        payload: dict[str, object] = {
+            "conflict_id": self.conflict_id,
+            "kind": self.kind,
+            "involved_claim_ids": list(self.involved_claim_ids),
+            "affected_group_ids": list(self.affected_group_ids),
+            "state": self.state,
+        }
+        if self.resolving_answer_id is not None:
+            payload["resolving_answer_id"] = self.resolving_answer_id
+        if self.resolving_evidence_id is not None:
+            payload["resolving_evidence_id"] = self.resolving_evidence_id
+        return payload
+
+
+# --------------------------------------------------------------------------- #
+# Claim/conflict input validation                                            #
+# --------------------------------------------------------------------------- #
+
+
+def _claim_utc_now_iso() -> str:
+    """Return the current UTC time as a microsecond ISO-8601 string."""
+
+    return datetime.now(UTC).isoformat(timespec="microseconds")
+
+
+def _claim_validate_node(value: object, *, code: str) -> str:
+    """Validate and return a stable identifier-shaped string."""
+
+    if type(value) is not str or _RECORD_ID_RE.match(value) is None:
+        raise EvidenceError(code) from None
+    return value
+
+
+def _claim_validate_text(value: object, *, code: str) -> str:
+    """Validate that ``value`` is a non-blank, bounded text string."""
+
+    if type(value) is not str or not value.strip():
+        raise EvidenceError(code) from None
+    if len(value) > MAX_TEXT_LENGTH:
+        raise EvidenceError(code) from None
+    return value
+
+
+def _claim_validate_evidence_class(value: object) -> str:
+    """Validate and return an allowed evidence-class value."""
+
+    if isinstance(value, EvidenceClass):
+        return value.value
+    if type(value) is str and value in _EVIDENCE_CLASS_VALUES:
+        return value
+    raise EvidenceError(CODE_EVIDENCE_CLAIM_INVALID) from None
+
+
+def _claim_validate_kind(value: object) -> str:
+    """Validate and return an allowed conflict-kind value."""
+
+    if isinstance(value, ConflictKind):
+        return value.value
+    if type(value) is str and value in _CONFLICT_KIND_VALUES:
+        return value
+    raise EvidenceError(CODE_EVIDENCE_CONFLICT_INVALID) from None
+
+
+def _claim_validate_id_list(
+    values: object,
+    *,
+    min_items: int = 0,
+    code: str = CODE_EVIDENCE_CLAIM_INVALID,
+) -> tuple[str, ...]:
+    """Validate a sequence of stable identifiers (deduplicated, order-stable)."""
+
+    if isinstance(values, str) or not isinstance(values, Sequence):
+        raise EvidenceError(code) from None
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in values:
+        identifier = _claim_validate_node(item, code=code)
+        if identifier not in seen:
+            seen.add(identifier)
+            result.append(identifier)
+    if len(result) < min_items:
+        raise EvidenceError(code) from None
+    return tuple(result)
+
+
+def _claim_validate_selectors(
+    selectors: object, evidence_store: EvidenceStore
+) -> tuple[_EvidenceSelector, ...]:
+    """Validate a non-empty selector sequence, rejecting stale revisions."""
+
+    if isinstance(selectors, str) or not isinstance(selectors, Sequence):
+        raise EvidenceError(CODE_EVIDENCE_CLAIM_INVALID) from None
+    if len(selectors) == 0:
+        raise EvidenceError(CODE_EVIDENCE_CLAIM_INVALID) from None
+    result: list[_EvidenceSelector] = []
+    for selector in selectors:
+        if not isinstance(selector, tuple(_SELECTOR_KINDS.values())):
+            raise EvidenceError(CODE_EVIDENCE_CLAIM_INVALID) from None
+        typed = cast("_EvidenceSelector", selector)
+        # validate_selector raises selector_stale for stale revisions and
+        # selector_out_of_range/not_found for malformed or stale selectors.
+        evidence_store.validate_selector(typed)
+        result.append(typed)
+    return tuple(result)
+
+
+# --------------------------------------------------------------------------- #
+# Selector reconstruction from a JSON mapping                                #
+# --------------------------------------------------------------------------- #
+
+
+def selector_from_mapping(data: object) -> _EvidenceSelector:
+    """Build a typed selector dataclass from a JSON-safe mapping.
+
+    Validates only the field shapes; binding to a recorded revision (rejecting
+    stale selectors) is enforced later by
+    :meth:`EvidenceStore.validate_selector`.
+    """
+
+    if not isinstance(data, Mapping):
+        raise EvidenceError(CODE_EVIDENCE_SELECTOR_OUT_OF_RANGE) from None
+    kind = data.get("kind")
+    record_id = data.get("record_id")
+    content_hash = data.get("content_hash")
+    revision = data.get("revision")
+    if (
+        type(kind) is not str
+        or type(record_id) is not str
+        or type(content_hash) is not str
+        or type(revision) is not int
+        or revision < 1
+    ):
+        raise EvidenceError(CODE_EVIDENCE_SELECTOR_OUT_OF_RANGE) from None
+    cls = _SELECTOR_KINDS.get(kind)
+    if cls is None:
+        raise EvidenceError(CODE_EVIDENCE_SELECTOR_OUT_OF_RANGE) from None
+    if kind == _KIND_DOCUMENT_LINE:
+        start = data.get("start_line")
+        end = data.get("end_line")
+        if type(start) is not int or type(end) is not int:
+            raise EvidenceError(CODE_EVIDENCE_SELECTOR_OUT_OF_RANGE) from None
+        return DocumentLineSelector(
+            record_id=record_id,
+            content_hash=content_hash,
+            revision=revision,
+            start_line=start,
+            end_line=end,
+        )
+    if kind == _KIND_CATALOG_PATH:
+        json_path = data.get("json_path")
+        if type(json_path) is not str:
+            raise EvidenceError(CODE_EVIDENCE_SELECTOR_OUT_OF_RANGE) from None
+        return CatalogPathSelector(
+            record_id=record_id,
+            content_hash=content_hash,
+            revision=revision,
+            json_path=json_path,
+        )
+    if kind == _KIND_SOURCE_FIELD:
+        field_name = data.get("field")
+        if type(field_name) is not str:
+            raise EvidenceError(CODE_EVIDENCE_SELECTOR_OUT_OF_RANGE) from None
+        return SourceFieldSelector(
+            record_id=record_id,
+            content_hash=content_hash,
+            revision=revision,
+            field=field_name,
+        )
+    if kind == _KIND_PROVIDER_SECTION:
+        section = data.get("section")
+        if type(section) is not str:
+            raise EvidenceError(CODE_EVIDENCE_SELECTOR_OUT_OF_RANGE) from None
+        return ProviderSectionSelector(
+            record_id=record_id,
+            content_hash=content_hash,
+            revision=revision,
+            section=section,
+        )
+    if kind == _KIND_INTERVIEW_EVENT:
+        event_id = data.get("event_id")
+        if type(event_id) is not str:
+            raise EvidenceError(CODE_EVIDENCE_SELECTOR_OUT_OF_RANGE) from None
+        return InterviewEventSelector(
+            record_id=record_id,
+            content_hash=content_hash,
+            revision=revision,
+            event_id=event_id,
+        )
+    if kind == _KIND_VERIFICATION_OUTCOME:
+        outcome = data.get("outcome")
+        if outcome not in _VERIFICATION_OUTCOMES:
+            raise EvidenceError(CODE_EVIDENCE_SELECTOR_OUT_OF_RANGE) from None
+        return VerificationOutcomeSelector(
+            record_id=record_id,
+            content_hash=content_hash,
+            revision=revision,
+            outcome=str(outcome),
+        )
+    raise EvidenceError(CODE_EVIDENCE_SELECTOR_OUT_OF_RANGE) from None
+
+
+# --------------------------------------------------------------------------- #
+# Reconstructed claim/conflict state                                         #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _ClaimIndex:
+    """In-memory projection rebuilt from the journals on every load/mutation."""
+
+    claims: dict[str, ClaimRecord] = field(default_factory=dict)
+    conflicts: dict[str, ConflictRecord] = field(default_factory=dict)
+
+
+# --------------------------------------------------------------------------- #
+# ClaimStore                                                                 #
+# --------------------------------------------------------------------------- #
+
+
+class ClaimStore:
+    """Append-only typed claim and conflict journal with stale propagation.
+
+    Mirrors the secrecy and append-only discipline of
+    :class:`EvidenceStore` and :class:`~selayer_discovery.interview.InterviewStore`.
+    Claims and conflicts live in two append-only JSONL journals inside the
+    Git-ignored session workspace. Every mutation binds a session artifact node
+    via :meth:`SessionStore.record_artifact` so transitive stale dependents
+    propagate through the session dependency index:
+
+    * a claim node depends on its creator event (a creator revision stales the
+      claim);
+    * a conflict node depends on its involved claims (a claim revision stales
+      the conflict);
+    * a semantic conflict resolution additionally depends on the charter
+      ``approver`` node, so a charter approver change stales the resolution;
+    * a deterministic conflict resolution depends only on its new evidence,
+      never on the approver.
+
+    Diagnostics never echo a claim statement, a resolution statement, a reason,
+    evidence bodies, or raw exception causes — only stable codes, constant
+    generic details, and validated safe identifiers.
+    """
+
+    def __init__(
+        self,
+        session_store: SessionStore,
+        evidence_store: EvidenceStore,
+        *,
+        lock_timeout: float = _DEFAULT_LOCK_TIMEOUT,
+    ) -> None:
+        self._session = session_store
+        self._evidence = evidence_store
+        self._root = session_store.root / _CLAIMS_DIR
+        self._lock_timeout = lock_timeout
+        self._claims_journal = self._root / _CLAIMS_JOURNAL
+        self._conflicts_journal = self._root / _CONFLICTS_JOURNAL
+        self._lock_path = self._root / _CLAIMS_LOCK
+        self._lock = FileLock(str(self._lock_path))
+        self._index = _ClaimIndex()
+
+    # -- construction ------------------------------------------------------- #
+
+    @classmethod
+    def create(
+        cls,
+        session_store: SessionStore,
+        evidence_store: EvidenceStore,
+        *,
+        lock_timeout: float = _DEFAULT_LOCK_TIMEOUT,
+    ) -> ClaimStore:
+        """Create the claim/conflict layout (idempotent) and load any journals."""
+
+        store = cls(session_store, evidence_store, lock_timeout=lock_timeout)
+        store._ensure_layout()
+        with store._locked():
+            store._index = store._reconstruct()
+        return store
+
+    @classmethod
+    def open(
+        cls,
+        session_store: SessionStore,
+        evidence_store: EvidenceStore,
+        *,
+        lock_timeout: float = _DEFAULT_LOCK_TIMEOUT,
+    ) -> ClaimStore:
+        """Open an existing claim/conflict store and rebuild state from journals."""
+
+        store = cls(session_store, evidence_store, lock_timeout=lock_timeout)
+        if not store._claims_journal.exists():
+            raise EvidenceError(CODE_EVIDENCE_CLAIM_NOT_INITIALIZED) from None
+        with store._locked():
+            store._index = store._reconstruct()
+        return store
+
+    def _ensure_layout(self) -> None:
+        self._root.mkdir(parents=True, exist_ok=True)
+        if os.name == "posix":
+            try:
+                os.chmod(self._root, 0o700)
+            except OSError:
+                pass
+
+    # -- properties --------------------------------------------------------- #
+
+    @property
+    def root(self) -> Path:
+        return self._root
+
+    def claims(self) -> tuple[ClaimRecord, ...]:
+        """Return all claims sorted by id."""
+
+        return tuple(
+            sorted(self._index.claims.values(), key=lambda c: c.claim_id)
+        )
+
+    def get_claim(self, claim_id: str) -> ClaimRecord:
+        """Return the claim with ``claim_id``."""
+
+        record = self._index.claims.get(claim_id)
+        if record is None:
+            raise EvidenceError(
+                CODE_EVIDENCE_CLAIM_NOT_FOUND, safe_ids=(claim_id,)
+            ) from None
+        return record
+
+    def conflicts(self) -> tuple[ConflictRecord, ...]:
+        """Return all conflicts (latest state per id) sorted by id."""
+
+        return tuple(
+            sorted(self._index.conflicts.values(), key=lambda c: c.conflict_id)
+        )
+
+    def get_conflict(self, conflict_id: str) -> ConflictRecord:
+        """Return the latest state of conflict ``conflict_id``."""
+
+        record = self._index.conflicts.get(conflict_id)
+        if record is None:
+            raise EvidenceError(
+                CODE_EVIDENCE_CONFLICT_NOT_FOUND, safe_ids=(conflict_id,)
+            ) from None
+        return record
+
+    # -- claim mutations ---------------------------------------------------- #
+
+    def add_claim(
+        self,
+        *,
+        claim_id: str,
+        subject: str,
+        statement: str,
+        evidence_class: EvidenceClass | str,
+        selectors: Sequence[_EvidenceSelector],
+        creator_event: str,
+        contradicts: Sequence[str] = (),
+        actor: str,
+    ) -> ClaimRecord:
+        """Record a typed, evidence-selector-backed claim tied to a creator event.
+
+        Requires a stable subject, a declarative statement, a valid evidence
+        class, at least one selector bound to a current (non-stale) revision,
+        and a creator event reference. The system never assigns a numeric
+        confidence; source observation scope stays explicit in the statement
+        and selector.
+        """
+
+        cid = _claim_validate_node(claim_id, code=CODE_EVIDENCE_CLAIM_INVALID)
+        subj = _claim_validate_node(subject, code=CODE_EVIDENCE_CLAIM_INVALID)
+        stmt = _claim_validate_text(
+            statement, code=CODE_EVIDENCE_CLAIM_INVALID
+        )
+        eclazz = _claim_validate_evidence_class(evidence_class)
+        creator = _claim_validate_node(
+            creator_event, code=CODE_EVIDENCE_CLAIM_INVALID
+        )
+        contra = _claim_validate_id_list(contradicts)
+        # Selectors are validated against the evidence store before the claim
+        # lock is acquired (stale revisions raise selector_stale).
+        sel_list = _claim_validate_selectors(selectors, self._evidence)
+        author = normalize_actor_identity(actor)
+        with self._locked():
+            if cid in self._index.claims:
+                raise EvidenceError(
+                    CODE_EVIDENCE_CLAIM_INVALID, safe_ids=(cid,)
+                ) from None
+            timestamp = _claim_utc_now_iso()
+            selector_kinds = tuple(sorted({s.kind for s in sel_list}))
+            record = ClaimRecord(
+                claim_id=cid,
+                subject=subj,
+                statement=stmt,
+                evidence_class=eclazz,
+                creator_event=creator,
+                contradicts=contra,
+                selector_kinds=selector_kinds,
+                actor=author,
+                timestamp=timestamp,
+                state=_CLAIM_STATE_CURRENT,
+            )
+            self._append_record(self._claims_journal, self._claim_payload(record))
+            self._index.claims[cid] = record
+            # Bind the claim as a session artifact node depending on its
+            # creator event so a creator revision emits the claim as stale.
+            self._session.record_artifact(
+                cid,
+                content_hash=canonical.fingerprint(self._claim_payload(record)),
+                depends_on=(creator,),
+                actor=author,
+            )
+            return record
+
+    def assert_executable_evidence(self, claim_ids: Sequence[str]) -> None:
+        """Reject inferred-only evidence for executable operations.
+
+        Raises :class:`EvidenceError` when the cited evidence is inferred-only
+        (no observed or asserted claim is present) or cites an unknown claim.
+        """
+
+        ids = _claim_validate_id_list(claim_ids, min_items=1)
+        has_non_inferred = False
+        for cid in ids:
+            record = self._index.claims.get(cid)
+            if record is None:
+                raise EvidenceError(
+                    CODE_EVIDENCE_CLAIM_NOT_FOUND, safe_ids=(cid,)
+                ) from None
+            if record.evidence_class != EvidenceClass.INFERRED.value:
+                has_non_inferred = True
+        if not has_non_inferred:
+            raise EvidenceError(CODE_EVIDENCE_CLAIM_INFERRED_ONLY) from None
+
+    # -- conflict mutations ------------------------------------------------- #
+
+    def add_conflict(
+        self,
+        *,
+        conflict_id: str,
+        kind: ConflictKind | str,
+        subject: str,
+        involved_claim_ids: Sequence[str],
+        affected_group_ids: Sequence[str],
+        reason: str,
+        actor: str,
+    ) -> ConflictRecord:
+        """Record an unresolved conflict affecting one or more dependency groups."""
+
+        cfid = _claim_validate_node(
+            conflict_id, code=CODE_EVIDENCE_CONFLICT_INVALID
+        )
+        kkind = _claim_validate_kind(kind)
+        subj = _claim_validate_node(
+            subject, code=CODE_EVIDENCE_CONFLICT_INVALID
+        )
+        involved = _claim_validate_id_list(
+            involved_claim_ids, min_items=1, code=CODE_EVIDENCE_CONFLICT_INVALID
+        )
+        groups = _claim_validate_id_list(
+            affected_group_ids,
+            min_items=1,
+            code=CODE_EVIDENCE_CONFLICT_INVALID,
+        )
+        _claim_validate_text(reason, code=CODE_EVIDENCE_CONFLICT_INVALID)
+        author = normalize_actor_identity(actor)
+        with self._locked():
+            if cfid in self._index.conflicts:
+                raise EvidenceError(
+                    CODE_EVIDENCE_CONFLICT_INVALID, safe_ids=(cfid,)
+                ) from None
+            for cid in involved:
+                if cid not in self._index.claims:
+                    raise EvidenceError(
+                        CODE_EVIDENCE_CLAIM_NOT_FOUND, safe_ids=(cid,)
+                    ) from None
+            timestamp = _claim_utc_now_iso()
+            record = ConflictRecord(
+                conflict_id=cfid,
+                kind=kkind,
+                subject=subj,
+                involved_claim_ids=involved,
+                affected_group_ids=groups,
+                state=_CONFLICT_STATE_UNRESOLVED,
+                resolution_statement=None,
+                resolving_answer_id=None,
+                resolving_evidence_id=None,
+                resolver=None,
+                resolved_at=None,
+                actor=author,
+                timestamp=timestamp,
+            )
+            self._append_record(
+                self._conflicts_journal, self._conflict_payload(record)
+            )
+            self._index.conflicts[cfid] = record
+            # Bind the conflict as a session artifact node depending on the
+            # involved claims so a claim revision emits the conflict as stale.
+            self._session.record_artifact(
+                cfid,
+                content_hash=canonical.fingerprint(self._conflict_payload(record)),
+                depends_on=tuple(involved),
+                actor=author,
+            )
+            return record
+
+    def resolve_conflict(
+        self,
+        *,
+        conflict_id: str,
+        statement: str,
+        answer_id: str = "",
+        evidence_id: str = "",
+        actor: str,
+    ) -> ConflictRecord:
+        """Resolve a conflict, recording statement, answer/evidence id, and actor.
+
+        Semantic conflicts require the charter's current named approver; the
+        resolution depends on the ``approver`` node so a charter approver change
+        stales it. Deterministic conflicts cannot be resolved by attestation
+        alone — they require a resolving evidence id (new passing evidence) and
+        never depend on the approver. The resolution never deletes the involved
+        (contrary) claims.
+        """
+
+        cfid = _claim_validate_node(
+            conflict_id, code=CODE_EVIDENCE_CONFLICT_NOT_FOUND
+        )
+        stmt = _claim_validate_text(
+            statement, code=CODE_EVIDENCE_CONFLICT_INVALID
+        )
+        answer = answer_id if type(answer_id) is str else ""
+        evidence = evidence_id if type(evidence_id) is str else ""
+        if answer:
+            answer = _claim_validate_node(
+                answer, code=CODE_EVIDENCE_CONFLICT_INVALID
+            )
+        if evidence:
+            evidence = _claim_validate_node(
+                evidence, code=CODE_EVIDENCE_CONFLICT_INVALID
+            )
+        author = normalize_actor_identity(actor)
+        with self._locked():
+            current = self._index.conflicts.get(cfid)
+            if current is None:
+                raise EvidenceError(
+                    CODE_EVIDENCE_CONFLICT_NOT_FOUND, safe_ids=(cfid,)
+                ) from None
+            if current.state == _CONFLICT_STATE_RESOLVED:
+                raise EvidenceError(
+                    CODE_EVIDENCE_CONFLICT_ALREADY_RESOLVED, safe_ids=(cfid,)
+                ) from None
+            deps: list[str] = list(current.involved_claim_ids)
+            if current.kind == ConflictKind.SEMANTIC.value:
+                approver = normalize_actor_identity(self._session.charter.approver)
+                if author != approver:
+                    raise EvidenceError(
+                        CODE_EVIDENCE_CONFLICT_ACTOR, safe_ids=(cfid,)
+                    ) from None
+                # The resolution depends on the approver so a charter approver
+                # change stales this semantic resolution.
+                deps.append("approver")
+            else:
+                # Deterministic failures cannot be resolved by attestation
+                # alone; they require new passing evidence.
+                if not evidence:
+                    raise EvidenceError(
+                        CODE_EVIDENCE_CONFLICT_DETERMINISTIC, safe_ids=(cfid,)
+                    ) from None
+            timestamp = _claim_utc_now_iso()
+            resolved = ConflictRecord(
+                conflict_id=current.conflict_id,
+                kind=current.kind,
+                subject=current.subject,
+                involved_claim_ids=current.involved_claim_ids,
+                affected_group_ids=current.affected_group_ids,
+                state=_CONFLICT_STATE_RESOLVED,
+                resolution_statement=stmt,
+                resolving_answer_id=answer or None,
+                resolving_evidence_id=evidence or None,
+                resolver=author,
+                resolved_at=timestamp,
+                actor=author,
+                timestamp=timestamp,
+            )
+            self._append_record(
+                self._conflicts_journal, self._conflict_payload(resolved)
+            )
+            self._index.conflicts[cfid] = resolved
+            # Re-record the conflict node with updated dependencies. A semantic
+            # resolution now depends on the approver; a deterministic resolution
+            # depends on the involved claims (and new evidence) but not approver.
+            self._session.record_artifact(
+                cfid,
+                content_hash=canonical.fingerprint(
+                    self._conflict_payload(resolved)
+                ),
+                depends_on=tuple(sorted(set(deps))),
+                actor=author,
+            )
+            return resolved
+
+    def group_blocked_by(self, group_id: str) -> tuple[str, ...]:
+        """Return sorted unresolved conflict ids that affect ``group_id``."""
+
+        gid = _claim_validate_node(
+            group_id, code=CODE_EVIDENCE_CONFLICT_INVALID
+        )
+        blocking = [
+            record.conflict_id
+            for record in self._index.conflicts.values()
+            if record.state == _CONFLICT_STATE_UNRESOLVED
+            and gid in record.affected_group_ids
+        ]
+        return tuple(sorted(blocking))
+
+    # -- payload builders --------------------------------------------------- #
+
+    @staticmethod
+    def _claim_payload(record: ClaimRecord) -> dict[str, object]:
+        return {
+            "claim_id": record.claim_id,
+            "subject": record.subject,
+            "statement": record.statement,
+            "evidence_class": record.evidence_class,
+            "creator_event": record.creator_event,
+            "contradicts": list(record.contradicts),
+            "selector_kinds": list(record.selector_kinds),
+            "actor": record.actor,
+            "timestamp": record.timestamp,
+            "state": record.state,
+        }
+
+    @staticmethod
+    def _conflict_payload(record: ConflictRecord) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "conflict_id": record.conflict_id,
+            "kind": record.kind,
+            "subject": record.subject,
+            "involved_claim_ids": list(record.involved_claim_ids),
+            "affected_group_ids": list(record.affected_group_ids),
+            "state": record.state,
+            "actor": record.actor,
+            "timestamp": record.timestamp,
+        }
+        if record.resolution_statement is not None:
+            payload["resolution_statement"] = record.resolution_statement
+        if record.resolving_answer_id is not None:
+            payload["resolving_answer_id"] = record.resolving_answer_id
+        if record.resolving_evidence_id is not None:
+            payload["resolving_evidence_id"] = record.resolving_evidence_id
+        if record.resolver is not None:
+            payload["resolver"] = record.resolver
+        if record.resolved_at is not None:
+            payload["resolved_at"] = record.resolved_at
+        return payload
+
+    # -- append + durability ------------------------------------------------ #
+
+    def _append_record(
+        self, journal: Path, payload: Mapping[str, object]
+    ) -> None:
+        """Append one canonical JSON line, flush, and fsync the journal."""
+
+        line = json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        try:
+            descriptor = os.open(journal, flags, 0o600)
+        except OSError:
+            raise EvidenceError(CODE_EVIDENCE_CLAIM_STORE_CORRUPT) from None
+        try:
+            with os.fdopen(descriptor, "a", closefd=False) as handle:
+                handle.write(line)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError:
+            raise EvidenceError(CODE_EVIDENCE_CLAIM_STORE_CORRUPT) from None
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if os.name == "posix":
+            try:
+                os.chmod(journal, 0o600)
+            except OSError:
+                pass
+
+    # -- reconstruction ----------------------------------------------------- #
+
+    def _reconstruct(self) -> _ClaimIndex:
+        index = _ClaimIndex()
+        if self._claims_journal.exists():
+            with self._claims_journal.open("r", encoding="utf-8") as handle:
+                for raw in handle:
+                    line = raw.rstrip("\n")
+                    if line == "":
+                        continue
+                    record = self._parse_claim(line)
+                    index.claims[record.claim_id] = record
+        if self._conflicts_journal.exists():
+            with self._conflicts_journal.open("r", encoding="utf-8") as handle:
+                for raw in handle:
+                    line = raw.rstrip("\n")
+                    if line == "":
+                        continue
+                    record = self._parse_conflict(line)
+                    # Last-write-wins: a resolution supersedes the unresolved
+                    # record while the journal stays append-only.
+                    index.conflicts[record.conflict_id] = record
+        return index
+
+    def _parse_claim(self, line: str) -> ClaimRecord:
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            raise EvidenceError(CODE_EVIDENCE_CLAIM_STORE_CORRUPT) from None
+        if not isinstance(obj, dict):
+            raise EvidenceError(CODE_EVIDENCE_CLAIM_STORE_CORRUPT) from None
+        evidence_class = obj.get("evidence_class")
+        if (
+            type(evidence_class) is not str
+            or evidence_class not in _EVIDENCE_CLASS_VALUES
+        ):
+            raise EvidenceError(CODE_EVIDENCE_CLAIM_STORE_CORRUPT) from None
+        return ClaimRecord(
+            claim_id=_claim_req_str(obj, "claim_id"),
+            subject=_claim_req_str(obj, "subject"),
+            statement=_claim_req_str(obj, "statement"),
+            evidence_class=evidence_class,
+            creator_event=_claim_req_str(obj, "creator_event"),
+            contradicts=_claim_tuple_str(obj.get("contradicts", ())),
+            selector_kinds=_claim_tuple_str(obj.get("selector_kinds", ())),
+            actor=_claim_req_str(obj, "actor"),
+            timestamp=_claim_validate_timestamp(obj.get("timestamp")),
+            state=_claim_req_str(obj, "state"),
+        )
+
+    def _parse_conflict(self, line: str) -> ConflictRecord:
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            raise EvidenceError(CODE_EVIDENCE_CLAIM_STORE_CORRUPT) from None
+        if not isinstance(obj, dict):
+            raise EvidenceError(CODE_EVIDENCE_CLAIM_STORE_CORRUPT) from None
+        kind = obj.get("kind")
+        state = obj.get("state")
+        if (
+            type(kind) is not str
+            or kind not in _CONFLICT_KIND_VALUES
+            or type(state) is not str
+            or state not in (_CONFLICT_STATE_UNRESOLVED, _CONFLICT_STATE_RESOLVED)
+        ):
+            raise EvidenceError(CODE_EVIDENCE_CLAIM_STORE_CORRUPT) from None
+        return ConflictRecord(
+            conflict_id=_claim_req_str(obj, "conflict_id"),
+            kind=kind,
+            subject=_claim_req_str(obj, "subject"),
+            involved_claim_ids=_claim_tuple_str(obj.get("involved_claim_ids", ())),
+            affected_group_ids=_claim_tuple_str(obj.get("affected_group_ids", ())),
+            state=state,
+            resolution_statement=_claim_opt_str(obj.get("resolution_statement")),
+            resolving_answer_id=_claim_opt_str(obj.get("resolving_answer_id")),
+            resolving_evidence_id=_claim_opt_str(obj.get("resolving_evidence_id")),
+            resolver=_claim_opt_str(obj.get("resolver")),
+            resolved_at=_claim_opt_timestamp(obj.get("resolved_at")),
+            actor=_claim_req_str(obj, "actor"),
+            timestamp=_claim_validate_timestamp(obj.get("timestamp")),
+        )
+
+    # -- locking ------------------------------------------------------------ #
+
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        """Acquire the claim lock, refresh from journals, then release."""
+
+        try:
+            self._lock.acquire(timeout=self._lock_timeout)
+        except Timeout:
+            raise EvidenceError(CODE_EVIDENCE_CLAIM_STORE_CORRUPT) from None
+        try:
+            self._index = self._reconstruct()
+            yield
+        finally:
+            if self._lock.lock_counter > 0:
+                self._lock.release()
+
+
+# --------------------------------------------------------------------------- #
+# Journal payload parsing helpers (strict on replay)                          #
+# --------------------------------------------------------------------------- #
+
+
+def _claim_req_str(payload: Mapping[str, object], key: str) -> str:
+    value = payload.get(key)
+    if type(value) is not str:
+        raise EvidenceError(CODE_EVIDENCE_CLAIM_STORE_CORRUPT) from None
+    return value
+
+
+def _claim_opt_str(value: object) -> str | None:
+    if value is None:
+        return None
+    if type(value) is str:
+        return value
+    raise EvidenceError(CODE_EVIDENCE_CLAIM_STORE_CORRUPT) from None
+
+
+def _claim_tuple_str(value: object) -> tuple[str, ...]:
+    if isinstance(value, str) or not isinstance(value, Sequence):
+        raise EvidenceError(CODE_EVIDENCE_CLAIM_STORE_CORRUPT) from None
+    return tuple(str(item) for item in value)
+
+
+def _claim_validate_timestamp(value: object) -> str:
+    """Validate that ``value`` is an ISO-8601 UTC string."""
+
+    if type(value) is not str:
+        raise EvidenceError(CODE_EVIDENCE_CLAIM_STORE_CORRUPT) from None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise EvidenceError(CODE_EVIDENCE_CLAIM_STORE_CORRUPT) from None
+    offset = parsed.tzinfo.utcoffset(parsed) if parsed.tzinfo is not None else None
+    if offset != timedelta(0):
+        raise EvidenceError(CODE_EVIDENCE_CLAIM_STORE_CORRUPT) from None
+    return value
+
+
+def _claim_opt_timestamp(value: object) -> str | None:
+    if value is None:
+        return None
+    return _claim_validate_timestamp(value)
