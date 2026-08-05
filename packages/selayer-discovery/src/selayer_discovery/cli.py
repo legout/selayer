@@ -51,12 +51,19 @@ from selayer.sources.profiles import (
     MappingProfileResolver,
 )
 from selayer.sources.registry import SourceRegistry
+from selayer_discovery.canonical import fingerprint
 from selayer_discovery.diagnostics import DiscoveryError
 from selayer_discovery.evidence import (
     MEDIA_TEXT_MARKDOWN,
     MEDIA_TEXT_PLAIN,
     EvidenceError,
     EvidenceStore,
+)
+from selayer_discovery.knowledge import (
+    CODE_KNOWLEDGE_DUPLICATE_PROVIDER,
+    CODE_KNOWLEDGE_PROVIDER_UNKNOWN,
+    KnowledgeError,
+    ProviderRegistry,
 )
 from selayer_discovery.model import SCHEMA_VERSION, normalize_actor_identity
 from selayer_discovery.profiling import (
@@ -176,6 +183,8 @@ def _error_payload(exc: BaseException) -> dict[str, object]:
     if isinstance(exc, SessionError):
         return exc.to_dict()
     if isinstance(exc, EvidenceError):
+        return exc.to_dict()
+    if isinstance(exc, KnowledgeError):
         return exc.to_dict()
     if isinstance(exc, SourceError):
         return {"code": exc.code, "source_id": _safe_id(exc.source_id)}
@@ -452,6 +461,110 @@ def _require_session(project: Path, session_id: str) -> Path:
     return session_dir
 
 
+_PROVIDER_CONFIG_KEY_RE = re.compile(r"\A[a-z][a-z0-9_.-]{0,63}\Z")
+_ENV_REF_RE = re.compile(r"\A[A-Z][A-Z0-9_]{0,127}\Z")
+_SECRET_KEY_PARTS = frozenset({"password", "passwd", "token", "secret", "credential", "apikey", "private_key"})
+_FORBIDDEN_PROVIDER_KEYS = frozenset({"command", "executable", "shell", "subprocess", "process"})
+
+
+def _parse_assignments(values: Sequence[str]) -> dict[str, str]:
+    """Parse ``KEY=VALUE`` options without exposing the value in errors."""
+
+    result: dict[str, str] = {}
+    for raw in values:
+        if type(raw) is not str or raw.count("=") != 1:
+            raise KnowledgeError("discovery.knowledge.invalid_configuration") from None
+        key, value = raw.split("=", 1)
+        if _PROVIDER_CONFIG_KEY_RE.match(key) is None or not value:
+            raise KnowledgeError("discovery.knowledge.invalid_configuration") from None
+        if key in result:
+            raise KnowledgeError("discovery.knowledge.invalid_configuration") from None
+        result[key] = value
+    return result
+
+
+def _validate_provider_configuration(
+    project: Path,
+    *,
+    provider_name: str,
+    provider_type: str,
+    options: Sequence[str],
+    env_refs: Sequence[str],
+    root: str | None,
+) -> tuple[dict[str, object], str]:
+    """Validate provider config and return safe config plus its fingerprint."""
+
+    if _PROVIDER_CONFIG_KEY_RE.match(provider_name) is None:
+        raise KnowledgeError("discovery.knowledge.invalid_configuration") from None
+    if _PROVIDER_CONFIG_KEY_RE.match(provider_type) is None:
+        raise KnowledgeError(CODE_KNOWLEDGE_PROVIDER_UNKNOWN, safe_provider=provider_type) from None
+    if provider_type not in ProviderRegistry.discover_types():
+        raise KnowledgeError(CODE_KNOWLEDGE_PROVIDER_UNKNOWN, safe_provider=provider_type) from None
+    parsed_options = _parse_assignments(options)
+    parsed_env = _parse_assignments(env_refs)
+    safe_options: dict[str, object] = {}
+    for key, value in parsed_options.items():
+        lowered = key.lower()
+        if lowered in _FORBIDDEN_PROVIDER_KEYS or any(part in lowered for part in _SECRET_KEY_PARTS):
+            raise KnowledgeError("discovery.knowledge.invalid_configuration") from None
+        if "://" in value or "@" in value or "\\x00" in value:
+            raise KnowledgeError("discovery.knowledge.invalid_configuration") from None
+        safe_options[key] = value
+    safe_env: dict[str, str] = {}
+    for key, value in parsed_env.items():
+        if key.lower() in _FORBIDDEN_PROVIDER_KEYS or any(part in key.lower() for part in _SECRET_KEY_PARTS):
+            raise KnowledgeError("discovery.knowledge.invalid_configuration") from None
+        if _ENV_REF_RE.match(value) is None:
+            raise KnowledgeError("discovery.knowledge.invalid_configuration") from None
+        safe_env[key] = value
+    if root is not None:
+        root_abs = _assert_contained(project, Path(root), kind="provider_root")
+        safe_options["root"] = root_abs.relative_to(project.resolve()).as_posix()
+    config: dict[str, object] = {
+        "provider_name": provider_name,
+        "provider_type": provider_type,
+        "options": safe_options,
+        "env_refs": safe_env,
+    }
+    return config, fingerprint(config)
+
+
+def _provider_artifact_id(provider_name: str) -> str:
+    return f"provider-{provider_name}"
+
+
+def _handle_intake_add_provider(args: argparse.Namespace) -> int:
+    project = _project_root(args.project)
+    session_id = _validate_session_id(args.session_id)
+    session_dir = _require_session(project, session_id)
+    store = SessionStore.open(session_dir)
+    snapshot = store.reconstruct()
+    artifact_id = _provider_artifact_id(args.name)
+    if artifact_id in snapshot.artifact_hashes:
+        raise KnowledgeError(
+            CODE_KNOWLEDGE_DUPLICATE_PROVIDER, safe_provider=args.name
+        ) from None
+    config, config_hash = _validate_provider_configuration(
+        project,
+        provider_name=args.name,
+        provider_type=args.provider_type,
+        options=tuple(args.option),
+        env_refs=tuple(args.env),
+        root=args.root,
+    )
+    actor = args.actor or store.charter.approver
+    store.record_artifact(artifact_id, content_hash=config_hash, actor=actor)
+    _emit_json(
+        {
+            "provider_name": config["provider_name"],
+            "provider_type": config["provider_type"],
+            "config_fingerprint": config_hash,
+            "artifact_id": artifact_id,
+        }
+    )
+    return EXIT_OK
+
+
 def _handle_intake_add_document(args: argparse.Namespace) -> int:
     project = _project_root(args.project)
     session_id = _validate_session_id(args.session_id)
@@ -507,14 +620,70 @@ def _handle_intake_snapshot(args: argparse.Namespace) -> int:
     media_type = args.media_type
     if media_type not in (MEDIA_TEXT_MARKDOWN, MEDIA_TEXT_PLAIN):
         raise EvidenceError("discovery.evidence.invalid_media") from None
+
+    provider_name = args.provider
+    resource_id = args.resource_id
+    revision = args.revision
+    selector = args.selector or ""
+    provider_snapshot = any(
+        value is not None for value in (provider_name, resource_id, revision)
+    ) or bool(selector)
+    store = SessionStore.open(session_dir)
+    if provider_snapshot:
+        if not provider_name or not resource_id or not revision:
+            raise KnowledgeError("discovery.knowledge.invalid_resource") from None
+        if _PROVIDER_CONFIG_KEY_RE.match(provider_name) is None:
+            raise KnowledgeError("discovery.knowledge.invalid_resource") from None
+        if resource_id.count(":") != 1 or not resource_id.startswith(f"{provider_name}:"):
+            raise KnowledgeError("discovery.knowledge.invalid_resource") from None
+        if _HEX64_RE.match(revision) is None:
+            raise KnowledgeError("discovery.knowledge.invalid_resource") from None
+        if (
+            type(selector) is not str
+            or len(selector) > 256
+            or any(ord(char) < 0x20 for char in selector)
+        ):
+            raise KnowledgeError("discovery.knowledge.invalid_resource") from None
+        provider_artifact = _provider_artifact_id(provider_name)
+        if provider_artifact not in store.reconstruct().artifact_hashes:
+            raise KnowledgeError(
+                CODE_KNOWLEDGE_PROVIDER_UNKNOWN, safe_provider=provider_name
+            ) from None
+        source = args.source or f"provider/{provider_name}/{_safe_file_name(resource_id)}"
+    else:
+        source = args.source
+        if not source:
+            raise EvidenceError("discovery.evidence.invalid_source") from None
+
     raw = _read_stdin_bytes()
-    store = EvidenceStore.create(_evidence_root(session_dir))
-    record = store.add_snapshot(
-        raw,
-        media_type=media_type,
-        source=args.source,
-    )
-    _emit_json(record.to_dict())
+    evidence = EvidenceStore.create(_evidence_root(session_dir))
+    record = evidence.add_snapshot(raw, media_type=media_type, source=source)
+    payload = record.to_dict()
+    if provider_snapshot:
+        artifact_id = f"knowledge-{_safe_file_name(resource_id)}"
+        artifact_hash = fingerprint(
+            {
+                "content_hash": record.content_hash,
+                "provider_name": provider_name,
+                "resource_id": resource_id,
+                "revision": revision,
+                "selector": selector,
+            }
+        )
+        actor = args.actor or store.charter.approver
+        result = store.record_artifact(
+            artifact_id, content_hash=artifact_hash, actor=actor
+        )
+        payload.update(
+            {
+                "provider_name": provider_name,
+                "resource_id": resource_id,
+                "provider_revision": revision,
+                "selector": selector,
+                "stale_targets": list(result.stale_targets),
+            }
+        )
+    _emit_json(payload)
     return EXIT_OK
 
 
@@ -990,6 +1159,19 @@ def _parser() -> argparse.ArgumentParser:
     )
     add_document_parser.set_defaults(func=_handle_intake_add_document)
 
+    provider_parser = intake_sub.add_parser(
+        "add-provider", help="Register a read-only knowledge provider type."
+    )
+    provider_parser.add_argument("--session-id", required=True)
+    provider_parser.add_argument("--project", help="Project root (default: cwd).")
+    provider_parser.add_argument("--name", required=True, help="Configured provider name.")
+    provider_parser.add_argument("--type", dest="provider_type", required=True)
+    provider_parser.add_argument("--root", help="Contained root for filesystem providers.")
+    provider_parser.add_argument("--option", action="append", default=[])
+    provider_parser.add_argument("--env", action="append", default=[])
+    provider_parser.add_argument("--actor")
+    provider_parser.set_defaults(func=_handle_intake_add_provider)
+
     snapshot_parser = intake_sub.add_parser(
         "snapshot", help="Store normalized text content read from stdin."
     )
@@ -997,9 +1179,12 @@ def _parser() -> argparse.ArgumentParser:
         "--session-id", dest="session_id", required=True, help="Session id."
     )
     snapshot_parser.add_argument("--project", help="Project root (default: cwd).")
-    snapshot_parser.add_argument(
-        "--source", required=True, help="Source label for the snapshot."
-    )
+    snapshot_parser.add_argument("--source", help="Source label for the snapshot.")
+    snapshot_parser.add_argument("--provider", help="Provider name for a provider snapshot.")
+    snapshot_parser.add_argument("--resource-id", help="Namespaced provider resource id.")
+    snapshot_parser.add_argument("--revision", help="Immutable provider revision hash.")
+    snapshot_parser.add_argument("--selector", help="Bounded provider selector.")
+    snapshot_parser.add_argument("--actor")
     snapshot_parser.add_argument(
         "--media-type",
         dest="media_type",
@@ -1076,6 +1261,7 @@ def _run(handler: object, args: argparse.Namespace) -> int:
         SessionError,
         EvidenceError,
         _CliError,
+        KnowledgeError,
         ProfilePolicyError,
         DiscoveryError,
     ) as exc:

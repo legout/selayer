@@ -1727,3 +1727,136 @@ def test_export_context_failcloses_on_approver_mismatch(
     err = json.loads(capsys.readouterr().err)
     assert err["code"] == "discovery.profile.policy_stale"
     assert err["safe_detail"] == "approver"
+
+
+# --------------------------------------------------------------------------- #
+# Knowledge-provider CLI intake (Task 12)                                    #
+# --------------------------------------------------------------------------- #
+
+
+def _add_test_provider(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], *, name: str = "wiki"
+) -> dict[str, Any]:
+    code = main(
+        [
+            "intake",
+            "add-provider",
+            "--session-id",
+            "session-policy-001",
+            "--project",
+            str(tmp_path),
+            "--name",
+            name,
+            "--type",
+            "okf-filesystem",
+            "--root",
+            ".",
+            "--env",
+            "catalog_ref=SELAYER_CATALOG",
+        ]
+    )
+    assert code == 0
+    return json.loads(capsys.readouterr().out)
+
+
+def test_intake_add_provider_records_safe_configuration(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _init_policy_session(tmp_path, capsys)
+    output = _add_test_provider(tmp_path, capsys)
+    assert output["provider_name"] == "wiki"
+    assert output["provider_type"] == "okf-filesystem"
+    assert len(output["config_fingerprint"]) == 64
+    store = SessionStore.open(
+        cli_module._session_dir(tmp_path.resolve(), "session-policy-001")
+    )
+    assert "provider-wiki" in store.reconstruct().artifact_hashes
+
+
+def test_intake_add_provider_rejects_duplicate_and_secret_options(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _init_policy_session(tmp_path, capsys)
+    _add_test_provider(tmp_path, capsys)
+    code = main(
+        [
+            "intake",
+            "add-provider",
+            "--session-id",
+            "session-policy-001",
+            "--project",
+            str(tmp_path),
+            "--name",
+            "wiki",
+            "--type",
+            "okf-filesystem",
+        ]
+    )
+    assert code == 1
+    assert json.loads(capsys.readouterr().err)["code"] == (
+        "discovery.knowledge.duplicate_provider"
+    )
+    code = main(
+        [
+            "intake",
+            "add-provider",
+            "--session-id",
+            "session-policy-001",
+            "--project",
+            str(tmp_path),
+            "--name",
+            "secrets",
+            "--type",
+            "okf-filesystem",
+            "--option",
+            "password=hunter2",
+        ]
+    )
+    assert code == 1
+    assert json.loads(capsys.readouterr().err)["code"] == (
+        "discovery.knowledge.invalid_configuration"
+    )
+
+
+def test_intake_snapshot_records_provider_revision_and_stales_dependents(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_policy_session(tmp_path, capsys)
+    _add_test_provider(tmp_path, capsys)
+    session_dir = cli_module._session_dir(tmp_path.resolve(), "session-policy-001")
+    store = SessionStore.open(session_dir)
+    store.record_artifact(
+        "draft-one",
+        content_hash="a" * 64,
+        depends_on=("knowledge-wiki-doc-1",),
+        actor="Dr. Alice Okonkwo",
+    )
+    monkeypatch.setattr(cli_module, "_read_stdin_bytes", lambda: b"first body")
+    args = [
+        "intake",
+        "snapshot",
+        "--session-id",
+        "session-policy-001",
+        "--project",
+        str(tmp_path),
+        "--provider",
+        "wiki",
+        "--resource-id",
+        "wiki:doc-1",
+        "--revision",
+        "b" * 64,
+        "--selector",
+        "section:one",
+        "--media-type",
+        "text/markdown",
+    ]
+    assert main(args) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first["provider_name"] == "wiki"
+    assert first["resource_id"] == "wiki:doc-1"
+    assert first["provider_revision"] == "b" * 64
+    assert first["stale_targets"] == []
+    monkeypatch.setattr(cli_module, "_read_stdin_bytes", lambda: b"changed body")
+    assert main(args[:-4] + ["--revision", "c" * 64, "--selector", "section:two", "--media-type", "text/markdown"]) == 0
+    second = json.loads(capsys.readouterr().out)
+    assert "draft-one" in second["stale_targets"]

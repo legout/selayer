@@ -12,6 +12,11 @@ dependencies = [
 [project.scripts]
 selayer-discovery = "selayer_discovery.cli:run"
 
+# Read-only knowledge-provider *types*. Only providers declared in this
+# group may be configured; executable paths and subprocesses are not supported.
+[project.entry-points."selayer_discovery.knowledge_providers"]
+okf-filesystem = "selayer_discovery.knowledge:FilesystemOkfProvider"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
