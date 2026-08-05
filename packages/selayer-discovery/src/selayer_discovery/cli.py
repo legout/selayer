@@ -89,6 +89,7 @@ from selayer_discovery.proposal import (
     build_proposal,
     reconstruct_candidate,
     render_review_preview,
+    render_review_summary,
     write_candidate,
 )
 from selayer_discovery.session import (
@@ -124,6 +125,7 @@ CODE_SESSION_ID_INVALID = "discovery.cli.session_id_invalid"
 CODE_PROFILE_LOAD = "discovery.profile.load_failed"
 CODE_PROFILE_SALT = "discovery.profile.salt_missing"
 CODE_PROFILE_STALE = "discovery.profile.policy_stale"
+CODE_PROPOSAL_ID_INVALID = "discovery.cli.proposal_id_invalid"
 CODE_INTERNAL = "discovery.cli.internal"
 
 # Stable session-id grammar (mirrors the session node-id shape so an id is safe
@@ -270,6 +272,19 @@ def _validate_session_id(value: object) -> str:
 
     if type(value) is not str or _SESSION_ID_RE.match(value) is None:
         raise _CliError(CODE_SESSION_ID_INVALID) from None
+    return value
+
+
+def _validate_proposal_id(value: object) -> str:
+    """Validate an explicit proposal id before using it as a path component.
+
+    The proposal id must satisfy the same stable node-id grammar as a session
+    id (no ``/``, no ``..``, no leading digit) so it is always a single safe
+    filesystem component and a safe diagnostic token.
+    """
+
+    if type(value) is not str or _SESSION_ID_RE.match(value) is None:
+        raise _CliError(CODE_PROPOSAL_ID_INVALID) from None
     return value
 
 
@@ -931,6 +946,13 @@ def _handle_evidence_resolve_conflict(args: argparse.Namespace) -> int:
 #: writes inside the ignored workspace.
 _PROPOSAL_REL = "proposals"
 
+#: Conventional project-contained authored knowledge roots. A reference update
+#: resolves its base against ``references/`` and an overlay update against
+#: ``okf_overlays/`` (consistent with the repo fixtures). When a root is absent
+#: the base is empty, which remains valid for create operations.
+_REFERENCE_ROOT_REL = "references"
+_OVERLAY_ROOT_REL = "okf_overlays"
+
 
 def _proposal_root(session_dir: Path) -> Path:
     """Return the proposal store root for a session directory."""
@@ -966,6 +988,47 @@ def _session_base_catalog_text(project: Path, session_dir: Path) -> str:
         raise _CliError(CODE_PROFILE_LOAD) from None
 
 
+def _load_authored_knowledge_root(project: Path, root_rel: str) -> dict[str, str]:
+    """Read authored ``.md`` files from a project-contained knowledge root.
+
+    Returns a mapping of POSIX-relative path to text for the root, or an empty
+    mapping when the root is absent (which remains valid for create
+    operations). Each file is resolved and asserted to stay inside the root so
+    a symlink can never pull in a file outside the project.
+    """
+
+    root_abs = _assert_contained(project, Path(root_rel), kind="knowledge_root")
+    if not root_abs.exists() or not root_abs.is_dir():
+        return {}
+    root_resolved = root_abs.resolve(strict=False)
+    result: dict[str, str] = {}
+    for path in sorted(root_abs.rglob("*.md")):
+        resolved = path.resolve(strict=False)
+        try:
+            resolved.relative_to(root_resolved)
+        except ValueError:
+            # Defence in depth: a symlink target escaping the root is skipped.
+            continue
+        rel = resolved.relative_to(root_resolved).as_posix()
+        try:
+            text = resolved.read_text(encoding="utf-8")
+        except OSError:
+            raise _CliError(CODE_PROFILE_LOAD) from None
+        result[rel] = text
+    return result
+
+
+def _authored_knowledge_bases(
+    project: Path,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Return the authored ``(references, overlays)`` bases for a project."""
+
+    return (
+        _load_authored_knowledge_root(project, _REFERENCE_ROOT_REL),
+        _load_authored_knowledge_root(project, _OVERLAY_ROOT_REL),
+    )
+
+
 def _handle_proposal_import(args: argparse.Namespace) -> int:
     project = _project_root(args.project)
     session_id = _validate_session_id(args.session_id)
@@ -973,16 +1036,17 @@ def _handle_proposal_import(args: argparse.Namespace) -> int:
     data = _load_proposal_mapping(project, args.proposal)
     proposal = build_proposal(data)
     base_catalog_text = _session_base_catalog_text(project, session_dir)
+    base_references, base_overlays = _authored_knowledge_bases(project)
     candidate = reconstruct_candidate(
         base_catalog_text=base_catalog_text,
-        base_references={},
-        base_overlays={},
+        base_references=base_references,
+        base_overlays=base_overlays,
         operations=proposal.operations,
     )
     preview = render_review_preview(
         base_catalog_text=base_catalog_text,
-        base_references={},
-        base_overlays={},
+        base_references=base_references,
+        base_overlays=base_overlays,
         candidate=candidate,
     )
     # Persist the reconstructed candidate and the proposal record inside the
@@ -1025,9 +1089,16 @@ def _handle_proposal_import(args: argparse.Namespace) -> int:
 def _read_proposal_record(session_dir: Path, proposal_id: str) -> dict[str, object]:
     """Load a stored proposal record, or raise a sanitized CLI error."""
 
-    record_path = (
-        _proposal_root(session_dir) / proposal_id / "proposal.json"
-    )
+    record_path = _proposal_root(session_dir) / proposal_id / "proposal.json"
+    # Containment defence in depth: the proposal id is grammar-validated by
+    # the caller, but assert the resolved record never escapes the session
+    # directory before any file is opened.
+    try:
+        record_path.resolve(strict=False).relative_to(
+            session_dir.resolve(strict=False)
+        )
+    except ValueError:
+        raise _CliError(CODE_PATH_NOT_CONTAINED, safe_detail="proposal") from None
     if not record_path.exists():
         raise _CliError(
             CODE_NOT_INITIALIZED, safe_ids=(proposal_id,)
@@ -1060,11 +1131,17 @@ def _handle_proposal_show(args: argparse.Namespace) -> int:
     project = _project_root(args.project)
     session_id = _validate_session_id(args.session_id)
     session_dir = _require_session(project, session_id)
-    proposal_id = args.proposal if args.proposal else _latest_proposal_id(session_dir)
+    proposal_id = (
+        _validate_proposal_id(args.proposal)
+        if args.proposal
+        else _latest_proposal_id(session_dir)
+    )
     record = _read_proposal_record(session_dir, proposal_id)
     # Reconstruct a fresh candidate from the stored typed operations and render
     # a fresh preview. Previews are renderings only and are never verify or
-    # apply authority.
+    # apply authority. The operator-facing output is a body-free summary so a
+    # document body or patch never reaches a terminal; the full preview API is
+    # retained for deterministic internal use.
     raw_groups = record.get("groups", [])
     proposal = build_proposal(
         {
@@ -1074,17 +1151,24 @@ def _handle_proposal_show(args: argparse.Namespace) -> int:
         }
     )
     base_catalog_text = _session_base_catalog_text(project, session_dir)
+    base_references, base_overlays = _authored_knowledge_bases(project)
     candidate = reconstruct_candidate(
         base_catalog_text=base_catalog_text,
-        base_references={},
-        base_overlays={},
+        base_references=base_references,
+        base_overlays=base_overlays,
         operations=proposal.operations,
     )
     preview = render_review_preview(
         base_catalog_text=base_catalog_text,
-        base_references={},
-        base_overlays={},
+        base_references=base_references,
+        base_overlays=base_overlays,
         candidate=candidate,
+    )
+    summary = render_review_summary(
+        base_references=base_references,
+        base_overlays=base_overlays,
+        candidate=candidate,
+        preview=preview,
     )
     _emit_json(
         {
@@ -1092,14 +1176,29 @@ def _handle_proposal_show(args: argparse.Namespace) -> int:
             "proposal_fingerprint": proposal.fingerprint,
             "candidate_fingerprint": candidate.fingerprint,
             "preview_fingerprint": preview.fingerprint,
-            "catalog_patch": preview.catalog_patch,
-            "reference_diffs": [
-                {"path": path, "diff": diff}
-                for path, diff in preview.reference_diffs
+            "catalog": {
+                "added_lines": summary.catalog_added_lines,
+                "removed_lines": summary.catalog_removed_lines,
+            },
+            "references": [
+                {
+                    "path": entry.path,
+                    "status": entry.status,
+                    "fingerprint": entry.fingerprint,
+                    "added_lines": entry.added_lines,
+                    "removed_lines": entry.removed_lines,
+                }
+                for entry in summary.references
             ],
-            "overlay_diffs": [
-                {"path": path, "diff": diff}
-                for path, diff in preview.overlay_diffs
+            "overlays": [
+                {
+                    "path": entry.path,
+                    "status": entry.status,
+                    "fingerprint": entry.fingerprint,
+                    "added_lines": entry.added_lines,
+                    "removed_lines": entry.removed_lines,
+                }
+                for entry in summary.overlays
             ],
         }
     )

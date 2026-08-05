@@ -324,6 +324,50 @@ class TestOperationSchema:
         )
         assert op.kind is OperationKind.CATALOG_DEPRECATE
 
+    def test_source_add_rejects_grain_only_state(self) -> None:
+        # A source after-state that only carries ``grain`` is incomplete: a
+        # strict SemanticLayer load needs a connector, a schema, and a grain.
+        with pytest.raises(ProposalError):
+            Operation.from_mapping(
+                _op(
+                    kind="catalog.add",
+                    target_id="source.shipping",
+                    after={"grain": ["id"]},
+                )
+            )
+
+    def test_source_add_rejects_grain_without_schema(self) -> None:
+        # ``grain`` plus a connector type but no schema is still incomplete.
+        with pytest.raises(ProposalError):
+            Operation.from_mapping(
+                _op(
+                    kind="catalog.add",
+                    target_id="source.shipping",
+                    after={
+                        "type": "parquet",
+                        "location": "data/shipping.parquet",
+                        "grain": ["id"],
+                    },
+                )
+            )
+
+    def test_source_add_accepts_complete_fields(self) -> None:
+        after = {
+            "type": "parquet",
+            "location": "data/shipping.parquet",
+            "grain": ["id"],
+            "schema": {
+                "fields": [
+                    {"name": "id", "type": "utf8", "nullable": False}
+                ]
+            },
+        }
+        op = Operation.from_mapping(
+            _op(kind="catalog.add", target_id="source.shipping", after=after)
+        )
+        assert op.kind is OperationKind.CATALOG_ADD
+        assert op.target_id == "source.shipping"
+
     def test_reference_create_carries_text_after(self) -> None:
         op = Operation.from_mapping(
             {
@@ -843,6 +887,109 @@ class TestCandidateReconstruction:
         ovl = dict(candidate.overlays)
         assert ovl["dimensions/order_status.md"] == after
 
+    def test_reference_operation_never_appears_in_overlays(
+        self, base_catalog_text: str
+    ) -> None:
+        # A reference operation must only affect the references subject; it
+        # must never leak into the overlay base.
+        after = "---\nselayer_id: dimension.order_status\n---\n# Order status\n"
+        op = Operation.from_mapping(
+            _op(
+                kind="reference.create",
+                target_id="dimensions/order_status.md",
+                after=after,
+            )
+        )
+        candidate = reconstruct_candidate(
+            base_catalog_text=base_catalog_text,
+            base_references={},
+            base_overlays={},
+            operations=(op,),
+        )
+        assert "dimensions/order_status.md" in dict(candidate.references)
+        assert "dimensions/order_status.md" not in dict(candidate.overlays)
+
+    def test_overlay_operation_never_appears_in_references(
+        self, base_catalog_text: str
+    ) -> None:
+        # An overlay operation must only affect the overlay subject; it must
+        # never leak into the reference base.
+        after = (
+            "---\nselayer_id: dimension.order_status\n---\n"
+            "## Usage Guidance\nUse this for status.\n"
+        )
+        op = Operation.from_mapping(
+            _op(
+                kind="overlay.create",
+                target_id="dimensions/order_status.md",
+                after=after,
+            )
+        )
+        candidate = reconstruct_candidate(
+            base_catalog_text=base_catalog_text,
+            base_references={},
+            base_overlays={},
+            operations=(op,),
+        )
+        assert "dimensions/order_status.md" in dict(candidate.overlays)
+        assert "dimensions/order_status.md" not in dict(candidate.references)
+
+    def test_reference_update_against_nonempty_authored_base(
+        self, base_catalog_text: str
+    ) -> None:
+        before = "---\nselayer_id: dimension.order_status\n---\n# Old\n"
+        after = "---\nselayer_id: dimension.order_status\n---\n# New\n"
+        op = Operation.from_mapping(
+            _op(
+                kind="reference.update",
+                target_id="dimensions/order_status.md",
+                before=before,
+                before_hash=_hash(before),
+                after=after,
+            )
+        )
+        candidate = reconstruct_candidate(
+            base_catalog_text=base_catalog_text,
+            base_references={"dimensions/order_status.md": before},
+            base_overlays={},
+            operations=(op,),
+        )
+        refs = dict(candidate.references)
+        assert refs["dimensions/order_status.md"] == after
+        # The overlay subject is untouched.
+        assert dict(candidate.overlays) == {}
+
+    def test_overlay_update_against_nonempty_authored_base(
+        self, base_catalog_text: str
+    ) -> None:
+        before = (
+            "---\nselayer_id: dimension.order_status\n---\n"
+            "## Usage Guidance\nOld.\n"
+        )
+        after = (
+            "---\nselayer_id: dimension.order_status\n---\n"
+            "## Usage Guidance\nNew.\n"
+        )
+        op = Operation.from_mapping(
+            _op(
+                kind="overlay.update",
+                target_id="dimensions/order_status.md",
+                before=before,
+                before_hash=_hash(before),
+                after=after,
+            )
+        )
+        candidate = reconstruct_candidate(
+            base_catalog_text=base_catalog_text,
+            base_references={},
+            base_overlays={"dimensions/order_status.md": before},
+            operations=(op,),
+        )
+        ovls = dict(candidate.overlays)
+        assert ovls["dimensions/order_status.md"] == after
+        # The reference subject is untouched.
+        assert dict(candidate.references) == {}
+
     def test_candidate_has_stable_fingerprint(
         self, base_catalog_text: str
     ) -> None:
@@ -860,6 +1007,23 @@ class TestCandidateReconstruction:
             operations=(op,),
         )
         assert first.fingerprint == second.fingerprint
+
+    def test_reconstruction_preserves_crlf_newlines(
+        self, base_catalog_text: str
+    ) -> None:
+        # A base catalog authored with CRLF line endings must be preserved on
+        # round-trip so a candidate never silently normalizes authored style.
+        crlf_text = base_catalog_text.replace("\n", "\r\n")
+        op = Operation.from_mapping(_op())
+        candidate = reconstruct_candidate(
+            base_catalog_text=crlf_text,
+            base_references={},
+            base_overlays={},
+            operations=(op,),
+        )
+        assert "\r\n" in candidate.catalog_text
+        # No lone LF introduced where CRLF was authored (no silent normalization).
+        assert "\n" not in candidate.catalog_text.replace("\r\n", "")
 
 
 # --------------------------------------------------------------------------- #
@@ -989,6 +1153,144 @@ class TestReviewPreview:
         )
 
 
+class TestReviewSummary:
+    def test_summary_has_no_raw_patch_or_diff_text(
+        self, base_catalog_text: str
+    ) -> None:
+        from selayer_discovery.proposal import render_review_summary
+
+        secret = "LEAKME-body-canary-424242"
+        after = (
+            "---\nselayer_id: dimension.order_status\n---\n"
+            f"## Usage Guidance\n{secret}\n"
+        )
+        op = Operation.from_mapping(
+            _op(
+                kind="overlay.create",
+                target_id="dimensions/order_status.md",
+                after=after,
+            )
+        )
+        candidate = reconstruct_candidate(
+            base_catalog_text=base_catalog_text,
+            base_references={},
+            base_overlays={},
+            operations=(op,),
+        )
+        preview = render_review_preview(
+            base_catalog_text=base_catalog_text,
+            base_references={},
+            base_overlays={},
+            candidate=candidate,
+        )
+        summary = render_review_summary(
+            base_references={},
+            base_overlays={},
+            candidate=candidate,
+            preview=preview,
+        )
+        # The raw body, patch, and diff text must never reach the summary.
+        import dataclasses
+
+        rendered = json.dumps(
+            dataclasses.asdict(summary), sort_keys=True
+        )
+        assert secret not in rendered
+        assert preview.catalog_patch not in rendered
+        assert "product_category" not in rendered
+
+    def test_summary_carries_counts_status_and_fingerprints(
+        self, base_catalog_text: str
+    ) -> None:
+        from selayer_discovery.proposal import render_review_summary
+
+        after = (
+            "---\nselayer_id: dimension.order_status\n---\n"
+            "## Usage Guidance\nUse this for status.\n"
+        )
+        op = Operation.from_mapping(
+            _op(
+                kind="overlay.create",
+                target_id="dimensions/order_status.md",
+                after=after,
+            )
+        )
+        candidate = reconstruct_candidate(
+            base_catalog_text=base_catalog_text,
+            base_references={},
+            base_overlays={},
+            operations=(op,),
+        )
+        preview = render_review_preview(
+            base_catalog_text=base_catalog_text,
+            base_references={},
+            base_overlays={},
+            candidate=candidate,
+        )
+        summary = render_review_summary(
+            base_references={},
+            base_overlays={},
+            candidate=candidate,
+            preview=preview,
+        )
+        assert summary.catalog_fingerprint == candidate.catalog_fingerprint
+        assert summary.preview_fingerprint == preview.fingerprint
+        # A catalog.add produces added lines but no removed lines.
+        assert summary.catalog_added_lines > 0
+        assert summary.catalog_removed_lines >= 0
+        assert len(summary.overlays) == 1
+        entry = summary.overlays[0]
+        assert entry.path == "dimensions/order_status.md"
+        assert entry.status == "added"
+        assert entry.fingerprint
+        assert entry.added_lines > 0
+        assert summary.references == ()
+
+    def test_summary_marks_updated_vs_added(
+        self, base_catalog_text: str
+    ) -> None:
+        from selayer_discovery.proposal import render_review_summary
+
+        before = (
+            "---\nselayer_id: dimension.order_status\n---\n"
+            "## Usage Guidance\nOld.\n"
+        )
+        after = (
+            "---\nselayer_id: dimension.order_status\n---\n"
+            "## Usage Guidance\nNew.\n"
+        )
+        op = Operation.from_mapping(
+            _op(
+                kind="reference.update",
+                target_id="dimensions/order_status.md",
+                before=before,
+                before_hash=_hash(before),
+                after=after,
+            )
+        )
+        candidate = reconstruct_candidate(
+            base_catalog_text=base_catalog_text,
+            base_references={"dimensions/order_status.md": before},
+            base_overlays={},
+            operations=(op,),
+        )
+        preview = render_review_preview(
+            base_catalog_text=base_catalog_text,
+            base_references={"dimensions/order_status.md": before},
+            base_overlays={},
+            candidate=candidate,
+        )
+        summary = render_review_summary(
+            base_references={"dimensions/order_status.md": before},
+            base_overlays={},
+            candidate=candidate,
+            preview=preview,
+        )
+        entry = summary.references[0]
+        assert entry.status == "updated"
+        assert entry.removed_lines >= 1
+
+
 # --------------------------------------------------------------------------- #
 # Step 6: proposal import / show CLI                                          #
 # --------------------------------------------------------------------------- #
@@ -1106,8 +1408,96 @@ class TestProposalImportCli:
         )
         assert rc == 0
         out = json.loads(capsys.readouterr().out)
-        assert "catalog_patch" in out
+        # ``show`` emits a safe summary (no raw patch/diff body text).
+        assert "catalog_patch" not in out
+        assert "reference_diffs" not in out
+        assert "overlay_diffs" not in out
         assert "preview_fingerprint" in out
+        assert out["catalog"]["added_lines"] >= 1
+
+    def test_proposal_show_summary_hides_document_body_canary(
+        self,
+        catalog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from selayer_discovery.cli import main
+
+        secret = "LEAKME-show-body-canary-778899"
+        after = (
+            "---\nselayer_id: dimension.order_status\n---\n"
+            f"## Usage Guidance\n{secret}\n"
+        )
+        op = _op(
+            kind="overlay.create",
+            target_id="dimensions/order_status.md",
+            after=after,
+        )
+        mapping = _proposal_mapping(
+            groups=[_group(operations=[op])],
+        )
+        _init_session(catalog_dir)
+        capsys.readouterr()
+        proposal_path = catalog_dir / "proposal.yaml"
+        _write_proposal_yaml(proposal_path, mapping)
+        assert (
+            main(
+                [
+                    "proposal",
+                    "import",
+                    "--session-id",
+                    "session-001",
+                    "--project",
+                    str(catalog_dir),
+                    "--proposal",
+                    str(proposal_path),
+                ]
+            )
+            == 0
+        )
+        capsys.readouterr()
+        rc = main(
+            [
+                "proposal",
+                "show",
+                "--session-id",
+                "session-001",
+                "--project",
+                str(catalog_dir),
+            ]
+        )
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert secret not in captured.out
+        assert secret not in captured.err
+
+    def test_proposal_show_rejects_traversal_proposal_id(
+        self,
+        catalog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from selayer_discovery.cli import main
+
+        _init_session(catalog_dir)
+        capsys.readouterr()
+        rc = main(
+            [
+                "proposal",
+                "show",
+                "--session-id",
+                "session-001",
+                "--project",
+                str(catalog_dir),
+                "--proposal",
+                "../../../etc/passwd",
+            ]
+        )
+        assert rc == 1
+        captured = capsys.readouterr()
+        err = json.loads(captured.err)
+        assert err["code"]
+        # The traversal id must never reach the filesystem as a raw path.
+        assert "passwd" not in captured.out
+        assert "passwd" not in captured.err
 
     def test_proposal_show_rejects_missing_session(
         self,
@@ -1129,6 +1519,159 @@ class TestProposalImportCli:
         assert rc == 1
         err = json.loads(capsys.readouterr().err)
         assert err["code"]
+
+    def test_proposal_overlay_update_loads_authored_okf_overlays_root(
+        self,
+        catalog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from selayer_discovery.cli import main
+
+        before = (
+            "---\nselayer_id: dimension.order_status\n---\n"
+            "## Usage Guidance\nOld.\n"
+        )
+        after = (
+            "---\nselayer_id: dimension.order_status\n---\n"
+            "## Usage Guidance\nNew.\n"
+        )
+        # An authored overlay root consistent with the repo fixtures.
+        overlay_root = catalog_dir / "okf_overlays" / "dimensions"
+        overlay_root.mkdir(parents=True)
+        (overlay_root / "order_status.md").write_text(before, encoding="utf-8")
+        op = _op(
+            kind="overlay.update",
+            target_id="dimensions/order_status.md",
+            before=before,
+            before_hash=_hash(before),
+            after=after,
+        )
+        mapping = _proposal_mapping(groups=[_group(operations=[op])])
+        _init_session(catalog_dir)
+        capsys.readouterr()
+        proposal_path = catalog_dir / "proposal.yaml"
+        _write_proposal_yaml(proposal_path, mapping)
+        rc = main(
+            [
+                "proposal",
+                "import",
+                "--session-id",
+                "session-001",
+                "--project",
+                str(catalog_dir),
+                "--proposal",
+                str(proposal_path),
+            ]
+        )
+        assert rc == 0
+        capsys.readouterr()
+        rc = main(
+            [
+                "proposal",
+                "show",
+                "--session-id",
+                "session-001",
+                "--project",
+                str(catalog_dir),
+            ]
+        )
+        assert rc == 0
+        out = json.loads(capsys.readouterr().out)
+        assert any(
+            e["path"] == "dimensions/order_status.md" and e["status"] == "updated"
+            for e in out["overlays"]
+        )
+
+    def test_proposal_reference_update_loads_authored_references_root(
+        self,
+        catalog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from selayer_discovery.cli import main
+
+        before = "---\nselayer_id: dimension.order_status\n---\n# Old\n"
+        after = "---\nselayer_id: dimension.order_status\n---\n# New\n"
+        reference_root = catalog_dir / "references" / "dimensions"
+        reference_root.mkdir(parents=True)
+        (reference_root / "order_status.md").write_text(before, encoding="utf-8")
+        op = _op(
+            kind="reference.update",
+            target_id="dimensions/order_status.md",
+            before=before,
+            before_hash=_hash(before),
+            after=after,
+        )
+        mapping = _proposal_mapping(groups=[_group(operations=[op])])
+        _init_session(catalog_dir)
+        capsys.readouterr()
+        proposal_path = catalog_dir / "proposal.yaml"
+        _write_proposal_yaml(proposal_path, mapping)
+        rc = main(
+            [
+                "proposal",
+                "import",
+                "--session-id",
+                "session-001",
+                "--project",
+                str(catalog_dir),
+                "--proposal",
+                str(proposal_path),
+            ]
+        )
+        assert rc == 0
+        capsys.readouterr()
+        rc = main(
+            [
+                "proposal",
+                "show",
+                "--session-id",
+                "session-001",
+                "--project",
+                str(catalog_dir),
+            ]
+        )
+        assert rc == 0
+        out = json.loads(capsys.readouterr().out)
+        assert any(
+            e["path"] == "dimensions/order_status.md" and e["status"] == "updated"
+            for e in out["references"]
+        )
+
+    def test_proposal_knowledge_create_valid_with_absent_roots(
+        self,
+        catalog_dir: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # When no authored roots exist, empty bases remain valid for create ops.
+        from selayer_discovery.cli import main
+
+        after = (
+            "---\nselayer_id: dimension.order_status\n---\n"
+            "## Usage Guidance\nNew.\n"
+        )
+        op = _op(
+            kind="overlay.create",
+            target_id="dimensions/order_status.md",
+            after=after,
+        )
+        mapping = _proposal_mapping(groups=[_group(operations=[op])])
+        _init_session(catalog_dir)
+        capsys.readouterr()
+        proposal_path = catalog_dir / "proposal.yaml"
+        _write_proposal_yaml(proposal_path, mapping)
+        rc = main(
+            [
+                "proposal",
+                "import",
+                "--session-id",
+                "session-001",
+                "--project",
+                str(catalog_dir),
+                "--proposal",
+                str(proposal_path),
+            ]
+        )
+        assert rc == 0
 
 
 # --------------------------------------------------------------------------- #

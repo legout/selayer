@@ -68,15 +68,18 @@ __all__ = [
     "GENESIS_HASH",
     "KNOWLEDGE_KINDS",
     "KnowledgeSubject",
+    "KnowledgeSummaryEntry",
     "Operation",
     "OperationKind",
     "Proposal",
     "ProposalError",
     "QueryCase",
     "ReviewPreview",
+    "ReviewSummary",
     "build_proposal",
     "reconstruct_candidate",
     "render_review_preview",
+    "render_review_summary",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -489,6 +492,36 @@ def _validate_overlay_document(text: str) -> None:
             )
 
 
+def _validate_source_after_shape(after: Mapping[str, object]) -> None:
+    """Require the complete source fields needed by a strict catalog load.
+
+    A data source is fully described by a connector (``type``), a declared
+    schema (inline ``schema`` or a ``schema_ref``), and a non-empty ``grain``.
+    This rejects an after-state that only carries ``grain`` (or grain without
+    a schema) so a proposal never produces a candidate source that fails to
+    load through :meth:`SemanticLayer.load`.
+    """
+
+    grain = after.get("grain")
+    if not isinstance(grain, list) or not grain:
+        raise ProposalError(
+            CODE_PROPOSAL_OPERATION_INVALID, safe_detail="incomplete after state"
+        )
+    connector_type = after.get("type")
+    if type(connector_type) is not str or not connector_type:
+        raise ProposalError(
+            CODE_PROPOSAL_OPERATION_INVALID, safe_detail="incomplete after state"
+        )
+    has_schema = isinstance(after.get("schema"), Mapping)
+    has_schema_ref = type(after.get("schema_ref")) is str and bool(
+        after.get("schema_ref")
+    )
+    if not has_schema and not has_schema_ref:
+        raise ProposalError(
+            CODE_PROPOSAL_OPERATION_INVALID, safe_detail="incomplete after state"
+        )
+
+
 def _validate_catalog_after_shape(
     kind: OperationKind,
     target_kind: str,
@@ -505,13 +538,12 @@ def _validate_catalog_after_shape(
     # ``op``/``path``/``value`` shapes) that does not describe a real object.
     required = _KIND_DISCRIMINATORS[target_kind]
     if target_kind == "source":
-        # Sources carry connector + schema + grain; require at least grain and
-        # either a connector ``type`` or a ``schema`` declaration.
-        if "grain" not in after:
-            raise ProposalError(
-                CODE_PROPOSAL_OPERATION_INVALID,
-                safe_detail="incomplete after state",
-            )
+        # A data source is fully described by a connector, a schema, and a
+        # grain. Require the complete set of fields needed by a strict
+        # ``SemanticLayer`` load so a source after-state that only carries
+        # ``grain`` (or grain without a schema) is rejected here rather than
+        # producing a candidate that fails to load.
+        _validate_source_after_shape(after)
     else:
         missing = required - set(after)
         if missing:
@@ -1212,12 +1244,20 @@ def build_proposal(data: object) -> Proposal:
 # --------------------------------------------------------------------------- #
 
 
-def _round_trip_yaml() -> YAML:
-    """Return a ``ruamel.yaml`` round-trip parser (preserves formatting)."""
+def _round_trip_yaml(*, line_break: str = "\n") -> YAML:
+    """Return a ``ruamel.yaml`` round-trip parser (preserves formatting).
+
+    ``line_break`` threads the authored newline style (``"\r\n"`` for CRLF,
+    ``"\n"`` otherwise) through load and dump so a candidate never silently
+    normalizes authored line endings.
+    """
 
     yaml = YAML()
     yaml.preserve_quotes = True
     yaml.width = 4096
+    # ``line_break`` accepts ``"\r\n"`` / ``"\n"`` at runtime; the ruamel
+    # type stubs declare it ``None``, so assign through a cast.
+    yaml.line_break = cast("Any", line_break)
     return yaml
 
 
@@ -1240,6 +1280,8 @@ class Candidate:
 def _apply_catalog_operation(
     data: Any,
     op: Operation,
+    *,
+    line_break: str = "\n",
 ) -> None:
     """Apply one catalog operation to a round-trip ``ruamel.yaml`` mapping."""
 
@@ -1256,7 +1298,7 @@ def _apply_catalog_operation(
                 CODE_PROPOSAL_RECONSTRUCTION_FAILED,
                 safe_detail="add target exists",
             )
-        collection[object_name] = _to_ruamel(op.after)
+        collection[object_name] = _to_ruamel(op.after, line_break=line_break)
         return
     if object_name not in collection:
         raise ProposalError(
@@ -1270,44 +1312,53 @@ def _apply_catalog_operation(
         after = op.after
         assert isinstance(after, Mapping)
         for key, value in after.items():
-            existing[key] = _to_ruamel(value)
+            existing[key] = _to_ruamel(value, line_break=line_break)
         return
     # catalog.edit: replace the object wholesale with the normalized after
     # state, preserving the collection's key order by re-inserting in place.
-    collection[object_name] = _to_ruamel(op.after)
+    collection[object_name] = _to_ruamel(op.after, line_break=line_break)
 
 
-def _to_ruamel(value: object) -> Any:
+def _to_ruamel(value: object, *, line_break: str = "\n") -> Any:
     """Round-trip a JSON-native value through ``ruamel.yaml`` for in-place use."""
 
     if isinstance(value, Mapping):
-        result: Any = _round_trip_yaml().map()
+        result: Any = _round_trip_yaml(line_break=line_break).map()
         for key, item in value.items():
-            result[key] = _to_ruamel(item)
+            result[key] = _to_ruamel(item, line_break=line_break)
         return result
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-        seq = _round_trip_yaml().seq()
+        seq = _round_trip_yaml(line_break=line_break).seq()
         for item in value:
-            seq.append(_to_ruamel(item))
+            seq.append(_to_ruamel(item, line_break=line_break))
         return seq
     return value
 
 
-def _dump_yaml(data: Any) -> str:
+def _dump_yaml(data: Any, *, line_break: str = "\n") -> str:
     buf = io.StringIO()
-    _round_trip_yaml().dump(data, buf)
+    _round_trip_yaml(line_break=line_break).dump(data, buf)
     return buf.getvalue()
 
 
 def _apply_knowledge_operations(
     base: Mapping[str, str],
     operations: Sequence[Operation],
+    *,
+    subject: KnowledgeSubject,
 ) -> tuple[tuple[str, str], ...]:
-    """Return the reconstructed knowledge files sorted by relative path."""
+    """Return the reconstructed knowledge files for one subject.
+
+    Only operations whose :func:`_knowledge_subject` equals ``subject`` are
+    applied. A reference operation therefore never appears in the overlay base
+    and vice versa, regardless of which base it is applied to.
+    """
 
     result: dict[str, str] = dict(base)
     for op in operations:
         if op.kind not in KNOWLEDGE_KINDS:
+            continue
+        if _knowledge_subject(op.kind) is not subject:
             continue
         if op.kind in (
             OperationKind.REFERENCE_CREATE,
@@ -1360,12 +1411,19 @@ def reconstruct_candidate(
             safe_detail="base catalog root not a mapping",
         ) from None
     catalog_ops = [op for op in operations if op.kind in CATALOG_KINDS]
+    # Preserve the authored newline style (CRLF vs LF) so a candidate never
+    # silently normalizes line endings.
+    line_break = "\r\n" if "\r\n" in base_catalog_text else "\n"
     for op in catalog_ops:
-        _apply_catalog_operation(data, op)
-    catalog_text = _dump_yaml(data)
+        _apply_catalog_operation(data, op, line_break=line_break)
+    catalog_text = _dump_yaml(data, line_break=line_break)
     catalog_fingerprint = canonical.fingerprint(catalog_text)
-    references = _apply_knowledge_operations(base_references, operations)
-    overlays = _apply_knowledge_operations(base_overlays, operations)
+    references = _apply_knowledge_operations(
+        base_references, operations, subject=KnowledgeSubject.REFERENCE
+    )
+    overlays = _apply_knowledge_operations(
+        base_overlays, operations, subject=KnowledgeSubject.OVERLAY
+    )
     fingerprint = canonical.fingerprint(
         {
             "catalog": catalog_fingerprint,
@@ -1471,6 +1529,121 @@ def render_review_preview(
         reference_diffs=reference_diffs,
         overlay_diffs=overlay_diffs,
         fingerprint=fingerprint,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Safe review summary                                                        #
+# --------------------------------------------------------------------------- #
+
+#: A knowledge file that did not exist in the authored base (a create).
+_STATUS_ADDED: str = "added"
+#: A knowledge file that existed in the authored base (an update).
+_STATUS_UPDATED: str = "updated"
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeSummaryEntry:
+    """A safe, body-free summary of one changed knowledge file.
+
+    Carries only a safe relative path, an add/update status, the file
+    fingerprint, and added/removed line counts. It never carries raw patch,
+    diff, or document-body text.
+    """
+
+    path: str
+    status: str
+    fingerprint: str
+    added_lines: int
+    removed_lines: int
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewSummary:
+    """A safe review summary: fingerprints, line counts, and path/status.
+
+    Never carries raw patch, diff, or document-body text. ``proposal show``
+    renders this to operators so a document body or patch never reaches a
+    terminal; the full :func:`render_review_preview` API remains for
+    deterministic internal use.
+    """
+
+    catalog_fingerprint: str
+    preview_fingerprint: str
+    catalog_added_lines: int
+    catalog_removed_lines: int
+    references: tuple[KnowledgeSummaryEntry, ...]
+    overlays: tuple[KnowledgeSummaryEntry, ...]
+
+
+def _diff_line_counts(diff: str) -> tuple[int, int]:
+    """Return ``(added, removed)`` line counts from a unified diff."""
+
+    added = 0
+    removed = 0
+    for line in diff.splitlines():
+        if line.startswith(("+++", "---")):
+            continue
+        if line.startswith("+"):
+            added += 1
+        elif line.startswith("-"):
+            removed += 1
+    return added, removed
+
+
+def _knowledge_summary(
+    base: Mapping[str, str],
+    candidate_files: Sequence[tuple[str, str]],
+    diffs: Sequence[tuple[str, str]],
+) -> tuple[KnowledgeSummaryEntry, ...]:
+    diff_by_path = {path: diff for path, diff in diffs}
+    text_by_path = {path: text for path, text in candidate_files}
+    entries: list[KnowledgeSummaryEntry] = []
+    for path in sorted(text_by_path):
+        added, removed = _diff_line_counts(diff_by_path.get(path, ""))
+        status = _STATUS_UPDATED if path in base else _STATUS_ADDED
+        entries.append(
+            KnowledgeSummaryEntry(
+                path=path,
+                status=status,
+                fingerprint=canonical.fingerprint(text_by_path[path]),
+                added_lines=added,
+                removed_lines=removed,
+            )
+        )
+    return tuple(entries)
+
+
+def render_review_summary(
+    *,
+    base_references: Mapping[str, str],
+    base_overlays: Mapping[str, str],
+    candidate: Candidate,
+    preview: ReviewPreview,
+) -> ReviewSummary:
+    """Render a body-free review summary (fingerprints, counts, path/status).
+
+    Unlike :func:`render_review_preview`, this never carries raw patch, diff,
+    or document-body text — only fingerprints, line counts, and safe relative
+    path/status metadata. It is the safe rendering surface for operator-facing
+    output (``proposal show``); the full preview API remains for deterministic
+    internal use.
+    """
+
+    catalog_added, catalog_removed = _diff_line_counts(preview.catalog_patch)
+    references = _knowledge_summary(
+        base_references, candidate.references, preview.reference_diffs
+    )
+    overlays = _knowledge_summary(
+        base_overlays, candidate.overlays, preview.overlay_diffs
+    )
+    return ReviewSummary(
+        catalog_fingerprint=candidate.catalog_fingerprint,
+        preview_fingerprint=preview.fingerprint,
+        catalog_added_lines=catalog_added,
+        catalog_removed_lines=catalog_removed,
+        references=references,
+        overlays=overlays,
     )
 
 
