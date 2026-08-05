@@ -1317,12 +1317,22 @@ class ClaimRecord:
     creator_event: str
     contradicts: tuple[str, ...]
     selector_kinds: tuple[str, ...]
+    #: Typed selectors retained for later revalidation against the current
+    #: evidence revision. Each carries only identifiers and hashes (record id,
+    #: content hash, revision, plus a kind-specific safe field) -- never a
+    #: document body or value -- so retention never leaks sensitive content.
+    selectors: tuple[_EvidenceSelector, ...]
     actor: str
     timestamp: str
     state: str
 
     def safe_dict(self) -> dict[str, object]:
-        """Return a JSON-safe mapping without free-text content."""
+        """Return a JSON-safe mapping without free-text content.
+
+        Exposes only the selector *kinds* (not the full selectors): readiness
+        revalidation reads ``.selectors`` directly while diagnostics surface
+        only the coarse kind labels.
+        """
 
         return {
             "claim_id": self.claim_id,
@@ -1757,6 +1767,7 @@ class ClaimStore:
                 creator_event=creator,
                 contradicts=contra,
                 selector_kinds=selector_kinds,
+                selectors=sel_list,
                 actor=author,
                 timestamp=timestamp,
                 state=_CLAIM_STATE_CURRENT,
@@ -1987,6 +1998,7 @@ class ClaimStore:
             "creator_event": record.creator_event,
             "contradicts": list(record.contradicts),
             "selector_kinds": list(record.selector_kinds),
+            "selectors": [selector.to_dict() for selector in record.selectors],
             "actor": record.actor,
             "timestamp": record.timestamp,
             "state": record.state,
@@ -2084,6 +2096,19 @@ class ClaimStore:
             or evidence_class not in _EVIDENCE_CLASS_VALUES
         ):
             raise EvidenceError(CODE_EVIDENCE_CLAIM_STORE_CORRUPT) from None
+        raw_selectors = obj.get("selectors", ())
+        if not isinstance(raw_selectors, Sequence) or isinstance(
+            raw_selectors, str
+        ):
+            raise EvidenceError(CODE_EVIDENCE_CLAIM_STORE_CORRUPT) from None
+        try:
+            selectors = tuple(
+                selector_from_mapping(item) for item in raw_selectors
+            )
+        except EvidenceError:
+            raise EvidenceError(CODE_EVIDENCE_CLAIM_STORE_CORRUPT) from None
+        if len(selectors) != len(raw_selectors):
+            raise EvidenceError(CODE_EVIDENCE_CLAIM_STORE_CORRUPT) from None
         return ClaimRecord(
             claim_id=_claim_req_str(obj, "claim_id"),
             subject=_claim_req_str(obj, "subject"),
@@ -2092,6 +2117,7 @@ class ClaimStore:
             creator_event=_claim_req_str(obj, "creator_event"),
             contradicts=_claim_tuple_str(obj.get("contradicts", ())),
             selector_kinds=_claim_tuple_str(obj.get("selector_kinds", ())),
+            selectors=selectors,
             actor=_claim_req_str(obj, "actor"),
             timestamp=_claim_validate_timestamp(obj.get("timestamp")),
             state=_claim_req_str(obj, "state"),

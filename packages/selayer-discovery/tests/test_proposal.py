@@ -1904,6 +1904,33 @@ def _dimension_type_edit_op(**overrides: Any) -> dict[str, Any]:
     return base
 
 
+def _fact_type_edit_op(**overrides: Any) -> dict[str, Any]:
+    # Edit ``fact.order_amount`` data_type ``decimal`` -> ``double``: both are
+    # compatible with the float64 ``amount`` column, so the candidate always
+    # loads and the static check passes. The ``data_type`` field change drives
+    # the derived ``type_changed`` impact (the conditional data-evidence gate).
+    before = {
+        "source": "orders",
+        "expression": "orders.amount",
+        "data_type": "decimal",
+        "description": "Order amount",
+    }
+    after = dict(before)
+    after["data_type"] = "double"
+    base: dict[str, Any] = {
+        "operation_id": "op-fact-type",
+        "kind": "catalog.edit",
+        "target_id": "fact.order_amount",
+        "before": before,
+        "before_hash": _hash(before),
+        "after": after,
+        "claim_ids": ["claim-c1"],
+        "group_ids": ["group-001"],
+    }
+    base.update(overrides)
+    return base
+
+
 def _deprecate_op(**overrides: Any) -> dict[str, Any]:
     before = {
         "source": "orders",
@@ -2180,6 +2207,25 @@ class TestQueryCases:
                 _query_case(sql="SELECT * FROM orders")
             )
 
+    def test_invalid_filter_type_is_accepted_rejection_code(self) -> None:
+        # ``invalid_filter_type`` is a stable core ``QueryPlanningError`` code
+        # (raised when a filter value's type mismatches a dimension's declared
+        # data type). A focused planner-rejection case may cite it.
+        case = QueryCase.from_mapping(
+            _query_case(
+                case_id="case-invalid-filter",
+                kind="planner_rejection",
+                description="A typed-mismatch filter is rejected.",
+                metrics=["total_revenue"],
+                dimensions=["order_status"],
+                filters=[
+                    {"dimension_id": "order_status", "operator": "equals", "value": 5}
+                ],
+                expected_rejection_code="invalid_filter_type",
+            )
+        )
+        assert case.expected_rejection_code == "invalid_filter_type"
+
     def test_rejects_unknown_rejection_code(self) -> None:
         with pytest.raises(ProposalError):
             QueryCase.from_mapping(
@@ -2409,6 +2455,46 @@ data_sources:
         acceptance = bundle.check("group-001", MandatoryCheckKind.ACCEPTANCE.value)
         assert acceptance.status == "passed"
 
+    def test_acceptance_invalid_filter_type_rejection_case(
+        self, base_catalog_text: str, tmp_path: Path
+    ) -> None:
+        # A focused planner-rejection case citing ``invalid_filter_type``: the
+        # typed filter value (int 5) mismatches the string ``order_status``
+        # dimension, so the core planner rejects with exactly that code.
+        op = _metric_add_op()
+        case = _query_case(
+            case_id="case-invalid-filter",
+            kind="planner_rejection",
+            description="A typed-mismatch filter is rejected.",
+            metrics=["total_revenue"],
+            dimensions=["order_status"],
+            filters=[
+                {"dimension_id": "order_status", "operator": "equals", "value": 5}
+            ],
+            expected_rejection_code="invalid_filter_type",
+        )
+        mapping = _proposal_mapping(
+            groups=[
+                _group(
+                    title="Add revenue metric",
+                    rationale="Revenue rollup.",
+                    operations=[op],
+                    query_cases=[case],
+                )
+            ]
+        )
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+        )
+        acceptance = bundle.check("group-001", MandatoryCheckKind.ACCEPTANCE.value)
+        assert acceptance.status == "passed"
+
     def test_okf_check_runs_for_overlay(
         self, base_catalog_text: str, tmp_path: Path
     ) -> None:
@@ -2507,6 +2593,146 @@ data_sources:
         assert "SELECT" not in rendered
         assert "product_category" not in rendered
         assert "Order status" not in rendered
+
+
+# --------------------------------------------------------------------------- #
+# Step 3b: conditional type/expression data-evidence gating (Task 17 fix)     #
+# --------------------------------------------------------------------------- #
+
+
+class TestTypeExpressionDataCitation:
+    """A type/expression group that cites observed data needs a physical check.
+
+    The pure impacts-only matrix keeps type/expression static-only. When a
+    type/expression group's normalized typed data cites data -- an observed
+    supporting claim and/or a bounded execution-assertion query case -- a
+    physical (reopenable) requirement is added at the group-check level. The
+    conditional is never derived from an agent-supplied impact list.
+    """
+
+    def test_type_expression_cited_by_execution_assertion_adds_physical(
+        self, base_catalog_text: str, tmp_path: Path
+    ) -> None:
+        op = _fact_type_edit_op()
+        case = _query_case(
+            case_id="case-exec-type",
+            kind="execution_assertion",
+            description="Bounded row count over the typed fact.",
+            metrics=[],
+            dimensions=["order_status"],
+            assertions=[{"operator": "row_count_max", "value": 100}],
+        )
+        mapping = _proposal_mapping(
+            groups=[
+                _group(
+                    title="Edit fact type",
+                    rationale="Type revision.",
+                    operations=[op],
+                    query_cases=[case],
+                )
+            ]
+        )
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+        )
+        kinds = {c.kind for c in bundle.checks_for("group-001")}
+        assert MandatoryCheckKind.STATIC.value in kinds
+        assert MandatoryCheckKind.PHYSICAL.value in kinds
+
+    def test_type_expression_cited_by_observed_claim_adds_physical(
+        self,
+        catalog_dir: Path,
+        base_catalog_text: str,
+        tmp_path: Path,
+    ) -> None:
+        _init_session(catalog_dir)
+        session_store, evidence, claims, interview = TestReadiness._stores(
+            catalog_dir
+        )
+        actor = session_store.charter.approver
+        TestReadiness._add_observed_claim(
+            claims, evidence, session_store, tmp_path, actor
+        )
+        op = _fact_type_edit_op()
+        mapping = _proposal_mapping(
+            groups=[
+                _group(
+                    title="Edit fact type",
+                    rationale="Type revision.",
+                    operations=[op],
+                )
+            ]
+        )
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+            interview_store=interview,
+            claim_store=claims,
+            evidence_store=evidence,
+        )
+        kinds = {c.kind for c in bundle.checks_for("group-001")}
+        assert MandatoryCheckKind.PHYSICAL.value in kinds
+
+    def test_type_expression_without_citation_has_no_physical(
+        self,
+        catalog_dir: Path,
+        base_catalog_text: str,
+        tmp_path: Path,
+    ) -> None:
+        # A type/expression group whose only supporting claim is ASSERTED (not
+        # observed) and which has no execution-assertion case stays static-only:
+        # the conditional physical requirement must not fire.
+        _init_session(catalog_dir)
+        session_store, evidence, claims, interview = TestReadiness._stores(
+            catalog_dir
+        )
+        actor = session_store.charter.approver
+        from selayer_discovery.model import EvidenceClass
+
+        TestReadiness._add_observed_claim(
+            claims,
+            evidence,
+            session_store,
+            tmp_path,
+            actor,
+            evidence_class=EvidenceClass.ASSERTED,
+        )
+        op = _fact_type_edit_op()
+        mapping = _proposal_mapping(
+            groups=[
+                _group(
+                    title="Edit fact type",
+                    rationale="Type revision.",
+                    operations=[op],
+                )
+            ]
+        )
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+            interview_store=interview,
+            claim_store=claims,
+            evidence_store=evidence,
+        )
+        kinds = {c.kind for c in bundle.checks_for("group-001")}
+        assert MandatoryCheckKind.STATIC.value in kinds
+        assert MandatoryCheckKind.PHYSICAL.value not in kinds
 
 
 # --------------------------------------------------------------------------- #
@@ -2810,6 +3036,190 @@ class TestReadiness:
         readiness = bundle.readiness_for("group-001")
         assert readiness.ready is False
         assert "check_failed" in readiness.blockers
+
+
+# --------------------------------------------------------------------------- #
+# Step 4b: evidence-readiness gates (Task 17 fix)                           #
+# --------------------------------------------------------------------------- #
+
+
+class TestEvidenceReadinessGates:
+    """Readiness validates supporting-claim selectors and reopenable evidence.
+
+    For every supporting claim, each retained selector is revalidated against
+    the current evidence revision: a stale or missing selector blocks. When a
+    group requires physical (reopenable) evidence, the referenced snapshot
+    content must exist and reopen safely; live/non-reopenable evidence blocks.
+    """
+
+    def test_stale_evidence_selector_blocks_readiness(
+        self,
+        catalog_dir: Path,
+        base_catalog_text: str,
+        tmp_path: Path,
+    ) -> None:
+        _init_session(catalog_dir)
+        session_store, evidence, claims, interview = TestReadiness._stores(
+            catalog_dir
+        )
+        actor = session_store.charter.approver
+        claim = TestReadiness._add_observed_claim(
+            claims, evidence, session_store, tmp_path, actor
+        )
+        # Revise the cited document after the claim was recorded so the
+        # retained selector now binds to a superseded revision.
+        doc = tmp_path / "spec.md"
+        doc.write_text("revised grain evidence\nline two\n", encoding="utf-8")
+        evidence.add_document(doc, allowed_roots=(tmp_path,))
+        interview.answer(gate="gate-grains", text="Yes.", actor=actor)
+        mapping = _proposal_mapping()
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+            interview_store=interview,
+            claim_store=claims,
+            evidence_store=evidence,
+        )
+        readiness = bundle.readiness_for("group-001")
+        assert readiness.ready is False
+        assert "evidence_selector_stale" in readiness.blockers
+        # The retained selectors are available for revalidation.
+        assert len(claim.selectors) == 1
+
+    def test_missing_evidence_selector_blocks_readiness(
+        self,
+        catalog_dir: Path,
+        base_catalog_text: str,
+        tmp_path: Path,
+    ) -> None:
+        _init_session(catalog_dir)
+        session_store, evidence, claims, interview = TestReadiness._stores(
+            catalog_dir
+        )
+        actor = session_store.charter.approver
+        TestReadiness._add_observed_claim(
+            claims, evidence, session_store, tmp_path, actor
+        )
+        interview.answer(gate="gate-grains", text="Yes.", actor=actor)
+        mapping = _proposal_mapping()
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        # An evidence store that does not contain the cited record: the
+        # retained selector's record is absent, so revalidation blocks.
+        from selayer_discovery.evidence import EvidenceStore
+
+        empty_evidence = EvidenceStore.create(tmp_path / "empty-evidence")
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+            interview_store=interview,
+            claim_store=claims,
+            evidence_store=empty_evidence,
+        )
+        readiness = bundle.readiness_for("group-001")
+        assert readiness.ready is False
+        assert "evidence_selector_stale" in readiness.blockers
+
+    def test_non_reopenable_evidence_blocks_readiness(
+        self,
+        catalog_dir: Path,
+        base_catalog_text: str,
+        tmp_path: Path,
+    ) -> None:
+        _init_session(catalog_dir)
+        session_store, evidence, claims, interview = TestReadiness._stores(
+            catalog_dir
+        )
+        actor = session_store.charter.approver
+        claim = TestReadiness._add_observed_claim(
+            claims, evidence, session_store, tmp_path, actor
+        )
+        interview.answer(gate="gate-grains", text="Yes.", actor=actor)
+        orders_path = catalog_dir / "data" / "orders.parquet"
+        op = _source_grain_edit_op(
+            before=_orders_source(str(orders_path), ["id"]),
+        )
+        mapping = _proposal_mapping(
+            groups=[
+                _group(
+                    title="Edit order grain",
+                    rationale="Grain revision.",
+                    operations=[op],
+                )
+            ]
+        )
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        # Delete the content-addressed snapshot backing the selector: the
+        # selector stays current (the manifest still records it) but the
+        # snapshot can no longer be reopened.
+        snapshot = evidence.snapshot_path(claim.selectors[0].content_hash)
+        snapshot.unlink()
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+            interview_store=interview,
+            claim_store=claims,
+            evidence_store=evidence,
+        )
+        readiness = bundle.readiness_for("group-001")
+        assert readiness.ready is False
+        assert "evidence_not_reopenable" in readiness.blockers
+
+    def test_reopenable_evidence_passes_for_physical_group(
+        self,
+        catalog_dir: Path,
+        base_catalog_text: str,
+        tmp_path: Path,
+    ) -> None:
+        _init_session(catalog_dir)
+        session_store, evidence, claims, interview = TestReadiness._stores(
+            catalog_dir
+        )
+        actor = session_store.charter.approver
+        TestReadiness._add_observed_claim(
+            claims, evidence, session_store, tmp_path, actor
+        )
+        interview.answer(gate="gate-grains", text="Yes.", actor=actor)
+        orders_path = catalog_dir / "data" / "orders.parquet"
+        op = _source_grain_edit_op(
+            before=_orders_source(str(orders_path), ["id"]),
+        )
+        mapping = _proposal_mapping(
+            groups=[
+                _group(
+                    title="Edit order grain",
+                    rationale="Grain revision.",
+                    operations=[op],
+                )
+            ]
+        )
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            mapping, base_catalog_text, tmp_path
+        )
+        bundle = verify_proposal(
+            proposal=proposal,
+            candidate=candidate,
+            candidate_layer=layer,
+            okf_output_dir=tmp_path / "okf",
+            interview_store=interview,
+            claim_store=claims,
+            evidence_store=evidence,
+        )
+        readiness = bundle.readiness_for("group-001")
+        assert readiness.ready is True
+        assert readiness.blockers == ()
 
 
 # --------------------------------------------------------------------------- #

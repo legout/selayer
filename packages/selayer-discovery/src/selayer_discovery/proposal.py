@@ -65,7 +65,7 @@ from selayer_discovery.model import MAX_TEXT_LENGTH, bounded_mapping
 
 if TYPE_CHECKING:
     from selayer.catalog import SemanticLayer
-    from selayer_discovery.evidence import ClaimStore, EvidenceStore
+    from selayer_discovery.evidence import ClaimRecord, ClaimStore, EvidenceStore
     from selayer_discovery.interview import InterviewStore
 
 __all__ = [
@@ -554,6 +554,9 @@ _ALLOWED_REJECTION_CODES: frozenset[str] = frozenset(
         "ambiguous_relationship_path",
         "row_expanding_path",
         "no_relationship_path",
+        # ``invalid_filter_type`` is raised by the core planner when a filter
+        # value's type does not match a dimension's declared data type.
+        "invalid_filter_type",
     }
 )
 
@@ -2133,6 +2136,54 @@ def _union_group_impacts(group: DependencyGroup) -> tuple[str, ...]:
     return tuple(sorted(flags))
 
 
+def _group_cites_data(
+    group: DependencyGroup, claim_store: ClaimStore | None
+) -> bool:
+    """Return whether a group cites observed data evidence.
+
+    A group cites data when it carries a bounded execution-assertion query
+    case (which runs the live planner/engine over data) or when one of its
+    supporting claims is a direct source observation (evidence class
+    ``observed``). Asserted or inferred-only claims do not count: they do not
+    cite data, so they do not widen the required evidence.
+    """
+
+    for case in group.query_cases:
+        if case.kind == "execution_assertion":
+            return True
+    if claim_store is not None:
+        for claim_id in group.supporting_claim_ids:
+            try:
+                claim = claim_store.get_claim(claim_id)
+            except Exception:  # noqa: BLE001, S112
+                continue
+            if claim.evidence_class == "observed":
+                return True
+    return False
+
+
+def _group_check_kinds(
+    group: DependencyGroup, claim_store: ClaimStore | None
+) -> frozenset[str]:
+    """Return the mandatory check kinds for one dependency group.
+
+    The pure impacts-only :func:`mandatory_check_kinds` is the baseline and
+    stays unchanged. When the group has a type/expression impact *and* its
+    normalized data cites observed evidence (an observed supporting claim or a
+    bounded execution-assertion query case), a reopenable physical data audit
+    is added. The conditional is never derived from an agent-supplied impact
+    list; it depends only on the derived impacts and the bound typed data.
+    """
+
+    impacts = _union_group_impacts(group)
+    kinds = mandatory_check_kinds(impacts)
+    if _TYPE_EXPRESSION_IMPACTS.intersection(impacts) and _group_cites_data(
+        group, claim_store
+    ):
+        kinds = kinds | {MandatoryCheckKind.PHYSICAL.value}
+    return kinds
+
+
 def _extract_selectors(group: DependencyGroup) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Extract metric and dimension selector names from catalog operations."""
 
@@ -2477,10 +2528,11 @@ def _run_group_checks(
     candidate: Candidate,
     layer: SemanticLayer,
     okf_output_dir: str | Path,
+    claim_store: ClaimStore | None,
 ) -> tuple[MandatoryCheck, ...]:
     """Derive and run every mandatory check for one dependency group."""
 
-    kinds = sorted(mandatory_check_kinds(_union_group_impacts(group)))
+    kinds = sorted(_group_check_kinds(group, claim_store))
     checks: list[MandatoryCheck] = []
     for kind in kinds:
         if kind == MandatoryCheckKind.STATIC.value:
@@ -2523,6 +2575,58 @@ def _topological_groups(
     return tuple(ordered)
 
 
+def _supporting_claim_records(
+    group: DependencyGroup, claim_store: ClaimStore
+) -> list[ClaimRecord]:
+    """Return the current supporting-claim records, skipping unknown ids."""
+
+    records: list[ClaimRecord] = []
+    for claim_id in group.supporting_claim_ids:
+        try:
+            records.append(claim_store.get_claim(claim_id))
+        except Exception:  # noqa: BLE001, S112
+            continue
+    return records
+
+
+def _selectors_current(
+    claims: Sequence[ClaimRecord], evidence_store: EvidenceStore
+) -> bool:
+    """Return whether every retained selector is still bound to its revision.
+
+    Each selector is revalidated against the current evidence revision via the
+    core :meth:`EvidenceStore.validate_selector` API. A stale, missing, or
+    malformed selector returns ``False`` so readiness can block with a stable
+    code. No body or value is read or surfaced.
+    """
+
+    for claim in claims:
+        for selector in claim.selectors:
+            try:
+                evidence_store.validate_selector(selector)
+            except Exception:  # noqa: BLE001
+                return False
+    return True
+
+
+def _snapshots_reopenable(
+    claims: Sequence[ClaimRecord], evidence_store: EvidenceStore
+) -> bool:
+    """Return whether every referenced snapshot content exists and reopens.
+
+    Uses the content-addressed :meth:`EvidenceStore.snapshot_path` to confirm
+    the on-disk snapshot backing each retained selector is present. This is a
+    live/non-reopenable check (path existence only); it never reads a body or
+    value and never duplicates the physical audit.
+    """
+
+    for claim in claims:
+        for selector in claim.selectors:
+            if not evidence_store.snapshot_path(selector.content_hash).is_file():
+                return False
+    return True
+
+
 def _group_readiness(
     group: DependencyGroup,
     checks: tuple[MandatoryCheck, ...],
@@ -2531,14 +2635,17 @@ def _group_readiness(
     readiness_by_group: Mapping[str, GroupReadiness],
     interview_store: InterviewStore | None,
     claim_store: ClaimStore | None,
+    evidence_store: EvidenceStore | None,
 ) -> GroupReadiness:
     """Compute the review-readiness verdict for one dependency group.
 
     Readiness requires: disposed affecting gates, current non-inferred
-    claims, no affected unresolved conflicts, ready dependencies, and every
-    mandatory check passed. Gate, claim, and conflict gates are evaluated only
-    when the corresponding store is provided; the mandatory-check and
-    dependency gates always apply.
+    claims with selectors still bound to their evidence revision, reopenable
+    snapshot content for groups requiring physical evidence, no affected
+    unresolved conflicts, ready dependencies, and every mandatory check
+    passed. Gate, claim, evidence, and conflict gates are evaluated only when
+    the corresponding store is provided; the mandatory-check and dependency
+    gates always apply.
     """
 
     blockers: list[str] = []
@@ -2546,21 +2653,31 @@ def _group_readiness(
         group.affecting_gates
     ):
         blockers.append("gate_open")
+    requires_physical = any(
+        check.kind == MandatoryCheckKind.PHYSICAL.value for check in checks
+    )
     if claim_store is not None:
-        has_current_non_inferred = False
-        for claim_id in group.supporting_claim_ids:
-            try:
-                claim = claim_store.get_claim(claim_id)
-            except Exception:  # noqa: BLE001, S112
-                continue
-            if (
-                claim.state == "current"
-                and claim.evidence_class != "inferred"
-            ):
-                has_current_non_inferred = True
-                break
+        supporting = _supporting_claim_records(group, claim_store)
+        has_current_non_inferred = any(
+            claim.state == "current" and claim.evidence_class != "inferred"
+            for claim in supporting
+        )
         if not has_current_non_inferred:
             blockers.append("claim_inferred_only")
+        # Revalidate every retained supporting selector against the current
+        # evidence revision: a stale or missing selector blocks readiness.
+        if evidence_store is not None and not _selectors_current(
+            supporting, evidence_store
+        ):
+            blockers.append("evidence_selector_stale")
+        # Groups requiring reopenable (physical) evidence must reference
+        # snapshot content that still exists and reopens on disk.
+        if (
+            requires_physical
+            and evidence_store is not None
+            and not _snapshots_reopenable(supporting, evidence_store)
+        ):
+            blockers.append("evidence_not_reopenable")
         for conflict in claim_store.conflicts():
             if (
                 group.group_id in conflict.affected_group_ids
@@ -2611,7 +2728,7 @@ def verify_proposal(
         okf_output_dir: a writable directory for OKF build artifacts.
         interview_store: optional interview store for gate readiness.
         claim_store: optional claim/conflict store for evidence readiness.
-        evidence_store: optional evidence store (currently informational).
+        evidence_store: optional evidence store for selector/snapshot readiness.
 
     Returns:
         An immutable :class:`VerificationBundle` bound to all input hashes.
@@ -2625,7 +2742,7 @@ def verify_proposal(
     group_checks: dict[str, tuple[MandatoryCheck, ...]] = {}
     for group in proposal.groups:
         group_checks[group.group_id] = _run_group_checks(
-            group, candidate, candidate_layer, okf_output_dir
+            group, candidate, candidate_layer, okf_output_dir, claim_store
         )
     readiness_by_group: dict[str, GroupReadiness] = {}
     for group in _topological_groups(proposal.groups):
@@ -2636,6 +2753,7 @@ def verify_proposal(
             readiness_by_group=readiness_by_group,
             interview_store=interview_store,
             claim_store=claim_store,
+            evidence_store=evidence_store,
         )
     groups = tuple(
         GroupVerification(

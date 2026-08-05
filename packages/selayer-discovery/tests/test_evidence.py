@@ -57,6 +57,7 @@ from selayer_discovery.evidence import (
     DocumentLineSelector,
     EvidenceError,
     EvidenceLimits,
+    EvidenceRecord,
     EvidenceStore,
     InterviewEventSelector,
     ProviderSectionSelector,
@@ -958,7 +959,7 @@ _SUBJECT = "source.shopfloor.orders"
 
 def _doc_selector(
     evidence: EvidenceStore, project: Path, body: bytes = b"line one\nline two\n"
-) -> tuple[DocumentLineSelector, object]:
+) -> tuple[DocumentLineSelector, EvidenceRecord]:
     """Ingest a document and return a revision-bound line selector plus record."""
 
     path = _doc(project, "spec.md", body)
@@ -1077,6 +1078,71 @@ def test_add_claim_records_current_claim_with_selectors(
     assert claim.creator_event == "answer-gate-grains"
     assert claim.contradicts == ("claim-grain-002",)
     assert claims.get_claim("claim-grain-001") == claim
+
+
+def test_claim_record_retains_typed_selectors_without_leaking_bodies(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+    tmp_path: Path,
+) -> None:
+    # ClaimRecord retains the typed selectors (record_id/content_hash/revision
+    # plus the kind-specific field) so readiness can revalidate them later
+    # against the current evidence revision. Selectors carry no body content,
+    # so retention never leaks a document body.
+    store, evidence, claims = _claim_store(session_root, charter, actor)
+    project = tmp_path / "project"
+    project.mkdir()
+    selector, record = _doc_selector(evidence, project)
+    store.record_artifact("answer-gate-grains", content_hash="a" * 64, actor=actor)
+    claim = claims.add_claim(
+        claim_id="claim-grain-retained",
+        subject=_SUBJECT,
+        statement="The grain is one row per confirmed order.",
+        evidence_class=EvidenceClass.OBSERVED,
+        selectors=(selector,),
+        creator_event="answer-gate-grains",
+        actor=actor,
+    )
+    assert len(claim.selectors) == 1
+    retained = claim.selectors[0]
+    assert retained.record_id == record.record_id
+    assert retained.content_hash == record.content_hash
+    assert retained.revision == record.revision
+    assert retained.kind == "document_line_range"
+    # The safe view exposes only selector kinds, never bodies or values.
+    safe = claim.safe_dict()
+    assert safe["selector_kinds"] == ["document_line_range"]
+    rendered = json.dumps(safe, sort_keys=True)
+    assert "line one" not in rendered
+
+
+def test_claim_selectors_round_trip_through_journal(
+    session_root: Path,
+    charter: SessionCharter,
+    actor: str,
+    tmp_path: Path,
+) -> None:
+    # Reopening the claim store from its append-only journal reconstructs the
+    # retained typed selectors exactly.
+    store, evidence, claims = _claim_store(session_root, charter, actor)
+    project = tmp_path / "project"
+    project.mkdir()
+    selector, _ = _doc_selector(evidence, project)
+    store.record_artifact("answer-gate-grains", content_hash="a" * 64, actor=actor)
+    claims.add_claim(
+        claim_id="claim-rt",
+        subject=_SUBJECT,
+        statement="The grain is one row per confirmed order.",
+        evidence_class=EvidenceClass.OBSERVED,
+        selectors=(selector,),
+        creator_event="answer-gate-grains",
+        actor=actor,
+    )
+    reopened = ClaimStore.open(store, evidence)
+    claim = reopened.get_claim("claim-rt")
+    assert len(claim.selectors) == 1
+    assert claim.selectors[0] == selector
 
 
 def test_add_claim_rejects_stale_selector(
