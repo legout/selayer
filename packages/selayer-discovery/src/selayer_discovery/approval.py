@@ -688,6 +688,7 @@ def prepare_apply_batch(
     base_hashes: Mapping[str, str],
     current_session_hashes: Mapping[str, str],
     approved_summary_hash: str,
+    group_candidate_fingerprints: Mapping[str, tuple[str, str]] | None = None,
 ) -> PreparedBatch:
     """Prepare a dependency-closed, non-overlapping batch of accepted groups.
 
@@ -713,6 +714,9 @@ def prepare_apply_batch(
         detail="invalid session hashes",
     )
     summary_hash = _require_hash(approved_summary_hash, detail="invalid summary hash")
+    per_group_fingerprints = group_candidate_fingerprints or {}
+    if not isinstance(per_group_fingerprints, Mapping):
+        raise ApprovalError(CODE_APPROVAL_INVALID, safe_detail="invalid group fingerprints") from None
     if not isinstance(attestations, Mapping):
         raise ApprovalError(
             CODE_APPROVAL_INVALID, safe_detail="invalid attestations"
@@ -758,9 +762,20 @@ def prepare_apply_batch(
             raise ApprovalError(CODE_APPROVAL_FINGERPRINT_CHANGED) from None
         if not readiness[gid].ready:
             raise ApprovalError(CODE_APPROVAL_GROUP_NOT_READY) from None
-        if bound["candidate"] != combined_candidate.fingerprint:
+        expected_group = per_group_fingerprints.get(gid)
+        expected_candidate = (
+            expected_group[0]
+            if isinstance(expected_group, tuple) and len(expected_group) == 2
+            else combined_candidate.fingerprint
+        )
+        expected_verification = (
+            expected_group[1]
+            if isinstance(expected_group, tuple) and len(expected_group) == 2
+            else combined_verification.fingerprint
+        )
+        if bound["candidate"] != expected_candidate:
             raise ApprovalError(CODE_APPROVAL_FINGERPRINT_CHANGED) from None
-        if bound["verification"] != combined_verification.fingerprint:
+        if bound["verification"] != expected_verification:
             raise ApprovalError(CODE_APPROVAL_FINGERPRINT_CHANGED) from None
         attestation_fingerprints.append(attestation.fingerprint)
     fingerprint = canonical.fingerprint(

@@ -262,6 +262,8 @@ _FIELD_IMPACTS: Mapping[str, str] = {
     "schema": _IMPACT_SCHEMA_CHANGED,
     "connector": _IMPACT_SOURCE_CHANGED,
     "type": _IMPACT_RELATIONSHIP_CHANGED,
+    "source": _IMPACT_SOURCE_CHANGED,
+    "column": _IMPACT_SOURCE_CHANGED,
     "source_column": _IMPACT_RELATIONSHIP_CHANGED,
     "target_column": _IMPACT_RELATIONSHIP_CHANGED,
     "target": _IMPACT_RELATIONSHIP_CHANGED,
@@ -1356,7 +1358,7 @@ def _reject_identity_rename(
     """
 
     identity_fields = {
-        "dimension": ("source", "column"),
+        "dimension": ("column",),
         "relationship": ("source", "target", "source_column", "target_column"),
         "source": ("name",),
         "fact": ("source",),

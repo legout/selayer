@@ -729,6 +729,12 @@ class InterviewStore:
             open_q = self._index.open_question_id
             question_id: str | None = None
             if open_q is not None:
+                question = self._index.questions.get(open_q)
+                if question is None or question.gate != gate_id:
+                    raise InterviewError(
+                        CODE_INTERVIEW_INVALID_INPUT,
+                        safe_detail="answer_gate_mismatch",
+                    ) from None
                 question_id = open_q
                 self._close_question(open_q, answer_id)
             record = AnswerRecord(

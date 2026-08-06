@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import ast
 import json
+import runpy
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
 import yaml
 from selayer_discovery.canonical import fingerprint
+from selayer_discovery.cli import _runtime_profile_resolver, main
 from selayer_discovery.evidence import (
     ClaimStore,
     EvidenceClass,
     EvidenceStore,
     selector_from_mapping,
 )
+from selayer_discovery.interview import InterviewStore
 from selayer_discovery.model import SCHEMA_VERSION
 from selayer_discovery.session import SessionCharter, SessionStore
 
@@ -21,6 +25,12 @@ from selayer.okf import OkfBundle
 from selayer.verification import verify_static
 
 _REPLAY = Path(__file__).parents[3] / "examples" / "shopfloor" / "discovery" / "replay"
+
+
+def _generate_shopfloor_data(path: Path) -> Any:
+    namespace = runpy.run_path(str(_REPLAY.parents[1] / "generate_data.py"))
+    generator = cast(Callable[[Path], Any], namespace["generate_shopfloor_data"])
+    return generator(path)
 
 
 def _snapshot_tree(path: Path) -> tuple[tuple[str, bytes], ...]:
@@ -112,7 +122,7 @@ def test_replay_wiki_queries_are_bounded_and_read_only() -> None:
 
 
 def test_replay_runs_temporary_catalog_okf_and_typed_evidence_flow(
-    tmp_path: Path,
+    tmp_path: Path, capsys: Any
 ) -> None:
     """Exercise the replay's deterministic core without a model or network."""
 
@@ -127,15 +137,28 @@ def test_replay_runs_temporary_catalog_okf_and_typed_evidence_flow(
         dict[str, Any],
         yaml.safe_load((_REPLAY / "defect.yaml").read_text(encoding="utf-8")),
     )
-    for source in catalog["data_sources"].values():
+    data_paths = _generate_shopfloor_data(tmp_path / "data")
+    generated_locations = {
+        "customer_orders": data_paths.customer_orders,
+        "production_orders": data_paths.production_orders_db,
+        "serialized_drives": data_paths.shopfloor_db,
+        "component_consumption": data_paths.component_consumption,
+        "component_lot_inspections": data_paths.component_lot_inspections,
+        "operation_executions": data_paths.operation_executions,
+        "machine_telemetry": data_paths.machine_telemetry,
+        "eol_test_runs": data_paths.eol_test_runs,
+    }
+    for source_id, source in catalog["data_sources"].items():
         schema_ref = source.pop("schema_ref")
         source["schema"] = yaml.safe_load(
             (root / "schemas" / Path(schema_ref).name).read_text(encoding="utf-8")
         )
+        source["location"] = str(generated_locations[source_id])
     target = catalog["dimensions"]["drive_serial_number"]
     before = dict(target)
     target.update(defect["replace"])
-    defective_catalog = tmp_path / "defective.yaml"
+    defective_state = dict(target)
+    defective_catalog = tmp_path / "shopfloor.yaml"
     defective_catalog.write_text(
         cast(str, yaml.safe_dump(catalog, sort_keys=False)), encoding="utf-8"
     )
@@ -157,7 +180,7 @@ def test_replay_runs_temporary_catalog_okf_and_typed_evidence_flow(
     correction = replay_proposal["groups"][0]["operations"][0]["after"]
     target.clear()
     target.update(correction)
-    corrected_catalog = tmp_path / "shopfloor.yaml"
+    corrected_catalog = tmp_path / "expected-corrected.yaml"
     corrected_catalog.write_text(
         cast(str, yaml.safe_dump(catalog, sort_keys=False)), encoding="utf-8"
     )
@@ -175,21 +198,40 @@ def test_replay_runs_temporary_catalog_okf_and_typed_evidence_flow(
     )
     assert bundle.concepts
 
+    runtime_profile_path = tmp_path / "runtime-profiles.yaml"
+    runtime_profile_path.write_text(
+        "version: 1\nprofiles:\n  shopfloor_readonly:\n"
+        "    allow_extension_install:\n      literal: false\n",
+        encoding="utf-8",
+    )
     charter = SessionCharter(
         schema_version=SCHEMA_VERSION,
         session_id="shopfloor-replay",
         business_question="Safe drive-level component and EOL analysis",
-        catalog_fingerprint=fingerprint(corrected_catalog.read_text(encoding="utf-8")),
+        catalog_fingerprint=fingerprint(defective_catalog.read_text(encoding="utf-8")),
         catalog_path="shopfloor.yaml",
+        runtime_profile="runtime-profiles.yaml",
         approver="Dr Alice Okonkwo",
         inclusions=("dimension.drive_serial_number",),
         exclusions=("operation-to-telemetry event joins",),
         acceptance_questions=("Does conformed drive identity hold?",),
     )
-    session = SessionStore.create(
-        tmp_path / "session", charter=charter, actor=charter.approver
+    session_dir = (
+        tmp_path
+        / ".selayer"
+        / "discovery"
+        / "sessions"
+        / charter.session_id
     )
-    evidence = EvidenceStore.create(tmp_path / "evidence")
+    resolver = _runtime_profile_resolver(tmp_path, charter)
+    assert (
+        resolver.resolve("shopfloor_readonly", source_id="shopfloor").name
+        == "shopfloor_readonly"
+    )
+    session = SessionStore.create(
+        session_dir, charter=charter, actor=charter.approver
+    )
+    evidence = EvidenceStore.create(session_dir / "evidence")
     records = []
     for index in range(4):
         document = tmp_path / f"business-{index}.txt"
@@ -200,30 +242,65 @@ def test_replay_runs_temporary_catalog_okf_and_typed_evidence_flow(
         media_type="text/plain",
         source="okf-filesystem",
     )
+    interview = InterviewStore.create(session)
+    question = interview.ask(
+        gate="gate-grains",
+        text="Does the drive identity preserve the declared grain?",
+        evidence_ids=(records[0].record_id,),
+        subjects=("dimension.drive_serial_number",),
+        actor=charter.approver,
+    )
+    answer = interview.answer(
+        gate="gate-grains",
+        text="The drive identity remains one row per serialized drive.",
+        actor=charter.approver,
+    )
+    interview.correct(
+        answer_id=answer.answer.answer_id,
+        reason="Clarify the source audit scope.",
+        replacement="The drive identity remains one row per serialized drive after source audit.",
+        actor=charter.approver,
+    )
+    assert question.question_id
+
     claims = ClaimStore.create(session, evidence)
     creator = "charter"
-    for index, (record, evidence_class) in enumerate(
-        zip(
-            records[:3],
-            (EvidenceClass.OBSERVED, EvidenceClass.ASSERTED, EvidenceClass.INFERRED),
-            strict=True,
+    claim_specs = (
+        (
+            "claim-drive-identity",
+            okf_record,
+            {
+                "kind": "source_field",
+                "field": "serial_number",
+            },
+            EvidenceClass.OBSERVED,
         ),
-        start=1,
-    ):
+        (
+            "claim-replay-2",
+            records[1],
+            {"kind": "document_line_range", "start_line": 1, "end_line": 1},
+            EvidenceClass.ASSERTED,
+        ),
+        (
+            "claim-replay-3",
+            records[2],
+            {"kind": "document_line_range", "start_line": 1, "end_line": 1},
+            EvidenceClass.INFERRED,
+        ),
+    )
+    for claim_id, record, selector_fields, evidence_class in claim_specs:
         selector = selector_from_mapping(
             {
-                "kind": "document_line_range",
+                **selector_fields,
                 "record_id": record.record_id,
                 "content_hash": record.content_hash,
                 "revision": record.revision,
-                "start_line": 1,
-                "end_line": 1,
             }
         )
         claims.add_claim(
-            claim_id=f"claim-replay-{index}",
+            claim_id=claim_id,
             subject="dimension.drive_serial_number",
-            statement=f"Replay claim {index} is bounded to one evidence snapshot.",
+            statement=f"Replay claim {claim_id} is bounded to one evidence snapshot.",
             evidence_class=evidence_class,
             selectors=(selector,),
             creator_event=creator,
@@ -231,6 +308,114 @@ def test_replay_runs_temporary_catalog_okf_and_typed_evidence_flow(
         )
     assert okf_record.content_hash
     assert len(claims.claims()) == 3
+
+    proposal_data = cast(
+        dict[str, Any],
+        yaml.safe_load((_REPLAY / "proposal.yaml").read_text(encoding="utf-8")),
+    )
+    proposal_operation = proposal_data["groups"][0]["operations"][0]
+    proposal_operation["before"] = defective_state
+    proposal_operation["before_hash"] = fingerprint(defective_state)
+    proposal_operation["after"] = dict(target)
+    proposal_operation["claim_ids"] = ["claim-drive-identity"]
+    proposal_path = tmp_path / "proposal.yaml"
+    proposal_path.write_text(
+        cast(str, yaml.safe_dump(proposal_data, sort_keys=False)), encoding="utf-8"
+    )
+    common = ["--project", str(tmp_path), "--session-id", charter.session_id]
+    import_result = main(
+        ["proposal", "import", *common, "--proposal", str(proposal_path)]
+    )
+    assert import_result == 0, capsys.readouterr().err
+    verify_result = main(
+        ["proposal", "verify", *common, "--proposal", proposal_data["proposal_id"]]
+    )
+    assert verify_result == 0, capsys.readouterr().err
+    attest_result = main(
+        [
+            "proposal",
+            "attest",
+            *common,
+            "--proposal",
+            proposal_data["proposal_id"],
+            "--group",
+            "group-conformed-drive",
+            "--approver",
+            charter.approver,
+        ]
+    )
+    assert attest_result == 0, capsys.readouterr().err
+    prepare_result = main(
+        [
+            "proposal",
+            "prepare-apply",
+            *common,
+            "--proposal",
+            proposal_data["proposal_id"],
+            "--group",
+            "group-conformed-drive",
+        ]
+    )
+    assert prepare_result == 0, capsys.readouterr().err
+    proposal_dir = (
+        tmp_path
+        / ".selayer"
+        / "discovery"
+        / "sessions"
+        / charter.session_id
+        / "proposals"
+        / proposal_data["proposal_id"]
+    )
+    batch = cast(
+        dict[str, Any],
+        json.loads((proposal_dir / "prepared-batch.json").read_text(encoding="utf-8")),
+    )
+    assert (
+        main(
+            [
+                "proposal",
+                "attest-apply",
+                *common,
+                "--proposal",
+                proposal_data["proposal_id"],
+                "--batch",
+                batch["fingerprint"],
+                "--approver",
+                charter.approver,
+            ]
+        )
+        == 0
+    )
+    assert (
+        main(
+            [
+                "proposal",
+                "export-preview",
+                *common,
+                "--proposal",
+                proposal_data["proposal_id"],
+            ]
+        )
+        == 0
+    )
+    assert (
+        main(
+            [
+                "proposal",
+                "apply",
+                *common,
+                "--proposal",
+                proposal_data["proposal_id"],
+                "--approver",
+                charter.approver,
+            ]
+        )
+        == 0
+    )
+    applied_layer = SemanticLayer.load(defective_catalog)
+    assert applied_layer.dimension("drive_serial_number").source == "serialized_drives"
+    assert "operation_telemetry_join" not in applied_layer.dimensions
+
     final_bundle = OkfBundle.build(
         corrected_layer,
         tmp_path / "okf-final",

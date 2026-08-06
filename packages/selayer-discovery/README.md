@@ -37,7 +37,10 @@ never edited by hand.
 
 ## Workflow
 
-Initialize a charter before intake and lock the catalog base:
+Initialize a charter before intake and lock the catalog base. An optional
+`runtime_profile` charter field names a project-contained version-1 profile
+file; only its path is persisted, while values resolve from environment
+references at scan time:
 
 ```bash
 selayer-discovery session init \

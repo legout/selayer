@@ -313,6 +313,7 @@ class SessionCharter:
     business_question: str = ""
     catalog_fingerprint: str = ""
     catalog_path: str = ""
+    runtime_profile: str = ""
     approver: str = ""
     inclusions: tuple[str, ...] = ()
     exclusions: tuple[str, ...] = ()
@@ -349,6 +350,10 @@ class SessionCharter:
         if len(self.business_question) > MAX_TEXT_LENGTH:
             raise SessionError(CODE_INVALID_CHARTER)
         if len(self.catalog_path) > MAX_TEXT_LENGTH:
+            raise SessionError(CODE_INVALID_CHARTER)
+        if type(self.runtime_profile) is not str:
+            raise SessionError(CODE_INVALID_CHARTER)
+        if len(self.runtime_profile) > MAX_TEXT_LENGTH:
             raise SessionError(CODE_INVALID_CHARTER)
         if len(self.approver) > MAX_TEXT_LENGTH:
             raise SessionError(CODE_INVALID_CHARTER)
@@ -570,6 +575,9 @@ def _charter_from_payload(payload: Mapping[str, object]) -> SessionCharter:
     catalog_path = record.get("catalog_path", "")
     if not isinstance(catalog_path, str):
         raise SessionError(CODE_INTEGRITY, safe_detail="malformed event")
+    runtime_profile = record.get("runtime_profile", "")
+    if not isinstance(runtime_profile, str):
+        raise SessionError(CODE_INTEGRITY, safe_detail="malformed event")
 
     return SessionCharter(
         schema_version=schema_version,
@@ -577,6 +585,7 @@ def _charter_from_payload(payload: Mapping[str, object]) -> SessionCharter:
         business_question=_text("business_question"),
         catalog_fingerprint=_text("catalog_fingerprint"),
         catalog_path=catalog_path,
+        runtime_profile=runtime_profile,
         approver=_text("approver"),
         inclusions=_text_tuple("inclusions"),
         exclusions=_text_tuple("exclusions"),

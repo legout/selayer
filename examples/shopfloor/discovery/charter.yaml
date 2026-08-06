@@ -18,5 +18,5 @@ acceptance_questions:
   - Does the corrected catalog preserve operation and EOL grain?
 approver: Dr Alice Okonkwo
 catalog: examples/shopfloor/shopfloor_semantic_layer.yaml
-runtime_profile: SHOPFLOOR_READONLY
+runtime_profile: examples/shopfloor/runtime-profiles.yaml
 summary_root: semantic_changes

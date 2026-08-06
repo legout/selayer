@@ -371,6 +371,26 @@ def test_ask_requires_at_least_one_evidence_and_subject(
 # --------------------------------------------------------------------------- #
 
 
+def test_answer_rejects_gate_mismatch_without_closing_question(
+    session_root: Path,
+    charter,
+    actor: str,  # type: ignore[no-untyped-def]
+) -> None:
+    store = _make_session(session_root, charter, actor)
+    interview = _interview(store)
+    _ask_grains(interview, actor=actor)
+    with pytest.raises(InterviewError) as raised:
+        interview.answer(
+            gate="gate-business-objective",
+            text="Wrong gate.",
+            actor=actor,
+        )
+    assert raised.value.code == "discovery.interview.invalid_input"
+    assert raised.value.safe_detail == "answer_gate_mismatch"
+    assert interview.open_question() is not None
+    assert not interview.answers()
+
+
 def test_answer_closes_open_question_and_disposes_gate(
     session_root: Path,
     charter,

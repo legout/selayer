@@ -1,49 +1,60 @@
 proposal_id: shopfloor-conformed-drive
 title: Conform drive identity for safe component analysis
 groups:
-  - group_id: group-conformed-drive
-    title: Conformed drive identity
-    rationale: Use current observed evidence to align drive identity without changing operation telemetry joins.
-    dependencies: []
-    supporting_claim_ids: [claim-drive-identity]
-    inferred_claim_ids: []
-    conflict_ids: []
-    affecting_gates: [gate-grains]
-    query_cases: []
-    operations:
-      - operation_id: operation-drive-identity
-        kind: catalog.edit
-        target_id: dimension.drive_serial_number
-        before:
-          source: operation_executions
-          column: serial_number
-          data_type: string
-        before_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-        after:
-          source: serialized_drives
-          column: serial_number
-          data_type: string
-        claim_ids: [claim-drive-identity]
-        group_ids: [group-conformed-drive]
-  - group_id: group-telemetry-join
-    title: Operation telemetry join
-    rationale: Explicitly blocked because the charter excludes event joins.
-    dependencies: []
-    supporting_claim_ids: []
-    inferred_claim_ids: []
-    conflict_ids: [conflict-operation-telemetry]
-    affecting_gates: [gate-relationships]
-    query_cases: []
-    operations:
-      - operation_id: operation-telemetry-join
-        kind: catalog.add
-        target_id: dimension.operation_telemetry_join
-        before: null
-        before_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-        after:
-          source: operation_executions
-          column: serial_number
-          data_type: string
-          description: Excluded event-join marker
-        claim_ids: [claim-telemetry]
-        group_ids: [group-telemetry-join]
+- group_id: group-conformed-drive
+  title: Conformed drive identity
+  rationale: Use current observed evidence to align drive identity without changing
+    operation telemetry joins.
+  dependencies: []
+  supporting_claim_ids:
+  - claim-drive-identity
+  inferred_claim_ids: []
+  conflict_ids: []
+  affecting_gates:
+  - gate-grains
+  query_cases: []
+  operations:
+  - operation_id: operation-drive-identity
+    kind: catalog.edit
+    target_id: dimension.drive_serial_number
+    before:
+      source: operation_executions
+      column: serial_number
+      data_type: string
+      description: Conformed drive serial number from the drive registry
+    before_hash: 14c55225554ad9ffabc6dec3497997e6dca37b14fc82a0e71825575ed62f8998
+    after:
+      source: serialized_drives
+      column: serial_number
+      data_type: string
+      description: Conformed drive serial number from the drive registry
+    claim_ids:
+    - claim-drive-identity
+    group_ids:
+    - group-conformed-drive
+- group_id: group-telemetry-join
+  title: Operation telemetry join
+  rationale: Explicitly blocked because the charter excludes event joins.
+  dependencies: []
+  supporting_claim_ids: []
+  inferred_claim_ids: []
+  conflict_ids:
+  - conflict-operation-telemetry
+  affecting_gates:
+  - gate-relationships
+  query_cases: []
+  operations:
+  - operation_id: operation-telemetry-join
+    kind: catalog.add
+    target_id: dimension.operation_telemetry_join
+    before: null
+    before_hash: '0000000000000000000000000000000000000000000000000000000000000000'
+    after:
+      source: operation_executions
+      column: serial_number
+      data_type: string
+      description: Excluded event-join marker
+    claim_ids:
+    - claim-telemetry
+    group_ids:
+    - group-telemetry-join

@@ -48,6 +48,10 @@ from ruamel.yaml import YAML, YAMLError
 
 from selayer.catalog import SemanticLayer
 from selayer.sources.errors import SourceError
+from selayer.sources.profile_file import (
+    ProfileFileValidationError,
+    load_profile_file,
+)
 from selayer.sources.profiles import (
     MappingArrowProviderResolver,
     MappingProfileResolver,
@@ -358,6 +362,7 @@ def _build_charter(
     *,
     explicit_session_id: str | None,
     catalog_path: str,
+    runtime_profile: str = "",
 ) -> SessionCharter:
     """Validate charter fields and construct a :class:`SessionCharter`.
 
@@ -395,6 +400,7 @@ def _build_charter(
     return SessionCharter(
         session_id=session_id,
         catalog_path=catalog_path,
+        runtime_profile=runtime_profile,
         business_question=data["business_question"],  # type: ignore[arg-type]
         catalog_fingerprint=data["catalog_fingerprint"],  # type: ignore[arg-type]
         approver=data["approver"],  # type: ignore[arg-type]
@@ -432,12 +438,24 @@ def _handle_init(args: argparse.Namespace) -> int:
     _assert_contained(project, Path(summary_root), kind="summary_root")
 
     data = _load_charter_mapping(Path(args.charter))
+    runtime_profile_value = data.get("runtime_profile", "")
+    if type(runtime_profile_value) is not str:
+        raise _CliError(CODE_CHARTER_INVALID) from None
+    runtime_profile = ""
+    if runtime_profile_value.strip():
+        profile_abs = _assert_contained(
+            project, Path(runtime_profile_value), kind="runtime_profile"
+        )
+        runtime_profile = profile_abs.relative_to(project_abs).as_posix()
     explicit_id = args.session_id
     if explicit_id is None:
         charter_id = data.get("session_id")
         explicit_id = charter_id if type(charter_id) is str and charter_id else None
     charter = _build_charter(
-        data, explicit_session_id=explicit_id, catalog_path=catalog_path
+        data,
+        explicit_session_id=explicit_id,
+        catalog_path=catalog_path,
+        runtime_profile=runtime_profile,
     )
     session_dir = _session_dir(project, charter.session_id)
     actor = args.actor or charter.approver
@@ -653,6 +671,23 @@ def _handle_intake_add_document(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _runtime_profile_resolver(
+    project: Path, charter: SessionCharter
+) -> MappingProfileResolver:
+    """Load the charter's project-contained runtime profile document."""
+
+    if not charter.runtime_profile:
+        return MappingProfileResolver({})
+    profile_path = _assert_contained(
+        project, project / charter.runtime_profile, kind="runtime_profile"
+    )
+    try:
+        resolver = load_profile_file(profile_path)
+    except ProfileFileValidationError:
+        raise _CliError(CODE_PROFILE_LOAD) from None
+    return resolver
+
+
 def _handle_profile_scan(args: argparse.Namespace) -> int:
     project = _project_root(args.project)
     session_id = _validate_session_id(args.session_id)
@@ -666,7 +701,7 @@ def _handle_profile_scan(args: argparse.Namespace) -> int:
     registry = SourceRegistry.create(
         layer,
         connection,
-        MappingProfileResolver({}),
+        _runtime_profile_resolver(project, charter),
         MappingArrowProviderResolver({}),
     )
     try:
@@ -1271,10 +1306,12 @@ def _current_evidence_lock(session_dir: Path) -> list[dict[str, object]]:
             entries.append(
                 {
                     "claim_id": claim.claim_id,
-                    "evidence_class": claim.evidence_class,
+                    "evidence_class": getattr(
+                        claim.evidence_class, "value", claim.evidence_class
+                    ),
                     "record_id": raw.get("record_id"),
                     "content_hash": raw.get("content_hash"),
-                    "revision": raw.get("revision"),
+                    "source_revision": raw.get("revision"),
                     "selector_kind": raw.get("kind"),
                 }
             )
@@ -1366,6 +1403,20 @@ def _approval_context(
     )
 
 
+def _group_approval_fingerprints(
+    project: Path, session_dir: Path, proposal_id: str, group_ids: Sequence[str]
+) -> dict[str, tuple[str, str]]:
+    """Reconstruct each selected group to validate its own attestation binding."""
+
+    result: dict[str, tuple[str, str]] = {}
+    for group_id in group_ids:
+        _, group_candidate, group_bundle, *_ = _approval_context(
+            project, session_dir, proposal_id, (group_id,)
+        )
+        result[group_id] = (group_candidate.fingerprint, group_bundle.fingerprint)
+    return result
+
+
 def _write_approval_json(path: Path, value: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -1394,7 +1445,7 @@ def _handle_proposal_attest(args: argparse.Namespace) -> int:
     session_dir = _require_session(project, session_id)
     proposal_id = _validate_proposal_id(args.proposal)
     proposal, candidate, bundle, _base_text, _bases, session_hashes, session_store = (
-        _approval_context(project, session_dir, proposal_id)
+        _approval_context(project, session_dir, proposal_id, (args.group,))
     )
     group = next(
         (item for item in proposal.groups if item.group_id == args.group), None
@@ -1465,6 +1516,9 @@ def _handle_proposal_prepare_apply(args: argparse.Namespace) -> int:
         )
     from selayer_discovery.approval import compute_approved_summary_hash
 
+    group_fingerprints = _group_approval_fingerprints(
+        project, session_dir, proposal_id, group_ids
+    )
     evidence_lock = _current_evidence_lock(session_dir)
     summary_hash = compute_approved_summary_hash(
         proposal=proposal,
@@ -1485,6 +1539,7 @@ def _handle_proposal_prepare_apply(args: argparse.Namespace) -> int:
         base_hashes=base_hashes,
         current_session_hashes=session_hashes,
         approved_summary_hash=summary_hash,
+        group_candidate_fingerprints=group_fingerprints,
     )
     path = _proposal_root(session_dir) / proposal_id / _BATCH_FILENAME
     _write_approval_json(path, batch.to_dict())
@@ -1680,6 +1735,9 @@ def _handle_proposal_export_preview(args: argparse.Namespace) -> int:
         for key in batch.session_hashes
     ):
         raise ApprovalError("discovery.approval.fingerprint_changed")
+    group_fingerprints = _group_approval_fingerprints(
+        project, session_dir, proposal_id, batch.group_ids
+    )
     attestations = {
         gid: GroupAttestation.from_mapping(
             _read_approval_json(
@@ -1700,8 +1758,8 @@ def _handle_proposal_export_preview(args: argparse.Namespace) -> int:
             attestation,
             current_input_hashes=session_hashes,
             current_group_fingerprint=fingerprint(group.to_dict()),
-            current_candidate_fingerprint=candidate.fingerprint,
-            current_verification_fingerprint=bundle.fingerprint,
+            current_candidate_fingerprint=group_fingerprints[gid][0],
+            current_verification_fingerprint=group_fingerprints[gid][1],
         )
     summary = render_approved_summary(
         proposal=proposal,
@@ -1829,6 +1887,9 @@ def _handle_proposal_apply(args: argparse.Namespace) -> int:
         for key in batch.session_hashes
     ):
         raise ApprovalError("discovery.approval.fingerprint_changed")
+    group_fingerprints = _group_approval_fingerprints(
+        project, session_dir, proposal_id, batch.group_ids
+    )
     files: dict[str, bytes] = {}
     catalog_rel = session_store.charter.catalog_path
     files[catalog_rel] = candidate.catalog_text.encode("utf-8")
@@ -1857,8 +1918,8 @@ def _handle_proposal_apply(args: argparse.Namespace) -> int:
             attestation,
             current_input_hashes=session_hashes,
             current_group_fingerprint=fingerprint(group.to_dict()),
-            current_candidate_fingerprint=candidate.fingerprint,
-            current_verification_fingerprint=bundle.fingerprint,
+            current_candidate_fingerprint=group_fingerprints[gid][0],
+            current_verification_fingerprint=group_fingerprints[gid][1],
         )
     evidence_lock = _current_evidence_lock(session_dir)
     expected_summary_hash = compute_approved_summary_hash(
@@ -1882,6 +1943,7 @@ def _handle_proposal_apply(args: argparse.Namespace) -> int:
         base_hashes=base_hashes,
         current_session_hashes=session_hashes,
         approved_summary_hash=expected_summary_hash,
+        group_candidate_fingerprints=group_fingerprints,
     )
     if prepared_now.fingerprint != batch.fingerprint:
         raise ApprovalError("discovery.approval.fingerprint_changed")
@@ -2266,7 +2328,7 @@ def _open_registry(
     registry = SourceRegistry.create(
         layer,
         connection,
-        MappingProfileResolver({}),
+        _runtime_profile_resolver(project, charter),
         MappingArrowProviderResolver({}),
     )
     return layer, connection, registry
