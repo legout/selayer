@@ -236,7 +236,11 @@ def _safe_target_path(project_root: Path, relative: str) -> Path:
     try:
         for component in PurePosixPath(rel).parts:
             cursor = cursor / component
-            if cursor.exists() and stat.S_ISLNK(os.lstat(cursor).st_mode):
+            try:
+                mode = os.lstat(cursor).st_mode
+            except FileNotFoundError:
+                break
+            if stat.S_ISLNK(mode):
                 raise TransactionError("discovery.transaction.path_not_contained")
         resolved = raw.resolve(strict=False)
         resolved.relative_to(project_root.resolve())
@@ -258,8 +262,11 @@ class ProjectLock:
 
     def __init__(self, project_root: Path, transaction_root: Path, transaction_id: str, actor: str) -> None:
         self.project_root = project_root.resolve()
-        self.root = transaction_root.resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
+        try:
+            self.root = transaction_root.resolve()
+            self.root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            raise TransactionError("discovery.transaction.durability_failed") from None
         self.path = self.root / ".project.lock"
         self.owner_path = self.root / ".project-owner.json"
         self.transaction_id = transaction_id
@@ -438,6 +445,7 @@ class ApplyJournal:
 
     @classmethod
     def open(cls, journal_path: Path, *, project_root: Path, injector: Callable[[str, str], None] | None = None) -> ApplyJournal:
+        _safe_file(journal_path)
         try:
             data = json.loads(journal_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -488,9 +496,22 @@ class ApplyJournal:
 
     def _artifact(self, relative: str) -> Path:
         safe = _safe_rel(relative)
-        path = (self.root / safe).resolve(strict=False)
+        cursor = self.root
+        for component in PurePosixPath(safe).parts:
+            cursor = cursor / component
+            try:
+                mode = os.lstat(cursor).st_mode
+            except FileNotFoundError:
+                break
+            except OSError:
+                raise TransactionError("discovery.transaction.target_unreadable") from None
+            if stat.S_ISLNK(mode):
+                raise TransactionError("discovery.transaction.path_not_contained")
         try:
+            path = (self.root / safe).resolve(strict=False)
             path.relative_to(self.root)
+        except OSError:
+            raise TransactionError("discovery.transaction.target_unreadable") from None
         except ValueError:
             raise TransactionError("discovery.transaction.path_not_contained") from None
         return path
@@ -618,7 +639,10 @@ def _recover_unlocked(transaction_root: Path, *, project_root: Path) -> tuple[st
         return ()
     except OSError:
         raise TransactionError("discovery.transaction.target_unreadable") from None
-    root = transaction_root.resolve()
+    try:
+        root = transaction_root.resolve()
+    except OSError:
+        raise TransactionError("discovery.transaction.target_unreadable") from None
     if not _exists(root):
         return ()
     recovered: list[str] = []

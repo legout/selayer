@@ -214,7 +214,11 @@ def test_apply_durability_failures_are_recoverable(
     )
     with pytest.raises(TransactionError):
         journal.apply()
-    assert recover(project / "transactions", project_root=project)
+    assert recover(project / "transactions", project_root=project) == (journal.transaction_id,)
+    expected = b"new" if failure == "applied_event_fsync" else b"old"
+    assert target.read_bytes() == expected
+    state = json.loads(journal.journal_path.read_text(encoding="utf-8"))["state"]
+    assert state == ("completed" if failure == "applied_event_fsync" else "rolled_back")
 
 
 def test_recovery_finalizes_missing_applied_marker(tmp_path: Path) -> None:
@@ -249,3 +253,30 @@ def test_corrupt_backup_causes_recovery_conflict(tmp_path: Path) -> None:
     (journal.root / journal.records[0].backup_path).write_bytes(b"tampered")
     with pytest.raises(RecoveryConflict):
         journal.rollback()
+
+
+def test_journal_and_staged_artifact_symlinks_are_rejected(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    journal = ApplyJournal.create(
+        project_root=project,
+        transaction_root=project / "transactions",
+        transaction_id="tx-010",
+        actor="Alice",
+        files={"file.txt": b"new"},
+    )
+    external = tmp_path / "external.json"
+    external.write_text("{}", encoding="utf-8")
+    journal_file = journal.journal_path
+    saved = journal_file.read_bytes()
+    journal_file.unlink()
+    journal_file.symlink_to(external)
+    with pytest.raises(TransactionError):
+        ApplyJournal.open(journal_file, project_root=project)
+    journal_file.unlink()
+    journal_file.write_bytes(saved)
+    staged = journal.root / journal.records[0].staged_path
+    staged.unlink()
+    staged.symlink_to(external)
+    with pytest.raises(TransactionError):
+        journal.apply()
