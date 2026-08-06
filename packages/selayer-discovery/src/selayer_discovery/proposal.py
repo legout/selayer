@@ -136,9 +136,7 @@ _KNOWLEDGE_PATH_RE: re.Pattern[str] = re.compile(
 
 CODE_PROPOSAL_INVALID: str = "discovery.proposal.invalid"
 CODE_PROPOSAL_OPERATION_INVALID: str = "discovery.proposal.operation_invalid"
-CODE_PROPOSAL_RECONSTRUCTION_FAILED: str = (
-    "discovery.proposal.reconstruction_failed"
-)
+CODE_PROPOSAL_RECONSTRUCTION_FAILED: str = "discovery.proposal.reconstruction_failed"
 CODE_PROPOSAL_CYCLE: str = "discovery.proposal.dependency_cycle"
 CODE_PROPOSAL_OVERLAPPING_TARGET: str = "discovery.proposal.overlapping_target"
 
@@ -379,17 +377,13 @@ class MandatoryCheck:
 
     def __post_init__(self) -> None:
         if self.kind not in {kind.value for kind in MandatoryCheckKind}:
-            raise ProposalError(
-                CODE_PROPOSAL_INVALID, safe_detail="invalid check kind"
-            )
+            raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="invalid check kind")
         if self.status not in _CHECK_STATUSES:
             raise ProposalError(
                 CODE_PROPOSAL_INVALID, safe_detail="invalid check status"
             )
         if type(self.code) is not str:
-            raise ProposalError(
-                CODE_PROPOSAL_INVALID, safe_detail="invalid check code"
-            )
+            raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="invalid check code")
         if type(self.digest) is not str or _HEX64_RE.match(self.digest) is None:
             raise ProposalError(
                 CODE_PROPOSAL_INVALID, safe_detail="invalid check digest"
@@ -462,9 +456,7 @@ class VerificationBundle:
         for group in self.groups:
             if group.group_id == group_id:
                 return group.checks
-        raise ProposalError(
-            CODE_PROPOSAL_INVALID, safe_detail="unknown group"
-        )
+        raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="unknown group")
 
     def check(self, group_id: str, kind: str) -> MandatoryCheck:
         """Return the single mandatory check of ``kind`` for ``group_id``."""
@@ -480,9 +472,7 @@ class VerificationBundle:
         for group in self.groups:
             if group.group_id == group_id:
                 return group.readiness
-        raise ProposalError(
-            CODE_PROPOSAL_INVALID, safe_detail="unknown group"
-        )
+        raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="unknown group")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -493,6 +483,7 @@ class VerificationBundle:
             "groups": [group.to_dict() for group in self.groups],
             "fingerprint": self.fingerprint,
         }
+
 
 # --------------------------------------------------------------------------- #
 # Overlay vocabulary (mirrors selayer.okf.composition)                        #
@@ -629,63 +620,43 @@ def _validate_case_selector_value(value: object) -> object:
                 )
             frozen.append(item)
         return tuple(frozen)
-    raise ProposalError(
-        CODE_PROPOSAL_INVALID, safe_detail="invalid case filter"
-    )
+    raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="invalid case filter")
 
 
 def _build_case_filter(data: object) -> CaseFilter:
     if not isinstance(data, Mapping):
-        raise ProposalError(
-            CODE_PROPOSAL_INVALID, safe_detail="invalid case filter"
-        )
+        raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="invalid case filter")
     unknown = set(data) - {"dimension_id", "operator", "value"}
     if unknown:
-        raise ProposalError(
-            CODE_PROPOSAL_INVALID, safe_detail="invalid case filter"
-        )
+        raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="invalid case filter")
     if {"dimension_id", "operator"} - set(data):
-        raise ProposalError(
-            CODE_PROPOSAL_INVALID, safe_detail="invalid case filter"
-        )
+        raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="invalid case filter")
     dimension_id = _validate_id(
         data["dimension_id"], regex=_NODE_ID_RE, detail="invalid case filter"
     )
     operator = data["operator"]
     if type(operator) is not str or operator not in _ALLOWED_FILTER_OPERATORS:
-        raise ProposalError(
-            CODE_PROPOSAL_INVALID, safe_detail="invalid case filter"
-        )
+        raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="invalid case filter")
     value = _validate_case_selector_value(data.get("value"))
     return CaseFilter(dimension_id=dimension_id, operator=operator, value=value)
 
 
 def _build_case_assertion(data: object) -> CaseAssertion:
     if not isinstance(data, Mapping):
-        raise ProposalError(
-            CODE_PROPOSAL_INVALID, safe_detail="invalid case assertion"
-        )
+        raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="invalid case assertion")
     unknown = set(data) - {"operator", "value"}
     if unknown:
-        raise ProposalError(
-            CODE_PROPOSAL_INVALID, safe_detail="invalid case assertion"
-        )
+        raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="invalid case assertion")
     if "operator" not in data:
-        raise ProposalError(
-            CODE_PROPOSAL_INVALID, safe_detail="invalid case assertion"
-        )
+        raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="invalid case assertion")
     operator = data["operator"]
     if type(operator) is not str or operator not in _ALLOWED_ASSERTION_OPERATORS:
-        raise ProposalError(
-            CODE_PROPOSAL_INVALID, safe_detail="invalid case assertion"
-        )
+        raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="invalid case assertion")
     value = data.get("value")
     if operator in ("row_count_max", "row_count_min") and (
         type(value) is not int or isinstance(value, bool) or value < 0
     ):
-        raise ProposalError(
-            CODE_PROPOSAL_INVALID, safe_detail="invalid case assertion"
-        )
+        raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="invalid case assertion")
     return CaseAssertion(operator=operator, value=value)
 
 
@@ -840,9 +811,7 @@ def _parse_knowledge_target(target_id: str, subject: KnowledgeSubject) -> str:
     # Reject any parent traversal component explicitly (defence in depth: the
     # regex already forbids ``..`` but PurePosixPath normalizes it).
     if any(part == ".." for part in pure.parts):
-        raise ProposalError(
-            CODE_PROPOSAL_OPERATION_INVALID, safe_detail="path escape"
-        )
+        raise ProposalError(CODE_PROPOSAL_OPERATION_INVALID, safe_detail="path escape")
     # Reject generated OKF output directories.
     if pure.parts and pure.parts[0] in _GENERATED_OKF_DIRS:
         raise ProposalError(
@@ -1087,7 +1056,8 @@ class Operation:
 
         if not isinstance(data, Mapping):
             raise ProposalError(
-                CODE_PROPOSAL_OPERATION_INVALID, safe_detail="operation must be a mapping"
+                CODE_PROPOSAL_OPERATION_INVALID,
+                safe_detail="operation must be a mapping",
             )
         allowed = {
             "operation_id",
@@ -1331,9 +1301,7 @@ class Operation:
         else:
             impacts = (_IMPACT_OVERLAY_CHANGED,)
         changed = (
-            ()
-            if before_text is None
-            else _text_changed_fields(before_text, after_raw)
+            () if before_text is None else _text_changed_fields(before_text, after_raw)
         )
         return cls(
             operation_id=operation_id,
@@ -1542,21 +1510,15 @@ def _build_case(data: object) -> QueryCase:
     )
     raw_filters = data.get("filters", ())
     if isinstance(raw_filters, str) or not isinstance(raw_filters, Sequence):
-        raise ProposalError(
-            CODE_PROPOSAL_INVALID, safe_detail="invalid case filter"
-        )
+        raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="invalid case filter")
     filters = tuple(_build_case_filter(item) for item in raw_filters)
     raw_assertions = data.get("assertions", ())
     if isinstance(raw_assertions, str) or not isinstance(raw_assertions, Sequence):
-        raise ProposalError(
-            CODE_PROPOSAL_INVALID, safe_detail="invalid case assertion"
-        )
+        raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="invalid case assertion")
     assertions = tuple(_build_case_assertion(item) for item in raw_assertions)
     expected = data.get("expected_rejection_code", "")
     if type(expected) is not str:
-        raise ProposalError(
-            CODE_PROPOSAL_INVALID, safe_detail="invalid rejection code"
-        )
+        raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="invalid rejection code")
     return QueryCase(
         case_id=_validate_id(
             data["case_id"], regex=_NODE_ID_RE, detail="invalid case id"
@@ -1616,9 +1578,7 @@ def _reject_dependency_cycles(groups: Sequence[DependencyGroup]) -> None:
         color[node] = GRAY
         for dep in by_id[node].dependencies:
             if color[dep] == GRAY:
-                raise ProposalError(
-                    CODE_PROPOSAL_CYCLE, safe_detail="dependency cycle"
-                )
+                raise ProposalError(CODE_PROPOSAL_CYCLE, safe_detail="dependency cycle")
             if color[dep] == WHITE:
                 visit(dep)
         color[node] = BLACK
@@ -1650,7 +1610,9 @@ def build_proposal(data: object) -> Proposal:
     """Validate a caller-supplied mapping and return a :class:`Proposal`."""
 
     if not isinstance(data, Mapping):
-        raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="proposal must be a mapping")
+        raise ProposalError(
+            CODE_PROPOSAL_INVALID, safe_detail="proposal must be a mapping"
+        )
     allowed = {"proposal_id", "title", "groups"}
     unknown = set(data) - allowed
     if unknown:
@@ -1882,7 +1844,9 @@ def reconstruct_candidate(
     fingerprint = canonical.fingerprint(
         {
             "catalog": catalog_fingerprint,
-            "references": {path: canonical.fingerprint(text) for path, text in references},
+            "references": {
+                path: canonical.fingerprint(text) for path, text in references
+            },
             "overlays": {path: canonical.fingerprint(text) for path, text in overlays},
         }
     )
@@ -2136,9 +2100,7 @@ def _union_group_impacts(group: DependencyGroup) -> tuple[str, ...]:
     return tuple(sorted(flags))
 
 
-def _group_cites_data(
-    group: DependencyGroup, claim_store: ClaimStore | None
-) -> bool:
+def _group_cites_data(group: DependencyGroup, claim_store: ClaimStore | None) -> bool:
     """Return whether a group cites observed data evidence.
 
     A group cites data when it carries a bounded execution-assertion query
@@ -2184,7 +2146,9 @@ def _group_check_kinds(
     return kinds
 
 
-def _extract_selectors(group: DependencyGroup) -> tuple[tuple[str, ...], tuple[str, ...]]:
+def _extract_selectors(
+    group: DependencyGroup,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Extract metric and dimension selector names from catalog operations."""
 
     metrics: list[str] = []
@@ -2232,9 +2196,7 @@ def _outcome_signature(report: object) -> tuple[object, ...]:
     )
 
 
-def _run_static_check(
-    layer: SemanticLayer, candidate: Candidate
-) -> MandatoryCheck:
+def _run_static_check(layer: SemanticLayer, candidate: Candidate) -> MandatoryCheck:
     """Run the static catalog check via the core public verification API."""
 
     from selayer.verification import verify_static
@@ -2254,9 +2216,7 @@ def _run_static_check(
     )
 
 
-def _run_physical_check(
-    layer: SemanticLayer, candidate: Candidate
-) -> MandatoryCheck:
+def _run_physical_check(layer: SemanticLayer, candidate: Candidate) -> MandatoryCheck:
     """Run the exact source/grain/relationship physical audit.
 
     A missing or unreadable source makes the core audit produce
@@ -2345,9 +2305,17 @@ def _assertion_passes(assertion: CaseAssertion, row_count: int) -> bool:
 
     value = assertion.value
     if assertion.operator == "row_count_max":
-        return isinstance(value, int) and not isinstance(value, bool) and row_count <= value
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and row_count <= value
+        )
     if assertion.operator == "row_count_min":
-        return isinstance(value, int) and not isinstance(value, bool) and row_count >= value
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and row_count >= value
+        )
     if assertion.operator == "non_empty":
         return row_count > 0
     return False
@@ -2414,9 +2382,7 @@ def _run_acceptance_check(
                     status, code = "unavailable", "acceptance_unavailable"
                     break
                 row_count = int(result.height)  # type: ignore[union-attr]
-                if not all(
-                    _assertion_passes(a, row_count) for a in case.assertions
-                ):
+                if not all(_assertion_passes(a, row_count) for a in case.assertions):
                     status, code = "failed", "acceptance_assertion_failed"
                     break
     except Exception:  # noqa: BLE001
@@ -2507,12 +2473,10 @@ def _run_okf_check(
         {
             "catalog": candidate.catalog_fingerprint,
             "references": {
-                path: canonical.fingerprint(text)
-                for path, text in candidate.references
+                path: canonical.fingerprint(text) for path, text in candidate.references
             },
             "overlays": {
-                path: canonical.fingerprint(text)
-                for path, text in candidate.overlays
+                path: canonical.fingerprint(text) for path, text in candidate.overlays
             },
         }
     )
@@ -2522,6 +2486,7 @@ def _run_okf_check(
         code=okf_code,
         digest=digest,
     )
+
 
 def _run_group_checks(
     group: DependencyGroup,
@@ -2547,9 +2512,7 @@ def _run_group_checks(
             group_output = Path(okf_output_dir) / group.group_id
             checks.append(_run_okf_check(layer, candidate, group_output))
         else:  # pragma: no cover - exhaustive over the matrix
-            raise ProposalError(
-                CODE_PROPOSAL_INVALID, safe_detail="unknown check kind"
-            )
+            raise ProposalError(CODE_PROPOSAL_INVALID, safe_detail="unknown check kind")
     return tuple(checks)
 
 

@@ -274,9 +274,7 @@ def test_total_byte_limit_rejects_overflow(tmp_path: Path) -> None:
     store = EvidenceStore.create(tmp_path / "evidence", limits=limits)
     store.add_snapshot(b"0123456789ABCDE\n", media_type=MEDIA_TEXT_PLAIN, source="a")
     with pytest.raises(EvidenceError) as raised:
-        store.add_snapshot(
-            b"01234567\n", media_type=MEDIA_TEXT_PLAIN, source="b"
-        )
+        store.add_snapshot(b"01234567\n", media_type=MEDIA_TEXT_PLAIN, source="b")
     assert raised.value.code == CODE_EVIDENCE_TOO_LARGE
 
 
@@ -490,18 +488,14 @@ def test_add_snapshot_rejects_credential_and_url_sources(tmp_path: Path) -> None
 
 def test_reopen_snapshot_passes_for_valid_content(tmp_path: Path) -> None:
     store = EvidenceStore.create(tmp_path / "evidence")
-    record = store.add_snapshot(
-        b"payload\n", media_type=MEDIA_TEXT_PLAIN, source="s1"
-    )
+    record = store.add_snapshot(b"payload\n", media_type=MEDIA_TEXT_PLAIN, source="s1")
     # A valid, untouched content-addressed snapshot reopens without raising.
     store.reopen_snapshot(record.content_hash)
 
 
 def test_reopen_snapshot_rejects_tampered_content(tmp_path: Path) -> None:
     store = EvidenceStore.create(tmp_path / "evidence")
-    record = store.add_snapshot(
-        b"payload\n", media_type=MEDIA_TEXT_PLAIN, source="s1"
-    )
+    record = store.add_snapshot(b"payload\n", media_type=MEDIA_TEXT_PLAIN, source="s1")
     # Overwrite the content-addressed snapshot with different bytes: the
     # re-hash no longer matches the recorded content_hash (tampering).
     store.snapshot_path(record.content_hash).write_bytes(b"tampered different\n")
@@ -522,9 +516,7 @@ def test_reopen_snapshot_rejects_oversized_file(tmp_path: Path) -> None:
     store = EvidenceStore.create(
         tmp_path / "evidence", limits=EvidenceLimits(max_document_bytes=8)
     )
-    record = store.add_snapshot(
-        b"short\n", media_type=MEDIA_TEXT_PLAIN, source="s1"
-    )
+    record = store.add_snapshot(b"short\n", media_type=MEDIA_TEXT_PLAIN, source="s1")
     # Grow the snapshot past the configured bound in place; the bounded read
     # catches the overflow before any hash comparison.
     store.snapshot_path(record.content_hash).write_bytes(b"x" * 16)
@@ -541,9 +533,7 @@ def test_reopen_snapshot_never_exposes_path_or_body(tmp_path: Path) -> None:
     store.snapshot_path(record.content_hash).write_bytes(b"tampered\n")
     with pytest.raises(EvidenceError) as raised:
         store.reopen_snapshot(record.content_hash)
-    rendered = repr(raised.value) + json.dumps(
-        raised.value.to_dict(), sort_keys=True
-    )
+    rendered = repr(raised.value) + json.dumps(raised.value.to_dict(), sort_keys=True)
     # Neither the on-disk path nor any body bytes surface in the diagnostic.
     assert str(store.snapshot_path(record.content_hash)) not in rendered
     assert "tampered" not in rendered
@@ -554,9 +544,7 @@ def test_reopen_snapshot_rejects_symlink_to_valid_external_file(
     tmp_path: Path,
 ) -> None:
     store = EvidenceStore.create(tmp_path / "evidence")
-    record = store.add_snapshot(
-        b"payload\n", media_type=MEDIA_TEXT_PLAIN, source="s1"
-    )
+    record = store.add_snapshot(b"payload\n", media_type=MEDIA_TEXT_PLAIN, source="s1")
     # Copy the genuine (normalized) snapshot bytes to an external file whose
     # content hashes to the recorded content_hash, then replace the snapshot
     # path with a symlink to it. A symlink-following stat would read this
@@ -571,9 +559,7 @@ def test_reopen_snapshot_rejects_symlink_to_valid_external_file(
         store.reopen_snapshot(record.content_hash)
     assert raised.value.code == CODE_EVIDENCE_NOT_REGULAR
     # The symlink target path and the substituted body never surface.
-    rendered = repr(raised.value) + json.dumps(
-        raised.value.to_dict(), sort_keys=True
-    )
+    rendered = repr(raised.value) + json.dumps(raised.value.to_dict(), sort_keys=True)
     assert str(external) not in rendered
     assert "payload" not in rendered
 
@@ -782,11 +768,21 @@ def test_typed_selectors_reject_malformed_fields(tmp_path: Path) -> None:
     ch = record.content_hash
     rev = record.revision
     for selector in (
-        CatalogPathSelector(record_id=rid, content_hash=ch, revision=rev, json_path="sources/0"),
-        SourceFieldSelector(record_id=rid, content_hash=ch, revision=rev, field="Bad-Field"),
-        ProviderSectionSelector(record_id=rid, content_hash=ch, revision=rev, section="bad space"),
-        InterviewEventSelector(record_id=rid, content_hash=ch, revision=rev, event_id="bad space"),
-        VerificationOutcomeSelector(record_id=rid, content_hash=ch, revision=rev, outcome="bogus"),
+        CatalogPathSelector(
+            record_id=rid, content_hash=ch, revision=rev, json_path="sources/0"
+        ),
+        SourceFieldSelector(
+            record_id=rid, content_hash=ch, revision=rev, field="Bad-Field"
+        ),
+        ProviderSectionSelector(
+            record_id=rid, content_hash=ch, revision=rev, section="bad space"
+        ),
+        InterviewEventSelector(
+            record_id=rid, content_hash=ch, revision=rev, event_id="bad space"
+        ),
+        VerificationOutcomeSelector(
+            record_id=rid, content_hash=ch, revision=rev, outcome="bogus"
+        ),
     ):
         with pytest.raises(EvidenceError) as raised:
             store.validate_selector(selector)
@@ -882,9 +878,7 @@ def test_cli_intake_add_document_returns_safe_metadata(
     project.mkdir()
     session_dir = _init_session(project, capsys)
     path = _doc(project, "spec.md", b"# Spec\nbody\r\n")
-    code, out, _, _ = _run_intake_add_document(
-        project, capsys, path=str(path)
-    )
+    code, out, _, _ = _run_intake_add_document(project, capsys, path=str(path))
     assert code == 0
     assert out is not None
     assert out["record_id"].startswith("document-")
@@ -1096,9 +1090,7 @@ def test_add_claim_requires_subject_statement_selectors_class_creator(
     project = tmp_path / "project"
     project.mkdir()
     selector, _ = _doc_selector(evidence, project)
-    store.record_artifact(
-        "answer-gate-grains", content_hash="a" * 64, actor=actor
-    )
+    store.record_artifact("answer-gate-grains", content_hash="a" * 64, actor=actor)
     base = {
         "claim_id": "claim-grain-001",
         "subject": _SUBJECT,
@@ -1109,7 +1101,13 @@ def test_add_claim_requires_subject_statement_selectors_class_creator(
         "actor": actor,
     }
     # Omitting each required field raises the invalid-claim code.
-    for missing in ("subject", "statement", "evidence_class", "selectors", "creator_event"):
+    for missing in (
+        "subject",
+        "statement",
+        "evidence_class",
+        "selectors",
+        "creator_event",
+    ):
         kwargs = dict(base)
         if missing == "selectors":
             kwargs[missing] = ()
@@ -1776,9 +1774,7 @@ def test_claim_store_survives_reopen(
 # --------------------------------------------------------------------------- #
 
 
-def _write_claim_input(
-    project: Path, name: str, claim: dict[str, Any]
-) -> Path:
+def _write_claim_input(project: Path, name: str, claim: dict[str, Any]) -> Path:
     path = project / name
     path.write_text(json.dumps(claim, sort_keys=True), encoding="utf-8")
     return path

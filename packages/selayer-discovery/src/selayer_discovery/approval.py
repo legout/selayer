@@ -103,9 +103,7 @@ APPLY_NOT_A_SIGNATURE_STATEMENT: str = (
 
 #: Accepted group decision values.
 _ATTENTION_ACCEPTED: str = "accepted"
-_DECISIONS: frozenset[str] = frozenset(
-    {_ATTENTION_ACCEPTED, "rejected", "deferred"}
-)
+_DECISIONS: frozenset[str] = frozenset({_ATTENTION_ACCEPTED, "rejected", "deferred"})
 
 #: The seven bound input-hash keys a group attestation carries.
 _GROUP_HASH_KEYS: tuple[str, ...] = (
@@ -278,7 +276,9 @@ def _require_hash_mapping(
     return result
 
 
-def _require_bounded_text(value: object, *, detail: str, allow_blank: bool = True) -> str:
+def _require_bounded_text(
+    value: object, *, detail: str, allow_blank: bool = True
+) -> str:
     if type(value) is not str:
         raise ApprovalError(CODE_APPROVAL_INVALID, safe_detail=detail) from None
     if not allow_blank and not value.strip():
@@ -402,9 +402,7 @@ class GroupAttestation:
             decision=_require_bounded_text(
                 data["decision"], detail="invalid attestation", allow_blank=False
             ),
-            reason=_require_bounded_text(
-                data["reason"], detail="invalid attestation"
-            ),
+            reason=_require_bounded_text(data["reason"], detail="invalid attestation"),
             input_hashes=input_hashes,
             not_a_signature=_require_bounded_text(
                 data["not_a_signature"], detail="invalid attestation"
@@ -481,7 +479,9 @@ def attest_group(
         current_approver, detail="invalid approver", allow_blank=False
     )
     if decision not in _DECISIONS:
-        raise ApprovalError(CODE_APPROVAL_INVALID, safe_detail="invalid decision") from None
+        raise ApprovalError(
+            CODE_APPROVAL_INVALID, safe_detail="invalid decision"
+        ) from None
     reason_text = _require_bounded_text(reason, detail="invalid reason")
     timestamp_text = _require_bounded_text(
         timestamp, detail="invalid timestamp", allow_blank=False
@@ -498,8 +498,7 @@ def attest_group(
     if not group_ready:
         raise ApprovalError(CODE_APPROVAL_GROUP_NOT_READY) from None
     blocked = tuple(
-        _require_id(item, detail="invalid conflict id")
-        for item in group_blocked
+        _require_id(item, detail="invalid conflict id") for item in group_blocked
     )
     if blocked:
         raise ApprovalError(CODE_APPROVAL_GROUP_BLOCKED) from None
@@ -713,9 +712,7 @@ def prepare_apply_batch(
         keys=_SESSION_HASH_KEYS,
         detail="invalid session hashes",
     )
-    summary_hash = _require_hash(
-        approved_summary_hash, detail="invalid summary hash"
-    )
+    summary_hash = _require_hash(approved_summary_hash, detail="invalid summary hash")
     if not isinstance(attestations, Mapping):
         raise ApprovalError(
             CODE_APPROVAL_INVALID, safe_detail="invalid attestations"
@@ -872,9 +869,7 @@ def attest_apply_batch(
     if approver_text != current:
         raise ApprovalError(CODE_APPROVAL_ACTOR) from None
     if prepared_batch_hash is not None:
-        expected = _require_hash(
-            prepared_batch_hash, detail="invalid batch hash"
-        )
+        expected = _require_hash(prepared_batch_hash, detail="invalid batch hash")
         if expected != batch.fingerprint:
             raise ApprovalError(CODE_APPROVAL_BATCH_HASH) from None
     fingerprint = canonical.fingerprint(
@@ -996,14 +991,17 @@ def _safe_operation_preview(group: Any) -> dict[str, object]:
 def _safe_knowledge_preview(path: str, text: str) -> str:
     """Render only metadata for an authored knowledge document."""
 
-    return json.dumps(
-        {
-            "path": path,
-            "content_fingerprint": canonical.fingerprint(text),
-            "byte_length": len(text.encode("utf-8")),
-        },
-        sort_keys=True,
-    ) + "\n"
+    return (
+        json.dumps(
+            {
+                "path": path,
+                "content_fingerprint": canonical.fingerprint(text),
+                "byte_length": len(text.encode("utf-8")),
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
 
 
 def _scan_preview_text(text: str) -> None:
@@ -1017,7 +1015,9 @@ def _scan_preview_text(text: str) -> None:
             ) from None
 
 
-def _build_evidence_lock(entries: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
+def _build_evidence_lock(
+    entries: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
     """Return safe evidence-lock entries: ids, hashes, revisions, selectors only.
 
     Rejects unknown keys, missing required keys, and any token that would carry
@@ -1118,9 +1118,7 @@ def render_approved_summary(
         decision_statement, detail="invalid decision statement", allow_blank=False
     )
     selected = set(group_ids)
-    accepted_groups = [
-        group for group in proposal.groups if group.group_id in selected
-    ]
+    accepted_groups = [group for group in proposal.groups if group.group_id in selected]
     # The sub-proposal of accepted groups only (typed operations remain apply
     # authority; the YAML is a review rendering).
     sub_proposal_payload: dict[str, object] = {
@@ -1148,7 +1146,9 @@ def render_approved_summary(
                 safe_detail="missing accepted group attestation",
             ) from None
         decision_lines.append(f"- {gid}: accepted")
-    decision_lines.extend(["", "Decision text is intentionally omitted from the safe preview."])
+    decision_lines.extend(
+        ["", "Decision text is intentionally omitted from the safe preview."]
+    )
     decision_md = "\n".join(decision_lines) + "\n"
     evidence_lock_payload = {
         "schema_version": SCHEMA_VERSION,
@@ -1214,7 +1214,9 @@ def render_approved_summary(
     for rel_path, text in _reference_paths(candidate):
         entries.append(
             ApprovedSummaryEntry(
-                path=_safe_preview_path(f"{_APPROVED_SUMMARY_REFERENCES_DIR}/{rel_path}"),
+                path=_safe_preview_path(
+                    f"{_APPROVED_SUMMARY_REFERENCES_DIR}/{rel_path}"
+                ),
                 text=_safe_knowledge_preview(rel_path, text),
             )
         )
@@ -1249,14 +1251,17 @@ def render_approved_summary(
 def _catalog_patch(base_catalog_text: str, candidate: Candidate) -> str:
     """Render catalog change metadata without copying catalog values."""
 
-    return json.dumps(
-        {
-            "base_catalog_fingerprint": canonical.fingerprint(base_catalog_text),
-            "candidate_catalog_fingerprint": candidate.catalog_fingerprint,
-            "changed": base_catalog_text != candidate.catalog_text,
-        },
-        sort_keys=True,
-    ) + "\n"
+    return (
+        json.dumps(
+            {
+                "base_catalog_fingerprint": canonical.fingerprint(base_catalog_text),
+                "candidate_catalog_fingerprint": candidate.catalog_fingerprint,
+                "changed": base_catalog_text != candidate.catalog_text,
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
 
 
 def compute_approved_summary_hash(
@@ -1305,8 +1310,7 @@ def compute_approved_summary_hash(
                 for path, text in candidate.references
             ],
             "overlays": [
-                [path, canonical.fingerprint(text)]
-                for path, text in candidate.overlays
+                [path, canonical.fingerprint(text)] for path, text in candidate.overlays
             ],
             "verification_fingerprint": verification.fingerprint,
             "evidence_lock": _build_evidence_lock(evidence_lock),
@@ -1358,9 +1362,7 @@ def write_approved_summary_preview(
     exports = session_dir / "exports" / batch_hash
     # Defence in depth: the exports root must stay inside the session dir.
     try:
-        exports.resolve(strict=False).relative_to(
-            session_dir.resolve(strict=False)
-        )
+        exports.resolve(strict=False).relative_to(session_dir.resolve(strict=False))
     except ValueError:
         raise ApprovalError(
             CODE_APPROVAL_PREVIEW_UNSAFE, safe_detail="invalid preview root"
@@ -1376,9 +1378,7 @@ def write_approved_summary_preview(
         _scan_preview_text(entry.text)
         target = exports / PurePosixPath(safe_path)
         try:
-            target.resolve(strict=False).relative_to(
-                exports.resolve(strict=False)
-            )
+            target.resolve(strict=False).relative_to(exports.resolve(strict=False))
         except ValueError:
             raise ApprovalError(
                 CODE_APPROVAL_PREVIEW_UNSAFE, safe_detail="invalid preview path"

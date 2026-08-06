@@ -116,7 +116,9 @@ MEDIA_TEXT_MARKDOWN: str = "text/markdown"
 MEDIA_TEXT_PLAIN: str = "text/plain"
 
 #: Media types accepted for snapshot intake (extensible in later tasks).
-_ALLOWED_MEDIA_TYPES: frozenset[str] = frozenset({MEDIA_TEXT_MARKDOWN, MEDIA_TEXT_PLAIN})
+_ALLOWED_MEDIA_TYPES: frozenset[str] = frozenset(
+    {MEDIA_TEXT_MARKDOWN, MEDIA_TEXT_PLAIN}
+)
 
 #: Document suffix → media type. Only these suffixes are accepted for documents.
 #: The long ``.markdown`` form is intentionally rejected; callers must use
@@ -868,7 +870,9 @@ class EvidenceStore:
 
         if media_type not in _ALLOWED_MEDIA_TYPES:
             raise EvidenceError(CODE_EVIDENCE_INVALID_MEDIA) from None
-        source_label = _validate_source_label(source, max_path_depth=self._limits.max_path_depth)
+        source_label = _validate_source_label(
+            source, max_path_depth=self._limits.max_path_depth
+        )
         if not isinstance(raw, (bytes, bytearray)):
             raise EvidenceError(CODE_EVIDENCE_INVALID_ENCODING) from None
         normalized, _ = _normalize_text(bytes(raw))
@@ -1012,9 +1016,9 @@ class EvidenceStore:
             return record
 
     def _record_id_for(self, kind: str, source: str) -> str:
-        digest = hashlib.sha256(
-            (kind + "\x00" + source).encode("utf-8")
-        ).hexdigest()[:16]
+        digest = hashlib.sha256((kind + "\x00" + source).encode("utf-8")).hexdigest()[
+            :16
+        ]
         record_id = f"{kind}-{digest}"
         if _RECORD_ID_RE.match(record_id) is None:
             raise EvidenceError(CODE_EVIDENCE_INVALID_SOURCE) from None
@@ -1176,7 +1180,9 @@ class EvidenceStore:
         content_hash = selector.content_hash
         revision = selector.revision
         if type(record_id) is not str or _RECORD_ID_RE.match(record_id) is None:
-            raise EvidenceError(CODE_EVIDENCE_NOT_FOUND, safe_ids=(record_id,)) from None
+            raise EvidenceError(
+                CODE_EVIDENCE_NOT_FOUND, safe_ids=(record_id,)
+            ) from None
         if type(content_hash) is not str or _HEX64_RE.match(content_hash) is None:
             raise EvidenceError(CODE_EVIDENCE_SELECTOR_STALE) from None
         if type(revision) is not int or revision < 1:
@@ -1184,10 +1190,14 @@ class EvidenceStore:
         kind = selector.kind
         expected_cls = _SELECTOR_KINDS.get(kind)
         if expected_cls is None or type(selector) is not expected_cls:
-            raise EvidenceError(CODE_EVIDENCE_NOT_FOUND, safe_ids=(record_id,)) from None
+            raise EvidenceError(
+                CODE_EVIDENCE_NOT_FOUND, safe_ids=(record_id,)
+            ) from None
         record = self._index.latest.get(record_id)
         if record is None:
-            raise EvidenceError(CODE_EVIDENCE_NOT_FOUND, safe_ids=(record_id,)) from None
+            raise EvidenceError(
+                CODE_EVIDENCE_NOT_FOUND, safe_ids=(record_id,)
+            ) from None
         # Bind to a specific revision, not just a content hash: identical
         # content re-added later produces a new revision whose hash repeats.
         if record.content_hash != content_hash or record.revision != revision:
@@ -1205,9 +1215,7 @@ class EvidenceStore:
             self._validate_typed_field(selector, kind, record_id)
 
     @staticmethod
-    def _validate_typed_field(
-        selector: object, kind: str, record_id: str
-    ) -> None:
+    def _validate_typed_field(selector: object, kind: str, record_id: str) -> None:
         """Validate the kind-specific field shape for non-line selectors."""
 
         valid: bool
@@ -1313,9 +1321,7 @@ _CONFLICT_STATE_UNRESOLVED: str = "unresolved"
 _CONFLICT_STATE_RESOLVED: str = "resolved"
 
 #: Allowed evidence-class values (mirrors :class:`EvidenceClass`).
-_EVIDENCE_CLASS_VALUES: frozenset[str] = frozenset(
-    {c.value for c in EvidenceClass}
-)
+_EVIDENCE_CLASS_VALUES: frozenset[str] = frozenset({c.value for c in EvidenceClass})
 
 
 class ConflictKind(StrEnum):
@@ -1333,9 +1339,7 @@ class ConflictKind(StrEnum):
 
 
 #: Allowed conflict-kind values.
-_CONFLICT_KIND_VALUES: frozenset[str] = frozenset(
-    {k.value for k in ConflictKind}
-)
+_CONFLICT_KIND_VALUES: frozenset[str] = frozenset({k.value for k in ConflictKind})
 
 
 @dataclass(frozen=True, slots=True)
@@ -1723,9 +1727,7 @@ class ClaimStore:
     def claims(self) -> tuple[ClaimRecord, ...]:
         """Return all claims sorted by id."""
 
-        return tuple(
-            sorted(self._index.claims.values(), key=lambda c: c.claim_id)
-        )
+        return tuple(sorted(self._index.claims.values(), key=lambda c: c.claim_id))
 
     def get_claim(self, claim_id: str) -> ClaimRecord:
         """Return the claim with ``claim_id``."""
@@ -1779,13 +1781,9 @@ class ClaimStore:
 
         cid = _claim_validate_node(claim_id, code=CODE_EVIDENCE_CLAIM_INVALID)
         subj = _claim_validate_node(subject, code=CODE_EVIDENCE_CLAIM_INVALID)
-        stmt = _claim_validate_text(
-            statement, code=CODE_EVIDENCE_CLAIM_INVALID
-        )
+        stmt = _claim_validate_text(statement, code=CODE_EVIDENCE_CLAIM_INVALID)
         eclazz = _claim_validate_evidence_class(evidence_class)
-        creator = _claim_validate_node(
-            creator_event, code=CODE_EVIDENCE_CLAIM_INVALID
-        )
+        creator = _claim_validate_node(creator_event, code=CODE_EVIDENCE_CLAIM_INVALID)
         contra = _claim_validate_id_list(contradicts)
         # Selectors are validated against the evidence store before the claim
         # lock is acquired (stale revisions raise selector_stale).
@@ -1858,13 +1856,9 @@ class ClaimStore:
     ) -> ConflictRecord:
         """Record an unresolved conflict affecting one or more dependency groups."""
 
-        cfid = _claim_validate_node(
-            conflict_id, code=CODE_EVIDENCE_CONFLICT_INVALID
-        )
+        cfid = _claim_validate_node(conflict_id, code=CODE_EVIDENCE_CONFLICT_INVALID)
         kkind = _claim_validate_kind(kind)
-        subj = _claim_validate_node(
-            subject, code=CODE_EVIDENCE_CONFLICT_INVALID
-        )
+        subj = _claim_validate_node(subject, code=CODE_EVIDENCE_CONFLICT_INVALID)
         involved = _claim_validate_id_list(
             involved_claim_ids, min_items=1, code=CODE_EVIDENCE_CONFLICT_INVALID
         )
@@ -1901,9 +1895,7 @@ class ClaimStore:
                 actor=author,
                 timestamp=timestamp,
             )
-            self._append_record(
-                self._conflicts_journal, self._conflict_payload(record)
-            )
+            self._append_record(self._conflicts_journal, self._conflict_payload(record))
             self._index.conflicts[cfid] = record
             # Bind the conflict as a session artifact node depending on the
             # involved claims so a claim revision emits the conflict as stale.
@@ -1934,18 +1926,12 @@ class ClaimStore:
         (contrary) claims.
         """
 
-        cfid = _claim_validate_node(
-            conflict_id, code=CODE_EVIDENCE_CONFLICT_NOT_FOUND
-        )
-        stmt = _claim_validate_text(
-            statement, code=CODE_EVIDENCE_CONFLICT_INVALID
-        )
+        cfid = _claim_validate_node(conflict_id, code=CODE_EVIDENCE_CONFLICT_NOT_FOUND)
+        stmt = _claim_validate_text(statement, code=CODE_EVIDENCE_CONFLICT_INVALID)
         answer = answer_id if type(answer_id) is str else ""
         evidence = evidence_id if type(evidence_id) is str else ""
         if answer:
-            answer = _claim_validate_node(
-                answer, code=CODE_EVIDENCE_CONFLICT_INVALID
-            )
+            answer = _claim_validate_node(answer, code=CODE_EVIDENCE_CONFLICT_INVALID)
         if evidence:
             evidence = _claim_validate_node(
                 evidence, code=CODE_EVIDENCE_CONFLICT_INVALID
@@ -2003,9 +1989,7 @@ class ClaimStore:
             # depends on the involved claims (and new evidence) but not approver.
             self._session.record_artifact(
                 cfid,
-                content_hash=canonical.fingerprint(
-                    self._conflict_payload(resolved)
-                ),
+                content_hash=canonical.fingerprint(self._conflict_payload(resolved)),
                 depends_on=tuple(sorted(set(deps))),
                 actor=author,
             )
@@ -2014,9 +1998,7 @@ class ClaimStore:
     def group_blocked_by(self, group_id: str) -> tuple[str, ...]:
         """Return sorted unresolved conflict ids that affect ``group_id``."""
 
-        gid = _claim_validate_node(
-            group_id, code=CODE_EVIDENCE_CONFLICT_INVALID
-        )
+        gid = _claim_validate_node(group_id, code=CODE_EVIDENCE_CONFLICT_INVALID)
         blocking = [
             record.conflict_id
             for record in self._index.conflicts.values()
@@ -2069,9 +2051,7 @@ class ClaimStore:
 
     # -- append + durability ------------------------------------------------ #
 
-    def _append_record(
-        self, journal: Path, payload: Mapping[str, object]
-    ) -> None:
+    def _append_record(self, journal: Path, payload: Mapping[str, object]) -> None:
         """Append one canonical JSON line, flush, and fsync the journal."""
 
         line = json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
@@ -2136,14 +2116,10 @@ class ClaimStore:
         ):
             raise EvidenceError(CODE_EVIDENCE_CLAIM_STORE_CORRUPT) from None
         raw_selectors = obj.get("selectors", ())
-        if not isinstance(raw_selectors, Sequence) or isinstance(
-            raw_selectors, str
-        ):
+        if not isinstance(raw_selectors, Sequence) or isinstance(raw_selectors, str):
             raise EvidenceError(CODE_EVIDENCE_CLAIM_STORE_CORRUPT) from None
         try:
-            selectors = tuple(
-                selector_from_mapping(item) for item in raw_selectors
-            )
+            selectors = tuple(selector_from_mapping(item) for item in raw_selectors)
         except EvidenceError:
             raise EvidenceError(CODE_EVIDENCE_CLAIM_STORE_CORRUPT) from None
         if len(selectors) != len(raw_selectors):

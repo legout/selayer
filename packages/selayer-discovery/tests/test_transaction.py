@@ -214,7 +214,9 @@ def test_apply_durability_failures_are_recoverable(
     )
     with pytest.raises(TransactionError):
         journal.apply()
-    assert recover(project / "transactions", project_root=project) == (journal.transaction_id,)
+    assert recover(project / "transactions", project_root=project) == (
+        journal.transaction_id,
+    )
     expected = b"new" if failure == "applied_event_fsync" else b"old"
     assert target.read_bytes() == expected
     state = json.loads(journal.journal_path.read_text(encoding="utf-8"))["state"]

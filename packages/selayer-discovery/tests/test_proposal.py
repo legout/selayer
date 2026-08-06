@@ -358,11 +358,7 @@ class TestOperationSchema:
             "type": "parquet",
             "location": "data/shipping.parquet",
             "grain": ["id"],
-            "schema": {
-                "fields": [
-                    {"name": "id", "type": "utf8", "nullable": False}
-                ]
-            },
+            "schema": {"fields": [{"name": "id", "type": "utf8", "nullable": False}]},
         }
         op = Operation.from_mapping(
             _op(kind="catalog.add", target_id="source.shipping", after=after)
@@ -388,8 +384,12 @@ class TestOperationSchema:
         assert isinstance(op.after, str)
 
     def test_overlay_update_carries_text_before_after(self) -> None:
-        before = "---\nselayer_id: dimension.order_status\n---\n## Usage Guidance\nOld.\n"
-        after = "---\nselayer_id: dimension.order_status\n---\n## Usage Guidance\nNew.\n"
+        before = (
+            "---\nselayer_id: dimension.order_status\n---\n## Usage Guidance\nOld.\n"
+        )
+        after = (
+            "---\nselayer_id: dimension.order_status\n---\n## Usage Guidance\nNew.\n"
+        )
         op = Operation.from_mapping(
             {
                 "operation_id": "operation-ovl",
@@ -594,8 +594,8 @@ class TestProhibitedMutations:
         after = (
             "---\n"
             "selayer_id: dimension.order_status\n"
-            "type: dimension\n"          # generated field
-            "title: Order status\n"      # generated field
+            "type: dimension\n"  # generated field
+            "title: Order status\n"  # generated field
             "---\n"
             "## Usage Guidance\n"
             "Guidance.\n"
@@ -846,9 +846,7 @@ class TestCandidateReconstruction:
         assert dim.status.value == "deprecated"
         assert dim.replaced_by == "dimension.order_state"
 
-    def test_reference_create_reconstructs_text(
-        self, base_catalog_text: str
-    ) -> None:
+    def test_reference_create_reconstructs_text(self, base_catalog_text: str) -> None:
         after = "---\nselayer_id: dimension.order_status\n---\n# Order status\n"
         op = Operation.from_mapping(
             _op(
@@ -866,9 +864,7 @@ class TestCandidateReconstruction:
         ref = dict(candidate.references)
         assert ref["dimensions/order_status.md"] == after
 
-    def test_overlay_create_reconstructs_text(
-        self, base_catalog_text: str
-    ) -> None:
+    def test_overlay_create_reconstructs_text(self, base_catalog_text: str) -> None:
         after = (
             "---\nselayer_id: dimension.order_status\n---\n"
             "## Usage Guidance\nUse this for status.\n"
@@ -965,12 +961,10 @@ class TestCandidateReconstruction:
         self, base_catalog_text: str
     ) -> None:
         before = (
-            "---\nselayer_id: dimension.order_status\n---\n"
-            "## Usage Guidance\nOld.\n"
+            "---\nselayer_id: dimension.order_status\n---\n## Usage Guidance\nOld.\n"
         )
         after = (
-            "---\nselayer_id: dimension.order_status\n---\n"
-            "## Usage Guidance\nNew.\n"
+            "---\nselayer_id: dimension.order_status\n---\n## Usage Guidance\nNew.\n"
         )
         op = Operation.from_mapping(
             _op(
@@ -992,9 +986,7 @@ class TestCandidateReconstruction:
         # The reference subject is untouched.
         assert dict(candidate.references) == {}
 
-    def test_candidate_has_stable_fingerprint(
-        self, base_catalog_text: str
-    ) -> None:
+    def test_candidate_has_stable_fingerprint(self, base_catalog_text: str) -> None:
         op = Operation.from_mapping(_op())
         first = reconstruct_candidate(
             base_catalog_text=base_catalog_text,
@@ -1151,7 +1143,8 @@ class TestReviewPreview:
             candidate=candidate,
         )
         assert any(
-            "order_status" in path and diff.strip() for path, diff in preview.reference_diffs
+            "order_status" in path and diff.strip()
+            for path, diff in preview.reference_diffs
         )
 
 
@@ -1194,9 +1187,7 @@ class TestReviewSummary:
         # The raw body, patch, and diff text must never reach the summary.
         import dataclasses
 
-        rendered = json.dumps(
-            dataclasses.asdict(summary), sort_keys=True
-        )
+        rendered = json.dumps(dataclasses.asdict(summary), sort_keys=True)
         assert secret not in rendered
         assert preview.catalog_patch not in rendered
         assert "product_category" not in rendered
@@ -1248,18 +1239,14 @@ class TestReviewSummary:
         assert entry.added_lines > 0
         assert summary.references == ()
 
-    def test_summary_marks_updated_vs_added(
-        self, base_catalog_text: str
-    ) -> None:
+    def test_summary_marks_updated_vs_added(self, base_catalog_text: str) -> None:
         from selayer_discovery.proposal import render_review_summary
 
         before = (
-            "---\nselayer_id: dimension.order_status\n---\n"
-            "## Usage Guidance\nOld.\n"
+            "---\nselayer_id: dimension.order_status\n---\n## Usage Guidance\nOld.\n"
         )
         after = (
-            "---\nselayer_id: dimension.order_status\n---\n"
-            "## Usage Guidance\nNew.\n"
+            "---\nselayer_id: dimension.order_status\n---\n## Usage Guidance\nNew.\n"
         )
         op = Operation.from_mapping(
             _op(
@@ -1530,12 +1517,10 @@ class TestProposalImportCli:
         from selayer_discovery.cli import main
 
         before = (
-            "---\nselayer_id: dimension.order_status\n---\n"
-            "## Usage Guidance\nOld.\n"
+            "---\nselayer_id: dimension.order_status\n---\n## Usage Guidance\nOld.\n"
         )
         after = (
-            "---\nselayer_id: dimension.order_status\n---\n"
-            "## Usage Guidance\nNew.\n"
+            "---\nselayer_id: dimension.order_status\n---\n## Usage Guidance\nNew.\n"
         )
         # An authored overlay root consistent with the repo fixtures.
         overlay_root = catalog_dir / "okf_overlays" / "dimensions"
@@ -1648,8 +1633,7 @@ class TestProposalImportCli:
         from selayer_discovery.cli import main
 
         after = (
-            "---\nselayer_id: dimension.order_status\n---\n"
-            "## Usage Guidance\nNew.\n"
+            "---\nselayer_id: dimension.order_status\n---\n## Usage Guidance\nNew.\n"
         )
         op = _op(
             kind="overlay.create",
@@ -2149,7 +2133,11 @@ class TestQueryCases:
         case = QueryCase.from_mapping(
             _query_case(
                 filters=[
-                    {"dimension_id": "order_status", "operator": "equals", "value": "open"}
+                    {
+                        "dimension_id": "order_status",
+                        "operator": "equals",
+                        "value": "open",
+                    }
                 ],
             )
         )
@@ -2160,7 +2148,9 @@ class TestQueryCases:
         with pytest.raises(ProposalError):
             QueryCase.from_mapping(
                 _query_case(
-                    assertions=[{"operator": "row_count_max", "value": 1, "sql": "SELECT 1"}],
+                    assertions=[
+                        {"operator": "row_count_max", "value": 1, "sql": "SELECT 1"}
+                    ],
                 )
             )
 
@@ -2197,16 +2187,18 @@ class TestQueryCases:
             QueryCase.from_mapping(
                 _query_case(
                     filters=[
-                        {"dimension_id": "order_status", "operator": "like", "value": "%"}
+                        {
+                            "dimension_id": "order_status",
+                            "operator": "like",
+                            "value": "%",
+                        }
                     ],
                 )
             )
 
     def test_rejects_sql_key_in_case(self) -> None:
         with pytest.raises(ProposalError):
-            QueryCase.from_mapping(
-                _query_case(sql="SELECT * FROM orders")
-            )
+            QueryCase.from_mapping(_query_case(sql="SELECT * FROM orders"))
 
     def test_invalid_filter_type_is_accepted_rejection_code(self) -> None:
         # ``invalid_filter_type`` is a stable core ``QueryPlanningError`` code
@@ -2241,7 +2233,11 @@ class TestQueryCases:
             QueryCase.from_mapping(
                 _query_case(
                     filters=[
-                        {"dimension_id": "order_status", "operator": "equals", "check": print}
+                        {
+                            "dimension_id": "order_status",
+                            "operator": "equals",
+                            "check": print,
+                        }
                     ],
                 )
             )
@@ -2529,8 +2525,7 @@ data_sources:
         # An overlay whose selayer_id does not match a catalog object fails
         # strict OKF integrity on load.
         after = (
-            "---\nselayer_id: dimension.nonexistent\n---\n"
-            "# Usage Guidance\nGuidance.\n"
+            "---\nselayer_id: dimension.nonexistent\n---\n# Usage Guidance\nGuidance.\n"
         )
         op = _overlay_create_op(after=after)
         mapping = _proposal_mapping(
@@ -2653,9 +2648,7 @@ class TestTypeExpressionDataCitation:
         tmp_path: Path,
     ) -> None:
         _init_session(catalog_dir)
-        session_store, evidence, claims, interview = TestReadiness._stores(
-            catalog_dir
-        )
+        session_store, evidence, claims, interview = TestReadiness._stores(catalog_dir)
         actor = session_store.charter.approver
         TestReadiness._add_observed_claim(
             claims, evidence, session_store, tmp_path, actor
@@ -2695,9 +2688,7 @@ class TestTypeExpressionDataCitation:
         # observed) and which has no execution-assertion case stays static-only:
         # the conditional physical requirement must not fire.
         _init_session(catalog_dir)
-        session_store, evidence, claims, interview = TestReadiness._stores(
-            catalog_dir
-        )
+        session_store, evidence, claims, interview = TestReadiness._stores(catalog_dir)
         actor = session_store.charter.approver
         from selayer_discovery.model import EvidenceClass
 
@@ -2999,9 +2990,7 @@ class TestReadiness:
         assert not readiness.ready
         assert "dependency_not_ready" in readiness.blockers
 
-    def test_blocked_by_failed_mandatory_check(
-        self, tmp_path: Path
-    ) -> None:
+    def test_blocked_by_failed_mandatory_check(self, tmp_path: Path) -> None:
         # A candidate whose source is missing fails the physical check; even
         # with a disposed gate and a current claim, readiness is blocked.
         _init_session_with_catalog(tmp_path)
@@ -3060,9 +3049,7 @@ class TestEvidenceReadinessGates:
         tmp_path: Path,
     ) -> None:
         _init_session(catalog_dir)
-        session_store, evidence, claims, interview = TestReadiness._stores(
-            catalog_dir
-        )
+        session_store, evidence, claims, interview = TestReadiness._stores(catalog_dir)
         actor = session_store.charter.approver
         claim = TestReadiness._add_observed_claim(
             claims, evidence, session_store, tmp_path, actor
@@ -3099,9 +3086,7 @@ class TestEvidenceReadinessGates:
         tmp_path: Path,
     ) -> None:
         _init_session(catalog_dir)
-        session_store, evidence, claims, interview = TestReadiness._stores(
-            catalog_dir
-        )
+        session_store, evidence, claims, interview = TestReadiness._stores(catalog_dir)
         actor = session_store.charter.approver
         TestReadiness._add_observed_claim(
             claims, evidence, session_store, tmp_path, actor
@@ -3136,9 +3121,7 @@ class TestEvidenceReadinessGates:
         tmp_path: Path,
     ) -> None:
         _init_session(catalog_dir)
-        session_store, evidence, claims, interview = TestReadiness._stores(
-            catalog_dir
-        )
+        session_store, evidence, claims, interview = TestReadiness._stores(catalog_dir)
         actor = session_store.charter.approver
         claim = TestReadiness._add_observed_claim(
             claims, evidence, session_store, tmp_path, actor
@@ -3185,9 +3168,7 @@ class TestEvidenceReadinessGates:
         tmp_path: Path,
     ) -> None:
         _init_session(catalog_dir)
-        session_store, evidence, claims, interview = TestReadiness._stores(
-            catalog_dir
-        )
+        session_store, evidence, claims, interview = TestReadiness._stores(catalog_dir)
         actor = session_store.charter.approver
         TestReadiness._add_observed_claim(
             claims, evidence, session_store, tmp_path, actor
@@ -3232,9 +3213,7 @@ class TestEvidenceReadinessGates:
         # block readiness: the snapshot "exists" but no longer reopens to the
         # recorded content hash, so the reopenability gate fails closed.
         _init_session(catalog_dir)
-        session_store, evidence, claims, interview = TestReadiness._stores(
-            catalog_dir
-        )
+        session_store, evidence, claims, interview = TestReadiness._stores(catalog_dir)
         actor = session_store.charter.approver
         claim = TestReadiness._add_observed_claim(
             claims, evidence, session_store, tmp_path, actor
@@ -3286,9 +3265,7 @@ class TestEvidenceReadinessGates:
         # with evidence_selector_stale rather than vacuously passing the
         # selector gates over an empty tuple.
         _init_session(catalog_dir)
-        session_store, evidence, claims, interview = TestReadiness._stores(
-            catalog_dir
-        )
+        session_store, evidence, claims, interview = TestReadiness._stores(catalog_dir)
         actor = session_store.charter.approver
         # Inject a legacy claim journal line: selector_kinds nonempty but no
         # persisted ``selectors`` field, then reopen the store to reconstruct.

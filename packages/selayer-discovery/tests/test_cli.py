@@ -1479,9 +1479,7 @@ def test_activate_policy_persists_activation_artifact(
 ) -> None:
     _init_policy_session(tmp_path, capsys)
     profile_path, _, _ = _activate_policy_for_cli(tmp_path, capsys)
-    session_dir = cli_module._session_dir(
-        tmp_path.resolve(), "session-policy-001"
-    )
+    session_dir = cli_module._session_dir(tmp_path.resolve(), "session-policy-001")
     activation_path = cli_module._activation_path(session_dir, "orders")
     assert activation_path.is_file()
     activation = PolicyActivation.from_dict(json.loads(activation_path.read_text()))
@@ -1557,9 +1555,7 @@ def test_session_context_bytes_used_sums_valid_context_exports(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _init_policy_session(tmp_path, capsys)
-    session_dir = cli_module._session_dir(
-        tmp_path.resolve(), "session-policy-001"
-    )
+    session_dir = cli_module._session_dir(tmp_path.resolve(), "session-policy-001")
     policy_dir = cli_module._policy_dir(session_dir)
     policy_dir.mkdir(parents=True, exist_ok=True)
     (policy_dir / "context-a.json").write_text('{"bytes": 100}', encoding="utf-8")
@@ -1583,7 +1579,9 @@ def test_export_context_stdout_contains_only_safe_summary(
     profile_path, policy_path, _ = _activate_policy_for_cli(tmp_path, capsys)
 
     class FakeRegistry:
-        def open_scan_session(self, *_args: object, **_kwargs: object) -> SourceScanSession:
+        def open_scan_session(
+            self, *_args: object, **_kwargs: object
+        ) -> SourceScanSession:
             return _policy_scan_session()
 
         def close(self) -> None:
@@ -1877,6 +1875,19 @@ def test_intake_snapshot_records_provider_revision_and_stales_dependents(
     assert first["provider_revision"] == "b" * 64
     assert first["stale_targets"] == []
     monkeypatch.setattr(cli_module, "_read_stdin_bytes", lambda: b"changed body")
-    assert main(args[:-4] + ["--revision", "c" * 64, "--selector", "section:two", "--media-type", "text/markdown"]) == 0
+    assert (
+        main(
+            args[:-4]
+            + [
+                "--revision",
+                "c" * 64,
+                "--selector",
+                "section:two",
+                "--media-type",
+                "text/markdown",
+            ]
+        )
+        == 0
+    )
     second = json.loads(capsys.readouterr().out)
     assert "draft-one" in second["stale_targets"]

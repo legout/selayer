@@ -250,7 +250,9 @@ def _full_input_hashes(
 _TIMESTAMP = "2026-07-31T12:00:00+00:00"
 
 
-def _attest(proposal: Proposal, **overrides: Any) -> tuple[GroupAttestation, Candidate, VerificationBundle]:
+def _attest(
+    proposal: Proposal, **overrides: Any
+) -> tuple[GroupAttestation, Candidate, VerificationBundle]:
     candidate = _candidate(proposal)
     bundle = _verification_bundle(proposal, candidate)
     inputs = _full_input_hashes(proposal, candidate, bundle)
@@ -650,9 +652,7 @@ class TestPrepareApplyBatch:
     def test_preserves_explicit_order(self) -> None:
         proposal = _two_group_proposal()
         candidate = _combined_candidate(proposal, ("group-001", "group-002"))
-        bundle = _combined_verification(
-            proposal, candidate, ("group-001", "group-002")
-        )
+        bundle = _combined_verification(proposal, candidate, ("group-001", "group-002"))
         attestations = {
             "group-001": _attest_group_obj(proposal, "group-001"),
             "group-002": _attest_group_obj(proposal, "group-002"),
@@ -818,9 +818,7 @@ class TestPrepareApplyBatch:
             )
         )
         candidate = _combined_candidate(proposal, ("group-001", "group-002"))
-        bundle = _combined_verification(
-            proposal, candidate, ("group-001", "group-002")
-        )
+        bundle = _combined_verification(proposal, candidate, ("group-001", "group-002"))
         attestations = {
             "group-001": _attest_group_obj(proposal, "group-001"),
             "group-002": _attest_group_obj(proposal, "group-002"),
@@ -843,9 +841,7 @@ class TestPrepareApplyBatch:
     ) -> None:
         proposal = _two_group_proposal()
         candidate = _combined_candidate(proposal, ("group-001", "group-002"))
-        bundle = _combined_verification(
-            proposal, candidate, ("group-001", "group-002")
-        )
+        bundle = _combined_verification(proposal, candidate, ("group-001", "group-002"))
         attestations = {
             "group-001": _attest_group_obj(proposal, "group-001"),
             "group-002": _attest_group_obj(proposal, "group-002"),
@@ -873,9 +869,7 @@ class TestPrepareApplyBatch:
     def test_fingerprint_stable_on_repeat(self) -> None:
         proposal = _two_group_proposal()
         candidate = _combined_candidate(proposal, ("group-001", "group-002"))
-        bundle = _combined_verification(
-            proposal, candidate, ("group-001", "group-002")
-        )
+        bundle = _combined_verification(proposal, candidate, ("group-001", "group-002"))
         attestations = {
             "group-001": _attest_group_obj(proposal, "group-001"),
             "group-002": _attest_group_obj(proposal, "group-002"),
@@ -890,9 +884,10 @@ class TestPrepareApplyBatch:
             "current_session_hashes": _current_session_hashes(),
             "approved_summary_hash": _HEX_A,
         }
-        assert prepare_apply_batch(**kwargs).fingerprint == prepare_apply_batch(
-            **kwargs
-        ).fingerprint
+        assert (
+            prepare_apply_batch(**kwargs).fingerprint
+            == prepare_apply_batch(**kwargs).fingerprint
+        )
 
     def test_applying_prior_batch_stales_unapplied_groups(self) -> None:
         # A prior apply changes the base catalog. The next prepare of an
@@ -1142,7 +1137,15 @@ class TestApplyBatchAttestation:
 
 def _preview_inputs(
     tmp_path: Path,
-) -> tuple[Proposal, Candidate, VerificationBundle, PreparedBatch, GroupAttestation, dict[str, str], dict[str, str]]:
+) -> tuple[
+    Proposal,
+    Candidate,
+    VerificationBundle,
+    PreparedBatch,
+    GroupAttestation,
+    dict[str, str],
+    dict[str, str],
+]:
     proposal = _two_group_proposal()
     candidate = _combined_candidate(proposal, ("group-001", "group-002"))
     bundle = _combined_verification(proposal, candidate, ("group-001", "group-002"))
@@ -1223,7 +1226,9 @@ def _render_summary(
         apply_attestation=apply_attestation,
         base_hashes=base_hashes,
         base_catalog_text=_BASE_CATALOG_YAML,
-        evidence_lock=evidence_lock if evidence_lock is not None else _evidence_lock_entries(),
+        evidence_lock=evidence_lock
+        if evidence_lock is not None
+        else _evidence_lock_entries(),
         decision_statement="Two dependency groups were accepted by the named approver.",
     )
     assert isinstance(summary, ApprovedSummary)
@@ -1261,12 +1266,11 @@ class TestApprovedSummaryPreview:
         # Every specified top-level file/dir exists.
         written = {str(p.relative_to(exports)) for p in exports.rglob("*")}
         for name in APPROVED_SUMMARY_FILES:
-            assert (exports / name).exists() or any(
-                p.startswith(name + "/") for p in written
-            ) or name in {
-                e.path.split("/", 1)[0]
-                for e in summary.entries
-            }
+            assert (
+                (exports / name).exists()
+                or any(p.startswith(name + "/") for p in written)
+                or name in {e.path.split("/", 1)[0] for e in summary.entries}
+            )
 
     def test_preview_path_is_hash_bound(self, tmp_path: Path) -> None:
 
