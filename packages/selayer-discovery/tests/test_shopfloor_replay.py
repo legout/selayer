@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 from typing import Any, cast
@@ -98,15 +99,30 @@ def test_replay_runs_temporary_catalog_okf_and_typed_evidence_flow(tmp_path: Pat
     target = catalog["dimensions"]["drive_serial_number"]
     before = dict(target)
     target.update(defect["replace"])
-    temporary_catalog = tmp_path / "shopfloor.yaml"
-    temporary_catalog.write_text(cast(str, yaml.safe_dump(catalog, sort_keys=False)), encoding="utf-8")
-    layer = SemanticLayer.load(temporary_catalog)
+    defective_catalog = tmp_path / "defective.yaml"
+    defective_catalog.write_text(cast(str, yaml.safe_dump(catalog, sort_keys=False)), encoding="utf-8")
+    defective_layer = SemanticLayer.load(defective_catalog)
     assert before != target
-    report = verify_static(layer)
-    assert report.complete
+    assert verify_static(defective_layer).complete
+    defective_bundle = OkfBundle.build(
+        defective_layer,
+        tmp_path / "okf-defective",
+        references_dir=root / "business_context",
+        overlays_dir=root / "okf_overlays",
+    )
+    assert defective_bundle.concepts
 
+    replay_proposal = cast(dict[str, Any], yaml.safe_load((_REPLAY / "proposal.yaml").read_text(encoding="utf-8")))
+    correction = replay_proposal["groups"][0]["operations"][0]["after"]
+    target.clear()
+    target.update(correction)
+    corrected_catalog = tmp_path / "shopfloor.yaml"
+    corrected_catalog.write_text(cast(str, yaml.safe_dump(catalog, sort_keys=False)), encoding="utf-8")
+    corrected_layer = SemanticLayer.load(corrected_catalog)
+    assert corrected_layer.dimension("drive_serial_number").source == "serialized_drives"
+    assert verify_static(corrected_layer).complete
     bundle = OkfBundle.build(
-        layer,
+        corrected_layer,
         tmp_path / "okf",
         references_dir=root / "business_context",
         overlays_dir=root / "okf_overlays",
@@ -117,7 +133,7 @@ def test_replay_runs_temporary_catalog_okf_and_typed_evidence_flow(tmp_path: Pat
         schema_version=SCHEMA_VERSION,
         session_id="shopfloor-replay",
         business_question="Safe drive-level component and EOL analysis",
-        catalog_fingerprint=fingerprint(temporary_catalog.read_text(encoding="utf-8")),
+        catalog_fingerprint=fingerprint(corrected_catalog.read_text(encoding="utf-8")),
         catalog_path="shopfloor.yaml",
         approver="Dr Alice Okonkwo",
         inclusions=("dimension.drive_serial_number",),
@@ -163,4 +179,15 @@ def test_replay_runs_temporary_catalog_okf_and_typed_evidence_flow(tmp_path: Pat
         )
     assert okf_record.content_hash
     assert len(claims.claims()) == 3
-    assert all("filesystem OKF evidence" not in path.read_text(encoding="utf-8") for path in (tmp_path / "okf").rglob("*.md"))
+    generated = "\n".join(path.read_text(encoding="utf-8") for path in (tmp_path / "okf").rglob("*.md"))
+    assert "filesystem OKF evidence" not in generated
+    assert all(f"business document {index}" not in generated for index in range(4))
+    assert not (tmp_path / "semantic_changes").exists()
+    source_text = (root.parent.parent / "packages" / "selayer-discovery" / "src" / "selayer_discovery" / "cli.py").read_text(encoding="utf-8")
+    tree = ast.parse(source_text)
+    assert not any(
+        alias.name == "subprocess"
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+    )

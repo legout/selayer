@@ -5,7 +5,7 @@ business_question: >-
 inclusions:
   - dimension.drive_serial_number
   - dimension.station_id
-  - fact.operation_executions
+  - fact.operation_execution_id
   - fact.eol_test_run_id
   - metric.component_count
   - metric.eol_attempt_count
