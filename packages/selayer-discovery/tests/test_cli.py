@@ -678,6 +678,19 @@ def test_unknown_command_is_usage_exit(
     assert raised.value.code == 2
 
 
+@pytest.mark.parametrize(
+    "command",
+    ("attest", "prepare-apply", "attest-apply", "export-preview"),
+)
+def test_proposal_approval_commands_are_registered(
+    command: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        main(["proposal", command, "--help"])
+    assert raised.value.code == 0
+    assert command in capsys.readouterr().out
+
+
 def test_session_subcommand_required(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

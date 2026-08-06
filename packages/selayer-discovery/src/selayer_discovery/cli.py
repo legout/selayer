@@ -39,7 +39,9 @@ import secrets
 import sys
 import uuid
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import duckdb
 from ruamel.yaml import YAML, YAMLError
@@ -51,6 +53,17 @@ from selayer.sources.profiles import (
     MappingProfileResolver,
 )
 from selayer.sources.registry import SourceRegistry
+from selayer_discovery.approval import (
+    ApplyBatchAttestation,
+    ApprovalError,
+    GroupAttestation,
+    PreparedBatch,
+    attest_apply_batch,
+    attest_group,
+    prepare_apply_batch,
+    render_approved_summary,
+    write_approved_summary_preview,
+)
 from selayer_discovery.canonical import fingerprint
 from selayer_discovery.diagnostics import DiscoveryError
 from selayer_discovery.evidence import (
@@ -85,7 +98,10 @@ from selayer_discovery.profiling import (
     verify_activation,
 )
 from selayer_discovery.proposal import (
+    Candidate,
+    Proposal,
     ProposalError,
+    VerificationBundle,
     build_proposal,
     reconstruct_candidate,
     render_review_preview,
@@ -1209,6 +1225,309 @@ def _handle_proposal_show(args: argparse.Namespace) -> int:
 #: The immutable verification report filename, written inside the Git-ignored
 #: proposal workspace and bound to the proposal's input hashes.
 _VERIFICATION_FILENAME: str = "verification.json"
+_APPROVALS_DIR = "attestations"
+_BATCH_FILENAME = "prepared-batch.json"
+_APPLY_ATTESTATION_FILENAME = "apply-attestation.json"
+
+
+def _approval_timestamp(value: str | None) -> str:
+    return value or datetime.now(UTC).isoformat(timespec="microseconds")
+
+
+def _proposal_for_approval(
+    session_dir: Path, proposal_id: str
+) -> tuple[dict[str, object], Proposal]:
+    record = _read_proposal_record(session_dir, proposal_id)
+    proposal = build_proposal(
+        {
+            "proposal_id": record.get("proposal_id"),
+            "title": record.get("title"),
+            "groups": record.get("groups", []),
+        }
+    )
+    return record, proposal
+
+
+def _approval_context(
+    project: Path,
+    session_dir: Path,
+    proposal_id: str,
+    selected_group_ids: Sequence[str] | None = None,
+) -> tuple[Proposal, Candidate, VerificationBundle, str, dict[str, str], dict[str, str], SessionStore]:
+    """Reconstruct and verify the current proposal for approval commands."""
+
+    from selayer_discovery.proposal import verify_proposal
+
+    _, full_proposal = _proposal_for_approval(session_dir, proposal_id)
+    selected = tuple(selected_group_ids or ())
+    if selected:
+        wanted = set(selected)
+        groups = [group for group in full_proposal.groups if group.group_id in wanted]
+        proposal = build_proposal(
+            {
+                "proposal_id": full_proposal.proposal_id,
+                "title": full_proposal.title,
+                "groups": [group.to_dict() for group in groups],
+            }
+        )
+    else:
+        proposal = full_proposal
+    base_catalog_text = _session_base_catalog_text(project, session_dir)
+    base_references, base_overlays = _authored_knowledge_bases(project)
+    candidate = reconstruct_candidate(
+        base_catalog_text=base_catalog_text,
+        base_references=base_references,
+        base_overlays=base_overlays,
+        operations=proposal.operations,
+    )
+    proposal_dir = _proposal_root(session_dir) / proposal_id
+    candidate_path = write_candidate(candidate, proposal_dir / "approval-candidate")
+    candidate_layer = SemanticLayer.load(candidate_path)
+    session_store = SessionStore.open(session_dir)
+    evidence_store = EvidenceStore.create(_evidence_root(session_dir))
+    claim_store = ClaimStore.create(session_store, evidence_store)
+    interview_store = InterviewStore.create(session_store)
+    bundle = verify_proposal(
+        proposal=proposal,
+        candidate=candidate,
+        candidate_layer=candidate_layer,
+        okf_output_dir=proposal_dir / "approval-okf",
+        interview_store=interview_store,
+        claim_store=claim_store,
+        evidence_store=evidence_store,
+    )
+    snapshot = session_store.reconstruct()
+    artifacts = snapshot.artifact_hashes
+    zero = "0" * 64
+    session_hashes = {
+        "charter": session_store.charter.fingerprint,
+        "base_catalog": fingerprint(base_catalog_text),
+        "policy": artifacts.get("policy", zero),
+        "evidence_lock": artifacts.get("evidence_lock", artifacts.get("evidence-lock", zero)),
+    }
+    base_hashes = {
+        "catalog": fingerprint(base_catalog_text),
+        "references": fingerprint(base_references),
+        "overlays": fingerprint(base_overlays),
+    }
+    return (
+        proposal,
+        candidate,
+        bundle,
+        base_catalog_text,
+        base_hashes,
+        session_hashes,
+        session_store,
+    )
+
+
+def _write_approval_json(path: Path, value: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(dict(value), handle, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    _restrict_file(path)
+
+
+def _read_approval_json(path: Path) -> dict[str, object]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, ValueError):
+        raise _CliError(CODE_INTERNAL) from None
+    if not isinstance(value, Mapping):
+        raise _CliError(CODE_INTERNAL)
+    return dict(value)
+
+
+def _handle_proposal_attest(args: argparse.Namespace) -> int:
+    project = _project_root(args.project)
+    session_id = _validate_session_id(args.session_id)
+    session_dir = _require_session(project, session_id)
+    proposal_id = _validate_proposal_id(args.proposal)
+    proposal, candidate, bundle, _base_text, _bases, session_hashes, session_store = _approval_context(
+        project, session_dir, proposal_id
+    )
+    group = next((item for item in proposal.groups if item.group_id == args.group), None)
+    if group is None:
+        raise ApprovalError("discovery.approval.unknown_group")
+    readiness = bundle.readiness_for(group.group_id)
+    input_hashes = dict(session_hashes)
+    input_hashes.update({
+        "group": fingerprint(group.to_dict()),
+        "candidate": candidate.fingerprint,
+        "verification": bundle.fingerprint,
+    })
+    approver = normalize_actor_identity(args.approver)
+    attestation = attest_group(
+        session_id=session_id,
+        group_id=group.group_id,
+        approver=approver,
+        current_approver=session_store.charter.approver,
+        decision=args.decision,
+        reason=args.reason or "",
+        input_hashes=input_hashes,
+        group_ready=readiness.ready,
+        group_blocked=readiness.blockers,
+        group_stale=False,
+        timestamp=_approval_timestamp(args.timestamp),
+    )
+    path = _proposal_root(session_dir) / proposal_id / _APPROVALS_DIR / f"{group.group_id}.json"
+    _write_approval_json(path, attestation.to_dict())
+    _emit_json({"proposal_id": proposal_id, "group_id": group.group_id, "fingerprint": attestation.fingerprint, "path": _workspace_rel(session_id) + f"/{_PROPOSAL_REL}/{proposal_id}/{_APPROVALS_DIR}/{group.group_id}.json"})
+    return EXIT_OK
+
+
+def _handle_proposal_prepare_apply(args: argparse.Namespace) -> int:
+    project = _project_root(args.project)
+    session_id = _validate_session_id(args.session_id)
+    session_dir = _require_session(project, session_id)
+    proposal_id = _validate_proposal_id(args.proposal)
+    group_ids = tuple(args.group)
+    proposal, candidate, bundle, base_text, base_hashes, session_hashes, _store = _approval_context(project, session_dir, proposal_id, group_ids)
+    attestations: dict[str, GroupAttestation] = {}
+    for group_id in group_ids:
+        path = _proposal_root(session_dir) / proposal_id / _APPROVALS_DIR / f"{group_id}.json"
+        attestations[group_id] = GroupAttestation.from_mapping(_read_approval_json(path))
+    from selayer_discovery.approval import compute_approved_summary_hash
+    summary_hash = compute_approved_summary_hash(
+        proposal=proposal,
+        group_ids=group_ids,
+        candidate=candidate,
+        verification=bundle,
+        base_hashes=base_hashes,
+        base_catalog_text=base_text,
+        evidence_lock=[],
+        decision_statement="Approved dependency batch.",
+    )
+    batch = prepare_apply_batch(
+        proposal=proposal,
+        group_ids=group_ids,
+        attestations=attestations,
+        combined_candidate=candidate,
+        combined_verification=bundle,
+        base_hashes=base_hashes,
+        current_session_hashes=session_hashes,
+        approved_summary_hash=summary_hash,
+    )
+    path = _proposal_root(session_dir) / proposal_id / _BATCH_FILENAME
+    _write_approval_json(path, batch.to_dict())
+    _emit_json({"proposal_id": proposal_id, "batch_hash": batch.fingerprint, "group_ids": list(batch.group_ids), "path": _workspace_rel(session_id) + f"/{_PROPOSAL_REL}/{proposal_id}/{_BATCH_FILENAME}"})
+    return EXIT_OK
+
+
+def _prepared_batch_from_mapping(data: Mapping[str, object]) -> PreparedBatch:
+    schema = data.get("schema_version")
+    if type(schema) is not int:
+        raise ApprovalError("discovery.approval.invalid")
+
+    def _strings(name: str) -> tuple[str, ...]:
+        raw = data.get(name)
+        if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+            raise ApprovalError("discovery.approval.invalid")
+        if not all(type(item) is str for item in raw):
+            raise ApprovalError("discovery.approval.invalid")
+        return tuple(cast(Sequence[str], raw))
+
+    def _hashes(name: str) -> dict[str, str]:
+        raw = data.get(name)
+        if not isinstance(raw, Mapping) or not all(
+            type(key) is str and type(value) is str for key, value in raw.items()
+        ):
+            raise ApprovalError("discovery.approval.invalid")
+        return dict(cast(Mapping[str, str], raw))
+
+    text_fields = (
+        "session_id",
+        "proposal_id",
+        "candidate_fingerprint",
+        "verification_fingerprint",
+        "approved_summary_hash",
+        "fingerprint",
+    )
+    values: dict[str, str] = {}
+    for field in text_fields:
+        value = data.get(field)
+        if type(value) is not str:
+            raise ApprovalError("discovery.approval.invalid")
+        values[field] = value
+    return PreparedBatch(
+        schema_version=schema,
+        session_id=values["session_id"],
+        proposal_id=values["proposal_id"],
+        group_ids=_strings("group_ids"),
+        attestation_fingerprints=_strings("attestation_fingerprints"),
+        base_hashes=_hashes("base_hashes"),
+        candidate_fingerprint=values["candidate_fingerprint"],
+        verification_fingerprint=values["verification_fingerprint"],
+        approved_summary_hash=values["approved_summary_hash"],
+        session_hashes=_hashes("session_hashes"),
+        fingerprint=values["fingerprint"],
+    )
+
+
+def _handle_proposal_attest_apply(args: argparse.Namespace) -> int:
+    project = _project_root(args.project)
+    session_id = _validate_session_id(args.session_id)
+    session_dir = _require_session(project, session_id)
+    proposal_id = _validate_proposal_id(args.proposal)
+    batch_path = _proposal_root(session_dir) / proposal_id / _BATCH_FILENAME
+    batch = _prepared_batch_from_mapping(_read_approval_json(batch_path))
+    session_store = SessionStore.open(session_dir)
+    attestation = attest_apply_batch(
+        batch=batch,
+        approver=normalize_actor_identity(args.approver),
+        current_approver=session_store.charter.approver,
+        timestamp=_approval_timestamp(args.timestamp),
+        prepared_batch_hash=args.batch or batch.fingerprint,
+    )
+    path = _proposal_root(session_dir) / proposal_id / _APPLY_ATTESTATION_FILENAME
+    _write_approval_json(path, attestation.to_dict())
+    _emit_json({"proposal_id": proposal_id, "batch_hash": attestation.batch_hash, "fingerprint": attestation.fingerprint, "path": _workspace_rel(session_id) + f"/{_PROPOSAL_REL}/{proposal_id}/{_APPLY_ATTESTATION_FILENAME}"})
+    return EXIT_OK
+
+
+def _handle_proposal_export_preview(args: argparse.Namespace) -> int:
+    project = _project_root(args.project)
+    session_id = _validate_session_id(args.session_id)
+    session_dir = _require_session(project, session_id)
+    proposal_id = _validate_proposal_id(args.proposal)
+    batch = _prepared_batch_from_mapping(_read_approval_json(_proposal_root(session_dir) / proposal_id / _BATCH_FILENAME))
+    apply_data = _read_approval_json(_proposal_root(session_dir) / proposal_id / _APPLY_ATTESTATION_FILENAME)
+    required_apply = ("schema_version", "session_id", "batch_hash", "approver", "not_a_signature", "timestamp", "fingerprint")
+    if not all(key in apply_data for key in required_apply) or not all(
+        type(apply_data[key]) is str for key in required_apply if key != "schema_version"
+    ) or type(apply_data["schema_version"]) is not int:
+        raise ApprovalError("discovery.approval.invalid")
+    apply_attestation = ApplyBatchAttestation(
+        schema_version=cast(int, apply_data["schema_version"]),
+        session_id=cast(str, apply_data["session_id"]),
+        batch_hash=cast(str, apply_data["batch_hash"]),
+        approver=cast(str, apply_data["approver"]),
+        not_a_signature=cast(str, apply_data["not_a_signature"]),
+        timestamp=cast(str, apply_data["timestamp"]),
+        fingerprint=cast(str, apply_data["fingerprint"]),
+    )
+    proposal, candidate, bundle, base_text, base_hashes, _session_hashes, _store = _approval_context(project, session_dir, proposal_id, batch.group_ids)
+    attestations = {gid: GroupAttestation.from_mapping(_read_approval_json(_proposal_root(session_dir) / proposal_id / _APPROVALS_DIR / f"{gid}.json")) for gid in batch.group_ids}
+    summary = render_approved_summary(
+        proposal=proposal,
+        group_ids=batch.group_ids,
+        candidate=candidate,
+        verification=bundle,
+        group_attestations=attestations,
+        apply_attestation=apply_attestation,
+        base_hashes=base_hashes,
+        base_catalog_text=base_text,
+        evidence_lock=[],
+        decision_statement="Approved dependency batch.",
+    )
+    write_approved_summary_preview(summary, session_dir, batch.fingerprint)
+    _emit_json({"proposal_id": proposal_id, "batch_hash": batch.fingerprint, "summary_fingerprint": summary.fingerprint, "workspace": _workspace_rel(session_id) + f"/exports/{batch.fingerprint}"})
+    return EXIT_OK
 
 
 def _handle_proposal_verify(args: argparse.Namespace) -> int:
@@ -2022,6 +2341,47 @@ def _parser() -> argparse.ArgumentParser:
     )
     proposal_verify_parser.set_defaults(func=_handle_proposal_verify)
 
+    proposal_attest_parser = proposal_sub.add_parser(
+            "attest", help="Record a named group decision."
+    )
+    proposal_attest_parser.add_argument("--session-id", required=True)
+    proposal_attest_parser.add_argument("--project")
+    proposal_attest_parser.add_argument("--proposal", required=True)
+    proposal_attest_parser.add_argument("--group", required=True)
+    proposal_attest_parser.add_argument("--approver", required=True)
+    proposal_attest_parser.add_argument("--decision", choices=("accepted", "rejected", "deferred"), default="accepted")
+    proposal_attest_parser.add_argument("--reason", default="")
+    proposal_attest_parser.add_argument("--timestamp")
+    proposal_attest_parser.set_defaults(func=_handle_proposal_attest)
+
+    proposal_prepare_parser = proposal_sub.add_parser(
+            "prepare-apply", help="Prepare an explicit dependency-closed batch."
+    )
+    proposal_prepare_parser.add_argument("--session-id", required=True)
+    proposal_prepare_parser.add_argument("--project")
+    proposal_prepare_parser.add_argument("--proposal", required=True)
+    proposal_prepare_parser.add_argument("--group", action="append", required=True)
+    proposal_prepare_parser.set_defaults(func=_handle_proposal_prepare_apply)
+
+    proposal_attest_apply_parser = proposal_sub.add_parser(
+            "attest-apply", help="Attest an exact prepared batch."
+    )
+    proposal_attest_apply_parser.add_argument("--session-id", required=True)
+    proposal_attest_apply_parser.add_argument("--project")
+    proposal_attest_apply_parser.add_argument("--proposal", required=True)
+    proposal_attest_apply_parser.add_argument("--approver", required=True)
+    proposal_attest_apply_parser.add_argument("--batch")
+    proposal_attest_apply_parser.add_argument("--timestamp")
+    proposal_attest_apply_parser.set_defaults(func=_handle_proposal_attest_apply)
+
+    proposal_export_parser = proposal_sub.add_parser(
+            "export-preview", help="Write the safe ignored approved-summary preview."
+    )
+    proposal_export_parser.add_argument("--session-id", required=True)
+    proposal_export_parser.add_argument("--project")
+    proposal_export_parser.add_argument("--proposal", required=True)
+    proposal_export_parser.set_defaults(func=_handle_proposal_export_preview)
+
     return parser
 
 
@@ -2046,6 +2406,7 @@ def _run(handler: object, args: argparse.Namespace) -> int:
         ProfilePolicyError,
         DiscoveryError,
         ProposalError,
+        ApprovalError,
     ) as exc:
         _emit_error(exc)
         return EXIT_ERROR
