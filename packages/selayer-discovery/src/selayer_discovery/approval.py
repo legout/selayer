@@ -761,6 +761,10 @@ def prepare_apply_batch(
             raise ApprovalError(CODE_APPROVAL_FINGERPRINT_CHANGED) from None
         if not readiness[gid].ready:
             raise ApprovalError(CODE_APPROVAL_GROUP_NOT_READY) from None
+        if bound["candidate"] != combined_candidate.fingerprint:
+            raise ApprovalError(CODE_APPROVAL_FINGERPRINT_CHANGED) from None
+        if bound["verification"] != combined_verification.fingerprint:
+            raise ApprovalError(CODE_APPROVAL_FINGERPRINT_CHANGED) from None
         attestation_fingerprints.append(attestation.fingerprint)
     fingerprint = canonical.fingerprint(
         {
@@ -967,6 +971,41 @@ def _safe_preview_path(rel_path: str) -> str:
     return rel_path
 
 
+def _safe_operation_preview(group: Any) -> dict[str, object]:
+    """Render operation metadata without before/after bodies or values."""
+
+    return {
+        "group_id": group.group_id,
+        "group_fingerprint": canonical.fingerprint(group.to_dict()),
+        "dependencies": list(group.dependencies),
+        "affecting_gates": list(group.affecting_gates),
+        "conflict_ids": list(group.conflict_ids),
+        "operations": [
+            {
+                "operation_id": operation.operation_id,
+                "kind": getattr(operation.kind, "value", operation.kind),
+                "target_id": operation.target_id,
+                "before_hash": operation.before_hash,
+                "claim_ids": list(operation.claim_ids),
+            }
+            for operation in group.operations
+        ],
+    }
+
+
+def _safe_knowledge_preview(path: str, text: str) -> str:
+    """Render only metadata for an authored knowledge document."""
+
+    return json.dumps(
+        {
+            "path": path,
+            "content_fingerprint": canonical.fingerprint(text),
+            "byte_length": len(text.encode("utf-8")),
+        },
+        sort_keys=True,
+    ) + "\n"
+
+
 def _scan_preview_text(text: str) -> None:
     """Reject any forbidden token in a rendered preview file's text."""
 
@@ -1075,7 +1114,7 @@ def render_approved_summary(
     bases = _require_hash_mapping(
         base_hashes, keys=_BASE_HASH_KEYS, detail="invalid base hashes"
     )
-    decision = _require_bounded_text(
+    _require_bounded_text(
         decision_statement, detail="invalid decision statement", allow_blank=False
     )
     selected = set(group_ids)
@@ -1087,8 +1126,8 @@ def render_approved_summary(
     sub_proposal_payload: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "proposal_id": proposal.proposal_id,
-        "title": proposal.title,
-        "groups": [group.to_dict() for group in accepted_groups],
+        "proposal_fingerprint": proposal.fingerprint,
+        "groups": [_safe_operation_preview(group) for group in accepted_groups],
     }
     yaml_buf = _dump_yaml(sub_proposal_payload)
     decision_lines: list[str] = [
@@ -1103,9 +1142,13 @@ def render_approved_summary(
     ]
     for gid in group_ids:
         attestation = group_attestations.get(gid)
-        decision_text = attestation.decision if attestation else "unknown"
-        decision_lines.append(f"- {gid}: {decision_text}")
-    decision_lines.extend(["", decision.strip()])
+        if attestation is None or attestation.decision != "accepted":
+            raise ApprovalError(
+                CODE_APPROVAL_GROUP_NOT_ACCEPTED,
+                safe_detail="missing accepted group attestation",
+            ) from None
+        decision_lines.append(f"- {gid}: accepted")
+    decision_lines.extend(["", "Decision text is intentionally omitted from the safe preview."])
     decision_md = "\n".join(decision_lines) + "\n"
     evidence_lock_payload = {
         "schema_version": SCHEMA_VERSION,
@@ -1115,9 +1158,20 @@ def render_approved_summary(
     verification_json = json.dumps(verification.to_dict(), sort_keys=True) + "\n"
     approval_payload: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
-        "apply_attestation": apply_attestation.to_dict(),
+        "apply_attestation": {
+            "session_id": apply_attestation.session_id,
+            "batch_hash": apply_attestation.batch_hash,
+            "approver": apply_attestation.approver,
+            "fingerprint": apply_attestation.fingerprint,
+        },
         "group_attestations": [
-            group_attestations[gid].to_dict()
+            {
+                "session_id": group_attestations[gid].session_id,
+                "group_id": gid,
+                "approver": group_attestations[gid].approver,
+                "decision": group_attestations[gid].decision,
+                "fingerprint": group_attestations[gid].fingerprint,
+            }
             for gid in group_ids
             if gid in group_attestations
         ],
@@ -1161,14 +1215,14 @@ def render_approved_summary(
         entries.append(
             ApprovedSummaryEntry(
                 path=_safe_preview_path(f"{_APPROVED_SUMMARY_REFERENCES_DIR}/{rel_path}"),
-                text=text,
+                text=_safe_knowledge_preview(rel_path, text),
             )
         )
     for rel_path, text in _overlay_paths(candidate):
         entries.append(
             ApprovedSummaryEntry(
                 path=_safe_preview_path(f"{_APPROVED_SUMMARY_OVERLAYS_DIR}/{rel_path}"),
-                text=text,
+                text=_safe_knowledge_preview(rel_path, text),
             )
         )
     # Final safety scan over every rendered entry.
@@ -1193,25 +1247,16 @@ def render_approved_summary(
 
 
 def _catalog_patch(base_catalog_text: str, candidate: Candidate) -> str:
-    """Render the deterministic base-to-candidate catalog diff.
+    """Render catalog change metadata without copying catalog values."""
 
-    This is the same review rendering ``render_review_preview`` produces: a
-    unified diff from the authored base catalog text to the reconstructed
-    candidate catalog text. It is a rendering only; typed operations remain
-    apply authority.
-    """
-
-    import difflib
-
-    return "".join(
-        difflib.unified_diff(
-            base_catalog_text.splitlines(keepends=True),
-            candidate.catalog_text.splitlines(keepends=True),
-            fromfile="a/catalog.yaml",
-            tofile="b/catalog.yaml",
-            n=0,
-        )
-    )
+    return json.dumps(
+        {
+            "base_catalog_fingerprint": canonical.fingerprint(base_catalog_text),
+            "candidate_catalog_fingerprint": candidate.catalog_fingerprint,
+            "changed": base_catalog_text != candidate.catalog_text,
+        },
+        sort_keys=True,
+    ) + "\n"
 
 
 def compute_approved_summary_hash(
@@ -1292,9 +1337,23 @@ def write_approved_summary_preview(
     the apply transaction; Task 18 writes under the ignored workspace only.
     """
 
-    if not _HEX64_RE.match(batch_hash):
+    if not _HEX64_RE.match(batch_hash) or summary.batch_hash != batch_hash:
         raise ApprovalError(
             CODE_APPROVAL_INVALID, safe_detail="invalid batch hash"
+        ) from None
+    expected_fingerprint = canonical.fingerprint(
+        {
+            "schema_version": summary.schema_version,
+            "batch_hash": summary.batch_hash,
+            "entries": [
+                {"path": entry.path, "fingerprint": canonical.fingerprint(entry.text)}
+                for entry in summary.entries
+            ],
+        }
+    )
+    if summary.fingerprint != expected_fingerprint:
+        raise ApprovalError(
+            CODE_APPROVAL_PREVIEW_UNSAFE, safe_detail="preview fingerprint mismatch"
         ) from None
     exports = session_dir / "exports" / batch_hash
     # Defence in depth: the exports root must stay inside the session dir.
@@ -1313,7 +1372,9 @@ def write_approved_summary_preview(
         except OSError:
             pass
     for entry in summary.entries:
-        target = exports / PurePosixPath(entry.path)
+        safe_path = _safe_preview_path(entry.path)
+        _scan_preview_text(entry.text)
+        target = exports / PurePosixPath(safe_path)
         try:
             target.resolve(strict=False).relative_to(
                 exports.resolve(strict=False)

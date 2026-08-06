@@ -62,6 +62,7 @@ from selayer_discovery.approval import (
     attest_group,
     prepare_apply_batch,
     render_approved_summary,
+    validate_group_attestation,
     write_approved_summary_preview,
 )
 from selayer_discovery.canonical import fingerprint
@@ -1248,6 +1249,29 @@ def _proposal_for_approval(
     return record, proposal
 
 
+def _current_evidence_lock(session_dir: Path) -> list[dict[str, object]]:
+    """Return body-free evidence metadata bound into approval hashes."""
+
+    session_store = SessionStore.open(session_dir)
+    evidence_store = EvidenceStore.create(_evidence_root(session_dir))
+    claim_store = ClaimStore.create(session_store, evidence_store)
+    entries: list[dict[str, object]] = []
+    for claim in claim_store.claims():
+        for selector in claim.selectors:
+            raw = selector.to_dict()
+            entries.append(
+                {
+                    "claim_id": claim.claim_id,
+                    "evidence_class": claim.evidence_class,
+                    "record_id": raw.get("record_id"),
+                    "content_hash": raw.get("content_hash"),
+                    "revision": raw.get("revision"),
+                    "selector_kind": raw.get("kind"),
+                }
+            )
+    return sorted(entries, key=lambda entry: (str(entry["claim_id"]), str(entry["record_id"])))
+
+
 def _approval_context(
     project: Path,
     session_dir: Path,
@@ -1298,12 +1322,14 @@ def _approval_context(
     )
     snapshot = session_store.reconstruct()
     artifacts = snapshot.artifact_hashes
+    evidence_lock = _current_evidence_lock(session_dir)
+    evidence_lock_hash = fingerprint(evidence_lock)
     zero = "0" * 64
     session_hashes = {
         "charter": session_store.charter.fingerprint,
         "base_catalog": fingerprint(base_catalog_text),
         "policy": artifacts.get("policy", zero),
-        "evidence_lock": artifacts.get("evidence_lock", artifacts.get("evidence-lock", zero)),
+        "evidence_lock": evidence_lock_hash,
     }
     base_hashes = {
         "catalog": fingerprint(base_catalog_text),
@@ -1393,6 +1419,7 @@ def _handle_proposal_prepare_apply(args: argparse.Namespace) -> int:
         path = _proposal_root(session_dir) / proposal_id / _APPROVALS_DIR / f"{group_id}.json"
         attestations[group_id] = GroupAttestation.from_mapping(_read_approval_json(path))
     from selayer_discovery.approval import compute_approved_summary_hash
+    evidence_lock = _current_evidence_lock(session_dir)
     summary_hash = compute_approved_summary_hash(
         proposal=proposal,
         group_ids=group_ids,
@@ -1400,7 +1427,7 @@ def _handle_proposal_prepare_apply(args: argparse.Namespace) -> int:
         verification=bundle,
         base_hashes=base_hashes,
         base_catalog_text=base_text,
-        evidence_lock=[],
+        evidence_lock=evidence_lock,
         decision_statement="Approved dependency batch.",
     )
     batch = prepare_apply_batch(
@@ -1454,19 +1481,39 @@ def _prepared_batch_from_mapping(data: Mapping[str, object]) -> PreparedBatch:
         if type(value) is not str:
             raise ApprovalError("discovery.approval.invalid")
         values[field] = value
-    return PreparedBatch(
+    group_ids = _strings("group_ids")
+    attestation_fingerprints = _strings("attestation_fingerprints")
+    base_hashes = _hashes("base_hashes")
+    session_hashes = _hashes("session_hashes")
+    batch = PreparedBatch(
         schema_version=schema,
         session_id=values["session_id"],
         proposal_id=values["proposal_id"],
-        group_ids=_strings("group_ids"),
-        attestation_fingerprints=_strings("attestation_fingerprints"),
-        base_hashes=_hashes("base_hashes"),
+        group_ids=group_ids,
+        attestation_fingerprints=attestation_fingerprints,
+        base_hashes=base_hashes,
         candidate_fingerprint=values["candidate_fingerprint"],
         verification_fingerprint=values["verification_fingerprint"],
         approved_summary_hash=values["approved_summary_hash"],
-        session_hashes=_hashes("session_hashes"),
+        session_hashes=session_hashes,
         fingerprint=values["fingerprint"],
     )
+    expected = fingerprint(
+        {
+            "schema_version": batch.schema_version,
+            "proposal_id": batch.proposal_id,
+            "group_ids": list(batch.group_ids),
+            "attestation_fingerprints": list(batch.attestation_fingerprints),
+            "base_hashes": dict(batch.base_hashes),
+            "candidate_fingerprint": batch.candidate_fingerprint,
+            "verification_fingerprint": batch.verification_fingerprint,
+            "session_hashes": dict(batch.session_hashes),
+            "approved_summary_hash": batch.approved_summary_hash,
+        }
+    )
+    if expected != batch.fingerprint:
+        raise ApprovalError("discovery.approval.fingerprint_changed")
+    return batch
 
 
 def _handle_proposal_attest_apply(args: argparse.Namespace) -> int:
@@ -1511,8 +1558,38 @@ def _handle_proposal_export_preview(args: argparse.Namespace) -> int:
         timestamp=cast(str, apply_data["timestamp"]),
         fingerprint=cast(str, apply_data["fingerprint"]),
     )
-    proposal, candidate, bundle, base_text, base_hashes, _session_hashes, _store = _approval_context(project, session_dir, proposal_id, batch.group_ids)
+    if apply_attestation.batch_hash != batch.fingerprint:
+        raise ApprovalError("discovery.approval.batch_hash")
+    expected_apply_fp = fingerprint(
+        {
+            "schema_version": apply_attestation.schema_version,
+            "session_id": apply_attestation.session_id,
+            "batch_hash": apply_attestation.batch_hash,
+            "approver": apply_attestation.approver,
+            "not_a_signature": apply_attestation.not_a_signature,
+            "timestamp": apply_attestation.timestamp,
+        }
+    )
+    if expected_apply_fp != apply_attestation.fingerprint:
+        raise ApprovalError("discovery.approval.fingerprint_changed")
+    proposal, candidate, bundle, base_text, base_hashes, session_hashes, _store = _approval_context(project, session_dir, proposal_id, batch.group_ids)
+    if candidate.fingerprint != batch.candidate_fingerprint or bundle.fingerprint != batch.verification_fingerprint:
+        raise ApprovalError("discovery.approval.fingerprint_changed")
+    if any(batch.session_hashes.get(key) != session_hashes.get(key) for key in batch.session_hashes):
+        raise ApprovalError("discovery.approval.fingerprint_changed")
     attestations = {gid: GroupAttestation.from_mapping(_read_approval_json(_proposal_root(session_dir) / proposal_id / _APPROVALS_DIR / f"{gid}.json")) for gid in batch.group_ids}
+    for index, gid in enumerate(batch.group_ids):
+        attestation = attestations[gid]
+        if attestation.fingerprint != batch.attestation_fingerprints[index]:
+            raise ApprovalError("discovery.approval.fingerprint_changed")
+        group = next(group for group in proposal.groups if group.group_id == gid)
+        validate_group_attestation(
+            attestation,
+            current_input_hashes=session_hashes,
+            current_group_fingerprint=fingerprint(group.to_dict()),
+            current_candidate_fingerprint=candidate.fingerprint,
+            current_verification_fingerprint=bundle.fingerprint,
+        )
     summary = render_approved_summary(
         proposal=proposal,
         group_ids=batch.group_ids,
@@ -1522,7 +1599,7 @@ def _handle_proposal_export_preview(args: argparse.Namespace) -> int:
         apply_attestation=apply_attestation,
         base_hashes=base_hashes,
         base_catalog_text=base_text,
-        evidence_lock=[],
+        evidence_lock=_current_evidence_lock(session_dir),
         decision_statement="Approved dependency batch.",
     )
     write_approved_summary_preview(summary, session_dir, batch.fingerprint)

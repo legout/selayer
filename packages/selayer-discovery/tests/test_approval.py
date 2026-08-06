@@ -1085,7 +1085,11 @@ class TestApplyBatchAttestation:
         batch_a = prepare_apply_batch(
             proposal=proposal,
             group_ids=("group-001",),
-            attestations={"group-001": _attest_group_obj(proposal, "group-001")},
+            attestations={
+                "group-001": _attest_group_obj(
+                    proposal, "group-001", candidate=candidate_a, bundle=bundle_a
+                )
+            },
             combined_candidate=candidate_a,
             combined_verification=bundle_a,
             base_hashes=_base_hashes(),
@@ -1100,8 +1104,12 @@ class TestApplyBatchAttestation:
             proposal=proposal,
             group_ids=("group-001", "group-002"),
             attestations={
-                "group-001": _attest_group_obj(proposal, "group-001"),
-                "group-002": _attest_group_obj(proposal, "group-002"),
+                "group-001": _attest_group_obj(
+                    proposal, "group-001", candidate=candidate_b, bundle=bundle_b
+                ),
+                "group-002": _attest_group_obj(
+                    proposal, "group-002", candidate=candidate_b, bundle=bundle_b
+                ),
             },
             combined_candidate=candidate_b,
             combined_verification=bundle_b,
@@ -1263,7 +1271,7 @@ class TestApprovedSummaryPreview:
     def test_preview_path_is_hash_bound(self, tmp_path: Path) -> None:
 
         summary, session_dir = _render_summary(tmp_path)
-        batch_hash = _HEX_B
+        batch_hash = summary.batch_hash
         root = write_approved_summary_preview(summary, session_dir, batch_hash)
         assert root.name == batch_hash
         assert root.parent.name == "exports"
@@ -1316,7 +1324,7 @@ class TestApprovedSummaryPreview:
         # not write a Git-visible semantic_changes/ summary (Task 20 owns that).
 
         summary, session_dir = _render_summary(tmp_path)
-        root = write_approved_summary_preview(summary, session_dir, _HEX_B)
+        root = write_approved_summary_preview(summary, session_dir, summary.batch_hash)
         # The preview lives under the ignored session workspace, never under a
         # ``semantic_changes`` directory.
         rendered = str(root)
