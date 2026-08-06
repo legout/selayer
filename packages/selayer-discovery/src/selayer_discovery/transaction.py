@@ -261,9 +261,13 @@ class ProjectLock:
     """Project-wide OS lock with safe owner metadata."""
 
     def __init__(self, project_root: Path, transaction_root: Path, transaction_id: str, actor: str) -> None:
-        self.project_root = project_root.resolve()
         try:
+            self.project_root = project_root.resolve()
             self.root = transaction_root.resolve()
+        except OSError:
+            raise TransactionError("discovery.transaction.target_unreadable") from None
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
             self.root.mkdir(parents=True, exist_ok=True)
         except OSError:
             raise TransactionError("discovery.transaction.durability_failed") from None
@@ -277,6 +281,8 @@ class ProjectLock:
         try:
             self._lock.acquire(timeout=0)
         except Timeout:
+            raise TransactionError("discovery.transaction.locked") from None
+        except OSError:
             raise TransactionError("discovery.transaction.locked") from None
         try:
             _atomic_json_write(
@@ -300,7 +306,10 @@ class ProjectLock:
             self.owner_path.unlink(missing_ok=True)
         except OSError:
             pass
-        self._lock.release()
+        try:
+            self._lock.release()
+        except OSError:
+            pass
 
 
 class ApplyJournal:
@@ -318,8 +327,11 @@ class ApplyJournal:
         next_target: int = 0,
         injector: Callable[[str, str], None] | None = None,
     ) -> None:
-        self.project_root = project_root.resolve()
-        self.root = root.resolve()
+        try:
+            self.project_root = project_root.resolve()
+            self.root = root.resolve()
+        except OSError:
+            raise TransactionError("discovery.transaction.target_unreadable") from None
         self.transaction_id = transaction_id
         self.actor = actor
         self._records = records
@@ -446,6 +458,13 @@ class ApplyJournal:
     @classmethod
     def open(cls, journal_path: Path, *, project_root: Path, injector: Callable[[str, str], None] | None = None) -> ApplyJournal:
         _safe_file(journal_path)
+        try:
+            journal_root = journal_path.parent.resolve()
+            journal_root.relative_to(project_root.resolve())
+        except OSError:
+            raise TransactionError("discovery.transaction.target_unreadable") from None
+        except ValueError:
+            raise TransactionError("discovery.transaction.path_not_contained") from None
         try:
             data = json.loads(journal_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
