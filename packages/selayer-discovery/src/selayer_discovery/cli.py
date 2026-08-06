@@ -1572,7 +1572,11 @@ def _handle_proposal_export_preview(args: argparse.Namespace) -> int:
     )
     if expected_apply_fp != apply_attestation.fingerprint:
         raise ApprovalError("discovery.approval.fingerprint_changed")
-    proposal, candidate, bundle, base_text, base_hashes, session_hashes, _store = _approval_context(project, session_dir, proposal_id, batch.group_ids)
+    proposal, candidate, bundle, base_text, base_hashes, session_hashes, session_store = _approval_context(project, session_dir, proposal_id, batch.group_ids)
+    if any(batch.base_hashes.get(key) != base_hashes.get(key) for key in batch.base_hashes):
+        raise ApprovalError("discovery.approval.fingerprint_changed")
+    if apply_attestation.session_id != session_id or apply_attestation.approver != session_store.charter.approver:
+        raise ApprovalError("discovery.approval.actor_mismatch")
     if candidate.fingerprint != batch.candidate_fingerprint or bundle.fingerprint != batch.verification_fingerprint:
         raise ApprovalError("discovery.approval.fingerprint_changed")
     if any(batch.session_hashes.get(key) != session_hashes.get(key) for key in batch.session_hashes):
