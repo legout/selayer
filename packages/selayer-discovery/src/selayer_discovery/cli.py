@@ -60,6 +60,7 @@ from selayer_discovery.approval import (
     PreparedBatch,
     attest_apply_batch,
     attest_group,
+    compute_approved_summary_hash,
     prepare_apply_batch,
     render_approved_summary,
     validate_group_attestation,
@@ -322,10 +323,10 @@ def _validate_proposal_id(value: object) -> str:
 def _load_charter_mapping(path: Path) -> dict[str, object]:
     """Load a charter YAML file into a mapping (never leaks parse details)."""
 
-    yaml = YAML(typ="safe")
+    safe_yaml = YAML(typ="safe")
     try:
         with path.open("r", encoding="utf-8") as handle:
-            data = yaml.load(handle)
+            data = safe_yaml.load(handle)
     except (OSError, YAMLError):
         raise _CliError(CODE_CHARTER_LOAD) from None
     if not isinstance(data, Mapping):
@@ -990,10 +991,10 @@ def _load_proposal_mapping(project: Path, raw_path: str) -> dict[str, object]:
     """Load a proposal YAML/JSON file from a project-contained path."""
 
     abs_path = _assert_contained(project, Path(raw_path), kind="proposal")
-    yaml = YAML(typ="safe")
+    safe_yaml = YAML(typ="safe")
     try:
         with abs_path.open("r", encoding="utf-8") as handle:
-            data = yaml.load(handle)
+            data = safe_yaml.load(handle)
     except (OSError, YAMLError):
         raise _CliError(CODE_PROFILE_LOAD) from None
     if not isinstance(data, Mapping):
@@ -1713,6 +1714,30 @@ def _handle_proposal_apply(args: argparse.Namespace) -> int:
             current_verification_fingerprint=bundle.fingerprint,
         )
     evidence_lock = _current_evidence_lock(session_dir)
+    expected_summary_hash = compute_approved_summary_hash(
+        proposal=proposal,
+        group_ids=batch.group_ids,
+        candidate=candidate,
+        verification=bundle,
+        base_hashes=base_hashes,
+        base_catalog_text=base_text,
+        evidence_lock=evidence_lock,
+        decision_statement="Approved dependency batch.",
+    )
+    if expected_summary_hash != batch.approved_summary_hash:
+        raise ApprovalError("discovery.approval.fingerprint_changed")
+    prepared_now = prepare_apply_batch(
+        proposal=proposal,
+        group_ids=batch.group_ids,
+        attestations=group_attestations,
+        combined_candidate=candidate,
+        combined_verification=bundle,
+        base_hashes=base_hashes,
+        current_session_hashes=session_hashes,
+        approved_summary_hash=expected_summary_hash,
+    )
+    if prepared_now.fingerprint != batch.fingerprint:
+        raise ApprovalError("discovery.approval.fingerprint_changed")
     summary = render_approved_summary(
         proposal=proposal,
         group_ids=batch.group_ids,
@@ -1737,11 +1762,15 @@ def _handle_proposal_apply(args: argparse.Namespace) -> int:
         files=files,
     )
     journal.apply()
-    session_store.record_artifact(
-        "base_catalog",
-        content_hash=fingerprint(candidate.catalog_text),
-        actor=args.approver,
-    )
+    try:
+        session_store.record_artifact(
+            "base_catalog",
+            content_hash=fingerprint(candidate.catalog_text),
+            actor=args.approver,
+        )
+    except SessionError:
+        journal.rollback()
+        raise
     _emit_json({"proposal_id": proposal_id, "batch_hash": batch.fingerprint, "transaction_id": transaction_id, "files": sorted(files)})
     return EXIT_OK
 
@@ -2635,6 +2664,14 @@ def _run(handler: object, args: argparse.Namespace) -> int:
     """Invoke a handler, rendering safe diagnostics on any failure."""
 
     try:
+        readonly = {
+            _handle_recover,
+            _handle_status,
+            _handle_proposal_show,
+            _handle_proposal_verify,
+        }
+        if handler not in readonly and _pending_transaction(_project_root(getattr(args, "project", None))):
+            raise _CliError("discovery.transaction.recovery_required")
         return handler(args)  # type: ignore[operator]
     except SystemExit:
         raise
