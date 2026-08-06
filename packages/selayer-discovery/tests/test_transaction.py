@@ -124,3 +124,94 @@ def test_rollback_stops_on_unexpected_current_hash_and_retains_backup(
         journal.rollback()
     assert target.read_bytes() == b"third-party"
     assert (journal.root / journal.records[0].backup_path).exists()
+
+
+def test_apply_conflicts_when_original_is_deleted(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / "file.txt"
+    target.write_bytes(b"old")
+    journal = ApplyJournal.create(
+        project_root=project,
+        transaction_root=project / "transactions",
+        transaction_id="tx-006",
+        actor="Alice",
+        files={"file.txt": b"new"},
+    )
+    target.unlink()
+    with pytest.raises(RecoveryConflict):
+        journal.apply()
+
+
+def test_symlink_target_is_rejected(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"outside")
+    (project / "file.txt").symlink_to(outside)
+    with pytest.raises(TransactionError):
+        ApplyJournal.create(
+            project_root=project,
+            transaction_root=project / "transactions",
+            transaction_id="tx-007",
+            actor="Alice",
+            files={"file.txt": b"new"},
+        )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        "staged_file_fsync",
+        "backup_write_fsync",
+        "initial_journal_fsync",
+    ),
+)
+def test_prepare_durability_failures_leave_targets_unchanged(
+    tmp_path: Path, failure: str
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / "file.txt"
+    target.write_bytes(b"old")
+    with pytest.raises(TransactionError):
+        ApplyJournal.create(
+            project_root=project,
+            transaction_root=project / "transactions",
+            transaction_id=f"tx-{failure.replace('_', '-')}",
+            actor="Alice",
+            files={"file.txt": b"new"},
+            injector=FailureInjector({failure}),
+        )
+    assert target.read_bytes() == b"old"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        "next_target_fsync",
+        "replace",
+        "target_directory_fsync",
+        "replaced_fsync",
+        "success_marker_fsync",
+        "applied_event_fsync",
+    ),
+)
+def test_apply_durability_failures_are_recoverable(
+    tmp_path: Path, failure: str
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / "file.txt"
+    target.write_bytes(b"old")
+    journal = ApplyJournal.create(
+        project_root=project,
+        transaction_root=project / "transactions",
+        transaction_id=f"tx-{failure.replace('_', '-')}",
+        actor="Alice",
+        files={"file.txt": b"new"},
+        injector=FailureInjector({failure}),
+    )
+    with pytest.raises(TransactionError):
+        journal.apply()
+    assert recover(project / "transactions", project_root=project)

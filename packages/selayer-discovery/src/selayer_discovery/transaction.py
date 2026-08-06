@@ -135,8 +135,16 @@ def _fsync_file(path: Path, injector: Callable[[str, str], None] | None, point: 
         injector(point, "after")
 
 
-def _fsync_directory(path: Path) -> None:
+def _fsync_directory(
+    path: Path,
+    injector: Callable[[str, str], None] | None = None,
+    point: str = "directory_fsync",
+) -> None:
+    if injector is not None:
+        injector(point, "before")
     if os.name != "posix":
+        if injector is not None:
+            injector(point, "after")
         return
     try:
         descriptor = os.open(path, os.O_RDONLY)
@@ -146,6 +154,8 @@ def _fsync_directory(path: Path) -> None:
             os.close(descriptor)
     except OSError:
         raise TransactionError("discovery.transaction.durability_failed") from None
+    if injector is not None:
+        injector(point, "after")
 
 
 def _safe_rel(value: str) -> str:
@@ -153,6 +163,30 @@ def _safe_rel(value: str) -> str:
     if pure.is_absolute() or not pure.parts or any(part in ("", ".", "..") for part in pure.parts):
         raise TransactionError("discovery.transaction.path_not_contained")
     return pure.as_posix()
+
+
+def _safe_target_path(project_root: Path, relative: str) -> Path:
+    rel = _safe_rel(relative)
+    raw = project_root / rel
+    cursor = project_root
+    try:
+        for component in PurePosixPath(rel).parts:
+            cursor = cursor / component
+            if cursor.exists() and stat.S_ISLNK(os.lstat(cursor).st_mode):
+                raise TransactionError("discovery.transaction.path_not_contained")
+        resolved = raw.resolve(strict=False)
+        resolved.relative_to(project_root.resolve())
+    except FileNotFoundError:
+        resolved = raw.resolve(strict=False)
+        try:
+            resolved.relative_to(project_root.resolve())
+        except ValueError:
+            raise TransactionError("discovery.transaction.path_not_contained") from None
+    except OSError:
+        raise TransactionError("discovery.transaction.target_unreadable") from None
+    except ValueError:
+        raise TransactionError("discovery.transaction.path_not_contained") from None
+    return resolved
 
 
 class ProjectLock:
@@ -244,6 +278,29 @@ class ApplyJournal:
         files: Mapping[str, bytes],
         injector: Callable[[str, str], None] | None = None,
     ) -> ApplyJournal:
+        project = project_root.resolve()
+        recover(transaction_root, project_root=project)
+        with ProjectLock(project, transaction_root, transaction_id, actor):
+            return cls._create_unlocked(
+                project_root=project,
+                transaction_root=transaction_root,
+                transaction_id=transaction_id,
+                actor=actor,
+                files=files,
+                injector=injector,
+            )
+
+    @classmethod
+    def _create_unlocked(
+        cls,
+        *,
+        project_root: Path,
+        transaction_root: Path,
+        transaction_id: str,
+        actor: str,
+        files: Mapping[str, bytes],
+        injector: Callable[[str, str], None] | None = None,
+    ) -> ApplyJournal:
         if not isinstance(transaction_id, str) or not transaction_id or len(transaction_id) > _MAX_TRANSACTION_ID:
             raise TransactionError("discovery.transaction.invalid_transaction")
         project = project_root.resolve()
@@ -262,11 +319,7 @@ class ApplyJournal:
             if not isinstance(content, bytes):
                 raise TransactionError("discovery.transaction.invalid_target")
             rel = _safe_rel(raw_path)
-            target = (project / rel).resolve(strict=False)
-            try:
-                target.relative_to(project)
-            except ValueError:
-                raise TransactionError("discovery.transaction.path_not_contained") from None
+            target = _safe_target_path(project, rel)
             if target.exists():
                 try:
                     mode = os.lstat(target).st_mode
@@ -356,12 +409,16 @@ class ApplyJournal:
         except OSError:
             raise TransactionError("discovery.transaction.durability_failed") from None
         _fsync_file(self.journal_path, self._injector, point or "journal_fsync")
-        _fsync_directory(self.root)
+        _fsync_directory(self.root, self._injector, "journal_directory_fsync")
 
     def _target(self, record: TargetRecord) -> Path:
-        path = (self.project_root / record.path).resolve(strict=False)
+        return _safe_target_path(self.project_root, record.path)
+
+    def _artifact(self, relative: str) -> Path:
+        safe = _safe_rel(relative)
+        path = (self.root / safe).resolve(strict=False)
         try:
-            path.relative_to(self.project_root)
+            path.relative_to(self.root)
         except ValueError:
             raise TransactionError("discovery.transaction.path_not_contained") from None
         return path
@@ -376,6 +433,8 @@ class ApplyJournal:
                 self._next_target = index
                 self._write_journal("next_target_fsync")
                 target = self._target(record)
+                if not target.exists() and not record.old_absent:
+                    raise RecoveryConflict()
                 if target.exists() and _hash_file(target) not in {record.old_hash, record.new_hash}:
                     raise RecoveryConflict()
                 if target.exists() and _hash_file(target) == record.new_hash:
@@ -386,10 +445,10 @@ class ApplyJournal:
                     continue
                 self._inject("replace", "before")
                 target.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(self.root / record.staged_path, target)
+                os.replace(self._artifact(record.staged_path), target)
                 self._inject("replace", "after")
                 _fsync_file(target, self._injector, "target_directory_fsync")
-                _fsync_directory(target.parent)
+                _fsync_directory(target.parent, self._injector, "target_directory_fsync")
                 self._records = tuple(
                     replace(item, state="replaced") if item.path == record.path else item
                     for item in self._records
@@ -398,10 +457,14 @@ class ApplyJournal:
             success = self.root / "success.json"
             success.write_text(json.dumps({"transaction_id": self.transaction_id, "new_hashes": [r.new_hash for r in self._records]}, sort_keys=True), encoding="utf-8")
             _fsync_file(success, self._injector, "success_marker_fsync")
+            self._state = "success_marked"
+            self._write_journal("applied_event_fsync")
+            applied = self.root / "applied.json"
+            applied.write_text(json.dumps({"transaction_id": self.transaction_id}, sort_keys=True), encoding="utf-8")
+            _fsync_file(applied, self._injector, "applied_event_fsync")
+            _fsync_directory(self.root, self._injector, "applied_directory_fsync")
             self._state = "completed"
             self._write_journal("applied_event_fsync")
-            (self.root / "applied.json").write_text(json.dumps({"transaction_id": self.transaction_id}, sort_keys=True), encoding="utf-8")
-            _fsync_file(self.root / "applied.json", self._injector, "applied_event_fsync")
 
     def _inject(self, point: str, phase: str) -> None:
         if self._injector is not None:
@@ -415,7 +478,10 @@ class ApplyJournal:
             for record in self._records:
                 target = self._target(record)
                 current = None if not target.exists() else _hash_file(target)
-                if current not in {None, record.old_hash, record.new_hash}:
+                allowed = {record.old_hash, record.new_hash}
+                if record.old_absent:
+                    allowed.add(None)
+                if current not in allowed:
                     raise RecoveryConflict()
             for record in reversed(self._records):
                 target = self._target(record)
@@ -424,9 +490,16 @@ class ApplyJournal:
                     if record.old_absent:
                         target.unlink(missing_ok=True)
                     else:
-                        target.write_bytes((self.root / record.backup_path).read_bytes())
+                        backup = self._artifact(record.backup_path)
+                        try:
+                            restored = backup.read_bytes()
+                        except OSError:
+                            raise TransactionError("discovery.transaction.backup_missing") from None
+                        if _hash_bytes(restored) != record.old_hash:
+                            raise RecoveryConflict()
+                        target.write_bytes(restored)
                         _fsync_file(target, self._injector, "target_directory_fsync")
-                    _fsync_directory(target.parent)
+                    _fsync_directory(target.parent, self._injector, "target_directory_fsync")
             self._state = "rolled_back"
             self._write_journal("rollback_fsync")
 
@@ -434,16 +507,38 @@ class ApplyJournal:
 def recover(transaction_root: Path, *, project_root: Path) -> tuple[str, ...]:
     """Recover every pending transaction; repeated calls are idempotent."""
 
+    try:
+        if stat.S_ISLNK(os.lstat(transaction_root).st_mode):
+            raise TransactionError("discovery.transaction.path_not_contained")
+    except FileNotFoundError:
+        return ()
+    except OSError:
+        raise TransactionError("discovery.transaction.target_unreadable") from None
     root = transaction_root.resolve()
     if not root.exists():
         return ()
     recovered: list[str] = []
-    for directory in sorted(path for path in root.iterdir() if path.is_dir() and not path.name.startswith(".")):
+    directories: list[Path] = []
+    for path in root.iterdir():
+        if path.name.startswith("."):
+            continue
+        try:
+            mode = os.lstat(path).st_mode
+        except OSError:
+            raise TransactionError("discovery.transaction.target_unreadable") from None
+        if stat.S_ISLNK(mode):
+            raise TransactionError("discovery.transaction.path_not_contained")
+        if stat.S_ISDIR(mode):
+            directories.append(path)
+    for directory in sorted(directories):
         journal_path = directory / "journal.json"
         if not journal_path.exists():
             continue
         journal = ApplyJournal.open(journal_path, project_root=project_root)
-        if journal.state in {"completed", "rolled_back"}:
+        applied = directory / "applied.json"
+        if journal.state == "rolled_back":
+            continue
+        if journal.state == "completed" and applied.exists():
             continue
         success = directory / "success.json"
         valid_success = False
@@ -453,17 +548,18 @@ def recover(transaction_root: Path, *, project_root: Path) -> tuple[str, ...]:
                 valid_success = (
                     isinstance(marker, Mapping)
                     and marker.get("transaction_id") == journal.transaction_id
+                    and marker.get("new_hashes") == [record.new_hash for record in journal.records]
                     and all(_hash_file(journal._target(record)) == record.new_hash for record in journal.records)
                 )
             except (OSError, ValueError, TransactionError):
                 valid_success = False
         if valid_success:
-            journal._state = "completed"
-            journal._write_journal("applied_event_fsync")
-            applied = directory / "applied.json"
             if not applied.exists():
                 applied.write_text(json.dumps({"transaction_id": journal.transaction_id}, sort_keys=True), encoding="utf-8")
                 _fsync_file(applied, None, "applied_event_fsync")
+                _fsync_directory(directory)
+            journal._state = "completed"
+            journal._write_journal("applied_event_fsync")
         else:
             journal.rollback()
         recovered.append(journal.transaction_id)
