@@ -26,11 +26,12 @@ _REPLAY = Path(__file__).parents[3] / "examples" / "shopfloor" / "discovery" / "
 def _snapshot_tree(path: Path) -> tuple[tuple[str, bytes], ...]:
     if not path.exists():
         return ()
+    ignored = {".git", ".pytest_cache", "__pycache__", "build", "dist"}
     return tuple(
         sorted(
             (str(child.relative_to(path)), child.read_bytes())
             for child in path.rglob("*")
-            if child.is_file()
+            if child.is_file() and not any(part in ignored for part in child.parts)
         )
     )
 
@@ -117,8 +118,7 @@ def test_replay_runs_temporary_catalog_okf_and_typed_evidence_flow(
 
     root = _REPLAY.parents[1]
     repository_root = root.parent.parent
-    repository_changes = repository_root / "semantic_changes"
-    repository_before = _snapshot_tree(repository_changes)
+    repository_before = _snapshot_tree(repository_root)
     catalog_source = root / "shopfloor_semantic_layer.yaml"
     catalog = cast(
         dict[str, Any], yaml.safe_load(catalog_source.read_text(encoding="utf-8"))
@@ -162,9 +162,10 @@ def test_replay_runs_temporary_catalog_okf_and_typed_evidence_flow(
         cast(str, yaml.safe_dump(catalog, sort_keys=False)), encoding="utf-8"
     )
     corrected_layer = SemanticLayer.load(corrected_catalog)
-    assert (
-        corrected_layer.dimension("drive_serial_number").source == "serialized_drives"
-    )
+    corrected_dimension = corrected_layer.dimension("drive_serial_number")
+    assert corrected_dimension.source == correction["source"]
+    assert corrected_dimension.column == correction["column"]
+    assert corrected_dimension.data_type == correction["data_type"]
     assert verify_static(corrected_layer).complete
     bundle = OkfBundle.build(
         corrected_layer,
@@ -243,7 +244,7 @@ def test_replay_runs_temporary_catalog_okf_and_typed_evidence_flow(
     )
     assert "filesystem OKF evidence" not in generated
     assert all(f"business document {index}" not in generated for index in range(4))
-    assert _snapshot_tree(repository_changes) == repository_before
+    assert _snapshot_tree(repository_root) == repository_before
 
     source_root = repository_root / "packages" / "selayer-discovery" / "src"
     forbidden_modules = {"subprocess", "requests", "httpx", "socket", "openai", "anthropic"}
@@ -252,9 +253,14 @@ def test_replay_runs_temporary_catalog_okf_and_typed_evidence_flow(
         imports = {
             alias.name.split(".", 1)[0]
             for node in ast.walk(tree)
-            if isinstance(node, (ast.Import, ast.ImportFrom))
+            if isinstance(node, ast.Import)
             for alias in node.names
         }
+        imports.update(
+            node.module.split(".", 1)[0]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module is not None
+        )
         assert not imports & forbidden_modules, source_path
         assert not any(
             isinstance(node, ast.Call)
