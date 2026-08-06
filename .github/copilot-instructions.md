@@ -2,9 +2,11 @@
 
 ## Scope
 
-This repository contains only the installable `selayer` semantic-layer library.
-Code under `legacy/` is unsupported historical reference material and must not
-be imported, packaged, linted, or extended as active product code.
+This repository contains the installable `selayer` semantic-layer library
+and its separate `selayer-discovery` companion. Code under `legacy/` is
+unsupported historical reference material and must not be imported, packaged,
+linted, or extended as active product code. Core `src/selayer/` must not import
+the discovery companion or any LLM SDK/runtime.
 
 ## Active modules
 
@@ -19,8 +21,15 @@ be imported, packaged, linted, or extended as active product code.
 - `src/selayer/okf/`: advisory OKF bundles and the unified CLI area.
 - `src/selayer/cli.py`: unified `catalog` and `okf` command-line surface.
 - `src/selayer/__init__.py`: curated public exports.
+- `packages/selayer-discovery/src/selayer_discovery/`: deterministic companion
+  state machine for sessions, evidence, proposals, verification, approval,
+  apply, and recovery.
+- `packages/selayer-discovery/skills/semantic-discovery/SKILL.md`: canonical
+  packaged agent forwarder; do not create a second skill implementation.
 - `tests/`: behavior, regression, and integration tests.
+- `packages/selayer-discovery/tests/`: companion contract and safety tests.
 - `examples/e_commerce/`: migrated schema-version-1 example catalog and script.
+- `examples/shopfloor/discovery/`: deterministic no-model discovery replay.
 
 ## Sources, profiles, and lifecycle
 
@@ -62,7 +71,36 @@ only the result-frame boundary.
 The catalog is execution authority. OKF is advisory and cannot add or override
 queryable dimensions, facts, measures, metrics, relationships, planning, or
 execution behavior. Keep LLM and agent orchestration outside the installable
-package.
+core package; the discovery companion is deterministic and accepts only typed
+operations and bounded evidence.
+
+## Semantic discovery workflow
+
+Install the companion explicitly with `uv sync --all-packages` (and `--extra
+delta` for the shopfloor replay). Follow this authority path:
+
+```text
+Evidence and interviews -> agent draft -> typed proposal -> deterministic checks
+-> named group decision -> prepared batch -> named batch attestation
+-> explicit recoverable apply -> Git review
+```
+
+Initialize a charter before intake. Use one interview question at a time and
+record answers, append-only corrections, typed claims, and conflicts through
+the `selayer-discovery` CLI. Never edit session, evidence, interview, policy,
+proposal, approval, or transaction files directly. Never write generated OKF by
+hand and never run Git from discovery.
+
+Default policy omits sensitive values; hard-denied fields stay unavailable and
+approved transformations are bounded, redacted, and canary-scanned. Value
+context requires named policy activation. Verification fails closed on missing
+or stale evidence, unresolved gates/conflicts/dependencies, unavailable
+snapshots, or skipped mandatory checks. Unresolved conflicts block only their
+affected groups. Apply requires both a named group decision and matching batch
+attestation, reruns mandatory checks, writes through a fsynced recoverable
+journal, and stops on target drift or ambiguous recovery. Run explicit recovery
+with `selayer-discovery recover --project <root>`; inspect changes and perform
+Git review afterward.
 
 - Bind user-provided filter values as DuckDB parameters.
 - Quote catalog identifiers and reject unknown metrics, dimensions, and filters.
@@ -81,10 +119,12 @@ Use uv for all dependency and command execution:
 
 ```bash
 uv sync
+uv sync --all-packages --extra delta
 uv run pytest -q
-uv run ruff check src tests examples
-uv run pyright src tests examples
+uv run ruff check src tests packages examples
+uv run pyright src tests packages examples
 uv build
+uv build --package selayer-discovery
 ```
 
 Add a failing test before changing behavior or fixing a defect. Keep chat, LLM,

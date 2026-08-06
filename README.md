@@ -19,6 +19,58 @@ uv sync --all-packages
 `--all-packages` also installs the `selayer-discovery` workspace member;
 plain `uv sync` only installs the root `selayer` package.
 
+## Agent-assisted semantic discovery
+
+`selayer-discovery` is a separate companion package. Install the full
+workspace, including the Delta extra used by the shopfloor replay, before
+using it:
+
+```bash
+uv sync
+uv sync --all-packages --extra delta
+uv run --package selayer-discovery selayer-discovery --help
+```
+
+The complete authority path is:
+
+```text
+Evidence and interviews -> agent draft -> typed proposal -> deterministic checks
+-> named group decision -> prepared batch -> named batch attestation
+-> explicit recoverable apply -> Git review
+```
+
+The catalog remains execution authority. Evidence, interviews, proposals,
+approval records, and OKF are advisory until typed operations pass deterministic
+checks and are explicitly applied. Generated OKF is never edited by discovery.
+
+Discovery is privacy-first: intake is normalized and bounded; default policy
+omits sensitive fields, hard-denied fields cannot be requested, and approved
+transformations are redacted and canary-scanned. Value-derived context requires
+named policy activation. Provider and transaction evidence is reopenable where
+required, while live or unavailable evidence keeps the affected group blocked.
+Exact profiles provide counts and audit metadata, not proof that physical data
+has not changed; rerun the required physical/source checks at verification and
+apply time.
+
+Use one question at a time in the adaptive interview. Corrections are
+append-only and stale their dependents. Unresolved conflicts block only their
+affected dependency groups. Deprecation is non-destructive and does not
+rewrite requests automatically.
+
+Apply is intentionally separate from approval: it requires a current named
+group decision, a matching prepared batch, and a named batch attestation. The
+apply journal is write-ahead and fsynced; target drift or an ambiguous recovery
+stops the operation rather than guessing. Recovery is explicit and idempotent:
+
+```bash
+uv run --package selayer-discovery selayer-discovery recover --project <root>
+```
+
+Discovery does not run Git. After apply, inspect the changed files and checks,
+then perform the normal Git review yourself. See
+[`packages/selayer-discovery/README.md`](packages/selayer-discovery/README.md)
+for the command workflow and safety rules.
+
 ## Example catalog
 
 ```python
@@ -216,7 +268,9 @@ re-readable temp tables. Connector metadata (`connector`, `generation`,
 `snapshot`, `schema_fingerprint`) is read from registry status at audit time,
 so the report reflects the data state observed at audit time, not an ongoing
 guarantee: a snapshot-capable connector (Delta, Iceberg) pins the snapshot it
-observed, while file connectors report `snapshot: null`. A required source
+observed. Local file connectors report a content digest that can be
+reacquired; remote profile-backed objects remain live and report
+`snapshot: null`. A required source
 that cannot be read audits as an `unavailable` outcome, which makes the report
 `complete: false` and `passed: false`; a data-quality failure (a null or
 duplicated grain) keeps the report complete but non-passing. No offending
