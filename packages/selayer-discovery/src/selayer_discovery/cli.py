@@ -116,6 +116,14 @@ from selayer_discovery.session import (
     SessionError,
     SessionStore,
 )
+from selayer_discovery.transaction import (
+    ApplyJournal,
+    RecoveryConflict,
+    TransactionError,
+)
+from selayer_discovery.transaction import (
+    recover as recover_transactions,
+)
 
 __all__ = ["main", "run"]
 
@@ -1611,6 +1619,143 @@ def _handle_proposal_export_preview(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _pending_transaction(project: Path) -> bool:
+    root = project / ".selayer" / "discovery" / "transactions"
+    if not root.exists():
+        return False
+    for directory in root.iterdir():
+        journal = directory / "journal.json"
+        if not journal.is_file():
+            continue
+        try:
+            data = json.loads(journal.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return True
+        if isinstance(data, Mapping) and data.get("state") not in {"completed", "rolled_back"}:
+            return True
+    return False
+
+
+def _load_apply_attestation(path: Path) -> ApplyBatchAttestation:
+    data = _read_approval_json(path)
+    required = ("schema_version", "session_id", "batch_hash", "approver", "not_a_signature", "timestamp", "fingerprint")
+    if not all(key in data for key in required) or type(data.get("schema_version")) is not int:
+        raise ApprovalError("discovery.approval.invalid")
+    if not all(type(data[key]) is str for key in required if key != "schema_version"):
+        raise ApprovalError("discovery.approval.invalid")
+    return ApplyBatchAttestation(
+        schema_version=cast(int, data["schema_version"]),
+        session_id=cast(str, data["session_id"]),
+        batch_hash=cast(str, data["batch_hash"]),
+        approver=cast(str, data["approver"]),
+        not_a_signature=cast(str, data["not_a_signature"]),
+        timestamp=cast(str, data["timestamp"]),
+        fingerprint=cast(str, data["fingerprint"]),
+    )
+
+
+def _handle_proposal_apply(args: argparse.Namespace) -> int:
+    project = _project_root(args.project)
+    session_id = _validate_session_id(args.session_id)
+    session_dir = _require_session(project, session_id)
+    if _pending_transaction(project):
+        raise _CliError("discovery.transaction.recovery_required")
+    proposal_id = _validate_proposal_id(args.proposal)
+    proposal_dir = _proposal_root(session_dir) / proposal_id
+    batch = _prepared_batch_from_mapping(_read_approval_json(proposal_dir / _BATCH_FILENAME))
+    apply_attestation = _load_apply_attestation(proposal_dir / _APPLY_ATTESTATION_FILENAME)
+    proposal, candidate, bundle, base_text, base_hashes, session_hashes, session_store = _approval_context(project, session_dir, proposal_id, batch.group_ids)
+    expected_apply_fp = fingerprint(
+        {
+            "schema_version": apply_attestation.schema_version,
+            "session_id": apply_attestation.session_id,
+            "batch_hash": apply_attestation.batch_hash,
+            "approver": apply_attestation.approver,
+            "not_a_signature": apply_attestation.not_a_signature,
+            "timestamp": apply_attestation.timestamp,
+        }
+    )
+    if expected_apply_fp != apply_attestation.fingerprint:
+        raise ApprovalError("discovery.approval.fingerprint_changed")
+    if apply_attestation.batch_hash != batch.fingerprint or apply_attestation.session_id != session_id or apply_attestation.approver != session_store.charter.approver:
+        raise ApprovalError("discovery.approval.fingerprint_changed")
+    if candidate.fingerprint != batch.candidate_fingerprint or bundle.fingerprint != batch.verification_fingerprint:
+        raise ApprovalError("discovery.approval.fingerprint_changed")
+    if any(batch.base_hashes.get(key) != base_hashes.get(key) for key in batch.base_hashes) or any(batch.session_hashes.get(key) != session_hashes.get(key) for key in batch.session_hashes):
+        raise ApprovalError("discovery.approval.fingerprint_changed")
+    files: dict[str, bytes] = {}
+    catalog_rel = session_store.charter.catalog_path
+    files[catalog_rel] = candidate.catalog_text.encode("utf-8")
+    for operation in proposal.operations:
+        kind = getattr(operation.kind, "value", str(operation.kind))
+        if kind == "reference.create" or kind == "reference.update":
+            text = dict(candidate.references).get(operation.target_id)
+            if text is not None:
+                files[f"references/{operation.target_id}"] = text.encode("utf-8")
+        elif kind == "overlay.create" or kind == "overlay.update":
+            text = dict(candidate.overlays).get(operation.target_id)
+            if text is not None:
+                files[f"okf_overlays/{operation.target_id}"] = text.encode("utf-8")
+    group_attestations = {
+        gid: GroupAttestation.from_mapping(_read_approval_json(proposal_dir / _APPROVALS_DIR / f"{gid}.json"))
+        for gid in batch.group_ids
+    }
+    for index, gid in enumerate(batch.group_ids):
+        attestation = group_attestations[gid]
+        if attestation.fingerprint != batch.attestation_fingerprints[index]:
+            raise ApprovalError("discovery.approval.fingerprint_changed")
+        group = next(group for group in proposal.groups if group.group_id == gid)
+        validate_group_attestation(
+            attestation,
+            current_input_hashes=session_hashes,
+            current_group_fingerprint=fingerprint(group.to_dict()),
+            current_candidate_fingerprint=candidate.fingerprint,
+            current_verification_fingerprint=bundle.fingerprint,
+        )
+    evidence_lock = _current_evidence_lock(session_dir)
+    summary = render_approved_summary(
+        proposal=proposal,
+        group_ids=batch.group_ids,
+        candidate=candidate,
+        verification=bundle,
+        group_attestations=group_attestations,
+        apply_attestation=apply_attestation,
+        base_hashes=base_hashes,
+        base_catalog_text=base_text,
+        evidence_lock=evidence_lock,
+        decision_statement="Approved dependency batch.",
+    )
+    summary_root = Path("semantic_changes") / proposal_id / batch.fingerprint
+    for entry in summary.entries:
+        files[(summary_root / entry.path).as_posix()] = entry.text.encode("utf-8")
+    transaction_id = f"apply-{batch.fingerprint[:16]}"
+    journal = ApplyJournal.create(
+        project_root=project,
+        transaction_root=project / ".selayer" / "discovery" / "transactions",
+        transaction_id=transaction_id,
+        actor=args.approver,
+        files=files,
+    )
+    journal.apply()
+    session_store.record_artifact(
+        "base_catalog",
+        content_hash=fingerprint(candidate.catalog_text),
+        actor=args.approver,
+    )
+    _emit_json({"proposal_id": proposal_id, "batch_hash": batch.fingerprint, "transaction_id": transaction_id, "files": sorted(files)})
+    return EXIT_OK
+
+
+def _handle_recover(args: argparse.Namespace) -> int:
+    project = _project_root(args.project)
+    recovered = recover_transactions(
+        project / ".selayer" / "discovery" / "transactions",
+        project_root=project,
+    )
+    _emit_json({"recovered": list(recovered)})
+    return EXIT_OK
+
+
 def _handle_proposal_verify(args: argparse.Namespace) -> int:
     project = _project_root(args.project)
     session_id = _validate_session_id(args.session_id)
@@ -2463,6 +2608,21 @@ def _parser() -> argparse.ArgumentParser:
     proposal_export_parser.add_argument("--proposal", required=True)
     proposal_export_parser.set_defaults(func=_handle_proposal_export_preview)
 
+    proposal_apply_parser = proposal_sub.add_parser(
+            "apply", help="Apply one current, attested batch explicitly."
+    )
+    proposal_apply_parser.add_argument("--session-id", required=True)
+    proposal_apply_parser.add_argument("--project")
+    proposal_apply_parser.add_argument("--proposal", required=True)
+    proposal_apply_parser.add_argument("--approver", required=True)
+    proposal_apply_parser.set_defaults(func=_handle_proposal_apply)
+
+    recover_parser = subparsers.add_parser(
+            "recover", help="Recover or roll back a pending apply transaction."
+    )
+    recover_parser.add_argument("--project")
+    recover_parser.set_defaults(func=_handle_recover)
+
     return parser
 
 
@@ -2488,6 +2648,8 @@ def _run(handler: object, args: argparse.Namespace) -> int:
         DiscoveryError,
         ProposalError,
         ApprovalError,
+        TransactionError,
+        RecoveryConflict,
     ) as exc:
         _emit_error(exc)
         return EXIT_ERROR
