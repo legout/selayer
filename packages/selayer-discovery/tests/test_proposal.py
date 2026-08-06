@@ -31,6 +31,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pyarrow as pa
@@ -47,6 +48,7 @@ from selayer_discovery.proposal import (
     ProposalError,
     QueryCase,
     ReviewPreview,
+    _run_physical_check,
     build_proposal,
     reconstruct_candidate,
     render_review_preview,
@@ -54,6 +56,7 @@ from selayer_discovery.proposal import (
 )
 
 from selayer.catalog import SemanticLayer
+from selayer.verification import PhysicalCheck
 
 # --------------------------------------------------------------------------- #
 # Catalog fixtures                                                            #
@@ -2299,6 +2302,46 @@ class TestVerificationChecks:
         assert MandatoryCheckKind.PHYSICAL.value in kinds
         physical = bundle.check("group-001", MandatoryCheckKind.PHYSICAL.value)
         assert physical.status == "passed"
+
+    def test_physical_check_uses_runtime_profile_resolver(
+        self,
+        catalog_dir: Path,
+        base_catalog_text: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        orders_path = catalog_dir / "data" / "orders.parquet"
+        proposal, candidate, layer, _ = _reconstruct_and_load(
+            _proposal_mapping(
+                groups=[
+                    _group(
+                        title="Edit order grain",
+                        rationale="Grain revision.",
+                        operations=[
+                            _source_grain_edit_op(
+                                before=_orders_source(str(orders_path), ["id"])
+                            )
+                        ],
+                    )
+                ]
+            ),
+            base_catalog_text,
+            tmp_path,
+        )
+        del proposal
+        resolver: Any = object()
+        seen: list[object] = []
+
+        def fake_verify(_layer: object, check: object) -> SimpleNamespace:
+            seen.append(check)
+            return SimpleNamespace(passed=True, complete=True, outcomes=(), diagnostics=())
+
+        monkeypatch.setattr("selayer.verification.verify_physical", fake_verify)
+        _run_physical_check(layer, candidate, profiles=resolver)
+        assert seen
+        check = seen[0]
+        assert isinstance(check, PhysicalCheck)
+        assert check.profiles is resolver
 
     def test_physical_check_unavailable_when_source_missing(
         self, tmp_path: Path

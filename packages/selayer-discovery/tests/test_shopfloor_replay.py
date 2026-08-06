@@ -12,12 +12,14 @@ from selayer_discovery.canonical import fingerprint
 from selayer_discovery.cli import _runtime_profile_resolver, main
 from selayer_discovery.evidence import (
     ClaimStore,
+    ConflictKind,
     EvidenceClass,
     EvidenceStore,
     selector_from_mapping,
 )
 from selayer_discovery.interview import InterviewStore
 from selayer_discovery.model import SCHEMA_VERSION
+from selayer_discovery.profiling import SourceProfile, propose_policy
 from selayer_discovery.session import SessionCharter, SessionStore
 
 from selayer import SemanticLayer
@@ -223,6 +225,55 @@ def test_replay_runs_temporary_catalog_okf_and_typed_evidence_flow(
         == "shopfloor_readonly"
     )
     session = SessionStore.create(session_dir, charter=charter, actor=charter.approver)
+    profile_scan_result = main(
+        [
+            "profile",
+            "scan",
+            "--project",
+            str(tmp_path),
+            "--session-id",
+            charter.session_id,
+            "--source-id",
+            "serialized_drives",
+            "--columns",
+            "serial_number",
+            "--grain",
+            "serial_number",
+        ]
+    )
+    profile_output = capsys.readouterr()
+    assert profile_scan_result == 0, profile_output.err
+    profile_data = cast(dict[str, Any], json.loads(profile_output.out))
+    assert profile_data["outcome"] == "completed"
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(profile_data), encoding="utf-8")
+    policy, _ = propose_policy(
+        SourceProfile.from_dict(profile_data),
+        ("serial_number",),
+        salt_id=fingerprint("shopfloor-replay-salt"),
+    )
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(json.dumps(policy.to_dict()), encoding="utf-8")
+    activation_result = main(
+        [
+            "profile",
+            "activate-policy",
+            "--project",
+            str(tmp_path),
+            "--session-id",
+            charter.session_id,
+            "--profile",
+            str(profile_path),
+            "--policy",
+            str(policy_path),
+            "--activated-at",
+            "2026-01-01",
+        ]
+    )
+    activation_output = capsys.readouterr()
+    assert activation_result == 0, activation_output.err
+    activation = cast(dict[str, Any], json.loads(activation_output.out))
+    assert session.reconstruct().artifact_hashes["policy"] == activation["fingerprint"]
     evidence = EvidenceStore.create(session_dir / "evidence")
     records = []
     for index in range(4):
@@ -279,6 +330,15 @@ def test_replay_runs_temporary_catalog_okf_and_typed_evidence_flow(
             {"kind": "document_line_range", "start_line": 1, "end_line": 1},
             EvidenceClass.INFERRED,
         ),
+        (
+            "claim-telemetry",
+            records[3],
+            {
+                "kind": "source_field",
+                "field": "serial_number",
+            },
+            EvidenceClass.ASSERTED,
+        ),
     )
     for claim_id, record, selector_fields, evidence_class in claim_specs:
         selector = selector_from_mapping(
@@ -298,8 +358,18 @@ def test_replay_runs_temporary_catalog_okf_and_typed_evidence_flow(
             creator_event=creator,
             actor=charter.approver,
         )
+    telemetry_conflict = claims.add_conflict(
+        conflict_id="conflict-operation-telemetry",
+        kind=ConflictKind.SEMANTIC,
+        subject="dimension.operation_telemetry_join",
+        involved_claim_ids=("claim-telemetry",),
+        affected_group_ids=("group-telemetry-join",),
+        reason="Charter excludes operation-to-telemetry joins.",
+        actor=charter.approver,
+    )
+    assert telemetry_conflict.state == "unresolved"
     assert okf_record.content_hash
-    assert len(claims.claims()) == 3
+    assert len(claims.claims()) == 4
 
     proposal_data = cast(
         dict[str, Any],
@@ -318,11 +388,32 @@ def test_replay_runs_temporary_catalog_okf_and_typed_evidence_flow(
     import_result = main(
         ["proposal", "import", *common, "--proposal", str(proposal_path)]
     )
-    assert import_result == 0, capsys.readouterr().err
+    import_output = capsys.readouterr()
+    assert import_result == 0, import_output.err
     verify_result = main(
         ["proposal", "verify", *common, "--proposal", proposal_data["proposal_id"]]
     )
-    assert verify_result == 0, capsys.readouterr().err
+    verify_output = capsys.readouterr()
+    assert verify_result == 0, verify_output.err
+    verification_path = (
+        tmp_path
+        / ".selayer"
+        / "discovery"
+        / "sessions"
+        / charter.session_id
+        / "proposals"
+        / proposal_data["proposal_id"]
+        / "verification.json"
+    )
+    verification = cast(
+        dict[str, Any], json.loads(verification_path.read_text(encoding="utf-8"))
+    )
+    telemetry_group = next(
+        group
+        for group in verification["groups"]
+        if group["group_id"] == "group-telemetry-join"
+    )
+    assert "conflict_unresolved" in telemetry_group["readiness"]["blockers"]
     attest_result = main(
         [
             "proposal",
@@ -349,15 +440,7 @@ def test_replay_runs_temporary_catalog_okf_and_typed_evidence_flow(
         ]
     )
     assert prepare_result == 0, capsys.readouterr().err
-    proposal_dir = (
-        tmp_path
-        / ".selayer"
-        / "discovery"
-        / "sessions"
-        / charter.session_id
-        / "proposals"
-        / proposal_data["proposal_id"]
-    )
+    proposal_dir = verification_path.parent
     batch = cast(
         dict[str, Any],
         json.loads((proposal_dir / "prepared-batch.json").read_text(encoding="utf-8")),

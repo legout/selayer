@@ -688,6 +688,20 @@ def _runtime_profile_resolver(
     return resolver
 
 
+def _runtime_profile_fingerprint(project: Path, charter: SessionCharter) -> str:
+    """Return a digest of the project-contained profile document, if any."""
+
+    if not charter.runtime_profile:
+        return fingerprint("")
+    profile_path = _assert_contained(
+        project, project / charter.runtime_profile, kind="runtime_profile"
+    )
+    try:
+        return hashlib.sha256(profile_path.read_bytes()).hexdigest()
+    except OSError:
+        raise _CliError(CODE_PROFILE_LOAD) from None
+
+
 def _handle_profile_scan(args: argparse.Namespace) -> int:
     project = _project_root(args.project)
     session_id = _validate_session_id(args.session_id)
@@ -1367,6 +1381,8 @@ def _approval_context(
     evidence_store = EvidenceStore.create(_evidence_root(session_dir))
     claim_store = ClaimStore.create(session_store, evidence_store)
     interview_store = InterviewStore.create(session_store)
+    runtime_profiles = _runtime_profile_resolver(project, session_store.charter)
+    runtime_profile_hash = _runtime_profile_fingerprint(project, session_store.charter)
     bundle = verify_proposal(
         proposal=proposal,
         candidate=candidate,
@@ -1375,6 +1391,8 @@ def _approval_context(
         interview_store=interview_store,
         claim_store=claim_store,
         evidence_store=evidence_store,
+        profiles=runtime_profiles,
+        runtime_profile_fingerprint=runtime_profile_hash,
     )
     snapshot = session_store.reconstruct()
     artifacts = snapshot.artifact_hashes
@@ -2041,6 +2059,8 @@ def _handle_proposal_verify(args: argparse.Namespace) -> int:
     evidence_store = EvidenceStore.create(_evidence_root(session_dir))
     claim_store = ClaimStore.create(session_store, evidence_store)
     interview_store = InterviewStore.create(session_store)
+    runtime_profiles = _runtime_profile_resolver(project, session_store.charter)
+    runtime_profile_hash = _runtime_profile_fingerprint(project, session_store.charter)
     okf_output_dir = proposal_dir / "verify-okf"
     bundle = verify_proposal(
         proposal=proposal,
@@ -2050,6 +2070,8 @@ def _handle_proposal_verify(args: argparse.Namespace) -> int:
         interview_store=interview_store,
         claim_store=claim_store,
         evidence_store=evidence_store,
+        profiles=runtime_profiles,
+        runtime_profile_fingerprint=runtime_profile_hash,
     )
     # Persist an immutable, sorted, safe report bound to the input hashes. The
     # content is a pure function of the inputs, so a repeated run with
@@ -2395,6 +2417,12 @@ def _handle_profile_activate_policy(args: argparse.Namespace) -> int:
     # Persist a safe activation artifact under the ignored session policy
     # directory so export-context can load and re-verify the current bindings.
     _write_activation(session_dir, profile.source_id, activation)
+    SessionStore.open(session_dir).record_artifact(
+        "policy",
+        content_hash=activation.fingerprint,
+        depends_on=("charter", "approver"),
+        actor=approver,
+    )
     _emit_json(activation.to_dict())
     return EXIT_OK
 

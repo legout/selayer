@@ -65,6 +65,7 @@ from selayer_discovery.model import MAX_TEXT_LENGTH, bounded_mapping
 
 if TYPE_CHECKING:
     from selayer.catalog import SemanticLayer
+    from selayer.sources.profiles import RuntimeProfileResolver
     from selayer_discovery.evidence import ClaimRecord, ClaimStore, EvidenceStore
     from selayer_discovery.interview import InterviewStore
 
@@ -2218,7 +2219,13 @@ def _run_static_check(layer: SemanticLayer, candidate: Candidate) -> MandatoryCh
     )
 
 
-def _run_physical_check(layer: SemanticLayer, candidate: Candidate) -> MandatoryCheck:
+def _run_physical_check(
+    layer: SemanticLayer,
+    candidate: Candidate,
+    *,
+    profiles: RuntimeProfileResolver | None = None,
+    runtime_profile_fingerprint: str = "",
+) -> MandatoryCheck:
     """Run the exact source/grain/relationship physical audit.
 
     A missing or unreadable source makes the core audit produce
@@ -2230,13 +2237,17 @@ def _run_physical_check(layer: SemanticLayer, candidate: Candidate) -> Mandatory
     from selayer.verification import PhysicalCheck, verify_physical
 
     try:
-        report = verify_physical(layer, PhysicalCheck())
+        report = verify_physical(layer, PhysicalCheck(profiles=profiles))
     except Exception:  # noqa: BLE001
         # Any unexpected failure during the physical audit (a connector or
         # driver error not sanitized by the core) is treated as unavailable so
         # readiness refuses rather than crashing.
         digest = canonical.fingerprint(
-            {"catalog": candidate.catalog_fingerprint, "outcomes": ()}
+            {
+                "catalog": candidate.catalog_fingerprint,
+                "runtime_profile": runtime_profile_fingerprint,
+                "outcomes": (),
+            }
         )
         return MandatoryCheck(
             kind=MandatoryCheckKind.PHYSICAL.value,
@@ -2247,6 +2258,7 @@ def _run_physical_check(layer: SemanticLayer, candidate: Candidate) -> Mandatory
     digest = canonical.fingerprint(
         {
             "catalog": candidate.catalog_fingerprint,
+            "runtime_profile": runtime_profile_fingerprint,
             "outcomes": _outcome_signature(report),
         }
     )
@@ -2496,6 +2508,8 @@ def _run_group_checks(
     layer: SemanticLayer,
     okf_output_dir: str | Path,
     claim_store: ClaimStore | None,
+    profiles: RuntimeProfileResolver | None,
+    runtime_profile_fingerprint: str,
 ) -> tuple[MandatoryCheck, ...]:
     """Derive and run every mandatory check for one dependency group."""
 
@@ -2505,7 +2519,14 @@ def _run_group_checks(
         if kind == MandatoryCheckKind.STATIC.value:
             checks.append(_run_static_check(layer, candidate))
         elif kind == MandatoryCheckKind.PHYSICAL.value:
-            checks.append(_run_physical_check(layer, candidate))
+            checks.append(
+                _run_physical_check(
+                    layer,
+                    candidate,
+                    profiles=profiles,
+                    runtime_profile_fingerprint=runtime_profile_fingerprint,
+                )
+            )
         elif kind == MandatoryCheckKind.COMPATIBILITY.value:
             checks.append(_run_compatibility_check(layer, group, candidate))
         elif kind == MandatoryCheckKind.ACCEPTANCE.value:
@@ -2705,6 +2726,8 @@ def verify_proposal(
     interview_store: InterviewStore | None = None,
     claim_store: ClaimStore | None = None,
     evidence_store: EvidenceStore | None = None,
+    profiles: RuntimeProfileResolver | None = None,
+    runtime_profile_fingerprint: str = "",
 ) -> VerificationBundle:
     """Verify a proposal's review readiness and return an immutable bundle.
 
@@ -2737,11 +2760,18 @@ def verify_proposal(
         "proposal": proposal.fingerprint,
         "candidate": candidate.fingerprint,
         "catalog": candidate.catalog_fingerprint,
+        "runtime_profile": runtime_profile_fingerprint,
     }
     group_checks: dict[str, tuple[MandatoryCheck, ...]] = {}
     for group in proposal.groups:
         group_checks[group.group_id] = _run_group_checks(
-            group, candidate, candidate_layer, okf_output_dir, claim_store
+            group,
+            candidate,
+            candidate_layer,
+            okf_output_dir,
+            claim_store,
+            profiles,
+            runtime_profile_fingerprint,
         )
     readiness_by_group: dict[str, GroupReadiness] = {}
     for group in _topological_groups(proposal.groups):
@@ -2766,6 +2796,7 @@ def verify_proposal(
         {
             "proposal_fingerprint": proposal.fingerprint,
             "candidate_fingerprint": candidate.fingerprint,
+            "input_hashes": input_hashes,
             "groups": [gv.to_dict() for gv in groups],
         }
     )

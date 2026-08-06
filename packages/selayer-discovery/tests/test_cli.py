@@ -1185,6 +1185,17 @@ def test_activate_policy_emits_activation(
     assert out["fingerprint"]  # activation binding fingerprint
     assert out["approver"]  # normalized charter approver
     assert out["activated_at"] == "2026-01-01"
+    session_dir = (
+        tmp_path
+        / ".selayer"
+        / "discovery"
+        / "sessions"
+        / "session-policy-001"
+    )
+    assert (
+        SessionStore.open(session_dir).reconstruct().artifact_hashes["policy"]
+        == out["fingerprint"]
+    )
 
 
 def _activate_policy_args(
