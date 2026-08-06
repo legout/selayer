@@ -109,6 +109,13 @@ def _hash_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        raise TransactionError("discovery.transaction.target_unreadable") from None
+
+
 def _hash_file(path: Path) -> str:
     digest = hashlib.sha256()
     try:
@@ -133,6 +140,63 @@ def _fsync_file(path: Path, injector: Callable[[str, str], None] | None, point: 
         raise TransactionError("discovery.transaction.durability_failed") from None
     if injector is not None:
         injector(point, "after")
+
+
+def _safe_file(path: Path) -> Path:
+    """Reject symlinks and non-regular artifact paths."""
+
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return path
+    except OSError:
+        raise TransactionError("discovery.transaction.target_unreadable") from None
+    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+        raise TransactionError("discovery.transaction.path_not_contained")
+    return path
+
+
+def _atomic_json_write(
+    path: Path,
+    value: Mapping[str, object],
+    injector: Callable[[str, str], None] | None,
+    point: str,
+) -> None:
+    """Write a JSON marker without following pre-existing symlinks."""
+
+    _safe_file(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    _safe_file(temporary)
+    try:
+        if temporary.exists():
+            temporary.unlink()
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        try:
+            os.write(descriptor, json.dumps(dict(value), sort_keys=True).encode("utf-8"))
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        if injector is not None:
+            injector(point, "after")
+        os.replace(temporary, path)
+    except FileExistsError:
+        raise TransactionError("discovery.transaction.path_not_contained") from None
+    except OSError:
+        raise TransactionError("discovery.transaction.durability_failed") from None
+    _fsync_file(path, injector, point)
+    _fsync_directory(path.parent, injector, "marker_directory_fsync")
+
+
+def _write_bytes(path: Path, content: bytes) -> None:
+    try:
+        path.write_bytes(content)
+        os.chmod(path, 0o600)
+    except OSError:
+        raise TransactionError("discovery.transaction.durability_failed") from None
 
 
 def _fsync_directory(
@@ -208,14 +272,15 @@ class ProjectLock:
         except Timeout:
             raise TransactionError("discovery.transaction.locked") from None
         try:
-            self.owner_path.write_text(
-                json.dumps({"transaction_id": self.transaction_id, "actor": self.actor}, sort_keys=True),
-                encoding="utf-8",
+            _atomic_json_write(
+                self.owner_path,
+                {"transaction_id": self.transaction_id, "actor": self.actor},
+                None,
+                "owner_fsync",
             )
-            os.chmod(self.owner_path, 0o600)
-        except OSError:
+        except TransactionError:
             self._lock.release()
-            raise TransactionError("discovery.transaction.durability_failed") from None
+            raise
         return self
 
     def __exit__(
@@ -279,8 +344,12 @@ class ApplyJournal:
         injector: Callable[[str, str], None] | None = None,
     ) -> ApplyJournal:
         project = project_root.resolve()
-        recover(transaction_root, project_root=project)
+        try:
+            transaction_root.resolve().relative_to(project)
+        except ValueError:
+            raise TransactionError("discovery.transaction.path_not_contained") from None
         with ProjectLock(project, transaction_root, transaction_id, actor):
+            _recover_unlocked(transaction_root, project_root=project)
             return cls._create_unlocked(
                 project_root=project,
                 transaction_root=transaction_root,
@@ -309,36 +378,41 @@ class ApplyJournal:
             root.relative_to(transaction_root.resolve())
         except ValueError:
             raise TransactionError("discovery.transaction.path_not_contained") from None
-        if root.exists():
+        if _exists(root):
             raise TransactionError("discovery.transaction.exists")
-        root.mkdir(parents=True)
-        (root / "staged").mkdir()
-        (root / "backups").mkdir()
+        try:
+            root.mkdir(parents=True)
+            (root / "staged").mkdir()
+            (root / "backups").mkdir()
+        except OSError:
+            raise TransactionError("discovery.transaction.durability_failed") from None
         records: list[TargetRecord] = []
         for index, (raw_path, content) in enumerate(sorted(files.items())):
             if not isinstance(content, bytes):
                 raise TransactionError("discovery.transaction.invalid_target")
             rel = _safe_rel(raw_path)
             target = _safe_target_path(project, rel)
-            if target.exists():
+            if _exists(target):
                 try:
                     mode = os.lstat(target).st_mode
                 except OSError:
                     raise TransactionError("discovery.transaction.target_unreadable") from None
                 if not stat.S_ISREG(mode):
                     raise TransactionError("discovery.transaction.target_not_regular")
-            old_absent = not target.exists()
+            old_absent = not _exists(target)
             old_hash = None if old_absent else _hash_file(target)
             staged_rel = f"staged/{index:04d}.bin"
             backup_rel = f"backups/{index:04d}.bak"
             staged = root / staged_rel
-            staged.write_bytes(content)
-            os.chmod(staged, 0o600)
+            _write_bytes(staged, content)
             _fsync_file(staged, injector, "staged_file_fsync")
             if not old_absent:
                 backup = root / backup_rel
-                backup.write_bytes(target.read_bytes())
-                os.chmod(backup, 0o600)
+                try:
+                    old_content = target.read_bytes()
+                except OSError:
+                    raise TransactionError("discovery.transaction.target_unreadable") from None
+                _write_bytes(backup, old_content)
                 _fsync_file(backup, injector, "backup_write_fsync")
             records.append(
                 TargetRecord(
@@ -401,14 +475,12 @@ class ApplyJournal:
             "next_target": self._next_target,
             "targets": [record.to_dict() for record in self._records],
         }
-        temporary = self.journal_path.with_suffix(".tmp")
-        try:
-            temporary.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
-            os.chmod(temporary, 0o600)
-            os.replace(temporary, self.journal_path)
-        except OSError:
-            raise TransactionError("discovery.transaction.durability_failed") from None
-        _fsync_file(self.journal_path, self._injector, point or "journal_fsync")
+        _atomic_json_write(
+            self.journal_path,
+            data,
+            self._injector,
+            point or "journal_fsync",
+        )
         _fsync_directory(self.root, self._injector, "journal_directory_fsync")
 
     def _target(self, record: TargetRecord) -> Path:
@@ -433,19 +505,22 @@ class ApplyJournal:
                 self._next_target = index
                 self._write_journal("next_target_fsync")
                 target = self._target(record)
-                if not target.exists() and not record.old_absent:
+                if not _exists(target) and not record.old_absent:
                     raise RecoveryConflict()
-                if target.exists() and _hash_file(target) not in {record.old_hash, record.new_hash}:
+                if _exists(target) and _hash_file(target) not in {record.old_hash, record.new_hash}:
                     raise RecoveryConflict()
-                if target.exists() and _hash_file(target) == record.new_hash:
+                if _exists(target) and _hash_file(target) == record.new_hash:
                     self._records = tuple(
                         replace(item, state="replaced") if item.path == record.path else item
                         for item in self._records
                     )
                     continue
                 self._inject("replace", "before")
-                target.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(self._artifact(record.staged_path), target)
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(self._artifact(record.staged_path), target)
+                except OSError:
+                    raise TransactionError("discovery.transaction.target_unreadable") from None
                 self._inject("replace", "after")
                 _fsync_file(target, self._injector, "target_directory_fsync")
                 _fsync_directory(target.parent, self._injector, "target_directory_fsync")
@@ -455,14 +530,21 @@ class ApplyJournal:
                 )
                 self._write_journal("replaced_fsync")
             success = self.root / "success.json"
-            success.write_text(json.dumps({"transaction_id": self.transaction_id, "new_hashes": [r.new_hash for r in self._records]}, sort_keys=True), encoding="utf-8")
-            _fsync_file(success, self._injector, "success_marker_fsync")
+            _atomic_json_write(
+                success,
+                {"transaction_id": self.transaction_id, "new_hashes": [r.new_hash for r in self._records]},
+                self._injector,
+                "success_marker_fsync",
+            )
             self._state = "success_marked"
             self._write_journal("applied_event_fsync")
             applied = self.root / "applied.json"
-            applied.write_text(json.dumps({"transaction_id": self.transaction_id}, sort_keys=True), encoding="utf-8")
-            _fsync_file(applied, self._injector, "applied_event_fsync")
-            _fsync_directory(self.root, self._injector, "applied_directory_fsync")
+            _atomic_json_write(
+                applied,
+                {"transaction_id": self.transaction_id},
+                self._injector,
+                "applied_event_fsync",
+            )
             self._state = "completed"
             self._write_journal("applied_event_fsync")
 
@@ -474,38 +556,60 @@ class ApplyJournal:
         if self._state == "rolled_back":
             return
         with ProjectLock(self.project_root, self.root.parent, self.transaction_id, self.actor):
-            # Preflight every target so an ambiguity never causes a partial rollback.
-            for record in self._records:
-                target = self._target(record)
-                current = None if not target.exists() else _hash_file(target)
-                allowed = {record.old_hash, record.new_hash}
+            self._rollback_unlocked()
+
+    def _rollback_unlocked(self) -> None:
+        if self._state == "rolled_back":
+            return
+        # Preflight every target so an ambiguity never causes a partial rollback.
+        for record in self._records:
+            target = self._target(record)
+            current = None if not _exists(target) else _hash_file(target)
+            allowed = {record.old_hash, record.new_hash}
+            if record.old_absent:
+                allowed.add(None)
+            if current not in allowed:
+                raise RecoveryConflict()
+        for record in reversed(self._records):
+            target = self._target(record)
+            current = None if not _exists(target) else _hash_file(target)
+            if current == record.new_hash:
                 if record.old_absent:
-                    allowed.add(None)
-                if current not in allowed:
-                    raise RecoveryConflict()
-            for record in reversed(self._records):
-                target = self._target(record)
-                current = None if not target.exists() else _hash_file(target)
-                if current == record.new_hash:
-                    if record.old_absent:
+                    try:
                         target.unlink(missing_ok=True)
-                    else:
-                        backup = self._artifact(record.backup_path)
-                        try:
-                            restored = backup.read_bytes()
-                        except OSError:
-                            raise TransactionError("discovery.transaction.backup_missing") from None
-                        if _hash_bytes(restored) != record.old_hash:
-                            raise RecoveryConflict()
-                        target.write_bytes(restored)
-                        _fsync_file(target, self._injector, "target_directory_fsync")
-                    _fsync_directory(target.parent, self._injector, "target_directory_fsync")
-            self._state = "rolled_back"
-            self._write_journal("rollback_fsync")
+                    except OSError:
+                        raise TransactionError("discovery.transaction.target_unreadable") from None
+                else:
+                    backup = self._artifact(record.backup_path)
+                    try:
+                        restored = backup.read_bytes()
+                    except OSError:
+                        raise TransactionError("discovery.transaction.backup_missing") from None
+                    if _hash_bytes(restored) != record.old_hash:
+                        raise RecoveryConflict()
+                    _write_bytes(target, restored)
+                    if _hash_bytes(restored) != record.old_hash:
+                        raise RecoveryConflict()
+                    _fsync_file(target, self._injector, "target_directory_fsync")
+                _fsync_directory(target.parent, self._injector, "target_directory_fsync")
+        self._state = "rolled_back"
+        self._write_journal("rollback_fsync")
 
 
 def recover(transaction_root: Path, *, project_root: Path) -> tuple[str, ...]:
-    """Recover every pending transaction; repeated calls are idempotent."""
+    """Recover every pending transaction under the project-wide lock."""
+
+    project = project_root.resolve()
+    try:
+        transaction_root.resolve().relative_to(project)
+    except ValueError:
+        raise TransactionError("discovery.transaction.path_not_contained") from None
+    with ProjectLock(project, transaction_root, "recovery", "recovery"):
+        return _recover_unlocked(transaction_root, project_root=project)
+
+
+def _recover_unlocked(transaction_root: Path, *, project_root: Path) -> tuple[str, ...]:
+    """Recover transactions while the caller owns the project lock."""
 
     try:
         if stat.S_ISLNK(os.lstat(transaction_root).st_mode):
@@ -515,11 +619,15 @@ def recover(transaction_root: Path, *, project_root: Path) -> tuple[str, ...]:
     except OSError:
         raise TransactionError("discovery.transaction.target_unreadable") from None
     root = transaction_root.resolve()
-    if not root.exists():
+    if not _exists(root):
         return ()
     recovered: list[str] = []
     directories: list[Path] = []
-    for path in root.iterdir():
+    try:
+        children = tuple(root.iterdir())
+    except OSError:
+        raise TransactionError("discovery.transaction.target_unreadable") from None
+    for path in children:
         if path.name.startswith("."):
             continue
         try:
@@ -531,36 +639,40 @@ def recover(transaction_root: Path, *, project_root: Path) -> tuple[str, ...]:
         if stat.S_ISDIR(mode):
             directories.append(path)
     for directory in sorted(directories):
-        journal_path = directory / "journal.json"
-        if not journal_path.exists():
+        journal_path = _safe_file(directory / "journal.json")
+        if not _exists(journal_path):
             continue
         journal = ApplyJournal.open(journal_path, project_root=project_root)
-        applied = directory / "applied.json"
+        applied = _safe_file(directory / "applied.json")
+        success = _safe_file(directory / "success.json")
         if journal.state == "rolled_back":
             continue
-        if journal.state == "completed" and applied.exists():
-            continue
-        success = directory / "success.json"
         valid_success = False
-        if success.exists():
+        try:
+            marker = json.loads(success.read_text(encoding="utf-8")) if _exists(success) else None
+            valid_success = (
+                isinstance(marker, Mapping)
+                and marker.get("transaction_id") == journal.transaction_id
+                and marker.get("new_hashes") == [record.new_hash for record in journal.records]
+                and all(_hash_file(journal._target(record)) == record.new_hash for record in journal.records)
+            )
+        except (OSError, ValueError, TransactionError):
+            valid_success = False
+        applied_valid = False
+        if _exists(applied):
             try:
-                marker = json.loads(success.read_text(encoding="utf-8"))
-                valid_success = (
-                    isinstance(marker, Mapping)
-                    and marker.get("transaction_id") == journal.transaction_id
-                    and marker.get("new_hashes") == [record.new_hash for record in journal.records]
-                    and all(_hash_file(journal._target(record)) == record.new_hash for record in journal.records)
-                )
-            except (OSError, ValueError, TransactionError):
-                valid_success = False
+                applied_data = json.loads(applied.read_text(encoding="utf-8"))
+                applied_valid = isinstance(applied_data, Mapping) and applied_data.get("transaction_id") == journal.transaction_id
+            except (OSError, ValueError):
+                applied_valid = False
+        if valid_success and journal.state == "completed" and applied_valid:
+            continue
         if valid_success:
-            if not applied.exists():
-                applied.write_text(json.dumps({"transaction_id": journal.transaction_id}, sort_keys=True), encoding="utf-8")
-                _fsync_file(applied, None, "applied_event_fsync")
-                _fsync_directory(directory)
+            if not applied_valid:
+                _atomic_json_write(applied, {"transaction_id": journal.transaction_id}, None, "applied_event_fsync")
             journal._state = "completed"
             journal._write_journal("applied_event_fsync")
         else:
-            journal.rollback()
+            journal._rollback_unlocked()
         recovered.append(journal.transaction_id)
     return tuple(recovered)

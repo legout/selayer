@@ -215,3 +215,37 @@ def test_apply_durability_failures_are_recoverable(
     with pytest.raises(TransactionError):
         journal.apply()
     assert recover(project / "transactions", project_root=project)
+
+
+def test_recovery_finalizes_missing_applied_marker(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    journal = ApplyJournal.create(
+        project_root=project,
+        transaction_root=project / "transactions",
+        transaction_id="tx-008",
+        actor="Alice",
+        files={"file.txt": b"new"},
+    )
+    journal.apply()
+    (journal.root / "applied.json").unlink()
+    assert recover(project / "transactions", project_root=project) == ("tx-008",)
+    assert (journal.root / "applied.json").exists()
+
+
+def test_corrupt_backup_causes_recovery_conflict(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / "file.txt"
+    target.write_bytes(b"old")
+    journal = ApplyJournal.create(
+        project_root=project,
+        transaction_root=project / "transactions",
+        transaction_id="tx-009",
+        actor="Alice",
+        files={"file.txt": b"new"},
+    )
+    journal.apply()
+    (journal.root / journal.records[0].backup_path).write_bytes(b"tampered")
+    with pytest.raises(RecoveryConflict):
+        journal.rollback()
