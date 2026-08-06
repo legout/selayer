@@ -15,7 +15,7 @@ groups:
         kind: catalog.edit
         target_id: dimension.drive_serial_number
         before:
-          source: serialized_drives
+          source: operation_executions
           column: serial_number
           data_type: string
         before_hash: "0000000000000000000000000000000000000000000000000000000000000000"

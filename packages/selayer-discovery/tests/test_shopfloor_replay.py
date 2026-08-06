@@ -5,6 +5,19 @@ from pathlib import Path
 from typing import Any, cast
 
 import yaml
+from selayer_discovery.canonical import fingerprint
+from selayer_discovery.evidence import (
+    ClaimStore,
+    EvidenceClass,
+    EvidenceStore,
+    selector_from_mapping,
+)
+from selayer_discovery.model import SCHEMA_VERSION
+from selayer_discovery.session import SessionCharter, SessionStore
+
+from selayer import SemanticLayer
+from selayer.okf import OkfBundle
+from selayer.verification import verify_static
 
 _REPLAY = Path(__file__).parents[3] / "examples" / "shopfloor" / "discovery" / "replay"
 
@@ -68,3 +81,86 @@ def test_replay_wiki_queries_are_bounded_and_read_only() -> None:
     assert query["provider"] == "okf-filesystem"
     assert all(item["max_results"] == 5 for item in query["queries"])
     assert all("write" not in item["text"].lower() for item in query["queries"])
+
+
+def test_replay_runs_temporary_catalog_okf_and_typed_evidence_flow(tmp_path: Path) -> None:
+    """Exercise the replay's deterministic core without a model or network."""
+
+    root = _REPLAY.parents[1]
+    catalog_source = root / "shopfloor_semantic_layer.yaml"
+    catalog = cast(dict[str, Any], yaml.safe_load(catalog_source.read_text(encoding="utf-8")))
+    defect = cast(dict[str, Any], yaml.safe_load((_REPLAY / "defect.yaml").read_text(encoding="utf-8")))
+    for source in catalog["data_sources"].values():
+        schema_ref = source.pop("schema_ref")
+        source["schema"] = yaml.safe_load(
+            (root / "schemas" / Path(schema_ref).name).read_text(encoding="utf-8")
+        )
+    target = catalog["dimensions"]["drive_serial_number"]
+    before = dict(target)
+    target.update(defect["replace"])
+    temporary_catalog = tmp_path / "shopfloor.yaml"
+    temporary_catalog.write_text(cast(str, yaml.safe_dump(catalog, sort_keys=False)), encoding="utf-8")
+    layer = SemanticLayer.load(temporary_catalog)
+    assert before != target
+    report = verify_static(layer)
+    assert report.complete
+
+    bundle = OkfBundle.build(
+        layer,
+        tmp_path / "okf",
+        references_dir=root / "business_context",
+        overlays_dir=root / "okf_overlays",
+    )
+    assert bundle.concepts
+
+    charter = SessionCharter(
+        schema_version=SCHEMA_VERSION,
+        session_id="shopfloor-replay",
+        business_question="Safe drive-level component and EOL analysis",
+        catalog_fingerprint=fingerprint(temporary_catalog.read_text(encoding="utf-8")),
+        catalog_path="shopfloor.yaml",
+        approver="Dr Alice Okonkwo",
+        inclusions=("dimension.drive_serial_number",),
+        exclusions=("operation-to-telemetry event joins",),
+        acceptance_questions=("Does conformed drive identity hold?",),
+    )
+    session = SessionStore.create(tmp_path / "session", charter=charter, actor=charter.approver)
+    evidence = EvidenceStore.create(tmp_path / "evidence")
+    records = []
+    for index in range(4):
+        document = tmp_path / f"business-{index}.txt"
+        document.write_text(f"business document {index}\n", encoding="utf-8")
+        records.append(evidence.add_document(document, allowed_roots=(tmp_path,)))
+    okf_record = evidence.add_snapshot(
+        b"filesystem OKF evidence\n",
+        media_type="text/plain",
+        source="okf-filesystem",
+    )
+    claims = ClaimStore.create(session, evidence)
+    creator = "charter"
+    for index, (record, evidence_class) in enumerate(
+        zip(records[:3], (EvidenceClass.OBSERVED, EvidenceClass.ASSERTED, EvidenceClass.INFERRED), strict=True),
+        start=1,
+    ):
+        selector = selector_from_mapping(
+            {
+                "kind": "document_line_range",
+                "record_id": record.record_id,
+                "content_hash": record.content_hash,
+                "revision": record.revision,
+                "start_line": 1,
+                "end_line": 1,
+            }
+        )
+        claims.add_claim(
+            claim_id=f"claim-replay-{index}",
+            subject="dimension.drive_serial_number",
+            statement=f"Replay claim {index} is bounded to one evidence snapshot.",
+            evidence_class=evidence_class,
+            selectors=(selector,),
+            creator_event=creator,
+            actor=charter.approver,
+        )
+    assert okf_record.content_hash
+    assert len(claims.claims()) == 3
+    assert all("filesystem OKF evidence" not in path.read_text(encoding="utf-8") for path in (tmp_path / "okf").rglob("*.md"))

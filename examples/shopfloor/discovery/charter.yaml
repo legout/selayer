@@ -4,11 +4,11 @@ business_question: >-
   component, operation, and end-of-line analysis?
 inclusions:
   - dimension.drive_serial_number
-  - dimension.component_number
-  - fact.operation_execution
-  - fact.eol_test_run
+  - dimension.station_id
+  - fact.operation_executions
+  - fact.eol_test_run_id
   - metric.component_count
-  - metric.eol_pass_rate
+  - metric.eol_attempt_count
 exclusions:
   - operation-to-telemetry event joins
   - customer identity and free-text analysis
