@@ -216,21 +216,13 @@ def test_replay_runs_temporary_catalog_okf_and_typed_evidence_flow(
         exclusions=("operation-to-telemetry event joins",),
         acceptance_questions=("Does conformed drive identity hold?",),
     )
-    session_dir = (
-        tmp_path
-        / ".selayer"
-        / "discovery"
-        / "sessions"
-        / charter.session_id
-    )
+    session_dir = tmp_path / ".selayer" / "discovery" / "sessions" / charter.session_id
     resolver = _runtime_profile_resolver(tmp_path, charter)
     assert (
         resolver.resolve("shopfloor_readonly", source_id="shopfloor").name
         == "shopfloor_readonly"
     )
-    session = SessionStore.create(
-        session_dir, charter=charter, actor=charter.approver
-    )
+    session = SessionStore.create(session_dir, charter=charter, actor=charter.approver)
     evidence = EvidenceStore.create(session_dir / "evidence")
     records = []
     for index in range(4):
@@ -432,7 +424,14 @@ def test_replay_runs_temporary_catalog_okf_and_typed_evidence_flow(
     assert _snapshot_tree(repository_root) == repository_before
 
     source_root = repository_root / "packages" / "selayer-discovery" / "src"
-    forbidden_modules = {"subprocess", "requests", "httpx", "socket", "openai", "anthropic"}
+    forbidden_modules = {
+        "subprocess",
+        "requests",
+        "httpx",
+        "socket",
+        "openai",
+        "anthropic",
+    }
     for source_path in source_root.rglob("*.py"):
         tree = ast.parse(source_path.read_text(encoding="utf-8"))
         imports = {

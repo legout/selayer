@@ -716,7 +716,9 @@ def prepare_apply_batch(
     summary_hash = _require_hash(approved_summary_hash, detail="invalid summary hash")
     per_group_fingerprints = group_candidate_fingerprints or {}
     if not isinstance(per_group_fingerprints, Mapping):
-        raise ApprovalError(CODE_APPROVAL_INVALID, safe_detail="invalid group fingerprints") from None
+        raise ApprovalError(
+            CODE_APPROVAL_INVALID, safe_detail="invalid group fingerprints"
+        ) from None
     if not isinstance(attestations, Mapping):
         raise ApprovalError(
             CODE_APPROVAL_INVALID, safe_detail="invalid attestations"
