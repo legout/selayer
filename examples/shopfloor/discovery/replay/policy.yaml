@@ -1,0 +1,20 @@
+version: 1
+salt_ref: SHOPFLOOR_DISCOVERY_SALT
+fields:
+  serial_number:
+    transform: hash
+  customer_name:
+    transform: omit
+  order_id:
+    transform: omit
+  free_text:
+    transform: omit
+  quantity:
+    transform: bucket
+    boundaries: [0, 1, 10, 100]
+limits:
+  rows_per_source: 20
+  fields_per_source: 50
+  bytes_per_source: 65536
+  bytes_per_session: 262144
+reveals: []

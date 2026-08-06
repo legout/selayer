@@ -1,0 +1,22 @@
+version: 1
+business_question: >-
+  Which serialized drives and component operations satisfy safe drive-level
+  component, operation, and end-of-line analysis?
+inclusions:
+  - dimension.drive_serial_number
+  - dimension.component_number
+  - fact.operation_execution
+  - fact.eol_test_run
+  - metric.component_count
+  - metric.eol_pass_rate
+exclusions:
+  - operation-to-telemetry event joins
+  - customer identity and free-text analysis
+  - generated OKF output edits
+acceptance_questions:
+  - Does drive identity conform across serialized drives and component consumption?
+  - Does the corrected catalog preserve operation and EOL grain?
+approver: Dr Alice Okonkwo
+catalog: examples/shopfloor/shopfloor_semantic_layer.yaml
+runtime_profile: SHOPFLOOR_READONLY
+summary_root: semantic_changes

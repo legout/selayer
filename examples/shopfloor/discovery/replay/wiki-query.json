@@ -1,0 +1,15 @@
+{
+  "provider": "okf-filesystem",
+  "queries": [
+    {
+      "id": "drive-identity",
+      "text": "serialized drive identity and component consumption",
+      "max_results": 5
+    },
+    {
+      "id": "eol-rate",
+      "text": "end of line test pass rate",
+      "max_results": 5
+    }
+  ]
+}

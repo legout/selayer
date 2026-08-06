@@ -1,0 +1,3 @@
+{"type":"question","event_id":"question-drive-grain","gate":"gate-grains","affected_groups":["group-conformed-drive"],"evidence_ids":["evidence-serialized-drives"],"question":"Is one serialized drive identity stable across the in-scope source snapshots?"}
+{"type":"answer","event_id":"answer-drive-grain-v1","question_id":"question-drive-grain","answer":"The normalized source evidence supports a conformed drive identity.","actor":"Dr Alice Okonkwo"}
+{"type":"correction","event_id":"correction-drive-grain-v2","supersedes":"answer-drive-grain-v1","reason":"The first answer omitted the component-consumption revision.","answer":"The conformed identity is supported only after the component-consumption revision is included.","actor":"Dr Alice Okonkwo"}

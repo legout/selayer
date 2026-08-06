@@ -1,0 +1,5 @@
+version: 1
+target: dimension.drive_serial_number
+replace:
+  source: operation_executions
+  column: serial_number

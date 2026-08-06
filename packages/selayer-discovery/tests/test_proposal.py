@@ -2350,7 +2350,7 @@ data_sources:
         physical = bundle.check("group-001", MandatoryCheckKind.PHYSICAL.value)
         assert physical.status == "unavailable"
         readiness = bundle.readiness_for("group-001")
-        assert readiness.ready is False
+        assert not readiness.ready
         assert "check_failed" in readiness.blockers
 
     def test_compatibility_and_acceptance_for_formula_impact(
@@ -2826,7 +2826,7 @@ class TestReadiness:
             evidence_store=evidence,
         )
         readiness = bundle.readiness_for("group-001")
-        assert readiness.ready is True
+        assert readiness.ready
         assert readiness.blockers == ()
 
     def test_blocked_by_open_gate(
@@ -2854,7 +2854,7 @@ class TestReadiness:
             evidence_store=evidence,
         )
         readiness = bundle.readiness_for("group-001")
-        assert readiness.ready is False
+        assert not readiness.ready
         assert "gate_open" in readiness.blockers
 
     def test_blocked_by_inferred_only_claim(
@@ -2891,7 +2891,7 @@ class TestReadiness:
             evidence_store=evidence,
         )
         readiness = bundle.readiness_for("group-001")
-        assert readiness.ready is False
+        assert not readiness.ready
         assert "claim_inferred_only" in readiness.blockers
 
     def test_blocked_by_unresolved_conflict(
@@ -2938,7 +2938,7 @@ class TestReadiness:
             evidence_store=evidence,
         )
         readiness = bundle.readiness_for("group-001")
-        assert readiness.ready is False
+        assert not readiness.ready
         assert "conflict_unresolved" in readiness.blockers
 
     def test_blocked_by_dependency_not_ready(
@@ -2996,7 +2996,7 @@ class TestReadiness:
             evidence_store=evidence,
         )
         readiness = bundle.readiness_for("group-001")
-        assert readiness.ready is False
+        assert not readiness.ready
         assert "dependency_not_ready" in readiness.blockers
 
     def test_blocked_by_failed_mandatory_check(
@@ -3035,7 +3035,7 @@ class TestReadiness:
             evidence_store=evidence,
         )
         readiness = bundle.readiness_for("group-001")
-        assert readiness.ready is False
+        assert not readiness.ready
         assert "check_failed" in readiness.blockers
 
 
@@ -3087,7 +3087,7 @@ class TestEvidenceReadinessGates:
             evidence_store=evidence,
         )
         readiness = bundle.readiness_for("group-001")
-        assert readiness.ready is False
+        assert not readiness.ready
         assert "evidence_selector_stale" in readiness.blockers
         # The retained selectors are available for revalidation.
         assert len(claim.selectors) == 1
@@ -3126,7 +3126,7 @@ class TestEvidenceReadinessGates:
             evidence_store=empty_evidence,
         )
         readiness = bundle.readiness_for("group-001")
-        assert readiness.ready is False
+        assert not readiness.ready
         assert "evidence_selector_stale" in readiness.blockers
 
     def test_non_reopenable_evidence_blocks_readiness(
@@ -3175,7 +3175,7 @@ class TestEvidenceReadinessGates:
             evidence_store=evidence,
         )
         readiness = bundle.readiness_for("group-001")
-        assert readiness.ready is False
+        assert not readiness.ready
         assert "evidence_not_reopenable" in readiness.blockers
 
     def test_reopenable_evidence_passes_for_physical_group(
@@ -3219,7 +3219,7 @@ class TestEvidenceReadinessGates:
             evidence_store=evidence,
         )
         readiness = bundle.readiness_for("group-001")
-        assert readiness.ready is True
+        assert readiness.ready
         assert readiness.blockers == ()
 
     def test_tampered_evidence_snapshot_blocks_readiness(
@@ -3271,7 +3271,7 @@ class TestEvidenceReadinessGates:
             evidence_store=evidence,
         )
         readiness = bundle.readiness_for("group-001")
-        assert readiness.ready is False
+        assert not readiness.ready
         assert "evidence_not_reopenable" in readiness.blockers
 
     def test_legacy_claim_without_selectors_blocks_readiness(
@@ -3330,7 +3330,7 @@ class TestEvidenceReadinessGates:
             evidence_store=evidence,
         )
         readiness = bundle.readiness_for("group-001")
-        assert readiness.ready is False
+        assert not readiness.ready
         assert "evidence_selector_stale" in readiness.blockers
 
 
