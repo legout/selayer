@@ -501,6 +501,7 @@ def test_public_exports_exclude_compiler_internals() -> None:
         "Relationship",
         "ReloadResult",
         "SemanticLayer",
+        "SemanticStatus",
         "SourceConnectionError",
         "SourceDependencyError",
         "SourceError",

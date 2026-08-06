@@ -432,7 +432,7 @@ def test_report_is_secret_safe_for_location_credentials(tmp_path: Path) -> None:
     outcome = _outcome(report, "source.orders.grain")
     assert outcome.status == "passed"
     assert outcome.evidence["connector"] == "parquet"
-    assert outcome.evidence["snapshot"] is None
+    assert isinstance(outcome.evidence["snapshot"], str)
 
 
 def test_unavailable_registry_produces_unavailable_outcomes() -> None:
@@ -565,7 +565,13 @@ def test_audit_parquet_source(tmp_path: Path) -> None:
         "events", ParquetConfig(str(path)), _id_value_schema(), ("id",)
     )
     report = verify(layer, PhysicalCheck())
-    _assert_clean_grain(report, "events", connector="parquet", sentinels=(str(path),))
+    _assert_clean_grain(
+        report,
+        "events",
+        connector="parquet",
+        sentinels=(str(path),),
+        snapshot_expected=True,
+    )
 
 
 def test_audit_csv_source(tmp_path: Path) -> None:
@@ -577,7 +583,13 @@ def test_audit_csv_source(tmp_path: Path) -> None:
         "events", CsvConfig(str(path)), _id_value_schema(), ("id",)
     )
     report = verify(layer, PhysicalCheck())
-    _assert_clean_grain(report, "events", connector="csv", sentinels=(str(path),))
+    _assert_clean_grain(
+        report,
+        "events",
+        connector="csv",
+        sentinels=(str(path),),
+        snapshot_expected=True,
+    )
 
 
 def test_audit_sqlite_source(tmp_path: Path) -> None:
@@ -597,7 +609,13 @@ def test_audit_sqlite_source(tmp_path: Path) -> None:
         "facts", SqliteConfig(str(path), "facts"), _id_value_schema(), ("id",)
     )
     report = verify(layer, PhysicalCheck())
-    _assert_clean_grain(report, "facts", connector="sqlite", sentinels=(str(path),))
+    _assert_clean_grain(
+        report,
+        "facts",
+        connector="sqlite",
+        sentinels=(str(path),),
+        snapshot_expected=True,
+    )
 
 
 def test_audit_duckdb_source(tmp_path: Path) -> None:
@@ -614,7 +632,13 @@ def test_audit_duckdb_source(tmp_path: Path) -> None:
         "facts", DuckDbConfig(str(path), "facts"), _id_value_schema(), ("id",)
     )
     report = verify(layer, PhysicalCheck())
-    _assert_clean_grain(report, "facts", connector="duckdb", sentinels=(str(path),))
+    _assert_clean_grain(
+        report,
+        "facts",
+        connector="duckdb",
+        sentinels=(str(path),),
+        snapshot_expected=True,
+    )
 
 
 # ---------------------------------------------------------------------------
