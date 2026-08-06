@@ -2334,7 +2334,9 @@ class TestVerificationChecks:
 
         def fake_verify(_layer: object, check: object) -> SimpleNamespace:
             seen.append(check)
-            return SimpleNamespace(passed=True, complete=True, outcomes=(), diagnostics=())
+            return SimpleNamespace(
+                passed=True, complete=True, outcomes=(), diagnostics=()
+            )
 
         monkeypatch.setattr("selayer.verification.verify_physical", fake_verify)
         _run_physical_check(layer, candidate, profiles=resolver)
