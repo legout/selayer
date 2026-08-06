@@ -79,12 +79,13 @@ selayer-discovery proposal import --session-id <id> --proposal <proposal.yaml>
 selayer-discovery proposal show --session-id <id> [--proposal <proposal-id>]
 selayer-discovery proposal verify --session-id <id> [--proposal <proposal-id>]
 selayer-discovery proposal attest --session-id <id> \
-  --group <group-id> --actor <approver>
+  --proposal <proposal-id> --group <group-id> --approver <approver>
 selayer-discovery proposal prepare-apply --session-id <id> \
-  --group <group-id> [...] --base <base-hash>
+  --proposal <proposal-id> --group <group-id> [...]
 selayer-discovery proposal attest-apply --session-id <id> \
-  --batch <batch-hash> --actor <approver>
-selayer-discovery proposal export-preview --session-id <id> --batch <batch-hash>
+  --proposal <proposal-id> --batch <batch-hash> --approver <approver>
+selayer-discovery proposal export-preview --session-id <id> \
+  --proposal <proposal-id>
 ```
 
 Verification fails closed. A group is ready only when required gates are
@@ -97,7 +98,7 @@ Apply requires a separate explicit request and both named attestations:
 
 ```bash
 selayer-discovery proposal apply --session-id <id> \
-  --batch <batch-hash> --actor <approver>
+  --proposal <proposal-id> --approver <approver>
 selayer-discovery recover --project <root>
 ```
 

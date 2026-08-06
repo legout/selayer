@@ -235,7 +235,7 @@ verification failure.
 
    ```bash
    selayer-discovery proposal attest --session-id <id> \
-     --group <group-id> --actor <approver>
+     --proposal <proposal-id> --group <group-id> --approver <approver>
    ```
 
 5. Prepare an explicit, ordered, dependency-closed, non-overlapping apply
@@ -243,7 +243,7 @@ verification failure.
 
    ```bash
    selayer-discovery proposal prepare-apply --session-id <id> \
-     --group <group-id> [...] --base <base-hash>
+     --proposal <proposal-id> --group <group-id> [...]
    ```
 
 6. Obtain the apply-batch attestation from the current named approver against
@@ -252,7 +252,7 @@ verification failure.
 
    ```bash
    selayer-discovery proposal attest-apply --session-id <id> \
-     --batch <batch-hash> --actor <approver>
+     --proposal <proposal-id> --batch <batch-hash> --approver <approver>
    ```
 
 7. Export the approved-summary preview (safe metadata only) bound to the
@@ -260,7 +260,7 @@ verification failure.
 
    ```bash
    selayer-discovery proposal export-preview --session-id <id> \
-     --batch <batch-hash>
+     --proposal <proposal-id>
    ```
 
 8. Invoke apply only after a separate explicit user request. Apply accepts
@@ -270,7 +270,7 @@ verification failure.
 
    ```bash
    selayer-discovery proposal apply --session-id <id> \
-     --batch <batch-hash> --actor <approver>
+     --proposal <proposal-id> --approver <approver>
    ```
 
    No group decision and apply-batch attestation, no apply. After apply, show
