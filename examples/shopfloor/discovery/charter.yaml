@@ -7,8 +7,8 @@ inclusions:
   - dimension.station_id
   - fact.operation_execution_id
   - fact.eol_test_run_id
-  - metric.component_count
-  - metric.eol_attempt_count
+  - measure.component_count_measure
+  - measure.eol_attempt_count
 exclusions:
   - operation-to-telemetry event joins
   - customer identity and free-text analysis
