@@ -1,0 +1,470 @@
+"""Durable, recoverable file transactions for approved discovery changes."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import stat
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
+from pathlib import Path, PurePosixPath
+from types import TracebackType
+from typing import Self
+
+from filelock import FileLock, Timeout
+
+__all__ = [
+    "ApplyJournal",
+    "FailureInjector",
+    "ProjectLock",
+    "RecoveryConflict",
+    "TargetRecord",
+    "TransactionError",
+    "recover",
+]
+
+_HEX64 = 64
+_MAX_TRANSACTION_ID = 128
+
+
+class TransactionError(Exception):
+    """Sanitized transaction failure with a stable code."""
+
+    def __init__(self, code: str = "discovery.transaction.failed") -> None:
+        self.code = code
+        super().__init__(code)
+
+
+class RecoveryConflict(TransactionError):
+    """The target changed outside the transaction and cannot be guessed."""
+
+    def __init__(self) -> None:
+        super().__init__("discovery.transaction.recovery_conflict")
+
+
+class FailureInjector:
+    """Deterministic failure injector used by durability tests."""
+
+    def __init__(self, failures: set[str] | Sequence[str] = ()) -> None:
+        self.failures = set(failures)
+
+    def __call__(self, point: str, phase: str) -> None:
+        if point in self.failures or f"{phase}_{point}" in self.failures:
+            raise TransactionError("discovery.transaction.injected_failure")
+
+
+@dataclass(frozen=True, slots=True)
+class TargetRecord:
+    path: str
+    old_hash: str | None
+    old_absent: bool
+    backup_path: str
+    staged_path: str
+    new_hash: str
+    state: str = "prepared"
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "old_hash": self.old_hash,
+            "old_absent": self.old_absent,
+            "backup_path": self.backup_path,
+            "staged_path": self.staged_path,
+            "new_hash": self.new_hash,
+            "state": self.state,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> TargetRecord:
+        if not isinstance(value, Mapping):
+            raise TransactionError("discovery.transaction.invalid_journal")
+        required = {
+            "path", "old_hash", "old_absent", "backup_path", "staged_path",
+            "new_hash", "state",
+        }
+        if set(value) != required:
+            raise TransactionError("discovery.transaction.invalid_journal")
+        if not isinstance(value["path"], str) or not isinstance(value["backup_path"], str):
+            raise TransactionError("discovery.transaction.invalid_journal")
+        if not isinstance(value["staged_path"], str) or not isinstance(value["new_hash"], str):
+            raise TransactionError("discovery.transaction.invalid_journal")
+        if not isinstance(value["state"], str) or type(value["old_absent"]) is not bool:
+            raise TransactionError("discovery.transaction.invalid_journal")
+        old_hash = value["old_hash"]
+        if old_hash is not None and not isinstance(old_hash, str):
+            raise TransactionError("discovery.transaction.invalid_journal")
+        return cls(
+            path=value["path"],
+            old_hash=old_hash,
+            old_absent=value["old_absent"],
+            backup_path=value["backup_path"],
+            staged_path=value["staged_path"],
+            new_hash=value["new_hash"],
+            state=value["state"],
+        )
+
+
+def _hash_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        raise TransactionError("discovery.transaction.target_unreadable") from None
+    return digest.hexdigest()
+
+
+def _fsync_file(path: Path, injector: Callable[[str, str], None] | None, point: str) -> None:
+    if injector is not None:
+        injector(point, "before")
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        raise TransactionError("discovery.transaction.durability_failed") from None
+    if injector is not None:
+        injector(point, "after")
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name != "posix":
+        return
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        raise TransactionError("discovery.transaction.durability_failed") from None
+
+
+def _safe_rel(value: str) -> str:
+    pure = PurePosixPath(value)
+    if pure.is_absolute() or not pure.parts or any(part in ("", ".", "..") for part in pure.parts):
+        raise TransactionError("discovery.transaction.path_not_contained")
+    return pure.as_posix()
+
+
+class ProjectLock:
+    """Project-wide OS lock with safe owner metadata."""
+
+    def __init__(self, project_root: Path, transaction_root: Path, transaction_id: str, actor: str) -> None:
+        self.project_root = project_root.resolve()
+        self.root = transaction_root.resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.path = self.root / ".project.lock"
+        self.owner_path = self.root / ".project-owner.json"
+        self.transaction_id = transaction_id
+        self.actor = actor.strip()[:128]
+        self._lock = FileLock(str(self.path))
+
+    def __enter__(self) -> Self:
+        try:
+            self._lock.acquire(timeout=0)
+        except Timeout:
+            raise TransactionError("discovery.transaction.locked") from None
+        try:
+            self.owner_path.write_text(
+                json.dumps({"transaction_id": self.transaction_id, "actor": self.actor}, sort_keys=True),
+                encoding="utf-8",
+            )
+            os.chmod(self.owner_path, 0o600)
+        except OSError:
+            self._lock.release()
+            raise TransactionError("discovery.transaction.durability_failed") from None
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        try:
+            self.owner_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        self._lock.release()
+
+
+class ApplyJournal:
+    """A journal-backed transaction whose target writes are recoverable."""
+
+    def __init__(
+        self,
+        *,
+        project_root: Path,
+        root: Path,
+        transaction_id: str,
+        actor: str,
+        records: tuple[TargetRecord, ...],
+        state: str,
+        next_target: int = 0,
+        injector: Callable[[str, str], None] | None = None,
+    ) -> None:
+        self.project_root = project_root.resolve()
+        self.root = root.resolve()
+        self.transaction_id = transaction_id
+        self.actor = actor
+        self._records = records
+        self._state = state
+        self._next_target = next_target
+        self._injector = injector
+
+    @property
+    def journal_path(self) -> Path:
+        return self.root / "journal.json"
+
+    @property
+    def records(self) -> tuple[TargetRecord, ...]:
+        return self._records
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        project_root: Path,
+        transaction_root: Path,
+        transaction_id: str,
+        actor: str,
+        files: Mapping[str, bytes],
+        injector: Callable[[str, str], None] | None = None,
+    ) -> ApplyJournal:
+        if not isinstance(transaction_id, str) or not transaction_id or len(transaction_id) > _MAX_TRANSACTION_ID:
+            raise TransactionError("discovery.transaction.invalid_transaction")
+        project = project_root.resolve()
+        root = (transaction_root / transaction_id).resolve()
+        try:
+            root.relative_to(transaction_root.resolve())
+        except ValueError:
+            raise TransactionError("discovery.transaction.path_not_contained") from None
+        if root.exists():
+            raise TransactionError("discovery.transaction.exists")
+        root.mkdir(parents=True)
+        (root / "staged").mkdir()
+        (root / "backups").mkdir()
+        records: list[TargetRecord] = []
+        for index, (raw_path, content) in enumerate(sorted(files.items())):
+            if not isinstance(content, bytes):
+                raise TransactionError("discovery.transaction.invalid_target")
+            rel = _safe_rel(raw_path)
+            target = (project / rel).resolve(strict=False)
+            try:
+                target.relative_to(project)
+            except ValueError:
+                raise TransactionError("discovery.transaction.path_not_contained") from None
+            if target.exists():
+                try:
+                    mode = os.lstat(target).st_mode
+                except OSError:
+                    raise TransactionError("discovery.transaction.target_unreadable") from None
+                if not stat.S_ISREG(mode):
+                    raise TransactionError("discovery.transaction.target_not_regular")
+            old_absent = not target.exists()
+            old_hash = None if old_absent else _hash_file(target)
+            staged_rel = f"staged/{index:04d}.bin"
+            backup_rel = f"backups/{index:04d}.bak"
+            staged = root / staged_rel
+            staged.write_bytes(content)
+            os.chmod(staged, 0o600)
+            _fsync_file(staged, injector, "staged_file_fsync")
+            if not old_absent:
+                backup = root / backup_rel
+                backup.write_bytes(target.read_bytes())
+                os.chmod(backup, 0o600)
+                _fsync_file(backup, injector, "backup_write_fsync")
+            records.append(
+                TargetRecord(
+                    path=rel,
+                    old_hash=old_hash,
+                    old_absent=old_absent,
+                    backup_path=backup_rel,
+                    staged_path=staged_rel,
+                    new_hash=_hash_bytes(content),
+                )
+            )
+        journal = cls(
+            project_root=project,
+            root=root,
+            transaction_id=transaction_id,
+            actor=actor,
+            records=tuple(records),
+            state="prepared",
+            injector=injector,
+        )
+        journal._write_journal("initial_journal_fsync")
+        return journal
+
+    @classmethod
+    def open(cls, journal_path: Path, *, project_root: Path, injector: Callable[[str, str], None] | None = None) -> ApplyJournal:
+        try:
+            data = json.loads(journal_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise TransactionError("discovery.transaction.invalid_journal") from None
+        if not isinstance(data, Mapping):
+            raise TransactionError("discovery.transaction.invalid_journal")
+        records_raw = data.get("targets")
+        if not isinstance(records_raw, Sequence) or isinstance(records_raw, (str, bytes)):
+            raise TransactionError("discovery.transaction.invalid_journal")
+        tx = data.get("transaction_id")
+        actor = data.get("actor")
+        state = data.get("state")
+        if not isinstance(tx, str) or not isinstance(actor, str) or not isinstance(state, str):
+            raise TransactionError("discovery.transaction.invalid_journal")
+        next_target = data.get("next_target", 0)
+        if type(next_target) is not int or next_target < 0:
+            raise TransactionError("discovery.transaction.invalid_journal")
+        return cls(
+            project_root=project_root,
+            root=journal_path.parent,
+            transaction_id=tx,
+            actor=actor,
+            records=tuple(TargetRecord.from_mapping(item) for item in records_raw),
+            state=state,
+            next_target=next_target,
+            injector=injector,
+        )
+
+    def _write_journal(self, point: str | None = None) -> None:
+        data = {
+            "schema_version": 1,
+            "transaction_id": self.transaction_id,
+            "actor": self.actor,
+            "state": self._state,
+            "next_target": self._next_target,
+            "targets": [record.to_dict() for record in self._records],
+        }
+        temporary = self.journal_path.with_suffix(".tmp")
+        try:
+            temporary.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, self.journal_path)
+        except OSError:
+            raise TransactionError("discovery.transaction.durability_failed") from None
+        _fsync_file(self.journal_path, self._injector, point or "journal_fsync")
+        _fsync_directory(self.root)
+
+    def _target(self, record: TargetRecord) -> Path:
+        path = (self.project_root / record.path).resolve(strict=False)
+        try:
+            path.relative_to(self.project_root)
+        except ValueError:
+            raise TransactionError("discovery.transaction.path_not_contained") from None
+        return path
+
+    def apply(self) -> None:
+        if self._state in {"completed", "rolled_back"}:
+            return
+        with ProjectLock(self.project_root, self.root.parent, self.transaction_id, self.actor):
+            self._state = "applying"
+            self._write_journal("next_target_fsync")
+            for index, record in enumerate(self._records):
+                self._next_target = index
+                self._write_journal("next_target_fsync")
+                target = self._target(record)
+                if target.exists() and _hash_file(target) not in {record.old_hash, record.new_hash}:
+                    raise RecoveryConflict()
+                if target.exists() and _hash_file(target) == record.new_hash:
+                    self._records = tuple(
+                        replace(item, state="replaced") if item.path == record.path else item
+                        for item in self._records
+                    )
+                    continue
+                self._inject("replace", "before")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(self.root / record.staged_path, target)
+                self._inject("replace", "after")
+                _fsync_file(target, self._injector, "target_directory_fsync")
+                _fsync_directory(target.parent)
+                self._records = tuple(
+                    replace(item, state="replaced") if item.path == record.path else item
+                    for item in self._records
+                )
+                self._write_journal("replaced_fsync")
+            success = self.root / "success.json"
+            success.write_text(json.dumps({"transaction_id": self.transaction_id, "new_hashes": [r.new_hash for r in self._records]}, sort_keys=True), encoding="utf-8")
+            _fsync_file(success, self._injector, "success_marker_fsync")
+            self._state = "completed"
+            self._write_journal("applied_event_fsync")
+            (self.root / "applied.json").write_text(json.dumps({"transaction_id": self.transaction_id}, sort_keys=True), encoding="utf-8")
+            _fsync_file(self.root / "applied.json", self._injector, "applied_event_fsync")
+
+    def _inject(self, point: str, phase: str) -> None:
+        if self._injector is not None:
+            self._injector(point, phase)
+
+    def rollback(self) -> None:
+        if self._state == "rolled_back":
+            return
+        with ProjectLock(self.project_root, self.root.parent, self.transaction_id, self.actor):
+            # Preflight every target so an ambiguity never causes a partial rollback.
+            for record in self._records:
+                target = self._target(record)
+                current = None if not target.exists() else _hash_file(target)
+                if current not in {None, record.old_hash, record.new_hash}:
+                    raise RecoveryConflict()
+            for record in reversed(self._records):
+                target = self._target(record)
+                current = None if not target.exists() else _hash_file(target)
+                if current == record.new_hash:
+                    if record.old_absent:
+                        target.unlink(missing_ok=True)
+                    else:
+                        target.write_bytes((self.root / record.backup_path).read_bytes())
+                        _fsync_file(target, self._injector, "target_directory_fsync")
+                    _fsync_directory(target.parent)
+            self._state = "rolled_back"
+            self._write_journal("rollback_fsync")
+
+
+def recover(transaction_root: Path, *, project_root: Path) -> tuple[str, ...]:
+    """Recover every pending transaction; repeated calls are idempotent."""
+
+    root = transaction_root.resolve()
+    if not root.exists():
+        return ()
+    recovered: list[str] = []
+    for directory in sorted(path for path in root.iterdir() if path.is_dir() and not path.name.startswith(".")):
+        journal_path = directory / "journal.json"
+        if not journal_path.exists():
+            continue
+        journal = ApplyJournal.open(journal_path, project_root=project_root)
+        if journal.state in {"completed", "rolled_back"}:
+            continue
+        success = directory / "success.json"
+        valid_success = False
+        if success.exists():
+            try:
+                marker = json.loads(success.read_text(encoding="utf-8"))
+                valid_success = (
+                    isinstance(marker, Mapping)
+                    and marker.get("transaction_id") == journal.transaction_id
+                    and all(_hash_file(journal._target(record)) == record.new_hash for record in journal.records)
+                )
+            except (OSError, ValueError, TransactionError):
+                valid_success = False
+        if valid_success:
+            journal._state = "completed"
+            journal._write_journal("applied_event_fsync")
+            applied = directory / "applied.json"
+            if not applied.exists():
+                applied.write_text(json.dumps({"transaction_id": journal.transaction_id}, sort_keys=True), encoding="utf-8")
+                _fsync_file(applied, None, "applied_event_fsync")
+        else:
+            journal.rollback()
+        recovered.append(journal.transaction_id)
+    return tuple(recovered)
